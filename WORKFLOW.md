@@ -10,6 +10,7 @@ hooks:
     git clone --depth 1 "$repo_url" .
 codex:
   command: codex app-server
+  read_timeout_ms: 15000
 ---
 
 你正在处理一个来自 Linear 的 issue。

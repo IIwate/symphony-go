@@ -94,6 +94,13 @@
 - **风险：真实环境问题过晚暴露** → 在本周期前半段就开始 smoke test，不等功能全部完成后再验证
 - **风险：Windows 上 `bash` 先命中 WSL 启动器** → 在实现层保留 Git Bash 优先解析兜底，并在实现文档、runbook、验证记录中明确标注为保留项
 
+## 收口结果（2026-03-07）
+
+- 已完成 HTTP API、SSE、Dashboard、`linear_graphql`、operator runbook、release checklist 与真实验证记录。
+- 已在真实 Linear 凭证环境完成 smoke test：dry-run、候选 issue 查询、HTTP/SSE/refresh、真实 issue 调度与动态工具链路验证通过。
+- 根据实测结果，仓库 `WORKFLOW.md` 已新增 `codex.read_timeout_ms: 15000`，用于适配当前主机上 `codex-cli 0.111.0` 的 `thread/start` 启动时延。
+- 本周期收口结论：**完成**。后续进入 Cycle 5 / Post-MVP 扩展，不再阻塞首版。
+
 ## 下一周期输入
 
 - 已验证的发布流程
