@@ -2,7 +2,7 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: demo
+  project_slug: db0a2d0d6058
 codex:
   command: codex app-server
 ---

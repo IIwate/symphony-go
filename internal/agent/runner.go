@@ -237,7 +237,7 @@ func (r *AppServerRunner) waitTurnStart(ctx context.Context, cfg *model.ServiceC
 		"method": "turn/start",
 		"params": map[string]any{
 			"threadId":       threadID,
-			"input":          []any{map[string]any{"type": "text", "text": prompt}},
+			"input":          []any{map[string]any{"type": "inputText", "text": prompt}},
 			"cwd":            params.WorkspacePath,
 			"title":          issue.Identifier + ": " + issue.Title,
 			"approvalPolicy": cfg.CodexApprovalPolicy,
@@ -450,13 +450,15 @@ func (r *AppServerRunner) dynamicTools(cfg *model.ServiceConfig) []any {
 func (r *AppServerRunner) handleToolCall(message map[string]any) (map[string]any, string) {
 	toolName, arguments, ok := extractToolCall(message)
 	if !ok {
-		return map[string]any{"success": false, "error": "unsupported_tool_call"}, "unsupported_tool_call"
+		result := map[string]any{"success": false, "error": "unsupported_tool_call"}
+		return dynamicToolResponse(result), "unsupported_tool_call"
 	}
 	if toolName != "linear_graphql" {
-		return map[string]any{"success": false, "error": "unsupported_tool_call"}, "unsupported_tool_call"
+		result := map[string]any{"success": false, "error": "unsupported_tool_call"}
+		return dynamicToolResponse(result), "unsupported_tool_call"
 	}
 	result := r.executeLinearGraphQL(arguments)
-	return result, "notification"
+	return dynamicToolResponse(result), "notification"
 }
 
 func (r *AppServerRunner) executeLinearGraphQL(arguments any) map[string]any {
@@ -522,6 +524,31 @@ func extractToolCall(message map[string]any) (string, any, bool) {
 		arguments = params
 	}
 	return toolName, arguments, toolName != ""
+}
+
+func dynamicToolResponse(result map[string]any) map[string]any {
+	response := make(map[string]any, len(result)+1)
+	for key, value := range result {
+		response[key] = value
+	}
+	if _, ok := response["contentItems"]; !ok {
+		text := dynamicToolResponseText(result)
+		response["contentItems"] = []any{
+			map[string]any{
+				"type": "inputText",
+				"text": text,
+			},
+		}
+	}
+	return response
+}
+
+func dynamicToolResponseText(result map[string]any) string {
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Sprintf("%v", result)
+	}
+	return string(encoded)
 }
 
 func parseLinearGraphQLInput(arguments any) (string, map[string]any, error) {

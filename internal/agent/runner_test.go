@@ -438,6 +438,20 @@ func containsApprovalResult(lines []string, id string) bool {
 	return false
 }
 
+func hasDynamicToolContentItems(result map[string]any) bool {
+	items, ok := result["contentItems"].([]any)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	first, ok := items[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	itemType, _ := first["type"].(string)
+	itemText, _ := first["text"].(string)
+	return itemType == "inputText" && strings.TrimSpace(itemText) != ""
+}
+
 func containsToolFailure(lines []string, id string) bool {
 	for _, line := range lines {
 		decoded := decodeLineNoTest(line)
@@ -448,7 +462,7 @@ func containsToolFailure(lines []string, id string) bool {
 		if !ok {
 			continue
 		}
-		if result["success"] == false && result["error"] == "unsupported_tool_call" {
+		if result["success"] == false && result["error"] == "unsupported_tool_call" && hasDynamicToolContentItems(result) {
 			return true
 		}
 	}
@@ -465,7 +479,7 @@ func containsToolSuccess(lines []string, id string) bool {
 		if !ok {
 			continue
 		}
-		if result["success"] == true {
+		if result["success"] == true && hasDynamicToolContentItems(result) {
 			return true
 		}
 	}
@@ -482,7 +496,7 @@ func containsToolGraphQLError(lines []string, id string) bool {
 		if !ok {
 			continue
 		}
-		if result["success"] == false && result["error"] == "linear_graphql_errors" {
+		if result["success"] == false && result["error"] == "linear_graphql_errors" && hasDynamicToolContentItems(result) {
 			return true
 		}
 	}
@@ -499,7 +513,7 @@ func containsToolInvalidArguments(lines []string, id string) bool {
 		if !ok {
 			continue
 		}
-		if result["success"] == false && result["error"] == "invalid_arguments" {
+		if result["success"] == false && result["error"] == "invalid_arguments" && hasDynamicToolContentItems(result) {
 			return true
 		}
 	}
