@@ -34,6 +34,7 @@
 - `workspace.root` 指向的目录具备创建、写入、删除权限
 - 日志文件目录具备追加写权限
 - 若启用 hooks，目标主机 shell 环境中可以执行对应脚本
+- Windows 主机建议安装 Git for Windows；实现层会优先使用 Git Bash，避免误命中 `C:/Windows/System32/bash.exe`（WSL 启动器）
 
 ## 3. 启动命令
 
@@ -228,6 +229,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - `codex app-server` 不存在
 - response timeout / turn timeout
 - user-input-required 被按策略硬失败
+- Windows 上 `bash` 命中了 WSL 启动器而不是 Git Bash
 - 子进程意外退出
 
 处理：
@@ -235,6 +237,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 检查 `codex.command`
 - 提升日志级别到 `debug`
 - 检查目标环境对 `codex app-server` 的可执行性
+- 在 Windows 上用 `Get-Command bash` 或 `where.exe bash` 确认优先命中 Git Bash；该兼容逻辑为保留项，不应删除
 
 ### 8.6 HTTP / SSE 问题
 

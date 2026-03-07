@@ -8,12 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/shell"
 )
 
 type Manager interface {
@@ -247,14 +247,16 @@ func (m *LocalManager) workspaceRoot() string {
 type ShellRunner struct{}
 
 func (ShellRunner) Run(ctx context.Context, dir string, script string) (string, string, error) {
-	cmd := exec.CommandContext(ctx, "bash", "-lc", script)
-	cmd.Dir = dir
+	cmd, err := shell.BashCommand(ctx, dir, script)
+	if err != nil {
+		return "", "", err
+	}
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	return stdout.String(), stderr.String(), err
 }

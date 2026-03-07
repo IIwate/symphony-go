@@ -83,12 +83,16 @@
   - `docs/release-checklist.md`
   - `docs/operator-runbook.md`
 - 真实环境验证记录
+  - `docs/real-integration-report-2026-03-07.md`
+- Windows 主机 shell 兼容说明
+  - 保留“Windows 下优先解析 Git Bash”的实现与文档说明，避免被误判为多余噪音后删除
 
 ## 风险与缓解
 
 - **风险：展示层反向耦合业务状态** → 严格限制 server 只读
 - **风险：动态 tool 扩展破坏协议稳定性** → 将 tool 广告与执行逻辑放在独立扩展层
 - **风险：真实环境问题过晚暴露** → 在本周期前半段就开始 smoke test，不等功能全部完成后再验证
+- **风险：Windows 上 `bash` 先命中 WSL 启动器** → 在实现层保留 Git Bash 优先解析兜底，并在实现文档、runbook、验证记录中明确标注为保留项
 
 ## 下一周期输入
 

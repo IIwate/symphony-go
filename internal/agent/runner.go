@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"symphony-go/internal/shell"
 	"time"
 
 	"symphony-go/internal/model"
@@ -775,8 +776,10 @@ func int64FromAny(value any) (int64, bool) {
 type execProcessFactory struct{}
 
 func (execProcessFactory) StartProcess(ctx context.Context, cwd string, command string) (Process, error) {
-	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
-	cmd.Dir = cwd
+	cmd, err := shell.BashCommand(ctx, cwd, command)
+	if err != nil {
+		return nil, err
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

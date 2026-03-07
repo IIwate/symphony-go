@@ -86,7 +86,7 @@ cmd/symphony → orchestrator → tracker (interface)
 | HTTP | `net/http` (1.22+) | 仅 5 端点，标准库足够 |
 | 日志 | `log/slog` | 标准库结构化日志 |
 | 文件监控 | `github.com/fsnotify/fsnotify` | 跨平台事实标准 |
-| 进程管理 | `os/exec` | bash -lc 子进程 + stdio pipe |
+| 进程管理 | `os/exec` | 本地 shell 子进程 + stdio pipe；默认 `bash -lc`，Windows 上优先 Git Bash 以规避 WSL bash stub |
 | 测试 | `testing` + `github.com/stretchr/testify` | 断言辅助 |
 
 ---
@@ -143,6 +143,8 @@ Worker goroutine 启动后:
   8. 执行 after_run 钩子
   9. 上报退出结果 → orchestrator 决定 retry 或 release
 ```
+
+> Windows 实现备注：hooks 与 Codex app-server 都通过统一 shell 解析层启动。Windows 主机上会优先探测 Git for Windows 的 `bash.exe`，再回退到 PATH 中的 `bash`。这样做是为了规避常见的 `C:/Windows/System32/bash.exe`（WSL 启动器）抢占命令解析顺序后导致的 `execvpe(/bin/bash) failed`，不是多余兼容代码。
 
 ### 3. 重试与退避
 
