@@ -187,9 +187,18 @@ var (
 	ErrTemplateParseError        = &WorkflowError{Code: "template_parse_error"}
 	ErrTemplateRenderError       = &WorkflowError{Code: "template_render_error"}
 	ErrInvalidCodexCommand       = &WorkflowError{Code: "invalid_codex_command"}
+	ErrWorkspacePathEscape       = &WorkspaceError{Code: "workspace_path_escape"}
+	ErrWorkspacePathConflict     = &WorkspaceError{Code: "workspace_path_conflict"}
+	ErrWorkspaceHookFailed       = &WorkspaceError{Code: "workspace_hook_failed"}
+	ErrWorkspaceHookTimeout      = &WorkspaceError{Code: "workspace_hook_timeout"}
 	ErrUnsupportedTrackerKind    = &TrackerError{Code: "unsupported_tracker_kind"}
 	ErrMissingTrackerAPIKey      = &TrackerError{Code: "missing_tracker_api_key"}
 	ErrMissingTrackerProjectSlug = &TrackerError{Code: "missing_tracker_project_slug"}
+	ErrLinearAPIRequest          = &TrackerError{Code: "linear_api_request"}
+	ErrLinearAPIStatus           = &TrackerError{Code: "linear_api_status"}
+	ErrLinearGraphQLErrors       = &TrackerError{Code: "linear_graphql_errors"}
+	ErrLinearUnknownPayload      = &TrackerError{Code: "linear_unknown_payload"}
+	ErrLinearMissingEndCursor    = &TrackerError{Code: "linear_missing_end_cursor"}
 )
 
 var workspaceKeyPattern = regexp.MustCompile(`[^A-Za-z0-9._-]`)

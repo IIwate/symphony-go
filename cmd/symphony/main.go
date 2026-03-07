@@ -4,10 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 
 	"symphony-go/internal/config"
+	"symphony-go/internal/logging"
 	"symphony-go/internal/workflow"
 )
 
@@ -71,18 +73,22 @@ func execute(args []string, stderr io.Writer) error {
 	if port >= 0 {
 		cfg.ServerPort = &port
 	}
+	logger, closer, err := logging.NewLogger(logging.Options{Level: logLevel, FilePath: logFile, Stderr: stderr})
+	if err != nil {
+		return err
+	}
+	defer closer.Close()
+	logger.Info("workflow loaded", slog.String("workflow_path", workflowPath))
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		return err
 	}
 
-	_ = logFile
-
 	if dryRun {
-		_, _ = fmt.Fprintln(stderr, "dry-run 校验通过")
+		logger.Info("dry-run 校验通过")
 		return nil
 	}
 
-	_, _ = fmt.Fprintln(stderr, "Cycle 1 骨架初始化完成；运行时编排将在后续周期接入。")
+	logger.Info("Cycle 2 基础设施层已开始，运行时编排将在后续周期接入。")
 	return nil
 }
 
