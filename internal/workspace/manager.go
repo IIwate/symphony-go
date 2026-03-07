@@ -26,20 +26,22 @@ type HookRunner interface {
 }
 
 type LocalManager struct {
-	cfg           *model.ServiceConfig
-	logger        *slog.Logger
-	runner        HookRunner
-	workspaceRoot string
+	configProvider func() *model.ServiceConfig
+	logger         *slog.Logger
+	runner         HookRunner
 }
 
 func NewManager(cfg *model.ServiceConfig, logger *slog.Logger, runner HookRunner) (*LocalManager, error) {
+	return NewDynamicManager(func() *model.ServiceConfig { return cfg }, logger, runner)
+}
+
+func NewDynamicManager(configProvider func() *model.ServiceConfig, logger *slog.Logger, runner HookRunner) (*LocalManager, error) {
+	if configProvider == nil {
+		return nil, model.NewWorkspaceError(nil, "service config provider is nil", nil)
+	}
+	cfg := configProvider()
 	if cfg == nil {
 		return nil, model.NewWorkspaceError(nil, "service config is nil", nil)
-	}
-
-	root, err := filepath.Abs(cfg.WorkspaceRoot)
-	if err != nil {
-		return nil, model.NewWorkspaceError(model.ErrWorkspacePathEscape, "resolve workspace root", err)
 	}
 
 	if logger == nil {
@@ -49,7 +51,7 @@ func NewManager(cfg *model.ServiceConfig, logger *slog.Logger, runner HookRunner
 		runner = ShellRunner{}
 	}
 
-	return &LocalManager{cfg: cfg, logger: logger, runner: runner, workspaceRoot: filepath.Clean(root)}, nil
+	return &LocalManager{configProvider: configProvider, logger: logger, runner: runner}, nil
 }
 
 func (m *LocalManager) CreateForIssue(ctx context.Context, identifier string) (*model.Workspace, error) {
@@ -73,8 +75,9 @@ func (m *LocalManager) CreateForIssue(ctx context.Context, identifier string) (*
 		return nil, model.NewWorkspaceError(model.ErrWorkspacePathConflict, fmt.Sprintf("stat workspace %q", workspace.Path), statErr)
 	}
 
-	if workspace.CreatedNow && m.cfg.HookAfterCreate != nil {
-		if err := m.runFatalHook(ctx, workspace.Path, "after_create", *m.cfg.HookAfterCreate); err != nil {
+	cfg := m.currentConfig()
+	if workspace.CreatedNow && cfg.HookAfterCreate != nil {
+		if err := m.runFatalHook(ctx, workspace.Path, "after_create", *cfg.HookAfterCreate); err != nil {
 			_ = os.RemoveAll(workspace.Path)
 			return nil, err
 		}
@@ -92,19 +95,21 @@ func (m *LocalManager) PrepareForRun(ctx context.Context, workspace *model.Works
 		_ = os.RemoveAll(filepath.Join(workspace.Path, name))
 	}
 
-	if m.cfg.HookBeforeRun == nil {
+	cfg := m.currentConfig()
+	if cfg.HookBeforeRun == nil {
 		return nil
 	}
 
-	return m.runFatalHook(ctx, workspace.Path, "before_run", *m.cfg.HookBeforeRun)
+	return m.runFatalHook(ctx, workspace.Path, "before_run", *cfg.HookBeforeRun)
 }
 
 func (m *LocalManager) FinalizeRun(ctx context.Context, workspace *model.Workspace) {
-	if workspace == nil || m.cfg.HookAfterRun == nil {
+	cfg := m.currentConfig()
+	if workspace == nil || cfg.HookAfterRun == nil {
 		return
 	}
 
-	_ = m.runBestEffortHook(ctx, workspace.Path, "after_run", *m.cfg.HookAfterRun)
+	_ = m.runBestEffortHook(ctx, workspace.Path, "after_run", *cfg.HookAfterRun)
 }
 
 func (m *LocalManager) CleanupWorkspace(ctx context.Context, identifier string) error {
@@ -124,8 +129,9 @@ func (m *LocalManager) CleanupWorkspace(ctx context.Context, identifier string) 
 		return model.NewWorkspaceError(model.ErrWorkspacePathConflict, fmt.Sprintf("workspace path %q is not a directory", workspace.Path), nil)
 	}
 
-	if m.cfg.HookBeforeRemove != nil {
-		_ = m.runBestEffortHook(ctx, workspace.Path, "before_remove", *m.cfg.HookBeforeRemove)
+	cfg := m.currentConfig()
+	if cfg.HookBeforeRemove != nil {
+		_ = m.runBestEffortHook(ctx, workspace.Path, "before_remove", *cfg.HookBeforeRemove)
 	}
 
 	if err := os.RemoveAll(workspace.Path); err != nil {
@@ -137,12 +143,13 @@ func (m *LocalManager) CleanupWorkspace(ctx context.Context, identifier string) 
 
 func (m *LocalManager) newWorkspace(identifier string) (*model.Workspace, error) {
 	workspaceKey := model.SanitizeWorkspaceKey(identifier)
-	workspacePath := filepath.Join(m.workspaceRoot, workspaceKey)
+	root := m.workspaceRoot()
+	workspacePath := filepath.Join(root, workspaceKey)
 	workspacePath, err := filepath.Abs(workspacePath)
 	if err != nil {
 		return nil, model.NewWorkspaceError(model.ErrWorkspacePathEscape, "resolve workspace path", err)
 	}
-	if err := ensureWithinRoot(m.workspaceRoot, workspacePath); err != nil {
+	if err := ensureWithinRoot(root, workspacePath); err != nil {
 		return nil, err
 	}
 
@@ -171,7 +178,7 @@ func (m *LocalManager) runBestEffortHook(ctx context.Context, dir string, hookNa
 
 func (m *LocalManager) runHook(ctx context.Context, dir string, hookName string, script string) (string, string, error) {
 	m.logger.Debug("workspace hook start", "hook", hookName, "workspace_path", dir)
-	hookCtx, cancel := context.WithTimeout(ctx, time.Duration(m.cfg.HookTimeoutMS)*time.Millisecond)
+	hookCtx, cancel := context.WithTimeout(ctx, time.Duration(m.currentConfig().HookTimeoutMS)*time.Millisecond)
 	defer cancel()
 
 	stdout, stderr, err := m.runner.Run(hookCtx, dir, script)
@@ -216,6 +223,25 @@ func truncateOutput(value string) string {
 	}
 
 	return trimmed[:256] + "...(truncated)"
+}
+
+func (m *LocalManager) currentConfig() *model.ServiceConfig {
+	if m.configProvider == nil {
+		return &model.ServiceConfig{}
+	}
+	cfg := m.configProvider()
+	if cfg == nil {
+		return &model.ServiceConfig{}
+	}
+	return cfg
+}
+
+func (m *LocalManager) workspaceRoot() string {
+	root, err := filepath.Abs(m.currentConfig().WorkspaceRoot)
+	if err != nil {
+		return filepath.Clean(m.currentConfig().WorkspaceRoot)
+	}
+	return filepath.Clean(root)
 }
 
 type ShellRunner struct{}

@@ -95,11 +95,8 @@ type Client interface {
 }
 
 type LinearClient struct {
-	httpClient   *http.Client
-	endpoint     string
-	apiKey       string
-	projectSlug  string
-	activeStates []string
+	httpClient     *http.Client
+	configProvider func() *model.ServiceConfig
 }
 
 func NewClient(cfg *model.ServiceConfig, httpClient *http.Client) (Client, error) {
@@ -114,6 +111,18 @@ func NewClient(cfg *model.ServiceConfig, httpClient *http.Client) (Client, error
 }
 
 func NewLinearClient(cfg *model.ServiceConfig, httpClient *http.Client) (*LinearClient, error) {
+	return NewDynamicLinearClient(func() *model.ServiceConfig { return cfg }, httpClient)
+}
+
+func NewDynamicClient(configProvider func() *model.ServiceConfig, httpClient *http.Client) (Client, error) {
+	return NewDynamicLinearClient(configProvider, httpClient)
+}
+
+func NewDynamicLinearClient(configProvider func() *model.ServiceConfig, httpClient *http.Client) (*LinearClient, error) {
+	if configProvider == nil {
+		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, "service config provider is nil", nil)
+	}
+	cfg := configProvider()
 	if cfg == nil {
 		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, "service config is nil", nil)
 	}
@@ -128,28 +137,27 @@ func NewLinearClient(cfg *model.ServiceConfig, httpClient *http.Client) (*Linear
 	}
 
 	return &LinearClient{
-		httpClient:   httpClient,
-		endpoint:     cfg.TrackerEndpoint,
-		apiKey:       cfg.TrackerAPIKey,
-		projectSlug:  cfg.TrackerProjectSlug,
-		activeStates: append([]string(nil), cfg.ActiveStates...),
+		httpClient:     httpClient,
+		configProvider: configProvider,
 	}, nil
 }
 
 func (c *LinearClient) FetchCandidateIssues(ctx context.Context) ([]model.Issue, error) {
+	cfg := c.currentConfig()
 	return c.fetchIssues(ctx, candidateIssuesQuery, map[string]any{
-		"projectSlug": c.projectSlug,
-		"states":      c.activeStates,
+		"projectSlug": cfg.TrackerProjectSlug,
+		"states":      append([]string(nil), cfg.ActiveStates...),
 	})
 }
 
 func (c *LinearClient) FetchIssuesByStates(ctx context.Context, states []string) ([]model.Issue, error) {
+	cfg := c.currentConfig()
 	if len(states) == 0 {
 		return []model.Issue{}, nil
 	}
 
 	return c.fetchIssues(ctx, issuesByStatesQuery, map[string]any{
-		"projectSlug": c.projectSlug,
+		"projectSlug": cfg.TrackerProjectSlug,
 		"states":      states,
 	})
 }
@@ -198,12 +206,13 @@ func (c *LinearClient) requestIssues(ctx context.Context, query string, variable
 		return nil, model.NewTrackerError(model.ErrLinearUnknownPayload, "marshal GraphQL request", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	cfg := c.currentConfig()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.TrackerEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, model.NewTrackerError(model.ErrLinearAPIRequest, "build Linear request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", c.apiKey)
+	req.Header.Set("Authorization", cfg.TrackerAPIKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -247,6 +256,17 @@ func cloneVariables(source map[string]any) map[string]any {
 		clone[key] = value
 	}
 	return clone
+}
+
+func (c *LinearClient) currentConfig() *model.ServiceConfig {
+	if c.configProvider == nil {
+		return &model.ServiceConfig{}
+	}
+	cfg := c.configProvider()
+	if cfg == nil {
+		return &model.ServiceConfig{}
+	}
+	return cfg
 }
 
 func normalizeIssue(node issueNode) model.Issue {

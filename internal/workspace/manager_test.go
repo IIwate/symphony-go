@@ -15,7 +15,7 @@ import (
 func TestCreateForIssueCreatesAndReusesWorkspace(t *testing.T) {
 	runner := &fakeRunner{}
 	manager := newTestManager(t, runner)
-	manager.cfg.HookAfterCreate = stringPtr("setup")
+	manager.currentConfig().HookAfterCreate = stringPtr("setup")
 
 	workspace1, err := manager.CreateForIssue(context.Background(), "ABC/1")
 	if err != nil {
@@ -47,10 +47,10 @@ func TestCreateForIssueRejectsEscapeAndFileConflict(t *testing.T) {
 		t.Fatalf("CreateForIssue(..) error = %v, want ErrWorkspacePathEscape", err)
 	}
 
-	if err := os.MkdirAll(manager.workspaceRoot, 0o755); err != nil {
+	if err := os.MkdirAll(manager.workspaceRoot(), 0o755); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
-	conflictPath := filepath.Join(manager.workspaceRoot, "conflict")
+	conflictPath := filepath.Join(manager.workspaceRoot(), "conflict")
 	if err := os.WriteFile(conflictPath, []byte("x"), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -62,14 +62,14 @@ func TestCreateForIssueRejectsEscapeAndFileConflict(t *testing.T) {
 func TestCreateForIssueCleansUpOnAfterCreateFailure(t *testing.T) {
 	runner := &fakeRunner{errorsByScript: map[string]error{"setup": errors.New("boom")}}
 	manager := newTestManager(t, runner)
-	manager.cfg.HookAfterCreate = stringPtr("setup")
+	manager.currentConfig().HookAfterCreate = stringPtr("setup")
 
 	_, err := manager.CreateForIssue(context.Background(), "ABC-1")
 	if !errors.Is(err, model.ErrWorkspaceHookFailed) {
 		t.Fatalf("CreateForIssue() error = %v, want ErrWorkspaceHookFailed", err)
 	}
 
-	if _, statErr := os.Stat(filepath.Join(manager.workspaceRoot, "ABC-1")); !errors.Is(statErr, os.ErrNotExist) {
+	if _, statErr := os.Stat(filepath.Join(manager.workspaceRoot(), "ABC-1")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("workspace still exists, stat error = %v", statErr)
 	}
 }
@@ -77,7 +77,7 @@ func TestCreateForIssueCleansUpOnAfterCreateFailure(t *testing.T) {
 func TestPrepareForRunCleansArtifactsAndFailsOnBeforeRun(t *testing.T) {
 	runner := &fakeRunner{errorsByScript: map[string]error{"before": errors.New("bad hook")}}
 	manager := newTestManager(t, runner)
-	manager.cfg.HookBeforeRun = stringPtr("before")
+	manager.currentConfig().HookBeforeRun = stringPtr("before")
 
 	workspace, err := manager.CreateForIssue(context.Background(), "ABC-2")
 	if err != nil {
@@ -103,8 +103,8 @@ func TestPrepareForRunCleansArtifactsAndFailsOnBeforeRun(t *testing.T) {
 func TestPrepareForRunTimeout(t *testing.T) {
 	runner := &fakeRunner{blockScript: "before"}
 	manager := newTestManager(t, runner)
-	manager.cfg.HookBeforeRun = stringPtr("before")
-	manager.cfg.HookTimeoutMS = 50
+	manager.currentConfig().HookBeforeRun = stringPtr("before")
+	manager.currentConfig().HookTimeoutMS = 50
 
 	workspace, err := manager.CreateForIssue(context.Background(), "ABC-3")
 	if err != nil {
@@ -123,8 +123,8 @@ func TestFinalizeRunAndCleanupIgnoreBestEffortHooks(t *testing.T) {
 		"remove": errors.New("remove failed"),
 	}}
 	manager := newTestManager(t, runner)
-	manager.cfg.HookAfterRun = stringPtr("after")
-	manager.cfg.HookBeforeRemove = stringPtr("remove")
+	manager.currentConfig().HookAfterRun = stringPtr("after")
+	manager.currentConfig().HookBeforeRemove = stringPtr("remove")
 
 	workspace, err := manager.CreateForIssue(context.Background(), "ABC-4")
 	if err != nil {

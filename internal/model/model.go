@@ -191,6 +191,15 @@ var (
 	ErrWorkspacePathConflict     = &WorkspaceError{Code: "workspace_path_conflict"}
 	ErrWorkspaceHookFailed       = &WorkspaceError{Code: "workspace_hook_failed"}
 	ErrWorkspaceHookTimeout      = &WorkspaceError{Code: "workspace_hook_timeout"}
+	ErrCodexNotFound             = &AgentError{Code: "codex_not_found"}
+	ErrInvalidWorkspaceCWD       = &AgentError{Code: "invalid_workspace_cwd"}
+	ErrResponseTimeout           = &AgentError{Code: "response_timeout"}
+	ErrTurnTimeout               = &AgentError{Code: "turn_timeout"}
+	ErrPortExit                  = &AgentError{Code: "port_exit"}
+	ErrResponseError             = &AgentError{Code: "response_error"}
+	ErrTurnFailed                = &AgentError{Code: "turn_failed"}
+	ErrTurnCancelled             = &AgentError{Code: "turn_cancelled"}
+	ErrTurnInputRequired         = &AgentError{Code: "turn_input_required"}
 	ErrUnsupportedTrackerKind    = &TrackerError{Code: "unsupported_tracker_kind"}
 	ErrMissingTrackerAPIKey      = &TrackerError{Code: "missing_tracker_api_key"}
 	ErrMissingTrackerProjectSlug = &TrackerError{Code: "missing_tracker_project_slug"}

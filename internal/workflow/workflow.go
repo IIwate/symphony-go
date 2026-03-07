@@ -41,6 +41,10 @@ func Load(path string) (*model.WorkflowDefinition, error) {
 }
 
 func Watch(ctx context.Context, path string, onChange func(*model.WorkflowDefinition)) error {
+	return WatchWithErrors(ctx, path, onChange, nil)
+}
+
+func WatchWithErrors(ctx context.Context, path string, onChange func(*model.WorkflowDefinition), onError func(error)) error {
 	workflowPath, err := filepath.Abs(normalizeWorkflowPath(path))
 	if err != nil {
 		return err
@@ -102,13 +106,22 @@ func Watch(ctx context.Context, path string, onChange func(*model.WorkflowDefini
 			case <-timerC:
 				timerC = nil
 				definition, loadErr := Load(workflowPath)
-				if loadErr != nil || onChange == nil {
+				if loadErr != nil {
+					if onError != nil {
+						onError(loadErr)
+					}
+					continue
+				}
+				if onChange == nil {
 					continue
 				}
 				onChange(definition)
-			case _, ok := <-watcher.Errors:
+			case watchErr, ok := <-watcher.Errors:
 				if !ok {
 					return
+				}
+				if onError != nil {
+					onError(watchErr)
 				}
 			}
 		}
