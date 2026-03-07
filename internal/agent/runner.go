@@ -237,7 +237,7 @@ func (r *AppServerRunner) waitTurnStart(ctx context.Context, cfg *model.ServiceC
 		"method": "turn/start",
 		"params": map[string]any{
 			"threadId":       threadID,
-			"input":          []any{map[string]any{"type": "inputText", "text": prompt}},
+			"input":          []any{map[string]any{"type": "text", "text": prompt}},
 			"cwd":            params.WorkspacePath,
 			"title":          issue.Identifier + ": " + issue.Title,
 			"approvalPolicy": cfg.CodexApprovalPolicy,
@@ -513,17 +513,52 @@ func extractToolCall(message map[string]any) (string, any, bool) {
 	if !ok {
 		return "", nil, false
 	}
-	toolName, _ := params["name"].(string)
+	msg, _ := params["msg"].(map[string]any)
+
+	toolName := toolNameFromMap(params)
 	if toolName == "" {
-		if rawTool, ok := params["tool"].(map[string]any); ok {
-			toolName, _ = rawTool["name"].(string)
+		toolName = toolNameFromMap(msg)
+	}
+
+	arguments := firstNonNil(
+		params["arguments"],
+		params["input"],
+		params["payload"],
+		msg["arguments"],
+		msg["input"],
+		msg["payload"],
+	)
+	if arguments == nil {
+		if len(msg) > 0 {
+			arguments = msg
+		} else {
+			arguments = params
 		}
 	}
-	arguments := firstNonNil(params["arguments"], params["input"], params["payload"])
-	if arguments == nil {
-		arguments = params
-	}
 	return toolName, arguments, toolName != ""
+}
+
+func toolNameFromMap(mapping map[string]any) string {
+	if len(mapping) == 0 {
+		return ""
+	}
+	if name := firstNonEmptyString(mapping["name"], mapping["tool"]); name != "" {
+		return name
+	}
+	if rawTool, ok := mapping["tool"].(map[string]any); ok {
+		return firstNonEmptyString(rawTool["name"], rawTool["tool"])
+	}
+	return ""
+}
+
+func firstNonEmptyString(values ...any) string {
+	for _, value := range values {
+		text, ok := value.(string)
+		if ok && strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func dynamicToolResponse(result map[string]any) map[string]any {

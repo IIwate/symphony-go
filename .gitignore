@@ -10,3 +10,4 @@ coverage.out
 bin/
 dist/
 .ace-tool/
+logs/

@@ -193,6 +193,86 @@ func TestRunnerLinearGraphQLToolSuccess(t *testing.T) {
 	}
 }
 
+func TestRunnerLinearGraphQLToolSuccessWithStringToolField(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"id":"u1"}}}`))
+	}))
+	defer server.Close()
+
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"tool": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        server.URL,
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	})
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsToolSuccess(factory.process.stdinRecorder.lines(), "tool-1") {
+		t.Fatalf("tool success response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
+func TestRunnerLinearGraphQLToolSuccessWithNestedMsgPayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"id":"u1"}}}`))
+	}))
+	defer server.Close()
+
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"msg": map[string]any{"tool": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        server.URL,
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	})
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsToolSuccess(factory.process.stdinRecorder.lines(), "tool-1") {
+		t.Fatalf("tool success response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
 func TestRunnerLinearGraphQLToolGraphQLErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"errors":[{"message":"bad query"}]}`))
