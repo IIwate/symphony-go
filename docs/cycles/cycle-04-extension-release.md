@@ -80,6 +80,8 @@
 - `linear_graphql` 扩展实现
 - Dashboard/SSE 基础能力
 - Release checklist 与 operator runbook
+  - `docs/release-checklist.md`
+  - `docs/operator-runbook.md`
 - 真实环境验证记录
 
 ## 风险与缓解
