@@ -95,9 +95,11 @@ type Orchestrator struct {
 
 	state model.OrchestratorState
 
-	mu       sync.RWMutex
-	snapshot Snapshot
-	started  bool
+	mu               sync.RWMutex
+	snapshot         Snapshot
+	started          bool
+	subscribers      map[int]chan Snapshot
+	nextSubscriberID int
 }
 
 func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, logger *slog.Logger) *Orchestrator {
@@ -127,6 +129,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 			RetryAttempts: map[string]*model.RetryEntry{},
 			Completed:     map[string]struct{}{},
 		},
+		subscribers: map[int]chan Snapshot{},
 	}
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
@@ -175,6 +178,7 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 				o.mu.Lock()
 				o.applyCurrentConfigLocked()
 				o.refreshSnapshotLocked()
+				o.publishSnapshotLocked()
 				o.mu.Unlock()
 			}
 		}
@@ -215,6 +219,37 @@ func (o *Orchestrator) Snapshot() Snapshot {
 	return o.snapshot
 }
 
+func (o *Orchestrator) SubscribeSnapshots(buffer int) (<-chan Snapshot, func()) {
+	if buffer <= 0 {
+		buffer = 1
+	}
+	ch := make(chan Snapshot, buffer)
+
+	o.mu.Lock()
+	id := o.nextSubscriberID
+	o.nextSubscriberID++
+	o.refreshSnapshotLocked()
+	snapshot := o.snapshot
+	o.subscribers[id] = ch
+	o.mu.Unlock()
+
+	select {
+	case ch <- snapshot:
+	default:
+	}
+
+	unsubscribe := func() {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if existing, ok := o.subscribers[id]; ok {
+			delete(o.subscribers, id)
+			close(existing)
+		}
+	}
+
+	return ch, unsubscribe
+}
+
 func (o *Orchestrator) RunOnce(ctx context.Context, allowDispatch bool) {
 	o.startupCleanup(ctx)
 	o.tickWithMode(ctx, allowDispatch)
@@ -230,12 +265,20 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	cfg := o.currentConfig()
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		o.logger.Warn("dispatch preflight failed", "error", err.Error())
+		o.mu.Lock()
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.mu.Unlock()
 		return
 	}
 
 	candidates, err := o.tracker.FetchCandidateIssues(ctx)
 	if err != nil {
 		o.logger.Warn("fetch candidate issues failed", "error", err.Error())
+		o.mu.Lock()
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.mu.Unlock()
 		return
 	}
 	sort.SliceStable(candidates, func(i int, j int) bool {
@@ -244,10 +287,15 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	if !allowDispatch {
 		o.mu.Lock()
 		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
 		o.mu.Unlock()
 		return
 	}
 	o.dispatchEligibleIssues(ctx, candidates)
+	o.mu.Lock()
+	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
+	o.mu.Unlock()
 }
 
 func (o *Orchestrator) dispatchEligibleIssues(ctx context.Context, candidates []model.Issue) {
@@ -292,6 +340,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		WorkerCancel: cancel,
 	}
 	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
 	o.mu.Unlock()
 
 	o.workerWG.Add(1)
@@ -375,6 +424,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		o.state.Completed[result.IssueID] = struct{}{}
 		o.scheduleRetryLocked(result.IssueID, entry.Identifier, 1, nil, true)
 		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
 		return
 	}
 
@@ -385,6 +435,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	errorText := result.Err.Error()
 	o.scheduleRetryLocked(result.IssueID, entry.Identifier, nextAttempt, &errorText, false)
 	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
 }
 
 func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
@@ -421,6 +472,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 		o.state.CodexRateLimits = event.RateLimits
 	}
 	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
 }
 
 func (o *Orchestrator) reconcileRunning(ctx context.Context) {
@@ -479,6 +531,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) {
 		o.terminateRunningLocked(ctx, issueID, false, false, "")
 	}
 	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
 }
 
 func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
@@ -514,6 +567,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 		o.mu.Lock()
 		delete(o.state.Claimed, issueID)
 		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
 		o.mu.Unlock()
 		return
 	}
@@ -523,6 +577,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 		o.mu.Lock()
 		delete(o.state.Claimed, issueID)
 		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
 		o.mu.Unlock()
 		return
 	}
@@ -726,6 +781,27 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		Retrying:    retrying,
 		CodexTotals: totals,
 		RateLimits:  o.state.CodexRateLimits,
+	}
+}
+
+func (o *Orchestrator) publishSnapshotLocked() {
+	if len(o.subscribers) == 0 {
+		return
+	}
+	snapshot := o.snapshot
+	for _, ch := range o.subscribers {
+		select {
+		case ch <- snapshot:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- snapshot:
+			default:
+			}
+		}
 	}
 }
 

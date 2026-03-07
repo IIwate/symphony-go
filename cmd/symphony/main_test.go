@@ -13,6 +13,7 @@ import (
 	"symphony-go/internal/agent"
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
+	"symphony-go/internal/orchestrator"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workflow"
 	"symphony-go/internal/workspace"
@@ -154,6 +155,7 @@ func stubDependencies(t *testing.T) func() {
 	origWorkspace := newWorkspaceFactory
 	origRunner := newAgentRunnerFactory
 	origOrchestrator := newOrchestratorFactory
+	origHTTPServer := newHTTPServerFactory
 	origNotify := notifySignalContext
 
 	watchWorkflowDefinition = workflow.WatchWithErrors
@@ -172,6 +174,9 @@ func stubDependencies(t *testing.T) func() {
 	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{}
 	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
+	}
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
 		return context.WithCancel(parent)
 	}
@@ -183,6 +188,7 @@ func stubDependencies(t *testing.T) func() {
 		newWorkspaceFactory = origWorkspace
 		newAgentRunnerFactory = origRunner
 		newOrchestratorFactory = origOrchestrator
+		newHTTPServerFactory = origHTTPServer
 		notifySignalContext = origNotify
 	}
 }
@@ -215,6 +221,7 @@ type fakeOrchestrator struct {
 	notifyReload func(*model.WorkflowDefinition)
 	start        func(context.Context) error
 	wait         func()
+	snapshot     orchestrator.Snapshot
 }
 
 func (f *fakeOrchestrator) Start(ctx context.Context) error {
@@ -238,7 +245,25 @@ func (f *fakeOrchestrator) NotifyWorkflowReload(def *model.WorkflowDefinition) {
 		f.notifyReload(def)
 	}
 }
-func (f *fakeOrchestrator) RequestRefresh() {}
+func (f *fakeOrchestrator) RequestRefresh()                 {}
+func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot { return f.snapshot }
+func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func()) {
+	ch := make(chan orchestrator.Snapshot, max(1, buffer))
+	ch <- f.snapshot
+	return ch, func() { close(ch) }
+}
+
+type fakeHTTPServer struct{ addr string }
+
+func (f *fakeHTTPServer) Addr() string                   { return f.addr }
+func (f *fakeHTTPServer) Shutdown(context.Context) error { return nil }
+
+func max(left int, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
 
 func writeWorkflow(t *testing.T, path string) {
 	t.Helper()

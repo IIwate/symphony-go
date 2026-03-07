@@ -11,23 +11,31 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"symphony-go/internal/agent"
 	"symphony-go/internal/config"
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
 	"symphony-go/internal/orchestrator"
+	"symphony-go/internal/server"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workflow"
 	"symphony-go/internal/workspace"
 )
 
 type orchestratorService interface {
+	server.RuntimeSource
 	Start(context.Context) error
 	Wait()
 	RunOnce(context.Context, bool)
 	NotifyWorkflowReload(*model.WorkflowDefinition)
 	RequestRefresh()
+}
+
+type httpServer interface {
+	Addr() string
+	Shutdown(context.Context) error
 }
 
 type runtimeState struct {
@@ -52,6 +60,9 @@ var (
 	}
 	newOrchestratorFactory = func(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, logger *slog.Logger) orchestratorService {
 		return orchestrator.NewOrchestrator(trackerClient, workspaceManager, runner, configFn, workflowFn, logger)
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+		return server.Start(runtime, logger, port)
 	}
 	notifySignalContext = func(parent context.Context, signals ...os.Signal) (context.Context, context.CancelFunc) {
 		return signal.NotifyContext(parent, signals...)
@@ -162,15 +173,32 @@ func execute(args []string, stderr io.Writer) error {
 		return err
 	}
 
+	var httpSrv httpServer
 	if cfg.ServerPort != nil {
-		logger.Warn("http server not implemented yet", "port", *cfg.ServerPort)
+		httpSrv, err = newHTTPServerFactory(orch, logger, *cfg.ServerPort)
+		if err != nil {
+			return err
+		}
+		logger.Info("http server started", "addr", httpSrv.Addr())
 	}
 
 	if err := orch.Start(ctx); err != nil {
+		if httpSrv != nil {
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancelShutdown()
+			_ = httpSrv.Shutdown(shutdownCtx)
+		}
 		return err
 	}
 	logger.Info("symphony started", slog.String("workflow_path", workflowPath))
 	orch.Wait()
+	if httpSrv != nil {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelShutdown()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("http server shutdown failed", "error", err.Error())
+		}
+	}
 	logger.Info("symphony stopped")
 	return nil
 }
