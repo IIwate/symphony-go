@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -59,6 +61,12 @@ func TestRunnerHandshakeAndContinuationTurns(t *testing.T) {
 	assertMethod(t, requests[2], "thread/start")
 	assertMethod(t, requests[3], "turn/start")
 	assertMethod(t, requests[4], "turn/start")
+
+	threadStart := decodeLine(t, requests[2])
+	paramsMap := threadStart["params"].(map[string]any)
+	if _, ok := paramsMap["dynamicTools"]; !ok {
+		t.Fatalf("thread/start missing dynamicTools: %+v", threadStart)
+	}
 
 	firstTurn := decodeLine(t, requests[3])
 	secondTurn := decodeLine(t, requests[4])
@@ -142,18 +150,129 @@ func TestRunnerReadTimeout(t *testing.T) {
 	}
 }
 
-func newTestRunner(factory *fakeProcessFactory, readTimeout int, turnTimeout int) Runner {
-	return NewRunner(func() *model.ServiceConfig {
-		return &model.ServiceConfig{
-			CodexCommand:           "codex app-server",
-			CodexApprovalPolicy:    "never",
-			CodexThreadSandbox:     "workspace-write",
-			CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
-			CodexReadTimeoutMS:     readTimeout,
-			CodexTurnTimeoutMS:     turnTimeout,
-			MaxTurns:               2,
+func TestRunnerLinearGraphQLToolSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "secret-key" {
+			t.Fatalf("Authorization header = %q, want secret-key", r.Header.Get("Authorization"))
 		}
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)), factory)
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"id":"u1"}}}`))
+	}))
+	defer server.Close()
+
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        server.URL,
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	})
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsToolSuccess(factory.process.stdinRecorder.lines(), "tool-1") {
+		t.Fatalf("tool success response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
+func TestRunnerLinearGraphQLToolGraphQLErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"errors":[{"message":"bad query"}]}`))
+	}))
+	defer server.Close()
+
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        server.URL,
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	})
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsToolGraphQLError(factory.process.stdinRecorder.lines(), "tool-1") {
+		t.Fatalf("tool graphql error response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
+func TestRunnerLinearGraphQLToolInvalidArguments(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query A { a } query B { b }"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsToolInvalidArguments(factory.process.stdinRecorder.lines(), "tool-1") {
+		t.Fatalf("tool invalid_arguments response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
+func newTestRunner(factory *fakeProcessFactory, readTimeout int, turnTimeout int) Runner {
+	return newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        "http://127.0.0.1",
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     readTimeout,
+		CodexTurnTimeoutMS:     turnTimeout,
+		MaxTurns:               2,
+	})
+}
+
+func newTestRunnerWithConfig(factory *fakeProcessFactory, cfg *model.ServiceConfig) Runner {
+	return NewRunner(func() *model.ServiceConfig { return cfg }, slog.New(slog.NewTextHandler(io.Discard, nil)), factory)
 }
 
 type fakeProcessFactory struct {
@@ -330,6 +449,57 @@ func containsToolFailure(lines []string, id string) bool {
 			continue
 		}
 		if result["success"] == false && result["error"] == "unsupported_tool_call" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsToolSuccess(lines []string, id string) bool {
+	for _, line := range lines {
+		decoded := decodeLineNoTest(line)
+		if decoded["id"] != id {
+			continue
+		}
+		result, ok := decoded["result"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if result["success"] == true {
+			return true
+		}
+	}
+	return false
+}
+
+func containsToolGraphQLError(lines []string, id string) bool {
+	for _, line := range lines {
+		decoded := decodeLineNoTest(line)
+		if decoded["id"] != id {
+			continue
+		}
+		result, ok := decoded["result"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if result["success"] == false && result["error"] == "linear_graphql_errors" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsToolInvalidArguments(lines []string, id string) bool {
+	for _, line := range lines {
+		decoded := decodeLineNoTest(line)
+		if decoded["id"] != id {
+			continue
+		}
+		result, ok := decoded["result"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if result["success"] == false && result["error"] == "invalid_arguments" {
 			return true
 		}
 	}

@@ -2,12 +2,14 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,6 +74,7 @@ type AppServerRunner struct {
 	configProvider func() *model.ServiceConfig
 	logger         *slog.Logger
 	processFactory ProcessFactory
+	httpClient     *http.Client
 	now            func() time.Time
 }
 
@@ -87,6 +90,7 @@ func NewRunner(configProvider func() *model.ServiceConfig, logger *slog.Logger, 
 		configProvider: configProvider,
 		logger:         logger,
 		processFactory: processFactory,
+		httpClient:     &http.Client{Timeout: 30 * time.Second},
 		now:            time.Now,
 	}
 }
@@ -214,6 +218,10 @@ func (r *AppServerRunner) waitThreadStart(ctx context.Context, cfg *model.Servic
 			"sandbox":        cfg.CodexThreadSandbox,
 			"cwd":            params.WorkspacePath,
 		},
+	}
+	if tools := r.dynamicTools(cfg); len(tools) > 0 {
+		requestParams := request["params"].(map[string]any)
+		requestParams["dynamicTools"] = tools
 	}
 	if err := writeJSONLine(writer, request); err != nil {
 		return nil, model.NewAgentError(model.ErrResponseError, "write thread/start request", err)
@@ -374,8 +382,9 @@ func (r *AppServerRunner) handleStreamMessage(writer io.Writer, message map[stri
 		return nil, false
 	}
 	if strings.Contains(lowerMethod, "tool/call") && message["id"] != nil {
-		_ = writeJSONLine(writer, map[string]any{"id": message["id"], "result": map[string]any{"success": false, "error": "unsupported_tool_call"}})
-		r.emit(params, AgentEvent{Event: "unsupported_tool_call", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: message})
+		toolResult, eventName := r.handleToolCall(message)
+		_ = writeJSONLine(writer, map[string]any{"id": message["id"], "result": toolResult})
+		r.emit(params, AgentEvent{Event: eventName, Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: toolResult})
 		return nil, false
 	}
 
@@ -415,6 +424,150 @@ func (r *AppServerRunner) config() *model.ServiceConfig {
 		return &model.ServiceConfig{}
 	}
 	return cfg
+}
+
+func (r *AppServerRunner) dynamicTools(cfg *model.ServiceConfig) []any {
+	if cfg == nil || model.NormalizeState(cfg.TrackerKind) != "linear" || strings.TrimSpace(cfg.TrackerAPIKey) == "" {
+		return nil
+	}
+	return []any{
+		map[string]any{
+			"name":        "linear_graphql",
+			"description": "Execute a single Linear GraphQL operation using Symphony runtime auth.",
+			"inputSchema": map[string]any{
+				"type":     "object",
+				"required": []string{"query"},
+				"properties": map[string]any{
+					"query":     map[string]any{"type": "string"},
+					"variables": map[string]any{"type": "object"},
+				},
+			},
+		},
+	}
+}
+
+func (r *AppServerRunner) handleToolCall(message map[string]any) (map[string]any, string) {
+	toolName, arguments, ok := extractToolCall(message)
+	if !ok {
+		return map[string]any{"success": false, "error": "unsupported_tool_call"}, "unsupported_tool_call"
+	}
+	if toolName != "linear_graphql" {
+		return map[string]any{"success": false, "error": "unsupported_tool_call"}, "unsupported_tool_call"
+	}
+	result := r.executeLinearGraphQL(arguments)
+	return result, "notification"
+}
+
+func (r *AppServerRunner) executeLinearGraphQL(arguments any) map[string]any {
+	query, variables, err := parseLinearGraphQLInput(arguments)
+	if err != nil {
+		return map[string]any{"success": false, "error": "invalid_arguments", "message": err.Error()}
+	}
+	cfg := r.config()
+	if model.NormalizeState(cfg.TrackerKind) != "linear" || strings.TrimSpace(cfg.TrackerAPIKey) == "" {
+		return map[string]any{"success": false, "error": "missing_auth", "message": "linear auth is not configured"}
+	}
+
+	body, err := json.Marshal(map[string]any{"query": query, "variables": variables})
+	if err != nil {
+		return map[string]any{"success": false, "error": "invalid_arguments", "message": err.Error()}
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, cfg.TrackerEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return map[string]any{"success": false, "error": "transport_failure", "message": err.Error()}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", cfg.TrackerAPIKey)
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return map[string]any{"success": false, "error": "transport_failure", "message": err.Error()}
+	}
+	defer resp.Body.Close()
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return map[string]any{"success": false, "error": "transport_failure", "message": err.Error()}
+	}
+	var decoded any
+	if err := json.Unmarshal(rawBody, &decoded); err != nil {
+		return map[string]any{"success": false, "error": "invalid_response", "message": err.Error()}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return map[string]any{"success": false, "error": "http_status", "status": resp.StatusCode, "body": decoded}
+	}
+	if envelope, ok := decoded.(map[string]any); ok {
+		if errorsValue, exists := envelope["errors"]; exists && errorsValue != nil {
+			if list, ok := errorsValue.([]any); ok && len(list) > 0 {
+				return map[string]any{"success": false, "error": "linear_graphql_errors", "body": decoded}
+			}
+		}
+	}
+	return map[string]any{"success": true, "body": decoded}
+}
+
+func extractToolCall(message map[string]any) (string, any, bool) {
+	params, ok := message["params"].(map[string]any)
+	if !ok {
+		return "", nil, false
+	}
+	toolName, _ := params["name"].(string)
+	if toolName == "" {
+		if rawTool, ok := params["tool"].(map[string]any); ok {
+			toolName, _ = rawTool["name"].(string)
+		}
+	}
+	arguments := firstNonNil(params["arguments"], params["input"], params["payload"])
+	if arguments == nil {
+		arguments = params
+	}
+	return toolName, arguments, toolName != ""
+}
+
+func parseLinearGraphQLInput(arguments any) (string, map[string]any, error) {
+	if text, ok := arguments.(string); ok {
+		query := strings.TrimSpace(text)
+		if query == "" {
+			return "", nil, fmt.Errorf("query must be a non-empty string")
+		}
+		if !hasSingleGraphQLOperation(query) {
+			return "", nil, fmt.Errorf("query must contain exactly one GraphQL operation")
+		}
+		return query, nil, nil
+	}
+	argsMap, ok := arguments.(map[string]any)
+	if !ok {
+		return "", nil, fmt.Errorf("arguments must be an object")
+	}
+	query, _ := argsMap["query"].(string)
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "", nil, fmt.Errorf("query must be a non-empty string")
+	}
+	if !hasSingleGraphQLOperation(query) {
+		return "", nil, fmt.Errorf("query must contain exactly one GraphQL operation")
+	}
+	if variablesValue, ok := argsMap["variables"]; ok && variablesValue != nil {
+		variables, ok := variablesValue.(map[string]any)
+		if !ok {
+			return "", nil, fmt.Errorf("variables must be an object")
+		}
+		return query, variables, nil
+	}
+	return query, nil, nil
+}
+
+func hasSingleGraphQLOperation(query string) bool {
+	lower := strings.ToLower(query)
+	count := 0
+	for _, keyword := range []string{"query", "mutation", "subscription"} {
+		count += strings.Count(lower, keyword+" ")
+		count += strings.Count(lower, keyword+"\n")
+		count += strings.Count(lower, keyword+"{")
+	}
+	if count == 0 {
+		return true
+	}
+	return count == 1
 }
 
 func (r *AppServerRunner) emit(params RunParams, event AgentEvent) {
