@@ -51,26 +51,27 @@ go run ./cmd/symphony --dry-run
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony ./path/to/WORKFLOW.md --dry-run
+go run ./cmd/symphony --dry-run ./path/to/WORKFLOW.md
 ```
 
 ### 3.2 正常启动（无 HTTP server）
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony ./WORKFLOW.md --log-level info --log-file ./logs/symphony.log
+go run ./cmd/symphony --log-level info --log-file ./logs/symphony.log ./WORKFLOW.md
 ```
 
 ### 3.3 正常启动（启用 HTTP server）
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony ./WORKFLOW.md --port 8080 --log-level info --log-file ./logs/symphony.log
+go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.log ./WORKFLOW.md
 ```
 
 ### 3.4 常用参数
 
 - `WORKFLOW.md` 路径：可选位置参数；未传时默认 `./WORKFLOW.md`
+- 当前 CLI 基于标准库 `flag`，请将 `--dry-run` / `--port` / `--log-file` / `--log-level` 写在路径参数之前
 - `--dry-run`：执行单次 poll cycle 验证后退出
 - `--port`：启用 HTTP server，当前实现绑定 loopback 地址
 - `--log-file`：同时输出到 stderr 与指定文件

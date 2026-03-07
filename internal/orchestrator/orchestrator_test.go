@@ -141,6 +141,55 @@ func TestReconcileRunningStopsTerminalAndInactiveIssues(t *testing.T) {
 	}
 }
 
+func TestRunOncePreflightFailureStillReconcilesRunningIssues(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+		CodexStallTimeoutMS: 300000,
+	}
+	runCh := make(chan string, 1)
+	runner := &fakeRunner{runCh: runCh}
+	workspace := &fakeWorkspaceManager{}
+	tracker := &fakeTracker{
+		candidateIssues: []model.Issue{
+			{ID: "candidate-1", Identifier: "ABC-NEW", Title: "new work", State: "Todo"},
+		},
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "Done"},
+		},
+	}
+	o := newTestOrchestrator(cfg, tracker, workspace, runner, now)
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:      &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier: "ABC-1",
+		StartedAt:  now.Add(-10 * time.Second),
+		WorkerCancel: func() {},
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.RunOnce(context.Background(), true)
+
+	if tracker.stateFetchCalls != 1 {
+		t.Fatalf("state fetch calls = %d, want 1", tracker.stateFetchCalls)
+	}
+	if tracker.candidateFetchCalls != 0 {
+		t.Fatalf("candidate fetch calls = %d, want 0", tracker.candidateFetchCalls)
+	}
+	if len(o.state.Running) != 0 {
+		t.Fatalf("running entries still exist: %+v", o.state.Running)
+	}
+	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
+		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
+	}
+	select {
+	case identifier := <-runCh:
+		t.Fatalf("unexpected dispatch for %q during preflight failure", identifier)
+	default:
+	}
+}
+
 func TestHandleCodexUpdateAggregatesUsage(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
@@ -197,15 +246,18 @@ func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient *fakeTracker, w
 }
 
 type fakeTracker struct {
-	candidateIssues []model.Issue
-	stateByID       map[string]model.Issue
-	terminalIssues  []model.Issue
-	candidateErr    error
-	stateErr        error
-	terminalErr     error
+	candidateIssues     []model.Issue
+	stateByID           map[string]model.Issue
+	terminalIssues      []model.Issue
+	candidateErr        error
+	stateErr            error
+	terminalErr         error
+	candidateFetchCalls int
+	stateFetchCalls     int
 }
 
 func (f *fakeTracker) FetchCandidateIssues(context.Context) ([]model.Issue, error) {
+	f.candidateFetchCalls++
 	if f.candidateErr != nil {
 		return nil, f.candidateErr
 	}
@@ -220,6 +272,7 @@ func (f *fakeTracker) FetchIssuesByStates(_ context.Context, _ []string) ([]mode
 }
 
 func (f *fakeTracker) FetchIssueStatesByIDs(_ context.Context, ids []string) ([]model.Issue, error) {
+	f.stateFetchCalls++
 	if f.stateErr != nil {
 		return nil, f.stateErr
 	}
