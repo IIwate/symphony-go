@@ -141,3 +141,93 @@ func TestValidateForDispatch(t *testing.T) {
 		})
 	}
 }
+
+func TestNewFromWorkflowAppliesGitHubDefaults(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "gh-secret")
+
+	definition := &model.WorkflowDefinition{
+		Config: map[string]any{
+			"tracker": map[string]any{
+				"kind":    "github",
+				"api_key": "$GITHUB_TOKEN",
+				"owner":   "octocat",
+				"repo":    "hello-world",
+			},
+		},
+	}
+
+	cfg, err := NewFromWorkflow(definition)
+	if err != nil {
+		t.Fatalf("NewFromWorkflow() error = %v", err)
+	}
+	if cfg.TrackerEndpoint != "https://api.github.com" {
+		t.Fatalf("TrackerEndpoint = %q, want https://api.github.com", cfg.TrackerEndpoint)
+	}
+	if cfg.TrackerAPIKey != "gh-secret" {
+		t.Fatalf("TrackerAPIKey = %q, want gh-secret", cfg.TrackerAPIKey)
+	}
+	if cfg.TrackerOwner != "octocat" {
+		t.Fatalf("TrackerOwner = %q, want octocat", cfg.TrackerOwner)
+	}
+	if cfg.TrackerRepo != "hello-world" {
+		t.Fatalf("TrackerRepo = %q, want hello-world", cfg.TrackerRepo)
+	}
+	if cfg.TrackerStateLabelPrefix != "symphony:" {
+		t.Fatalf("TrackerStateLabelPrefix = %q, want symphony:", cfg.TrackerStateLabelPrefix)
+	}
+	if len(cfg.ActiveStates) != 2 || cfg.ActiveStates[0] != "todo" || cfg.ActiveStates[1] != "in-progress" {
+		t.Fatalf("ActiveStates = %+v, want [todo in-progress]", cfg.ActiveStates)
+	}
+	if len(cfg.TerminalStates) != 2 || cfg.TerminalStates[0] != "closed" || cfg.TerminalStates[1] != "cancelled" {
+		t.Fatalf("TerminalStates = %+v, want [closed cancelled]", cfg.TerminalStates)
+	}
+}
+
+func TestValidateForDispatchGitHub(t *testing.T) {
+	base := defaultServiceConfig()
+	base.TrackerKind = "github"
+	base.TrackerAPIKey = "secret"
+	base.TrackerOwner = "octocat"
+	base.TrackerRepo = "hello-world"
+
+	tests := []struct {
+		name   string
+		mutate func(*model.ServiceConfig)
+		target error
+	}{
+		{
+			name: "missing owner",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.TrackerOwner = ""
+			},
+			target: model.ErrMissingTrackerOwner,
+		},
+		{
+			name: "missing repo",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.TrackerRepo = ""
+			},
+			target: model.ErrMissingTrackerRepo,
+		},
+		{
+			name: "missing api key",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.TrackerAPIKey = ""
+			},
+			target: model.ErrMissingTrackerAPIKey,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := *base
+			cfg.MaxConcurrentAgentsByState = map[string]int{}
+			tc.mutate(&cfg)
+
+			err := ValidateForDispatch(&cfg)
+			if !errors.Is(err, tc.target) {
+				t.Fatalf("ValidateForDispatch() error = %v, want %v", err, tc.target)
+			}
+		})
+	}
+}

@@ -38,6 +38,9 @@ type ServiceConfig struct {
 	TrackerEndpoint            string
 	TrackerAPIKey              string
 	TrackerProjectSlug         string
+	TrackerOwner               string
+	TrackerRepo                string
+	TrackerStateLabelPrefix    string
 	ActiveStates               []string
 	TerminalStates             []string
 	PollIntervalMS             int
@@ -181,33 +184,41 @@ type TrackerError struct {
 }
 
 var (
-	ErrMissingWorkflowFile       = &WorkflowError{Code: "missing_workflow_file"}
-	ErrWorkflowParseError        = &WorkflowError{Code: "workflow_parse_error"}
-	ErrFrontMatterNotMap         = &WorkflowError{Code: "workflow_front_matter_not_a_map"}
-	ErrTemplateParseError        = &WorkflowError{Code: "template_parse_error"}
-	ErrTemplateRenderError       = &WorkflowError{Code: "template_render_error"}
-	ErrInvalidCodexCommand       = &WorkflowError{Code: "invalid_codex_command"}
-	ErrWorkspacePathEscape       = &WorkspaceError{Code: "workspace_path_escape"}
-	ErrWorkspacePathConflict     = &WorkspaceError{Code: "workspace_path_conflict"}
-	ErrWorkspaceHookFailed       = &WorkspaceError{Code: "workspace_hook_failed"}
-	ErrWorkspaceHookTimeout      = &WorkspaceError{Code: "workspace_hook_timeout"}
-	ErrCodexNotFound             = &AgentError{Code: "codex_not_found"}
-	ErrInvalidWorkspaceCWD       = &AgentError{Code: "invalid_workspace_cwd"}
-	ErrResponseTimeout           = &AgentError{Code: "response_timeout"}
-	ErrTurnTimeout               = &AgentError{Code: "turn_timeout"}
-	ErrPortExit                  = &AgentError{Code: "port_exit"}
-	ErrResponseError             = &AgentError{Code: "response_error"}
-	ErrTurnFailed                = &AgentError{Code: "turn_failed"}
-	ErrTurnCancelled             = &AgentError{Code: "turn_cancelled"}
-	ErrTurnInputRequired         = &AgentError{Code: "turn_input_required"}
-	ErrUnsupportedTrackerKind    = &TrackerError{Code: "unsupported_tracker_kind"}
-	ErrMissingTrackerAPIKey      = &TrackerError{Code: "missing_tracker_api_key"}
-	ErrMissingTrackerProjectSlug = &TrackerError{Code: "missing_tracker_project_slug"}
-	ErrLinearAPIRequest          = &TrackerError{Code: "linear_api_request"}
-	ErrLinearAPIStatus           = &TrackerError{Code: "linear_api_status"}
-	ErrLinearGraphQLErrors       = &TrackerError{Code: "linear_graphql_errors"}
-	ErrLinearUnknownPayload      = &TrackerError{Code: "linear_unknown_payload"}
-	ErrLinearMissingEndCursor    = &TrackerError{Code: "linear_missing_end_cursor"}
+	ErrMissingWorkflowFile         = &WorkflowError{Code: "missing_workflow_file"}
+	ErrWorkflowParseError          = &WorkflowError{Code: "workflow_parse_error"}
+	ErrFrontMatterNotMap           = &WorkflowError{Code: "workflow_front_matter_not_a_map"}
+	ErrTemplateParseError          = &WorkflowError{Code: "template_parse_error"}
+	ErrTemplateRenderError         = &WorkflowError{Code: "template_render_error"}
+	ErrInvalidCodexCommand         = &WorkflowError{Code: "invalid_codex_command"}
+	ErrWorkspacePathEscape         = &WorkspaceError{Code: "workspace_path_escape"}
+	ErrWorkspacePathConflict       = &WorkspaceError{Code: "workspace_path_conflict"}
+	ErrWorkspaceHookFailed         = &WorkspaceError{Code: "workspace_hook_failed"}
+	ErrWorkspaceHookTimeout        = &WorkspaceError{Code: "workspace_hook_timeout"}
+	ErrCodexNotFound               = &AgentError{Code: "codex_not_found"}
+	ErrInvalidWorkspaceCWD         = &AgentError{Code: "invalid_workspace_cwd"}
+	ErrResponseTimeout             = &AgentError{Code: "response_timeout"}
+	ErrTurnTimeout                 = &AgentError{Code: "turn_timeout"}
+	ErrPortExit                    = &AgentError{Code: "port_exit"}
+	ErrResponseError               = &AgentError{Code: "response_error"}
+	ErrTurnFailed                  = &AgentError{Code: "turn_failed"}
+	ErrTurnCancelled               = &AgentError{Code: "turn_cancelled"}
+	ErrTurnInputRequired           = &AgentError{Code: "turn_input_required"}
+	ErrUnsupportedTrackerKind      = &TrackerError{Code: "unsupported_tracker_kind"}
+	ErrMissingTrackerAPIKey        = &TrackerError{Code: "missing_tracker_api_key"}
+	ErrMissingTrackerProjectSlug   = &TrackerError{Code: "missing_tracker_project_slug"}
+	ErrMissingTrackerOwner         = &TrackerError{Code: "missing_tracker_owner"}
+	ErrMissingTrackerRepo          = &TrackerError{Code: "missing_tracker_repo"}
+	ErrLinearAPIRequest            = &TrackerError{Code: "linear_api_request"}
+	ErrLinearAPIStatus             = &TrackerError{Code: "linear_api_status"}
+	ErrLinearGraphQLErrors         = &TrackerError{Code: "linear_graphql_errors"}
+	ErrLinearUnknownPayload        = &TrackerError{Code: "linear_unknown_payload"}
+	ErrLinearMissingEndCursor      = &TrackerError{Code: "linear_missing_end_cursor"}
+	ErrGitHubAPIRequest            = &TrackerError{Code: "github_api_request"}
+	ErrGitHubAPIStatus             = &TrackerError{Code: "github_api_status"}
+	ErrGitHubUnknownPayload        = &TrackerError{Code: "github_unknown_payload"}
+	ErrGitHubRateLimit             = &TrackerError{Code: "github_rate_limit"}
+	ErrGitHubPermissionDenied      = &TrackerError{Code: "github_permission_denied"}
+	ErrGitHubUnexpectedPullRequest = &TrackerError{Code: "github_unexpected_pull_request"}
 )
 
 var workspaceKeyPattern = regexp.MustCompile(`[^A-Za-z0-9._-]`)

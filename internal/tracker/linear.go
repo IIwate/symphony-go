@@ -103,11 +103,14 @@ func NewClient(cfg *model.ServiceConfig, httpClient *http.Client) (Client, error
 	if cfg == nil {
 		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, "service config is nil", nil)
 	}
-	if cfg.TrackerKind != "linear" {
+	switch cfg.TrackerKind {
+	case "linear":
+		return NewLinearClient(cfg, httpClient)
+	case "github":
+		return NewGitHubClient(cfg, httpClient)
+	default:
 		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, fmt.Sprintf("unsupported tracker.kind %q", cfg.TrackerKind), nil)
 	}
-
-	return NewLinearClient(cfg, httpClient)
 }
 
 func NewLinearClient(cfg *model.ServiceConfig, httpClient *http.Client) (*LinearClient, error) {
@@ -115,7 +118,21 @@ func NewLinearClient(cfg *model.ServiceConfig, httpClient *http.Client) (*Linear
 }
 
 func NewDynamicClient(configProvider func() *model.ServiceConfig, httpClient *http.Client) (Client, error) {
-	return NewDynamicLinearClient(configProvider, httpClient)
+	if configProvider == nil {
+		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, "service config provider is nil", nil)
+	}
+	cfg := configProvider()
+	if cfg == nil {
+		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, "service config is nil", nil)
+	}
+	switch cfg.TrackerKind {
+	case "linear":
+		return NewDynamicLinearClient(configProvider, httpClient)
+	case "github":
+		return NewDynamicGitHubClient(configProvider, httpClient)
+	default:
+		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, fmt.Sprintf("unsupported tracker.kind %q", cfg.TrackerKind), nil)
+	}
 }
 
 func NewDynamicLinearClient(configProvider func() *model.ServiceConfig, httpClient *http.Client) (*LinearClient, error) {
