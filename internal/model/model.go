@@ -38,6 +38,9 @@ type ServiceConfig struct {
 	TrackerEndpoint            string
 	TrackerAPIKey              string
 	TrackerProjectSlug         string
+	TrackerOwner               string
+	TrackerRepo                string
+	TrackerStateLabelPrefix    string
 	ActiveStates               []string
 	TerminalStates             []string
 	PollIntervalMS             int
@@ -203,11 +206,17 @@ var (
 	ErrUnsupportedTrackerKind    = &TrackerError{Code: "unsupported_tracker_kind"}
 	ErrMissingTrackerAPIKey      = &TrackerError{Code: "missing_tracker_api_key"}
 	ErrMissingTrackerProjectSlug = &TrackerError{Code: "missing_tracker_project_slug"}
+	ErrMissingTrackerOwner       = &TrackerError{Code: "missing_tracker_owner"}
+	ErrMissingTrackerRepo        = &TrackerError{Code: "missing_tracker_repo"}
 	ErrLinearAPIRequest          = &TrackerError{Code: "linear_api_request"}
 	ErrLinearAPIStatus           = &TrackerError{Code: "linear_api_status"}
 	ErrLinearGraphQLErrors       = &TrackerError{Code: "linear_graphql_errors"}
 	ErrLinearUnknownPayload      = &TrackerError{Code: "linear_unknown_payload"}
 	ErrLinearMissingEndCursor    = &TrackerError{Code: "linear_missing_end_cursor"}
+	ErrGitHubAPIRequest          = &TrackerError{Code: "github_api_request"}
+	ErrGitHubAPIStatus           = &TrackerError{Code: "github_api_status"}
+	ErrGitHubUnknownPayload      = &TrackerError{Code: "github_unknown_payload"}
+	ErrGitHubPullRequest         = &TrackerError{Code: "github_pull_request"}
 )
 
 var workspaceKeyPattern = regexp.MustCompile(`[^A-Za-z0-9._-]`)
