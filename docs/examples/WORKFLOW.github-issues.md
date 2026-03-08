@@ -36,3 +36,5 @@ codex:
 
 > 使用前请把 `owner`、`repo` 和可选的 `repo_url` 替换成你的真实仓库信息。
 > GitHub tracker 默认通过 `symphony:*` 标签识别状态；同一 issue 不要同时保留多个状态标签。
+> 若需验证真实 GitHub API，可设置 `SYMPHONY_GITHUB_INTEGRATION=1`、`GITHUB_TOKEN`、`GITHUB_TEST_OWNER`、`GITHUB_TEST_REPO`，再执行 `go test ./internal/tracker -run TestGitHubIntegration -count=1`。
+

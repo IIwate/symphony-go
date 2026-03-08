@@ -15,7 +15,7 @@
 ### 高优先级
 
 - Charm TUI
-- GitHub Issues tracker — [RFC](../rfcs/github-issues-tracker.md)
+- GitHub Issues tracker — [RFC](../rfcs/github-issues-tracker.md)，交付落点见 `docs/operator-runbook.md` 与 `docs/examples/WORKFLOW.github-issues.md`
 
 ### 中优先级
 

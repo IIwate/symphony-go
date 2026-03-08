@@ -159,6 +159,24 @@ curl http://127.0.0.1:8080/api/v1/state
 curl -X POST http://127.0.0.1:8080/api/v1/refresh
 ```
 
+### 6.4 GitHub 集成测试（可选）
+
+- 默认跳过；仅在需要验证真实 GitHub API 连通性时开启
+- 开启方式：设置 `SYMPHONY_GITHUB_INTEGRATION=1`
+- 必要环境变量：`GITHUB_TOKEN`、`GITHUB_TEST_OWNER`、`GITHUB_TEST_REPO`
+- 建议命令：
+
+```powershell
+$env:SYMPHONY_GITHUB_INTEGRATION="1"
+$env:GITHUB_TOKEN="<your-token>"
+$env:GITHUB_TEST_OWNER="<owner>"
+$env:GITHUB_TEST_REPO="<repo>"
+go test ./internal/tracker -run TestGitHubIntegration -count=1
+```
+
+- 期望结果：测试通过，或在无候选 issue 时输出 0 条候选 issue 的日志
+- 若命中权限错误，优先检查 token 是否具备仓库 `Issues: Read` 权限
+
 ## 7. 日志使用说明
 
 ### 7.1 推荐配置
@@ -306,6 +324,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 记录当前版本号 / 提交哈希
 - 确认工作区目录和日志路径无需额外迁移
 - 确认回滚版本与当前 `WORKFLOW.md` 契约兼容
+- 若当前使用 GitHub tracker，回滚到 Linear 时同步恢复 `tracker.project_slug` 与 `LINEAR_API_KEY`
 
 ## 10. 发布前建议操作顺序
 

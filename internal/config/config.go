@@ -28,18 +28,23 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 
 	tracker := getMap(configMap, "tracker")
 	cfg.TrackerKind = model.NormalizeState(getString(tracker, "kind", ""))
+	applyTrackerDefaults(cfg)
 	if endpoint := strings.TrimSpace(getString(tracker, "endpoint", "")); endpoint != "" {
 		cfg.TrackerEndpoint = endpoint
 	}
 	cfg.TrackerAPIKey = resolveEnvString(strings.TrimSpace(getString(tracker, "api_key", "")))
 	cfg.TrackerProjectSlug = strings.TrimSpace(getString(tracker, "project_slug", ""))
+	cfg.TrackerOwner = strings.TrimSpace(getString(tracker, "owner", ""))
+	cfg.TrackerRepo = strings.TrimSpace(getString(tracker, "repo", ""))
+	if prefix := strings.TrimSpace(getString(tracker, "state_label_prefix", "")); prefix != "" {
+		cfg.TrackerStateLabelPrefix = prefix
+	}
 	if states, ok := getStringSlice(tracker, "active_states"); ok && len(states) > 0 {
 		cfg.ActiveStates = states
 	}
 	if states, ok := getStringSlice(tracker, "terminal_states"); ok && len(states) > 0 {
 		cfg.TerminalStates = states
 	}
-
 	polling := getMap(configMap, "polling")
 	if interval, ok := getInt(polling, "interval_ms"); ok && interval > 0 {
 		cfg.PollIntervalMS = interval
@@ -116,18 +121,46 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 	if cfg == nil {
 		return model.NewWorkflowError(model.ErrWorkflowParseError, "service config is nil", nil)
 	}
-	if cfg.TrackerKind == "" {
+
+	kind := model.NormalizeState(cfg.TrackerKind)
+	if kind == "" {
 		return model.NewTrackerError(model.ErrUnsupportedTrackerKind, "tracker.kind is required", nil)
 	}
-	if cfg.TrackerKind != "linear" {
+
+	switch kind {
+	case "linear":
+		if strings.TrimSpace(cfg.TrackerAPIKey) == "" {
+			return model.NewTrackerError(model.ErrMissingTrackerAPIKey, "tracker.api_key is required", nil)
+		}
+		if strings.TrimSpace(cfg.TrackerProjectSlug) == "" {
+			return model.NewTrackerError(model.ErrMissingTrackerProjectSlug, "tracker.project_slug is required", nil)
+		}
+	case "github":
+		if strings.TrimSpace(cfg.TrackerAPIKey) == "" {
+			return model.NewTrackerError(model.ErrMissingTrackerAPIKey, "tracker.api_key is required", nil)
+		}
+		if strings.TrimSpace(cfg.TrackerOwner) == "" {
+			return model.NewTrackerError(model.ErrMissingTrackerOwner, "tracker.owner is required", nil)
+		}
+		if strings.TrimSpace(cfg.TrackerRepo) == "" {
+			return model.NewTrackerError(model.ErrMissingTrackerRepo, "tracker.repo is required", nil)
+		}
+		if strings.TrimSpace(cfg.TrackerEndpoint) == "" {
+			cfg.TrackerEndpoint = "https://api.github.com"
+		}
+		if strings.TrimSpace(cfg.TrackerStateLabelPrefix) == "" {
+			cfg.TrackerStateLabelPrefix = "symphony:"
+		}
+		if len(cfg.ActiveStates) == 0 {
+			cfg.ActiveStates = []string{"todo", "in-progress"}
+		}
+		if len(cfg.TerminalStates) == 0 {
+			cfg.TerminalStates = []string{"closed", "cancelled"}
+		}
+	default:
 		return model.NewTrackerError(model.ErrUnsupportedTrackerKind, fmt.Sprintf("unsupported tracker.kind %q", cfg.TrackerKind), nil)
 	}
-	if strings.TrimSpace(cfg.TrackerAPIKey) == "" {
-		return model.NewTrackerError(model.ErrMissingTrackerAPIKey, "tracker.api_key is required", nil)
-	}
-	if strings.TrimSpace(cfg.TrackerProjectSlug) == "" {
-		return model.NewTrackerError(model.ErrMissingTrackerProjectSlug, "tracker.project_slug is required", nil)
-	}
+
 	if strings.TrimSpace(cfg.CodexCommand) == "" {
 		return model.NewWorkflowError(model.ErrInvalidCodexCommand, "codex.command is required", nil)
 	}
@@ -154,6 +187,25 @@ func defaultServiceConfig() *model.ServiceConfig {
 		CodexTurnTimeoutMS:         3600000,
 		CodexReadTimeoutMS:         5000,
 		CodexStallTimeoutMS:        300000,
+	}
+}
+
+func applyTrackerDefaults(cfg *model.ServiceConfig) {
+	if cfg == nil {
+		return
+	}
+
+	switch model.NormalizeState(cfg.TrackerKind) {
+	case "github":
+		cfg.TrackerEndpoint = "https://api.github.com"
+		cfg.ActiveStates = []string{"todo", "in-progress"}
+		cfg.TerminalStates = []string{"closed", "cancelled"}
+		cfg.TrackerStateLabelPrefix = "symphony:"
+	default:
+		cfg.TrackerEndpoint = "https://api.linear.app/graphql"
+		cfg.ActiveStates = []string{"Todo", "In Progress"}
+		cfg.TerminalStates = []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"}
+		cfg.TrackerStateLabelPrefix = ""
 	}
 }
 
