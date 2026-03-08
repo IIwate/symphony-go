@@ -26,7 +26,8 @@
 
 ### 2.2 必要凭证
 
-- `LINEAR_API_KEY` 已在当前环境中注入
+- 当 `tracker.kind=linear` 时：注入 `LINEAR_API_KEY`
+- 当 `tracker.kind=github` 时：注入 `GITHUB_TOKEN`
 - 不要把 token 明文写入日志、命令历史或共享文档
 
 ### 2.3 目录与权限
@@ -35,6 +36,14 @@
 - 日志文件目录具备追加写权限
 - 若启用 hooks，目标主机 shell 环境中可以执行对应脚本
 - Windows 主机建议安装 Git for Windows；实现层会优先使用 Git Bash，避免误命中 `C:/Windows/System32/bash.exe`（WSL 启动器）
+
+### 2.4 GitHub Issues tracker 接入约定
+
+- `tracker.owner` / `tracker.repo` 必须指向目标仓库
+- 状态标签默认使用 `state_label_prefix=symphony:`，例如 `symphony:todo`、`symphony:in-progress`、`symphony:cancelled`
+- 同一 issue 若存在多个 `symphony:*` 状态标签，系统应记录告警并跳过该 issue；先人工清理标签冲突
+- GitHub `/issues` 接口返回的 PR 条目会被过滤，不会参与调度
+- 参考示例：`docs/examples/WORKFLOW.github-issues.md`
 
 ## 3. 启动命令
 
@@ -52,6 +61,12 @@ go run ./cmd/symphony --dry-run
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
 go run ./cmd/symphony --dry-run ./path/to/WORKFLOW.md
+```
+GitHub Issues tracker 示例：
+
+```powershell
+$env:GITHUB_TOKEN="<your-token>"
+go run ./cmd/symphony --dry-run ./docs/examples/WORKFLOW.github-issues.md
 ```
 
 ### 3.2 正常启动（无 HTTP server）
@@ -118,7 +133,8 @@ curl http://127.0.0.1:8080/api/v1/state
 
 ### 6.1 配置烟测
 
-- 设置 `LINEAR_API_KEY`
+- `tracker.kind=linear`：设置 `LINEAR_API_KEY`
+- `tracker.kind=github`：设置 `GITHUB_TOKEN`，并使用 GitHub workflow 示例或自定义 workflow
 - 执行 `go run ./cmd/symphony --dry-run`
 - 期望结果：退出码为 0，日志出现“dry-run 校验通过”
 
@@ -184,8 +200,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 常见原因：
 
 - `tracker.kind` 缺失或不支持
-- `LINEAR_API_KEY` 未注入
-- `tracker.project_slug` 缺失
+- `tracker.kind=linear` 但 `LINEAR_API_KEY` 未注入或 `tracker.project_slug` 缺失
+- `tracker.kind=github` 但 `GITHUB_TOKEN` 未注入或 `tracker.owner` / `tracker.repo` 缺失
 - `codex.command` 为空
 
 处理：
@@ -201,11 +217,15 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - Todo issue 被非终态 blocker 阻塞
 - 并发槽位耗尽
 - issue 已处于 claimed / running / retrying
+- GitHub issue 缺少 `symphony:*` 状态标签
+- GitHub issue 同时存在多个 `symphony:*` 状态标签，已被系统跳过
+- 实际对象是 Pull Request，已被 GitHub tracker 过滤
 
 处理：
 
 - 检查 `/api/v1/state`
 - 检查日志中的 `retrying` / slots / blocker 相关信息
+- 若使用 GitHub tracker，检查 issue labels 是否符合 `symphony:*` 约定，并清理冲突状态标签
 - 手动调用 `/api/v1/refresh`
 
 ### 8.4 工作区问题
@@ -254,6 +274,21 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 检查本机端口占用
 - 在本机访问 `127.0.0.1:<port>` 验证，而不是直接从外部地址访问
 
+### 8.7 GitHub API 权限或限流问题
+
+常见原因：
+
+- `GITHUB_TOKEN` scope / fine-grained 权限不足
+- `X-RateLimit-Remaining` 过低或命中 secondary rate limit
+- `tracker.owner` / `tracker.repo` 指向了错误仓库
+
+处理：
+
+- 检查 token 是否具备仓库 `Issues: Read` 权限
+- 提高 `polling.interval_ms`，避免高频轮询
+- 观察日志中的 rate limit 告警与 GitHub 返回头
+- 用示例文件 `docs/examples/WORKFLOW.github-issues.md` 对照当前配置
+
 ## 9. 关闭与回滚
 
 ### 9.1 正常关闭
@@ -285,6 +320,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - `docs/release-checklist.md`
 - `docs/cycles/cycle-04-extension-release.md`
+- `docs/rfcs/github-issues-tracker.md`
+- `docs/examples/WORKFLOW.github-issues.md`
 - `IMPLEMENTATION.md`
 - `REQUIREMENTS.md`
 - `SPEC.md`
