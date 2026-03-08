@@ -208,6 +208,8 @@ var (
 	ErrLinearGraphQLErrors       = &TrackerError{Code: "linear_graphql_errors"}
 	ErrLinearUnknownPayload      = &TrackerError{Code: "linear_unknown_payload"}
 	ErrLinearMissingEndCursor    = &TrackerError{Code: "linear_missing_end_cursor"}
+	ErrLinearStateNotFound       = &TrackerError{Code: "linear_state_not_found"}
+	ErrLinearTransitionFailed    = &TrackerError{Code: "linear_transition_failed"}
 )
 
 var workspaceKeyPattern = regexp.MustCompile(`[^A-Za-z0-9._-]`)

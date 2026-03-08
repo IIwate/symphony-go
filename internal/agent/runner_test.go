@@ -336,6 +336,107 @@ func TestRunnerLinearGraphQLToolInvalidArguments(t *testing.T) {
 	}
 }
 
+func TestStreamingNoiseNotEmitted(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"delta": "hi"}}),
+		jsonLine(map[string]any{"method": "codex/event/agent_message_delta", "params": map[string]any{"delta": "hi"}}),
+		jsonLine(map[string]any{"method": "item/started", "params": map[string]any{"id": "item-1"}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	events := make([]AgentEvent, 0)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Noise"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		OnEvent:        func(event AgentEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, event := range events {
+		if event.Event == "other_message" {
+			t.Fatalf("unexpected other_message event: %+v", event)
+		}
+	}
+	if !containsEvent(events, "session_started") || !containsEvent(events, "turn_completed") {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestTelemetryEmittedOnce(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "thread/tokenUsage/updated", "params": map[string]any{"tokenUsage": map[string]any{"inputTokens": 5, "outputTokens": 7, "totalTokens": 12}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	events := make([]AgentEvent, 0)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Usage"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		OnEvent:        func(event AgentEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	usageEvents := 0
+	for _, event := range events {
+		if event.Usage != nil && event.Usage.TotalTokens == 12 {
+			usageEvents++
+			if event.Event != "notification" {
+				t.Fatalf("usage event = %+v, want notification only", event)
+			}
+		}
+	}
+	if usageEvents != 1 {
+		t.Fatalf("usageEvents = %d, want 1; events=%+v", usageEvents, events)
+	}
+}
+
+func TestTerminalEventsStillEmittedWithUsage(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{"tokenUsage": map[string]any{"inputTokens": 5, "outputTokens": 7, "totalTokens": 12}}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	events := make([]AgentEvent, 0)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Done"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		OnEvent:        func(event AgentEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	usageEvents := 0
+	for _, event := range events {
+		if event.Usage != nil && event.Usage.TotalTokens == 12 {
+			usageEvents++
+			if event.Event != "turn_completed" {
+				t.Fatalf("terminal usage event = %+v, want turn_completed", event)
+			}
+		}
+	}
+	if usageEvents != 1 {
+		t.Fatalf("usageEvents = %d, want 1; events=%+v", usageEvents, events)
+	}
+}
+
 func newTestRunner(factory *fakeProcessFactory, readTimeout int, turnTimeout int) Runner {
 	return newTestRunnerWithConfig(factory, &model.ServiceConfig{
 		TrackerKind:            "linear",

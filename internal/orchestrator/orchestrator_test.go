@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -162,9 +163,9 @@ func TestRunOncePreflightFailureStillReconcilesRunningIssues(t *testing.T) {
 	}
 	o := newTestOrchestrator(cfg, tracker, workspace, runner, now)
 	o.state.Running["1"] = &model.RunningEntry{
-		Issue:      &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
-		Identifier: "ABC-1",
-		StartedAt:  now.Add(-10 * time.Second),
+		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:   "ABC-1",
+		StartedAt:    now.Add(-10 * time.Second),
 		WorkerCancel: func() {},
 	}
 	o.state.Claimed["1"] = struct{}{}
@@ -235,6 +236,191 @@ func TestHandleCodexUpdateAggregatesUsage(t *testing.T) {
 	}
 }
 
+func TestHandleWorkerExitAlreadyTerminal(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "Done"},
+		},
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:   "ABC-1",
+		RetryAttempt: 0,
+		StartedAt:    now.Add(-time.Second),
+		WorkerCancel: func() {},
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.handleWorkerExit(WorkerResult{IssueID: "1", Identifier: "ABC-1", StartedAt: now, Phase: model.PhaseSucceeded})
+
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
+		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
+	}
+	if _, ok := o.state.Claimed["1"]; ok {
+		t.Fatal("claimed entry still exists")
+	}
+}
+
+func TestHandleWorkerExitHasNewOpenPRTransitionsToDone(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	tracker.onTransition = func(issueID string, targetState string) {
+		trackerIssue := tracker.stateByID[issueID]
+		trackerIssue.State = "Done"
+		tracker.stateByID[issueID] = trackerIssue
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:   "ABC-1",
+		RetryAttempt: 0,
+		StartedAt:    now.Add(-time.Second),
+		WorkerCancel: func() {},
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:      "1",
+		Identifier:   "ABC-1",
+		StartedAt:    now,
+		Phase:        model.PhaseSucceeded,
+		HasNewOpenPR: true,
+		FinalBranch:  "iiwate4268/iiwate-33-test",
+	})
+
+	if tracker.transitionCalls != 1 || tracker.transitionTarget != "Done" {
+		t.Fatalf("transition calls = %d target = %q", tracker.transitionCalls, tracker.transitionTarget)
+	}
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
+		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
+	}
+}
+
+func TestHandleWorkerExitNoNewPRSchedulesContinuation(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:   "ABC-1",
+		RetryAttempt: 0,
+		StartedAt:    now.Add(-time.Second),
+		WorkerCancel: func() {},
+	}
+
+	o.handleWorkerExit(WorkerResult{IssueID: "1", Identifier: "ABC-1", StartedAt: now, Phase: model.PhaseSucceeded})
+
+	retry := o.state.RetryAttempts["1"]
+	if retry == nil {
+		t.Fatal("continuation retry missing")
+	}
+	if retry.DueAt.Sub(now) != time.Second {
+		t.Fatalf("continuation retry delay = %v, want 1s", retry.DueAt.Sub(now))
+	}
+}
+
+func TestHandleWorkerExitTransitionFailureSchedulesBackoffRetry(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+		MaxRetryBackoffMS:   300000,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+		transitionErr: errors.New("boom"),
+	}
+	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.randFloat = func() float64 { return 0 }
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:   "ABC-1",
+		RetryAttempt: 0,
+		StartedAt:    now.Add(-time.Second),
+		WorkerCancel: func() {},
+	}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:      "1",
+		Identifier:   "ABC-1",
+		StartedAt:    now,
+		Phase:        model.PhaseSucceeded,
+		HasNewOpenPR: true,
+		FinalBranch:  "iiwate4268/iiwate-33-test",
+	})
+
+	retry := o.state.RetryAttempts["1"]
+	if retry == nil {
+		t.Fatal("backoff retry missing")
+	}
+	if retry.Attempt != 1 {
+		t.Fatalf("retry attempt = %d, want 1", retry.Attempt)
+	}
+	if retry.DueAt.Sub(now) != 5*time.Second {
+		t.Fatalf("backoff retry delay = %v, want 5s", retry.DueAt.Sub(now))
+	}
+}
+
+func TestHandleCodexUpdateTurnCountIncrementsOnTurnChangeOnly(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:      &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier: "ABC-1",
+		StartedAt:  now,
+	}
+
+	o.handleCodexUpdate(CodexUpdate{IssueID: "1", Event: agent.AgentEvent{Event: "notification", Timestamp: now, TurnID: stringPtr("turn-1")}})
+	o.handleCodexUpdate(CodexUpdate{IssueID: "1", Event: agent.AgentEvent{Event: "notification", Timestamp: now.Add(time.Second), TurnID: stringPtr("turn-1")}})
+	o.handleCodexUpdate(CodexUpdate{IssueID: "1", Event: agent.AgentEvent{Event: "notification", Timestamp: now.Add(2 * time.Second), TurnID: stringPtr("turn-2")}})
+
+	entry := o.state.Running["1"]
+	if entry.Session.TurnCount != 2 {
+		t.Fatalf("turn count = %d, want 2", entry.Session.TurnCount)
+	}
+}
+
 func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient *fakeTracker, workspaceManager *fakeWorkspaceManager, runner *fakeRunner, now time.Time) *Orchestrator {
 	o := NewOrchestrator(trackerClient, workspaceManager, runner, func() *model.ServiceConfig {
 		return cfg
@@ -242,6 +428,8 @@ func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient *fakeTracker, w
 		return &model.WorkflowDefinition{PromptTemplate: "Issue {{ issue.identifier }}"}
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	o.now = func() time.Time { return now }
+	o.gitBranchFn = func(context.Context, string) (string, error) { return "", nil }
+	o.openPRHeadsFn = func(context.Context, string) (map[string]struct{}, error) { return map[string]struct{}{}, nil }
 	return o
 }
 
@@ -252,8 +440,13 @@ type fakeTracker struct {
 	candidateErr        error
 	stateErr            error
 	terminalErr         error
+	transitionErr       error
+	onTransition        func(issueID string, targetState string)
 	candidateFetchCalls int
 	stateFetchCalls     int
+	transitionCalls     int
+	transitionIssueID   string
+	transitionTarget    string
 }
 
 func (f *fakeTracker) FetchCandidateIssues(context.Context) ([]model.Issue, error) {
@@ -283,6 +476,19 @@ func (f *fakeTracker) FetchIssueStatesByIDs(_ context.Context, ids []string) ([]
 		}
 	}
 	return result, nil
+}
+
+func (f *fakeTracker) TransitionIssue(_ context.Context, issueID string, targetState string) error {
+	f.transitionCalls++
+	f.transitionIssueID = issueID
+	f.transitionTarget = targetState
+	if f.transitionErr != nil {
+		return f.transitionErr
+	}
+	if f.onTransition != nil {
+		f.onTransition(issueID, targetState)
+	}
+	return nil
 }
 
 type fakeWorkspaceManager struct {

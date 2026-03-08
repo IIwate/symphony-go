@@ -354,25 +354,10 @@ func (r *AppServerRunner) waitForTurnEnd(ctx context.Context, timeoutMS int, wri
 func (r *AppServerRunner) handleStreamMessage(writer io.Writer, message map[string]any, params RunParams, pid *string, threadID string, turnID string, sessionID string) (error, bool) {
 	timestamp := r.now().UTC()
 	method, _ := message["method"].(string)
+	lowerMethod := strings.ToLower(method)
 	usage := extractUsage(message)
 	rateLimits := extractRateLimits(message)
 
-	if usage != nil || rateLimits != nil {
-		r.emit(params, AgentEvent{
-			Event:             "notification",
-			Timestamp:         timestamp,
-			CodexAppServerPID: pid,
-			SessionID:         optionalPtr(sessionID),
-			ThreadID:          optionalPtr(threadID),
-			TurnID:            optionalPtr(turnID),
-			Usage:             usage,
-			RateLimits:        rateLimits,
-			Message:           method,
-			Payload:           message,
-		})
-	}
-
-	lowerMethod := strings.ToLower(method)
 	if strings.Contains(lowerMethod, "requestuserinput") {
 		r.emit(params, AgentEvent{Event: "turn_input_required", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: message})
 		return model.NewAgentError(model.ErrTurnInputRequired, "turn requested user input", nil), false
@@ -391,21 +376,59 @@ func (r *AppServerRunner) handleStreamMessage(writer io.Writer, message map[stri
 
 	switch lowerMethod {
 	case "turn/completed":
-		r.emit(params, AgentEvent{Event: "turn_completed", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Usage: usage, Message: method, Payload: message})
+		r.emit(params, AgentEvent{Event: "turn_completed", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Usage: usage, RateLimits: rateLimits, Message: method, Payload: message})
 		return nil, true
 	case "turn/failed":
-		r.emit(params, AgentEvent{Event: "turn_failed", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Usage: usage, Message: method, Payload: message})
+		r.emit(params, AgentEvent{Event: "turn_failed", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Usage: usage, RateLimits: rateLimits, Message: method, Payload: message})
 		return model.NewAgentError(model.ErrTurnFailed, "turn failed", nil), false
 	case "turn/cancelled":
-		r.emit(params, AgentEvent{Event: "turn_cancelled", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Usage: usage, Message: method, Payload: message})
+		r.emit(params, AgentEvent{Event: "turn_cancelled", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Usage: usage, RateLimits: rateLimits, Message: method, Payload: message})
 		return model.NewAgentError(model.ErrTurnCancelled, "turn cancelled", nil), false
 	}
 
-	if method != "" {
-		r.emit(params, AgentEvent{Event: "other_message", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Usage: usage, Message: method, Payload: message})
+	if usage != nil || rateLimits != nil {
+		r.emit(params, AgentEvent{
+			Event:             "notification",
+			Timestamp:         timestamp,
+			CodexAppServerPID: pid,
+			SessionID:         optionalPtr(sessionID),
+			ThreadID:          optionalPtr(threadID),
+			TurnID:            optionalPtr(turnID),
+			Usage:             usage,
+			RateLimits:        rateLimits,
+			Message:           method,
+			Payload:           message,
+		})
+		return nil, false
+	}
+
+	if method != "" && !isStreamingNoise(lowerMethod) {
+		r.emit(params, AgentEvent{Event: "other_message", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: message})
 	}
 
 	return nil, false
+}
+
+func isStreamingNoise(lowerMethod string) bool {
+	if lowerMethod == "" {
+		return false
+	}
+	if strings.HasPrefix(lowerMethod, "item/") || strings.HasPrefix(lowerMethod, "items/") {
+		return true
+	}
+	if strings.HasPrefix(lowerMethod, "response/") {
+		return true
+	}
+	if strings.HasPrefix(lowerMethod, "codex/event/item_") {
+		return true
+	}
+	if strings.Contains(lowerMethod, "/delta") || strings.HasSuffix(lowerMethod, "_delta") {
+		return true
+	}
+	if strings.HasPrefix(lowerMethod, "codex/event/") && strings.Contains(lowerMethod, "delta") {
+		return true
+	}
+	return false
 }
 
 func (r *AppServerRunner) stopProcess(process Process) {

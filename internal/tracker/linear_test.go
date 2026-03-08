@@ -178,6 +178,107 @@ func TestFetchCandidateIssuesMapsHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestTransitionIssueSuccess(t *testing.T) {
+	var sawStateQuery bool
+	var sawMutation bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBody(t, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(body.Query, "IssueTeamStates"):
+			sawStateQuery = true
+			if body.Variables["id"] != "1" {
+				t.Fatalf("state query id = %v, want 1", body.Variables["id"])
+			}
+			_, _ = w.Write([]byte(`{"data":{"issue":{"team":{"states":{"nodes":[{"id":"done-state","name":"Done","type":"completed"},{"id":"progress-state","name":"In Progress","type":"started"}]}}}}}`))
+		case strings.Contains(body.Query, "MoveIssueToState"):
+			sawMutation = true
+			if body.Variables["id"] != "1" {
+				t.Fatalf("mutation id = %v, want 1", body.Variables["id"])
+			}
+			if body.Variables["stateId"] != "done-state" {
+				t.Fatalf("stateId = %v, want done-state", body.Variables["stateId"])
+			}
+			_, _ = w.Write([]byte(`{"data":{"issueUpdate":{"success":true}}}`))
+		default:
+			t.Fatalf("unexpected query: %s", body.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestLinearClient(t, server.URL)
+	if err := client.TransitionIssue(context.Background(), "1", "Done"); err != nil {
+		t.Fatalf("TransitionIssue() error = %v", err)
+	}
+	if !sawStateQuery || !sawMutation {
+		t.Fatalf("stateQuery=%v mutation=%v, want both true", sawStateQuery, sawMutation)
+	}
+}
+
+func TestTransitionIssueCompletedFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBody(t, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(body.Query, "IssueTeamStates"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"team":{"states":{"nodes":[{"id":"review-state","name":"In Review","type":"started"},{"id":"completed-state","name":"Closed","type":"completed"}]}}}}}`))
+		case strings.Contains(body.Query, "MoveIssueToState"):
+			if body.Variables["stateId"] != "completed-state" {
+				t.Fatalf("stateId = %v, want completed-state", body.Variables["stateId"])
+			}
+			_, _ = w.Write([]byte(`{"data":{"issueUpdate":{"success":true}}}`))
+		default:
+			t.Fatalf("unexpected query: %s", body.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestLinearClient(t, server.URL)
+	if err := client.TransitionIssue(context.Background(), "1", "Done"); err != nil {
+		t.Fatalf("TransitionIssue() error = %v", err)
+	}
+}
+
+func TestTransitionIssueStateNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBody(t, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if !strings.Contains(body.Query, "IssueTeamStates") {
+			t.Fatalf("unexpected query: %s", body.Query)
+		}
+		_, _ = w.Write([]byte(`{"data":{"issue":{"team":{"states":{"nodes":[{"id":"todo-state","name":"Todo","type":"unstarted"},{"id":"progress-state","name":"In Progress","type":"started"}]}}}}}`))
+	}))
+	defer server.Close()
+
+	client := newTestLinearClient(t, server.URL)
+	err := client.TransitionIssue(context.Background(), "1", "Done")
+	if !errors.Is(err, model.ErrLinearStateNotFound) {
+		t.Fatalf("TransitionIssue() error = %v, want ErrLinearStateNotFound", err)
+	}
+}
+
+func TestTransitionIssueMutationFailed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBody(t, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(body.Query, "IssueTeamStates"):
+			_, _ = w.Write([]byte(`{"data":{"issue":{"team":{"states":{"nodes":[{"id":"done-state","name":"Done","type":"completed"}]}}}}}`))
+		case strings.Contains(body.Query, "MoveIssueToState"):
+			_, _ = w.Write([]byte(`{"data":{"issueUpdate":{"success":false}}}`))
+		default:
+			t.Fatalf("unexpected query: %s", body.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestLinearClient(t, server.URL)
+	err := client.TransitionIssue(context.Background(), "1", "Done")
+	if !errors.Is(err, model.ErrLinearTransitionFailed) {
+		t.Fatalf("TransitionIssue() error = %v, want ErrLinearTransitionFailed", err)
+	}
+}
+
 func newTestLinearClient(t *testing.T, endpoint string) *LinearClient {
 	t.Helper()
 

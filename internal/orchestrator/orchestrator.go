@@ -1,8 +1,11 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -14,17 +17,20 @@ import (
 	"symphony-go/internal/agent"
 	"symphony-go/internal/config"
 	"symphony-go/internal/model"
+	"symphony-go/internal/shell"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workspace"
 )
 
 type WorkerResult struct {
-	IssueID    string
-	Identifier string
-	Attempt    *int
-	StartedAt  time.Time
-	Phase      model.RunPhase
-	Err        error
+	IssueID      string
+	Identifier   string
+	Attempt      *int
+	StartedAt    time.Time
+	Phase        model.RunPhase
+	Err          error
+	HasNewOpenPR bool
+	FinalBranch  string
 }
 
 type CodexUpdate struct {
@@ -71,14 +77,16 @@ type RetrySnapshot struct {
 }
 
 type Orchestrator struct {
-	tracker    tracker.Client
-	workspace  workspace.Manager
-	runner     agent.Runner
-	configFn   func() *model.ServiceConfig
-	workflowFn func() *model.WorkflowDefinition
-	logger     *slog.Logger
-	now        func() time.Time
-	randFloat  func() float64
+	tracker       tracker.Client
+	workspace     workspace.Manager
+	runner        agent.Runner
+	configFn      func() *model.ServiceConfig
+	workflowFn    func() *model.WorkflowDefinition
+	logger        *slog.Logger
+	now           func() time.Time
+	randFloat     func() float64
+	gitBranchFn   func(context.Context, string) (string, error)
+	openPRHeadsFn func(context.Context, string) (map[string]struct{}, error)
 
 	tickTimer      *time.Timer
 	workerResultCh chan WorkerResult
@@ -116,8 +124,10 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		logger:         logger,
 		now:            time.Now,
 		randFloat:      func() float64 { return 0.5 },
+		gitBranchFn:    defaultGitBranch,
+		openPRHeadsFn:  defaultOpenPRHeads,
 		workerResultCh: make(chan WorkerResult, 128),
-		codexUpdateCh:  make(chan CodexUpdate, 256),
+		codexUpdateCh:  make(chan CodexUpdate, 1024),
 		configReloadCh: make(chan *model.WorkflowDefinition, 8),
 		refreshCh:      make(chan struct{}, 8),
 		retryFireCh:    make(chan string, 128),
@@ -371,6 +381,8 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			}
 		}
 
+		preBranch, preOpenPRHeads, hasPRContext := o.capturePRContext(workerCtx, workspaceRef.Path)
+
 		result.Phase = model.PhaseStreamingTurn
 		runErr := o.runner.Run(workerCtx, agent.RunParams{
 			Issue:          cloneIssue(&issue),
@@ -404,6 +416,9 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			result.Phase = phaseFromError(runErr)
 		} else {
 			result.Phase = model.PhaseSucceeded
+			if hasPRContext {
+				result.HasNewOpenPR, result.FinalBranch = o.detectNewOpenPR(workerCtx, workspaceRef.Path, preBranch, preOpenPRHeads)
+			}
 		}
 		o.sendWorkerResult(result)
 	}()
@@ -411,31 +426,76 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 
 func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-
 	entry := o.state.Running[result.IssueID]
 	if entry == nil {
+		o.mu.Unlock()
 		return
 	}
 	o.addRuntimeLocked(entry)
 	delete(o.state.Running, result.IssueID)
+	identifier := entry.Identifier
+	retryAttempt := entry.RetryAttempt
 
-	if result.Err == nil {
-		o.state.Completed[result.IssueID] = struct{}{}
-		o.scheduleRetryLocked(result.IssueID, entry.Identifier, 1, nil, true)
+	if result.Err != nil {
+		nextAttempt := retryAttempt + 1
+		if nextAttempt <= 0 {
+			nextAttempt = 1
+		}
+		errorText := result.Err.Error()
+		o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false)
 		o.refreshSnapshotLocked()
 		o.publishSnapshotLocked()
+		o.mu.Unlock()
 		return
 	}
 
-	nextAttempt := entry.RetryAttempt + 1
-	if nextAttempt <= 0 {
-		nextAttempt = 1
-	}
-	errorText := result.Err.Error()
-	o.scheduleRetryLocked(result.IssueID, entry.Identifier, nextAttempt, &errorText, false)
+	o.state.Completed[result.IssueID] = struct{}{}
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
+	o.mu.Unlock()
+
+	ctx := o.runtimeContext()
+	cfg := o.currentConfig()
+	issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{result.IssueID})
+	if err == nil && len(issues) > 0 && o.isTerminalState(issues[0].State, cfg) {
+		o.completeSuccessfulIssue(ctx, result.IssueID, identifier)
+		return
+	}
+
+	if result.HasNewOpenPR {
+		transitioner, ok := o.tracker.(tracker.IssueTransitioner)
+		if ok {
+			transitionErr := transitioner.TransitionIssue(ctx, result.IssueID, "Done")
+			if transitionErr != nil {
+				o.logger.Warn("post-worker transition failed", "issue_id", result.IssueID, "branch", result.FinalBranch, "error", transitionErr.Error())
+			} else {
+				issues, err = o.tracker.FetchIssueStatesByIDs(ctx, []string{result.IssueID})
+				if err == nil && len(issues) > 0 && o.isTerminalState(issues[0].State, cfg) {
+					o.completeSuccessfulIssue(ctx, result.IssueID, identifier)
+					return
+				}
+			}
+			nextAttempt := retryAttempt + 1
+			if nextAttempt <= 0 {
+				nextAttempt = 1
+			}
+			errorText := "post-worker transition did not reach terminal state"
+			o.mu.Lock()
+			o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false)
+			o.refreshSnapshotLocked()
+			o.publishSnapshotLocked()
+			o.mu.Unlock()
+			return
+		}
+
+		o.logger.Warn("tracker does not support issue transition", "issue_id", result.IssueID, "branch", result.FinalBranch)
+	}
+
+	o.mu.Lock()
+	o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true)
+	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
+	o.mu.Unlock()
 }
 
 func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
@@ -461,7 +521,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 	if event.ThreadID != nil {
 		entry.Session.ThreadID = *event.ThreadID
 	}
-	if event.TurnID != nil {
+	if event.TurnID != nil && entry.Session.TurnID != *event.TurnID {
 		entry.Session.TurnID = *event.TurnID
 		entry.Session.TurnCount++
 	}
@@ -911,6 +971,122 @@ func (o *Orchestrator) sendCodexUpdate(update CodexUpdate) {
 	default:
 		o.logger.Warn("codex update channel is full", "issue_id", update.IssueID)
 	}
+}
+
+func (o *Orchestrator) runtimeContext() context.Context {
+	if o.runCtx != nil {
+		return o.runCtx
+	}
+	return context.Background()
+}
+
+func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID string, identifier string) {
+	if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
+		o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
+	}
+
+	o.mu.Lock()
+	delete(o.state.Claimed, issueID)
+	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
+	o.mu.Unlock()
+}
+
+func (o *Orchestrator) capturePRContext(ctx context.Context, workspacePath string) (string, map[string]struct{}, bool) {
+	if o.gitBranchFn == nil || o.openPRHeadsFn == nil {
+		return "", nil, false
+	}
+
+	preBranch, err := o.gitBranchFn(ctx, workspacePath)
+	if err != nil {
+		o.logger.Warn("pre-run branch detection failed", "workspace_path", workspacePath, "error", err.Error())
+		return "", nil, false
+	}
+	preOpenPRHeads, err := o.openPRHeadsFn(ctx, workspacePath)
+	if err != nil {
+		o.logger.Warn("pre-run open PR detection failed", "workspace_path", workspacePath, "error", err.Error())
+		return "", nil, false
+	}
+	return preBranch, preOpenPRHeads, true
+}
+
+func (o *Orchestrator) detectNewOpenPR(ctx context.Context, workspacePath string, preBranch string, preOpenPRHeads map[string]struct{}) (bool, string) {
+	if o.gitBranchFn == nil || o.openPRHeadsFn == nil {
+		return false, ""
+	}
+
+	postBranch, err := o.gitBranchFn(ctx, workspacePath)
+	if err != nil {
+		o.logger.Warn("post-run branch detection failed", "workspace_path", workspacePath, "error", err.Error())
+		return false, ""
+	}
+	postOpenPRHeads, err := o.openPRHeadsFn(ctx, workspacePath)
+	if err != nil {
+		o.logger.Warn("post-run open PR detection failed", "workspace_path", workspacePath, "error", err.Error())
+		return false, postBranch
+	}
+	if strings.TrimSpace(postBranch) == "" || postBranch == preBranch {
+		return false, postBranch
+	}
+	if _, existed := preOpenPRHeads[postBranch]; existed {
+		return false, postBranch
+	}
+	if _, open := postOpenPRHeads[postBranch]; !open {
+		return false, postBranch
+	}
+	return true, postBranch
+}
+
+func defaultGitBranch(ctx context.Context, workspacePath string) (string, error) {
+	stdout, stderr, err := runBashOutput(ctx, workspacePath, "git branch --show-current")
+	if err != nil {
+		return "", fmt.Errorf("git branch --show-current: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	return strings.TrimSpace(stdout), nil
+}
+
+func defaultOpenPRHeads(ctx context.Context, workspacePath string) (map[string]struct{}, error) {
+	stdout, stderr, err := runBashOutput(ctx, workspacePath, "gh pr list --state open --json headRefName")
+	if err != nil {
+		return nil, fmt.Errorf("gh pr list: %w: %s", err, strings.TrimSpace(stderr))
+	}
+
+	var payload []struct {
+		HeadRefName string `json:"headRefName"`
+	}
+	if strings.TrimSpace(stdout) == "" {
+		return map[string]struct{}{}, nil
+	}
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		return nil, fmt.Errorf("decode gh pr list output: %w", err)
+	}
+
+	result := make(map[string]struct{}, len(payload))
+	for _, item := range payload {
+		branch := strings.TrimSpace(item.HeadRefName)
+		if branch == "" {
+			continue
+		}
+		result[branch] = struct{}{}
+	}
+	return result, nil
+}
+
+func runBashOutput(ctx context.Context, workspacePath string, script string) (string, string, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd, err := shell.BashCommand(probeCtx, workspacePath, script)
+	if err != nil {
+		return "", "", err
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	return stdout.String(), stderr.String(), err
 }
 
 func compareIssues(left model.Issue, right model.Issue) bool {
