@@ -88,34 +88,13 @@ const issueStatesByIDsQuery = `query IssueStatesByIDs($ids: [ID!]!, $after: Stri
   }
 }`
 
-type Client interface {
-	FetchCandidateIssues(ctx context.Context) ([]model.Issue, error)
-	FetchIssuesByStates(ctx context.Context, states []string) ([]model.Issue, error)
-	FetchIssueStatesByIDs(ctx context.Context, ids []string) ([]model.Issue, error)
-}
-
 type LinearClient struct {
 	httpClient     *http.Client
 	configProvider func() *model.ServiceConfig
 }
 
-func NewClient(cfg *model.ServiceConfig, httpClient *http.Client) (Client, error) {
-	if cfg == nil {
-		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, "service config is nil", nil)
-	}
-	if cfg.TrackerKind != "linear" {
-		return nil, model.NewTrackerError(model.ErrUnsupportedTrackerKind, fmt.Sprintf("unsupported tracker.kind %q", cfg.TrackerKind), nil)
-	}
-
-	return NewLinearClient(cfg, httpClient)
-}
-
 func NewLinearClient(cfg *model.ServiceConfig, httpClient *http.Client) (*LinearClient, error) {
 	return NewDynamicLinearClient(func() *model.ServiceConfig { return cfg }, httpClient)
-}
-
-func NewDynamicClient(configProvider func() *model.ServiceConfig, httpClient *http.Client) (Client, error) {
-	return NewDynamicLinearClient(configProvider, httpClient)
 }
 
 func NewDynamicLinearClient(configProvider func() *model.ServiceConfig, httpClient *http.Client) (*LinearClient, error) {

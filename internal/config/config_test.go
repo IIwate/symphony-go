@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"symphony-go/internal/model"
@@ -87,6 +88,48 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	}
 }
 
+func TestNewFromWorkflowAppliesGitHubDefaults(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "gh-secret")
+
+	definition := &model.WorkflowDefinition{
+		Config: map[string]any{
+			"tracker": map[string]any{
+				"kind":    "github",
+				"api_key": "$GITHUB_TOKEN",
+				"owner":   "octocat",
+				"repo":    "demo",
+			},
+		},
+	}
+
+	cfg, err := NewFromWorkflow(definition)
+	if err != nil {
+		t.Fatalf("NewFromWorkflow() error = %v", err)
+	}
+
+	if cfg.TrackerAPIKey != "gh-secret" {
+		t.Fatalf("TrackerAPIKey = %q, want gh-secret", cfg.TrackerAPIKey)
+	}
+	if cfg.TrackerEndpoint != "https://api.github.com" {
+		t.Fatalf("TrackerEndpoint = %q, want GitHub default", cfg.TrackerEndpoint)
+	}
+	if cfg.TrackerOwner != "octocat" {
+		t.Fatalf("TrackerOwner = %q, want octocat", cfg.TrackerOwner)
+	}
+	if cfg.TrackerRepo != "demo" {
+		t.Fatalf("TrackerRepo = %q, want demo", cfg.TrackerRepo)
+	}
+	if cfg.TrackerStateLabelPrefix != "symphony:" {
+		t.Fatalf("TrackerStateLabelPrefix = %q, want symphony:", cfg.TrackerStateLabelPrefix)
+	}
+	if !reflect.DeepEqual(cfg.ActiveStates, []string{"todo", "in-progress"}) {
+		t.Fatalf("ActiveStates = %#v, want GitHub defaults", cfg.ActiveStates)
+	}
+	if !reflect.DeepEqual(cfg.TerminalStates, []string{"closed", "cancelled"}) {
+		t.Fatalf("TerminalStates = %#v, want GitHub defaults", cfg.TerminalStates)
+	}
+}
+
 func TestValidateForDispatch(t *testing.T) {
 	base := defaultServiceConfig()
 	base.TrackerKind = "linear"
@@ -118,6 +161,69 @@ func TestValidateForDispatch(t *testing.T) {
 				cfg.TrackerProjectSlug = ""
 			},
 			target: model.ErrMissingTrackerProjectSlug,
+		},
+		{
+			name: "missing codex command",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.CodexCommand = ""
+			},
+			target: model.ErrInvalidCodexCommand,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := *base
+			cfg.MaxConcurrentAgentsByState = map[string]int{}
+			tc.mutate(&cfg)
+
+			err := ValidateForDispatch(&cfg)
+			if !errors.Is(err, tc.target) {
+				t.Fatalf("ValidateForDispatch() error = %v, want %v", err, tc.target)
+			}
+		})
+	}
+}
+
+func TestValidateForDispatchGitHub(t *testing.T) {
+	base := defaultServiceConfigForTracker("github")
+	base.TrackerKind = "github"
+	base.TrackerAPIKey = "secret"
+	base.TrackerOwner = "octocat"
+	base.TrackerRepo = "demo"
+
+	valid := *base
+	valid.MaxConcurrentAgentsByState = map[string]int{}
+	valid.TrackerProjectSlug = ""
+	if err := ValidateForDispatch(&valid); err != nil {
+		t.Fatalf("ValidateForDispatch(valid github) error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*model.ServiceConfig)
+		target error
+	}{
+		{
+			name: "missing api key",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.TrackerAPIKey = ""
+			},
+			target: model.ErrMissingTrackerAPIKey,
+		},
+		{
+			name: "missing owner",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.TrackerOwner = ""
+			},
+			target: model.ErrMissingTrackerOwner,
+		},
+		{
+			name: "missing repo",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.TrackerRepo = ""
+			},
+			target: model.ErrMissingTrackerRepo,
 		},
 		{
 			name: "missing codex command",
