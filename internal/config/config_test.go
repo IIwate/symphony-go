@@ -22,11 +22,15 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 				"kind":            "linear",
 				"api_key":         "$LINEAR_API_KEY",
 				"project_slug":    "demo",
+				"repo":            "ignored-repo",
 				"active_states":   "Todo, In Progress",
 				"terminal_states": []any{"Closed", "Done"},
 			},
-			"polling":   map[string]any{"interval_ms": "45000"},
-			"workspace": map[string]any{"root": "~/symphony"},
+			"polling": map[string]any{"interval_ms": "45000"},
+			"workspace": map[string]any{
+				"root":                "~/symphony",
+				"linear_branch_scope": "Symphony Go",
+			},
 			"hooks": map[string]any{
 				"before_run": "echo hi",
 				"timeout_ms": "12000",
@@ -60,6 +64,9 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	}
 	if cfg.WorkspaceRoot != filepath.Join(homeDir, "symphony") {
 		t.Fatalf("WorkspaceRoot = %q, want %q", cfg.WorkspaceRoot, filepath.Join(homeDir, "symphony"))
+	}
+	if cfg.WorkspaceLinearBranchScope != "symphony-go" {
+		t.Fatalf("WorkspaceLinearBranchScope = %q, want symphony-go", cfg.WorkspaceLinearBranchScope)
 	}
 	if cfg.HookBeforeRun == nil || *cfg.HookBeforeRun != "echo hi" {
 		t.Fatalf("HookBeforeRun = %v, want echo hi", cfg.HookBeforeRun)

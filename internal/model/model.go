@@ -38,10 +38,12 @@ type ServiceConfig struct {
 	TrackerEndpoint            string
 	TrackerAPIKey              string
 	TrackerProjectSlug         string
+	TrackerRepo                string
 	ActiveStates               []string
 	TerminalStates             []string
 	PollIntervalMS             int
 	WorkspaceRoot              string
+	WorkspaceLinearBranchScope string
 	HookAfterCreate            *string
 	HookBeforeRun              *string
 	HookAfterRun               *string
@@ -64,6 +66,7 @@ type ServiceConfig struct {
 type Workspace struct {
 	Path         string
 	WorkspaceKey string
+	Identifier   string
 	CreatedNow   bool
 }
 

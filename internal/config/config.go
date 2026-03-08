@@ -33,6 +33,7 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	}
 	cfg.TrackerAPIKey = resolveEnvString(strings.TrimSpace(getString(tracker, "api_key", "")))
 	cfg.TrackerProjectSlug = strings.TrimSpace(getString(tracker, "project_slug", ""))
+	cfg.TrackerRepo = strings.TrimSpace(getString(tracker, "repo", ""))
 	if states, ok := getStringSlice(tracker, "active_states"); ok && len(states) > 0 {
 		cfg.ActiveStates = states
 	}
@@ -49,6 +50,7 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	if root := expandHomePath(strings.TrimSpace(getString(workspace, "root", ""))); root != "" {
 		cfg.WorkspaceRoot = root
 	}
+	cfg.WorkspaceLinearBranchScope = slugifyScopeValue(getString(workspace, "linear_branch_scope", ""))
 
 	hooks := getMap(configMap, "hooks")
 	if value, ok := getOptionalString(hooks, "after_create"); ok {
@@ -356,6 +358,29 @@ func splitAndTrim(value string) []string {
 	}
 
 	return items
+}
+
+func slugifyScopeValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(trimmed) {
+		isAlpha := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		if isAlpha || isDigit {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
 }
 
 func stringifyValue(value any) string {
