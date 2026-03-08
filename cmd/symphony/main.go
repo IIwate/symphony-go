@@ -133,6 +133,9 @@ func execute(args []string, stderr io.Writer) error {
 		return err
 	}
 	defer closer.Close()
+	previousDefaultLogger := slog.Default()
+	slog.SetDefault(logger)
+	defer slog.SetDefault(previousDefaultLogger)
 	logger.Info("workflow loaded", slog.String("workflow_path", workflowPath))
 
 	if err := config.ValidateForDispatch(cfg); err != nil {

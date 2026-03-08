@@ -284,3 +284,38 @@ hello {{ issue.title }}
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 }
+
+func TestRunCLIUsesAppLoggerAsDefaultLogger(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	workingDir := t.TempDir()
+	writeWorkflow(t, filepath.Join(workingDir, "WORKFLOW.md"))
+
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	defer func() { _ = os.Chdir(originalDir) }()
+	if err := os.Chdir(workingDir); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+
+	previousDefault := slog.Default()
+	restore := stubDependencies(t)
+	defer restore()
+
+	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
+		slog.Warn("global logger probe")
+		return &fakeTrackerClient{}, nil
+	}
+
+	var stderr bytes.Buffer
+	if exitCode := runCLI([]string{"--dry-run"}, &stderr); exitCode != 0 {
+		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "global logger probe") {
+		t.Fatalf("stderr = %q, want global logger probe", stderr.String())
+	}
+	if slog.Default() != previousDefault {
+		t.Fatalf("default slog logger was not restored")
+	}
+}
