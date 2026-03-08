@@ -2,10 +2,12 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: db0a2d0d6058
+  project_slug: 93f75f5af725
+workspace:
+  root: H:/code/temp/symphony_workspaces
 hooks:
   before_run: |
-    repo_url="${SYMPHONY_GIT_REPO:-https://github.com/IIwate/linear-test}"
+    repo_url="${SYMPHONY_GIT_REPO:-https://github.com/IIwate/symphony-go}"
     find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     git clone --depth 1 "$repo_url" .
 codex:
@@ -23,3 +25,5 @@ codex:
 {% endif %}
 
 请先理解问题，再按仓库工作流完成开发任务。
+
+完成开发后，请推送分支并创建 PR，但不要自行 merge PR。
