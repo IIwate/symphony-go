@@ -40,14 +40,15 @@ type CodexUpdate struct {
 }
 
 type Snapshot struct {
-	GeneratedAt time.Time
-	Service     ServiceSnapshot
-	Counts      SnapshotCounts
-	Running     []RunningSnapshot
-	Retrying    []RetrySnapshot
-	Alerts      []AlertSnapshot
-	CodexTotals model.TokenTotals
-	RateLimits  any
+	GeneratedAt   time.Time
+	Service       ServiceSnapshot
+	Counts        SnapshotCounts
+	Running       []RunningSnapshot
+	AwaitingMerge []AwaitingMergeSnapshot
+	Retrying      []RetrySnapshot
+	Alerts        []AlertSnapshot
+	CodexTotals   model.TokenTotals
+	RateLimits    any
 }
 
 type ServiceSnapshot struct {
@@ -56,8 +57,9 @@ type ServiceSnapshot struct {
 }
 
 type SnapshotCounts struct {
-	Running  int
-	Retrying int
+	Running       int
+	AwaitingMerge int
+	Retrying      int
 }
 
 type RunningSnapshot struct {
@@ -87,12 +89,45 @@ type RetrySnapshot struct {
 	Error           *string
 }
 
+type AwaitingMergeSnapshot struct {
+	IssueID         string
+	IssueIdentifier string
+	WorkspacePath   string
+	State           string
+	Branch          string
+	PRNumber        int
+	PRURL           string
+	PRState         string
+	AwaitingSince   time.Time
+	LastError       *string
+	AttemptCount    int
+}
+
 type AlertSnapshot struct {
 	Code            string
 	Level           string
 	Message         string
 	IssueID         string
 	IssueIdentifier string
+}
+
+type PullRequestState string
+
+const (
+	PullRequestStateOpen   PullRequestState = "open"
+	PullRequestStateMerged PullRequestState = "merged"
+	PullRequestStateClosed PullRequestState = "closed"
+)
+
+type PullRequestInfo struct {
+	Number     int
+	URL        string
+	HeadBranch string
+	State      PullRequestState
+}
+
+type PullRequestLookup interface {
+	FindByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error)
 }
 
 type Orchestrator struct {
@@ -106,6 +141,7 @@ type Orchestrator struct {
 	randFloat     func() float64
 	gitBranchFn   func(context.Context, string) (string, error)
 	openPRHeadsFn func(context.Context, string) (map[string]struct{}, error)
+	prLookup      PullRequestLookup
 
 	tickTimer      *time.Timer
 	workerResultCh chan WorkerResult
@@ -164,6 +200,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		doneCh:         make(chan struct{}),
 		state: model.OrchestratorState{
 			Running:       map[string]*model.RunningEntry{},
+			AwaitingMerge: map[string]*model.AwaitingMergeEntry{},
 			Claimed:       map[string]struct{}{},
 			RetryAttempts: map[string]*model.RetryEntry{},
 			Completed:     map[string]struct{}{},
@@ -175,6 +212,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		startedAt:      time.Now().UTC(),
 		serviceVersion: BuildVersion,
 	}
+	o.prLookup = ghPRLookup{}
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
 	return o
@@ -305,6 +343,7 @@ func (o *Orchestrator) tick(ctx context.Context) {
 
 func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	stateRefreshAttempted, stateRefreshSucceeded := o.reconcileRunning(ctx)
+	o.reconcileAwaitingMerge(ctx)
 
 	cfg := o.currentConfig()
 	if err := config.ValidateForDispatch(cfg); err != nil {
@@ -516,8 +555,13 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	o.addRuntimeLocked(entry)
 	delete(o.state.Running, result.IssueID)
 	identifier := entry.Identifier
+	workspacePath := entry.WorkspacePath
 	retryAttempt := entry.RetryAttempt
 	stallCount := entry.StallCount
+	issueState := ""
+	if entry.Issue != nil {
+		issueState = entry.Issue.State
+	}
 	o.logger.Info(
 		"worker finished",
 		"issue_id", result.IssueID,
@@ -549,38 +593,48 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	ctx := o.runtimeContext()
 	cfg := o.currentConfig()
 	issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{result.IssueID})
-	if err == nil && len(issues) > 0 && o.isTerminalState(issues[0].State, cfg) {
-		o.completeSuccessfulIssue(ctx, result.IssueID, identifier)
-		return
+	if err == nil && len(issues) > 0 {
+		issueState = issues[0].State
+		if o.isTerminalState(issues[0].State, cfg) {
+			o.completeSuccessfulIssue(ctx, result.IssueID, identifier)
+			return
+		}
 	}
 
 	if result.HasNewOpenPR && cfg.OrchestratorAutoCloseOnPR {
-		transitioner, ok := o.tracker.(tracker.IssueTransitioner)
-		if ok {
-			transitionErr := transitioner.TransitionIssue(ctx, result.IssueID, "Done")
-			if transitionErr != nil {
-				o.logger.Warn("post-worker transition failed", "issue_id", result.IssueID, "branch", result.FinalBranch, "error", transitionErr.Error())
-			} else {
-				issues, err = o.tracker.FetchIssueStatesByIDs(ctx, []string{result.IssueID})
-				if err == nil && len(issues) > 0 && o.isTerminalState(issues[0].State, cfg) {
-					o.completeSuccessfulIssue(ctx, result.IssueID, identifier)
-					return
-				}
-			}
-			nextAttempt := retryAttempt + 1
-			if nextAttempt <= 0 {
-				nextAttempt = 1
-			}
-			errorText := "post-worker transition did not reach terminal state"
+		pr, lookupErr := o.lookupPullRequestByHeadBranch(ctx, workspacePath, result.FinalBranch)
+		if lookupErr != nil {
+			o.logger.Warn("post-run PR status lookup failed", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch, "error", lookupErr.Error())
+			errorText := lookupErr.Error()
+			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, nil, &errorText)
+			return
+		}
+		if pr == nil {
+			errorText := "pull request lookup returned no match"
+			o.logger.Warn("post-run PR lookup returned no match", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch)
+			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, nil, &errorText)
+			return
+		}
+		switch pr.State {
+		case PullRequestStateMerged:
+			o.tryCompleteMergedPullRequest(ctx, result.IssueID, identifier, result.FinalBranch, retryAttempt, stallCount)
+			return
+		case PullRequestStateOpen:
+			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr, nil)
+			return
+		case PullRequestStateClosed:
 			o.mu.Lock()
-			o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false, stallCount)
+			o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount)
 			o.refreshSnapshotLocked()
 			o.publishSnapshotLocked()
 			o.mu.Unlock()
 			return
+		default:
+			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
+			o.logger.Warn("post-run PR state is unsupported", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch, "state", pr.State)
+			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr, &errorText)
+			return
 		}
-
-		o.logger.Warn("tracker does not support issue transition", "issue_id", result.IssueID, "branch", result.FinalBranch)
 	}
 
 	o.mu.Lock()
@@ -695,6 +749,142 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	return true, true
+}
+
+func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
+	o.mu.RLock()
+	pending := make(map[string]model.AwaitingMergeEntry, len(o.state.AwaitingMerge))
+	for issueID, entry := range o.state.AwaitingMerge {
+		if entry == nil {
+			continue
+		}
+		pending[issueID] = *entry
+	}
+	o.mu.RUnlock()
+	if len(pending) == 0 {
+		return
+	}
+
+	cfg := o.currentConfig()
+	ids := make([]string, 0, len(pending))
+	for issueID := range pending {
+		ids = append(ids, issueID)
+	}
+	refreshed, err := o.tracker.FetchIssueStatesByIDs(ctx, ids)
+	byID := make(map[string]model.Issue, len(refreshed))
+	if err != nil {
+		o.logger.Warn("awaiting-merge state refresh failed", "error", err.Error())
+	} else {
+		for _, issue := range refreshed {
+			byID[issue.ID] = issue
+		}
+	}
+
+	for issueID, entry := range pending {
+		if issue, ok := byID[issueID]; ok {
+			switch {
+			case o.isTerminalState(issue.State, cfg):
+				o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
+				continue
+			case !o.isActiveState(issue.State, cfg):
+				o.mu.Lock()
+				current := o.state.AwaitingMerge[issueID]
+				if current != nil {
+					delete(o.state.AwaitingMerge, issueID)
+					delete(o.state.Claimed, issueID)
+					o.refreshSnapshotLocked()
+					o.publishSnapshotLocked()
+				}
+				o.mu.Unlock()
+				continue
+			default:
+				o.mu.Lock()
+				current := o.state.AwaitingMerge[issueID]
+				if current != nil && current.State != issue.State {
+					current.State = issue.State
+					o.refreshSnapshotLocked()
+					o.publishSnapshotLocked()
+				}
+				o.mu.Unlock()
+			}
+		}
+
+		pr, err := o.lookupPullRequestByHeadBranch(ctx, entry.WorkspacePath, entry.Branch)
+		if err != nil {
+			o.logger.Warn("awaiting-merge PR lookup failed", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "error", err.Error())
+			errorText := err.Error()
+			o.mu.Lock()
+			current := o.state.AwaitingMerge[issueID]
+			if current != nil {
+				current.LastError = optionalError(errorText)
+				o.refreshSnapshotLocked()
+				o.publishSnapshotLocked()
+			}
+			o.mu.Unlock()
+			continue
+		}
+		if pr == nil {
+			o.logger.Warn("awaiting-merge PR lookup returned no match", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch)
+			o.mu.Lock()
+			current := o.state.AwaitingMerge[issueID]
+			if current == nil {
+				o.mu.Unlock()
+				continue
+			}
+			delete(o.state.AwaitingMerge, issueID)
+			o.scheduleRetryLocked(issueID, current.Identifier, 1, nil, true, current.StallCount)
+			o.refreshSnapshotLocked()
+			o.publishSnapshotLocked()
+			o.mu.Unlock()
+			continue
+		}
+
+		switch pr.State {
+		case PullRequestStateOpen:
+			o.mu.Lock()
+			current := o.state.AwaitingMerge[issueID]
+			if current != nil {
+				changed := current.PRNumber != pr.Number || current.PRURL != pr.URL || current.PRState != string(pr.State) || current.LastError != nil
+				current.PRNumber = pr.Number
+				current.PRURL = pr.URL
+				current.PRState = string(pr.State)
+				current.LastError = nil
+				if changed {
+					o.refreshSnapshotLocked()
+					o.publishSnapshotLocked()
+				}
+			}
+			o.mu.Unlock()
+		case PullRequestStateMerged:
+			o.tryCompleteMergedPullRequest(ctx, issueID, entry.Identifier, entry.Branch, entry.RetryAttempt, entry.StallCount)
+		case PullRequestStateClosed:
+			o.mu.Lock()
+			current := o.state.AwaitingMerge[issueID]
+			if current == nil {
+				o.mu.Unlock()
+				continue
+			}
+			delete(o.state.AwaitingMerge, issueID)
+			o.scheduleRetryLocked(issueID, current.Identifier, 1, nil, true, current.StallCount)
+			o.refreshSnapshotLocked()
+			o.publishSnapshotLocked()
+			o.mu.Unlock()
+		default:
+			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
+			o.logger.Warn("awaiting-merge PR state is unsupported", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "state", pr.State)
+			o.mu.Lock()
+			current := o.state.AwaitingMerge[issueID]
+			if current != nil {
+				current.PRNumber = pr.Number
+				current.PRURL = pr.URL
+				current.PRState = string(pr.State)
+				current.LastError = optionalError(errorText)
+				o.refreshSnapshotLocked()
+				o.publishSnapshotLocked()
+			}
+			o.mu.Unlock()
+		}
+	}
 }
 
 func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
@@ -937,6 +1127,29 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		running = append(running, row)
 	}
 
+	awaitingMerge := make([]AwaitingMergeSnapshot, 0, len(o.state.AwaitingMerge))
+	for issueID, entry := range o.state.AwaitingMerge {
+		awaitingMerge = append(awaitingMerge, AwaitingMergeSnapshot{
+			IssueID:         issueID,
+			IssueIdentifier: entry.Identifier,
+			WorkspacePath:   entry.WorkspacePath,
+			State:           entry.State,
+			Branch:          entry.Branch,
+			PRNumber:        entry.PRNumber,
+			PRURL:           entry.PRURL,
+			PRState:         entry.PRState,
+			AwaitingSince:   entry.AwaitingSince,
+			LastError:       entry.LastError,
+			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
+		})
+	}
+	sort.SliceStable(awaitingMerge, func(i int, j int) bool {
+		if awaitingMerge[i].IssueIdentifier != awaitingMerge[j].IssueIdentifier {
+			return awaitingMerge[i].IssueIdentifier < awaitingMerge[j].IssueIdentifier
+		}
+		return awaitingMerge[i].IssueID < awaitingMerge[j].IssueID
+	})
+
 	retrying := make([]RetrySnapshot, 0, len(o.state.RetryAttempts))
 	for issueID, entry := range o.state.RetryAttempts {
 		retrying = append(retrying, RetrySnapshot{
@@ -978,6 +1191,18 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			})
 		}
 	}
+	for issueID, entry := range o.state.AwaitingMerge {
+		if entry.LastError == nil {
+			continue
+		}
+		alerts = append(alerts, AlertSnapshot{
+			Code:            "merge_status_unknown",
+			Level:           "warn",
+			Message:         *entry.LastError,
+			IssueID:         issueID,
+			IssueIdentifier: entry.Identifier,
+		})
+	}
 	sort.SliceStable(alerts, func(i int, j int) bool {
 		if alerts[i].Code != alerts[j].Code {
 			return alerts[i].Code < alerts[j].Code
@@ -1000,14 +1225,16 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			StartedAt: o.startedAt,
 		},
 		Counts: SnapshotCounts{
-			Running:  len(running),
-			Retrying: len(retrying),
+			Running:       len(running),
+			AwaitingMerge: len(awaitingMerge),
+			Retrying:      len(retrying),
 		},
-		Running:     running,
-		Retrying:    retrying,
-		Alerts:      alerts,
-		CodexTotals: totals,
-		RateLimits:  o.state.CodexRateLimits,
+		Running:       running,
+		AwaitingMerge: awaitingMerge,
+		Retrying:      retrying,
+		Alerts:        alerts,
+		CodexTotals:   totals,
+		RateLimits:    o.state.CodexRateLimits,
 	}
 }
 
@@ -1065,6 +1292,9 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	if _, ok := o.state.Running[issue.ID]; ok {
+		return false
+	}
+	if _, ok := o.state.AwaitingMerge[issue.ID]; ok {
 		return false
 	}
 	if !ignoreClaim {
@@ -1147,12 +1377,89 @@ func (o *Orchestrator) runtimeContext() context.Context {
 	return context.Background()
 }
 
+func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, issueState string, workspacePath string, branch string, retryAttempt int, stallCount int, pr *PullRequestInfo, lastError *string) {
+	var errorCopy *string
+	if lastError != nil {
+		errorCopy = optionalError(*lastError)
+	}
+	entry := &model.AwaitingMergeEntry{
+		Identifier:    identifier,
+		State:         issueState,
+		WorkspacePath: workspacePath,
+		Branch:        branch,
+		RetryAttempt:  retryAttempt,
+		StallCount:    stallCount,
+		AwaitingSince: o.now().UTC(),
+		LastError:     errorCopy,
+	}
+	if pr != nil {
+		entry.PRNumber = pr.Number
+		entry.PRURL = pr.URL
+		entry.PRState = string(pr.State)
+	}
+
+	o.mu.Lock()
+	o.state.Claimed[issueID] = struct{}{}
+	o.state.AwaitingMerge[issueID] = entry
+	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
+	o.mu.Unlock()
+}
+
+func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, branch string, retryAttempt int, stallCount int) bool {
+	transitioner, ok := o.tracker.(tracker.IssueTransitioner)
+	errorText := ""
+	if !ok {
+		errorText = "tracker does not support issue transition"
+		o.logger.Warn("tracker does not support issue transition", "issue_id", issueID, "issue_identifier", identifier, "branch", branch)
+	} else if err := transitioner.TransitionIssue(ctx, issueID, "Done"); err != nil {
+		errorText = fmt.Sprintf("post-merge transition failed: %s", err.Error())
+		o.logger.Warn("post-merge transition failed", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "error", err.Error())
+	} else {
+		issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{issueID})
+		cfg := o.currentConfig()
+		if err == nil && len(issues) > 0 && o.isTerminalState(issues[0].State, cfg) {
+			o.completeSuccessfulIssue(ctx, issueID, identifier)
+			return true
+		}
+		if err != nil {
+			errorText = fmt.Sprintf("post-merge state refresh failed: %s", err.Error())
+		} else {
+			errorText = "post-merge transition did not reach terminal state"
+		}
+	}
+
+	nextAttempt := retryAttempt + 1
+	if nextAttempt <= 0 {
+		nextAttempt = 1
+	}
+	o.mu.Lock()
+	delete(o.state.AwaitingMerge, issueID)
+	o.scheduleRetryLocked(issueID, identifier, nextAttempt, optionalError(errorText), false, stallCount)
+	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
+	o.mu.Unlock()
+	return false
+}
+
+func (o *Orchestrator) lookupPullRequestByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error) {
+	branch := strings.TrimSpace(headBranch)
+	if branch == "" {
+		return nil, nil
+	}
+	if o.prLookup == nil {
+		return nil, errors.New("pull request lookup is not configured")
+	}
+	return o.prLookup.FindByHeadBranch(ctx, workspacePath, branch)
+}
+
 func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID string, identifier string) {
 	if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
 		o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
 	}
 
 	o.mu.Lock()
+	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.Claimed, issueID)
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
@@ -1202,6 +1509,54 @@ func (o *Orchestrator) detectNewOpenPR(ctx context.Context, workspacePath string
 		return false, postBranch
 	}
 	return true, postBranch
+}
+
+type ghPRLookup struct{}
+
+func (ghPRLookup) FindByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error) {
+	stdout, stderr, err := runBashOutput(ctx, workspacePath, fmt.Sprintf("gh pr list --state all --head %s --json number,url,state,mergedAt,headRefName", bashSingleQuote(headBranch)))
+	if err != nil {
+		return nil, fmt.Errorf("gh pr list: %w: %s", err, strings.TrimSpace(stderr))
+	}
+
+	var payload []struct {
+		Number      int     `json:"number"`
+		URL         string  `json:"url"`
+		State       string  `json:"state"`
+		MergedAt    *string `json:"mergedAt"`
+		HeadRefName string  `json:"headRefName"`
+	}
+	if strings.TrimSpace(stdout) == "" {
+		return nil, nil
+	}
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		return nil, fmt.Errorf("decode gh pr list output: %w", err)
+	}
+
+	branch := strings.TrimSpace(headBranch)
+	var selected *PullRequestInfo
+	for _, item := range payload {
+		if strings.TrimSpace(item.HeadRefName) != branch {
+			continue
+		}
+		state := PullRequestStateClosed
+		switch {
+		case item.MergedAt != nil && strings.TrimSpace(*item.MergedAt) != "":
+			state = PullRequestStateMerged
+		case strings.EqualFold(item.State, "open"):
+			state = PullRequestStateOpen
+		}
+		candidate := &PullRequestInfo{
+			Number:     item.Number,
+			URL:        strings.TrimSpace(item.URL),
+			HeadBranch: branch,
+			State:      state,
+		}
+		if selected == nil || candidate.Number > selected.Number {
+			selected = candidate
+		}
+	}
+	return selected, nil
 }
 
 func defaultGitBranch(ctx context.Context, workspacePath string) (string, error) {
@@ -1352,6 +1707,10 @@ func errorString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func bashSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func (o *Orchestrator) rememberCompletedLocked(issueID string) {

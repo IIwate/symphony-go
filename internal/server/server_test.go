@@ -45,8 +45,12 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 		t.Fatalf("service.uptime_seconds = %v, want positive", service["uptime_seconds"])
 	}
 	counts := payload["counts"].(map[string]any)
-	if counts["running"].(float64) != 1 || counts["retrying"].(float64) != 1 {
+	if counts["running"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["retrying"].(float64) != 1 {
 		t.Fatalf("counts = %+v", counts)
+	}
+	awaitingMerge := payload["awaiting_merge"].([]any)
+	if len(awaitingMerge) != 1 {
+		t.Fatalf("awaiting_merge = %+v, want 1 entry", awaitingMerge)
 	}
 	alerts := payload["alerts"].([]any)
 	if len(alerts) != 1 {
@@ -91,6 +95,27 @@ func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
 	}
 	if retryPayload["last_error"] != "workspace_hook_failed: before_run failed" {
 		t.Fatalf("last_error = %v", retryPayload["last_error"])
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-3", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var awaitingPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &awaitingPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if awaitingPayload["status"] != "awaiting_merge" {
+		t.Fatalf("status = %v, want awaiting_merge", awaitingPayload["status"])
+	}
+	if awaitingPayload["attempt_count"].(float64) != 1 {
+		t.Fatalf("attempt_count = %v, want 1", awaitingPayload["attempt_count"])
+	}
+	awaitingEntry := awaitingPayload["awaiting_merge"].(map[string]any)
+	if awaitingEntry["pr_state"] != "open" {
+		t.Fatalf("awaiting_merge.pr_state = %v, want open", awaitingEntry["pr_state"])
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/MISSING", nil)
@@ -353,8 +378,9 @@ func sampleSnapshot() orchestrator.Snapshot {
 			StartedAt: now.Add(-5 * time.Minute),
 		},
 		Counts: orchestrator.SnapshotCounts{
-			Running:  1,
-			Retrying: 1,
+			Running:       1,
+			AwaitingMerge: 1,
+			Retrying:      1,
 		},
 		Running: []orchestrator.RunningSnapshot{
 			{
@@ -372,6 +398,20 @@ func sampleSnapshot() orchestrator.Snapshot {
 				TotalTokens:         15,
 				CurrentRetryAttempt: 1,
 				AttemptCount:        2,
+			},
+		},
+		AwaitingMerge: []orchestrator.AwaitingMergeSnapshot{
+			{
+				IssueID:         "3",
+				IssueIdentifier: "ABC-3",
+				WorkspacePath:   "C:/work/ABC-3",
+				State:           "In Progress",
+				Branch:          "iiwate/linear-symphony-go-abc-3",
+				PRNumber:        99,
+				PRURL:           "https://example.test/pr/99",
+				PRState:         "open",
+				AwaitingSince:   now.Add(-2 * time.Minute),
+				AttemptCount:    1,
 			},
 		},
 		Retrying: []orchestrator.RetrySnapshot{

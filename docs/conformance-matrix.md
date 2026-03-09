@@ -63,7 +63,7 @@
 | stall timeout 杀 worker 并排队 retry | `internal/orchestrator` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestReconcileRunningSchedulesRetryForStalledSession` | `FLOW.md` | 本轮新增 |
 | preflight 失败仍先 reconcile | `internal/orchestrator` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestRunOncePreflightFailureStillReconcilesRunningIssues` | `REQUIREMENTS.md` |  |
 | token totals 聚合 / turn 计数去重 | `internal/orchestrator` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestHandleCodexUpdateAggregatesUsage`、`TestHandleCodexUpdateTurnCountIncrementsOnTurnChangeOnly` | `FLOW.md` |  |
-| PR auto-close 扩展、feature flag 关闭路径 | `internal/orchestrator` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestHandleWorkerExitHasNewOpenPRTransitionsToDone`、`TestHandleWorkerExitTransitionFailureSchedulesBackoffRetry`、`TestHandleWorkerExitHasNewOpenPRDisabledSchedulesContinuation` | `FLOW.md` | Go 实现扩展 |
+| PR merge gating 扩展、AwaitingMerge 对账与 feature flag 关闭路径 | `internal/orchestrator` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestHandleWorkerExitHasNewOpenPRMergedTransitionsToDone`、`TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge`、`TestHandleWorkerExitMergedPRTransitionFailureSchedulesBackoffRetry`、`TestReconcileAwaitingMergeMergedClosesIssue`、`TestReconcileAwaitingMergeClosedSchedulesContinuationRetry`、`TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert`、`TestIsDispatchEligibleRejectsAwaitingMerge`、`TestHandleWorkerExitHasNewOpenPRDisabledSchedulesContinuation` | `FLOW.md`、`docs/rfcs/pr-merge-gating.md` | Go 实现扩展 |
 | slot exhaustion requeue、`max_retry_backoff_ms` 封顶 | `internal/orchestrator` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestHandleRetryTimerRequeuesWhenNoSlotsAvailable`、`TestScheduleRetryLockedCapsBackoffAtConfiguredMaximum` | `REQUIREMENTS.md` | 本轮补齐 retry 边界 |
 
 ### §17.5 Coding-Agent App-Server Client
@@ -87,7 +87,7 @@
 | secrets 脱敏 | `internal/logging` | 已覆盖 | `internal/logging/logging_test.go`：`TestNewLoggerMasksSecrets` | `REQUIREMENTS.md` |  |
 | sink 失败不拖垮主流程 | `internal/logging` | 已覆盖 | `internal/logging/logging_test.go`：`TestFanoutWriterSurvivesSinkFailure` | `REQUIREMENTS.md` |  |
 | token totals 聚合 | `internal/orchestrator` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestHandleCodexUpdateAggregatesUsage` | `FLOW.md` |  |
-| alerts / issue 详情增强字段 | `internal/orchestrator`、`internal/server` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestSnapshotIncludesAlertsAndWorkspaceContext`、`TestRunOnceSetsAndClearsTrackerAlert`；`internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot`、`TestIssueEndpointReturnsKnownIssueAnd404ForUnknown` | `FLOW.md`、`docs/operator-runbook.md` | 本轮新增 |
+| alerts / issue 详情增强字段 / AwaitingMerge 状态面 | `internal/orchestrator`、`internal/server` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestSnapshotIncludesAlertsAndWorkspaceContext`、`TestRunOnceSetsAndClearsTrackerAlert`、`TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert`；`internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot`、`TestIssueEndpointReturnsKnownIssueAnd404ForUnknown` | `FLOW.md`、`docs/operator-runbook.md` | 包含 `awaiting_merge` 列表、计数与 `merge_status_unknown` 告警 |
 | rate-limit 聚合展示 | `internal/orchestrator`、`internal/server` | 已覆盖 | `internal/orchestrator/orchestrator_test.go`：`TestHandleCodexUpdateStoresRateLimitsInSnapshot`；`internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot` | `docs/release-checklist.md` | 本轮补齐聚合与状态面展示 |
 
 ### §17.7 CLI and Host Lifecycle
@@ -105,7 +105,7 @@
 
 | SPEC 条目 | 实现包 | 现状 | 测试锚点 | 文档锚点 | 备注 |
 |---|---|---|---|---|---|
-| `/` Dashboard、`/api/v1/state`、`/api/v1/{identifier}`、`/api/v1/refresh`、`/api/v1/events` | `internal/server` | 已覆盖 | `internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot`、`TestIssueEndpointReturnsKnownIssueAnd404ForUnknown`、`TestRefreshEndpointAndMethodNotAllowed`、`TestEventsEndpointSendsSnapshotAndUpdate`、`TestDashboardAndMethodNotAllowed` | `docs/operator-runbook.md`、`docs/release-checklist.md` |  |
+| `/` Dashboard、`/api/v1/state`、`/api/v1/{identifier}`、`/api/v1/refresh`、`/api/v1/events` | `internal/server` | 已覆盖 | `internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot`、`TestIssueEndpointReturnsKnownIssueAnd404ForUnknown`、`TestRefreshEndpointAndMethodNotAllowed`、`TestEventsEndpointSendsSnapshotAndUpdate`、`TestDashboardAndMethodNotAllowed` | `docs/operator-runbook.md`、`docs/release-checklist.md` | `/api/v1/state` 包含 `awaiting_merge` 列表与计数 |
 | 404 / 405 / SSE `snapshot` + `update` | `internal/server` | 已覆盖 | 同上 | `FLOW.md` |  |
 | SSE 不可用 / 客户端断开 / 并发订阅 / rate-limit 展示 | `internal/server` | 已覆盖 | `internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot`、`TestEventsEndpointClientDisconnect`、`TestEventsEndpointNoFlusherReturns500`、`TestEventsEndpointConcurrentClients` | `docs/release-checklist.md` | 本轮补齐 SSE 负例与并发订阅 |
 

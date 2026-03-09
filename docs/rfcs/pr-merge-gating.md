@@ -1,6 +1,6 @@
 # RFC: PR Merge Gating
 
-> **状态**: 草案
+> **状态**: 已实现（2026-03-10）
 > **对应**: Cycle 5 扩展池 "PR Merge Gating" / `docs/cycles/cycle-05-post-mvp.md`
 > **前置**: Cycle 1-4 首版交付完成
 
@@ -356,17 +356,18 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 
 | 测试 | 覆盖点 |
 |---|---|
-| `TestHandleWorkerExitNewPROpensAwaitingMerge` | 成功运行后进入 `AwaitingMerge`，不直接 close |
+| `TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge` | 成功运行后进入 `AwaitingMerge`，不直接 close |
 | `TestReconcileAwaitingMergeMergedClosesIssue` | PR merged 后触发 `TransitionIssue` 并清理 |
-| `TestReconcileAwaitingMergeClosedUnmergedSchedulesContinuation` | PR closed/unmerged 回退 continuation retry |
-| `TestDispatchEligibilityRejectsAwaitingMerge` | `AwaitingMerge` issue 不会被重新 dispatch |
-| `TestAutoCloseOnPRFalseKeepsCurrentContinuationPath` | feature flag 关闭时保持现有行为 |
+| `TestReconcileAwaitingMergeClosedSchedulesContinuationRetry` | PR closed/unmerged 回退 continuation retry |
+| `TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert` | PR 查询失败时保留 `AwaitingMerge` 并暴露告警 |
+| `TestIsDispatchEligibleRejectsAwaitingMerge` | `AwaitingMerge` issue 不会被重新 dispatch |
+| `TestHandleWorkerExitHasNewOpenPRDisabledSchedulesContinuation` | feature flag 关闭时保持现有行为 |
 
 ### 13.2 `internal/server/server_test.go`
 
 | 测试 | 覆盖点 |
 |---|---|
-| `TestStateResponseIncludesAwaitingMerge` | `/api/v1/state` 返回 awaiting-merge 信息 |
+| `TestStateEndpointReturnsSnapshot` | `/api/v1/state` 返回 awaiting-merge 信息 |
 
 ### 13.3 `cmd/symphony/main_test.go`
 

@@ -39,7 +39,7 @@
 - `[实现扩展]` agent 会话支持动态工具 `linear_graphql`。
 - `[实现扩展]` HTTP 服务是可选能力，监听 `127.0.0.1:<port>`。
 - `[实现扩展]` Git 分支准备逻辑已落在 workspace 层。
-- `[实现扩展 — 超出 SPEC 边界]` orchestrator 可在特定条件下检测新 open PR，并在 `orchestrator.auto_close_on_pr=true` 时主动尝试把 issue 转成 `Done`。
+- `[实现扩展 — 超出 SPEC 边界]` orchestrator 可在特定条件下检测关联 PR，并在 `orchestrator.auto_close_on_pr=true` 时采用 merge-aware 收口：open PR 进入 `AwaitingMerge`，merged PR 才尝试把 issue 转成 `Done`。
 
 ### 2.2 与 SPEC 的关键关系
 
@@ -864,7 +864,7 @@ worker goroutine 的真实顺序是：
 5. 调用 `runner.Run`
 6. 若 workspace 支持 `FinalizeRun`，执行 `FinalizeRun`
 7. 根据 `runner.Run` 结果构造 `WorkerResult`
-8. 若运行成功，检查是否产生新的 open PR
+8. 若运行成功，检查是否产生关联 PR，并根据 `open` / `merged` / `closed` 进入不同成功路径
 9. 通过 `workerResultCh` 回传结果
 
 ### 10.8 正常退出与 continuation retry
@@ -877,7 +877,7 @@ worker goroutine 的真实顺序是：
 - 清理工作区
 - 释放 `Claimed`
 
-#### 路径 B：本轮运行创建了新的 open PR
+#### 路径 B：本轮运行创建了关联 PR
 
 - `[实现扩展 — 超出 SPEC 边界]` 这是当前 Go 实现加出来的成功路径。
 - `[核心规范]` 按 SPEC 16.6，正常 worker 退出后的标准行为应是：记录 bookkeeping 后安排短延迟 continuation retry，而不是由 orchestrator 主动推断 PR 并写 tracker。
@@ -895,10 +895,12 @@ worker goroutine 的真实顺序是：
 
 然后：
 
-1. 若 tracker 支持 `IssueTransitioner`，尝试把 issue 转到 `Done`
-2. 再刷新 issue 状态
-3. 若已进入终态，则清理工作区并释放 claim
-4. 若没有进入终态，则进入错误重试
+1. 通过 `gh pr list --state all --head <branch>` 查询该 head branch 的真实 PR 状态
+2. 若 PR 仍 open：把 issue 放入 `AwaitingMerge`
+3. 若 PR 已 merged：尝试 `TransitionIssue("Done")`
+4. 再刷新 issue 状态；若已进入终态，则清理工作区并释放 claim
+5. 若 merge 后仍未进入终态，则进入错误重试
+6. 若 PR 已 closed 但未 merged，则回退到标准 continuation retry
 
 若 `orchestrator.auto_close_on_pr=false`：
 
@@ -1433,10 +1435,10 @@ SPEC 没有强制统一安全姿态，但明确建议按部署风险加固。适
 #### 成功路径
 
 - 若 issue 已是终态：清理工作区并释放
-- 若发现新的 open PR：
-  - `[实现扩展 — 超出 SPEC 边界]` orchestrator 会尝试把 issue 转为 `Done`
-  - 若成功进入终态，清理工作区并释放
-  - 若未进入终态，继续重试
+- 若发现关联 PR：
+  - PR open：进入 `AwaitingMerge`
+  - PR merged：`[实现扩展 — 超出 SPEC 边界]` orchestrator 尝试把 issue 转为 `Done`
+  - PR closed/unmerged：回退 continuation retry
 - 若 issue 仍是活跃态：
   - `[核心规范]` 安排 continuation retry
 
