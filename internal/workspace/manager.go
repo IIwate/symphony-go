@@ -79,7 +79,9 @@ func (m *LocalManager) CreateForIssue(ctx context.Context, identifier string) (*
 	cfg := m.currentConfig()
 	if workspace.CreatedNow && cfg.HookAfterCreate != nil {
 		if err := m.runFatalHook(ctx, workspace.Path, "after_create", *cfg.HookAfterCreate); err != nil {
-			_ = os.RemoveAll(workspace.Path)
+			if cleanupErr := os.RemoveAll(workspace.Path); cleanupErr != nil {
+				m.logger.Warn("cleanup workspace after after_create failure failed", "workspace_path", workspace.Path, "error", cleanupErr.Error())
+			}
 			return nil, err
 		}
 	}
@@ -93,7 +95,10 @@ func (m *LocalManager) PrepareForRun(ctx context.Context, workspace *model.Works
 	}
 
 	for _, name := range []string{"tmp", ".elixir_ls"} {
-		_ = os.RemoveAll(filepath.Join(workspace.Path, name))
+		path := filepath.Join(workspace.Path, name)
+		if err := os.RemoveAll(path); err != nil {
+			m.logger.Warn("cleanup workspace artifact failed", "workspace_path", workspace.Path, "artifact_path", path, "error", err.Error())
+		}
 	}
 
 	cfg := m.currentConfig()

@@ -40,6 +40,9 @@ func TestRunCLIUsesDefaultWorkflowPath(t *testing.T) {
 	if exitCode := runCLI([]string{"--dry-run"}, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
+	if !strings.Contains(stderr.String(), "dry-run 仍会访问 tracker 并执行 startupCleanup") {
+		t.Fatalf("stderr = %q, want dry-run side-effect warning", stderr.String())
+	}
 	if !strings.Contains(stderr.String(), "dry-run 校验通过") {
 		t.Fatalf("stderr = %q, want dry-run success message", stderr.String())
 	}

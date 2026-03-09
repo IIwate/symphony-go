@@ -22,6 +22,16 @@ type Issue struct {
 	UpdatedAt   *time.Time
 }
 
+func CloneIssue(issue *Issue) *Issue {
+	if issue == nil {
+		return nil
+	}
+	copyValue := *issue
+	copyValue.Labels = append([]string(nil), issue.Labels...)
+	copyValue.BlockedBy = append([]BlockerRef(nil), issue.BlockedBy...)
+	return &copyValue
+}
+
 type BlockerRef struct {
 	ID         *string
 	Identifier *string

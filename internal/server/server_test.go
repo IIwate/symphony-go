@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +34,16 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	if payload["generated_at"] == nil {
 		t.Fatalf("generated_at missing: %+v", payload)
 	}
+	service := payload["service"].(map[string]any)
+	if service["version"] != "test-build" {
+		t.Fatalf("service.version = %v, want test-build", service["version"])
+	}
+	if service["started_at"] == nil {
+		t.Fatalf("service.started_at missing: %+v", service)
+	}
+	if service["uptime_seconds"].(float64) <= 0 {
+		t.Fatalf("service.uptime_seconds = %v, want positive", service["uptime_seconds"])
+	}
 	counts := payload["counts"].(map[string]any)
 	if counts["running"].(float64) != 1 || counts["retrying"].(float64) != 1 {
 		t.Fatalf("counts = %+v", counts)
@@ -38,6 +51,10 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	alerts := payload["alerts"].([]any)
 	if len(alerts) != 1 {
 		t.Fatalf("alerts = %+v, want 1 alert", alerts)
+	}
+	rateLimits := payload["rate_limits"].(map[string]any)
+	if rateLimits["remaining"] != float64(9) {
+		t.Fatalf("rate_limits = %+v, want remaining=9", rateLimits)
 	}
 }
 
@@ -158,6 +175,21 @@ func TestDashboardAndMethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestWriteJSONLogsEncodeFailure(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	writer := &failingResponseWriter{header: make(http.Header), writeErr: errors.New("boom")}
+
+	writeJSON(writer, http.StatusOK, map[string]any{"ok": true}, logger)
+
+	if writer.status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", writer.status)
+	}
+	if !strings.Contains(logs.String(), "http response encode failed") {
+		t.Fatalf("warn log missing: %s", logs.String())
+	}
+}
+
 type fakeRuntime struct {
 	mu           sync.Mutex
 	snapshot     orchestrator.Snapshot
@@ -203,6 +235,10 @@ func sampleSnapshot() orchestrator.Snapshot {
 	now := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
 	return orchestrator.Snapshot{
 		GeneratedAt: now,
+		Service: orchestrator.ServiceSnapshot{
+			Version:   "test-build",
+			StartedAt: now.Add(-5 * time.Minute),
+		},
 		Counts: orchestrator.SnapshotCounts{
 			Running:  1,
 			Retrying: 1,
@@ -243,10 +279,32 @@ func sampleSnapshot() orchestrator.Snapshot {
 			},
 		},
 		CodexTotals: orchestrator.Snapshot{}.CodexTotals,
+		RateLimits:  map[string]any{"remaining": 9, "resetAt": "2026-03-07T12:05:00Z"},
 	}
 }
 
 func stringPtr(value string) *string {
 	copyValue := value
 	return &copyValue
+}
+
+type failingResponseWriter struct {
+	header   http.Header
+	status   int
+	writeErr error
+}
+
+func (w *failingResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *failingResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *failingResponseWriter) Write(_ []byte) (int, error) {
+	return 0, w.writeErr
 }

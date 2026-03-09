@@ -94,6 +94,25 @@ func TestRenderPromptUnknownFilter(t *testing.T) {
 	}
 }
 
+func TestRenderPromptAttemptVariable(t *testing.T) {
+	rendered, err := RenderPrompt("{% if attempt %}Attempt {{ attempt }}{% else %}No attempt{% endif %}", &model.Issue{Title: "Test"}, nil)
+	if err != nil {
+		t.Fatalf("RenderPrompt() error = %v", err)
+	}
+	if rendered != "No attempt" {
+		t.Fatalf("RenderPrompt() with nil attempt = %q, want No attempt", rendered)
+	}
+
+	attempt := 2
+	rendered, err = RenderPrompt("{% if attempt %}Attempt {{ attempt }}{% else %}No attempt{% endif %}", &model.Issue{Title: "Test"}, &attempt)
+	if err != nil {
+		t.Fatalf("RenderPrompt() error = %v", err)
+	}
+	if rendered != "Attempt 2" {
+		t.Fatalf("RenderPrompt() with attempt=2 = %q, want Attempt 2", rendered)
+	}
+}
+
 func TestWatchReloadsOnChange(t *testing.T) {
 	path := writeWorkflowFile(t, "first")
 	ctx, cancel := context.WithCancel(context.Background())

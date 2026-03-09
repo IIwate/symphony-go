@@ -153,7 +153,7 @@ func (r *AppServerRunner) Run(ctx context.Context, params RunParams) error {
 		return model.NewAgentError(model.ErrResponseError, "thread/start response missing thread id", nil)
 	}
 
-	issue := cloneIssue(params.Issue)
+	issue := model.CloneIssue(params.Issue)
 	maxTurns := params.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = cfg.MaxTurns
@@ -198,7 +198,7 @@ func (r *AppServerRunner) Run(ctx context.Context, params RunParams) error {
 		if refreshed == nil {
 			break
 		}
-		issue = cloneIssue(refreshed)
+		issue = model.CloneIssue(refreshed)
 		if !params.IsActive(issue.State) {
 			break
 		}
@@ -363,13 +363,17 @@ func (r *AppServerRunner) handleStreamMessage(writer io.Writer, message map[stri
 		return model.NewAgentError(model.ErrTurnInputRequired, "turn requested user input", nil), false
 	}
 	if strings.Contains(lowerMethod, "approval") && message["id"] != nil {
-		_ = writeJSONLine(writer, map[string]any{"id": message["id"], "result": map[string]any{"approved": true}})
+		if err := writeJSONLine(writer, map[string]any{"id": message["id"], "result": map[string]any{"approved": true}}); err != nil && r.logger != nil {
+			r.logger.Warn("failed to write approval response", "method", method, "request_id", fmt.Sprint(message["id"]), "error", err.Error())
+		}
 		r.emit(params, AgentEvent{Event: "approval_auto_approved", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: message})
 		return nil, false
 	}
 	if strings.Contains(lowerMethod, "tool/call") && message["id"] != nil {
 		toolResult, eventName := r.handleToolCall(message)
-		_ = writeJSONLine(writer, map[string]any{"id": message["id"], "result": toolResult})
+		if err := writeJSONLine(writer, map[string]any{"id": message["id"], "result": toolResult}); err != nil && r.logger != nil {
+			r.logger.Warn("failed to write tool response", "method", method, "request_id", fmt.Sprint(message["id"]), "event", eventName, "error", err.Error())
+		}
 		r.emit(params, AgentEvent{Event: eventName, Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: toolResult})
 		return nil, false
 	}
@@ -435,7 +439,9 @@ func (r *AppServerRunner) stopProcess(process Process) {
 	if process == nil {
 		return
 	}
-	_ = process.Stdin().Close()
+	if stdin := process.Stdin(); stdin != nil {
+		_ = stdin.Close()
+	}
 	_ = process.Kill()
 }
 
@@ -681,16 +687,6 @@ func buildTurnPrompt(params RunParams, issue *model.Issue, turnNumber int, maxTu
 	}
 
 	return fmt.Sprintf("Continue working on issue %s (%d/%d turns). Re-check progress and finish only if the issue no longer needs active work.", issue.Identifier, turnNumber, maxTurns), nil
-}
-
-func cloneIssue(issue *model.Issue) *model.Issue {
-	if issue == nil {
-		return nil
-	}
-	copyValue := *issue
-	copyValue.Labels = append([]string(nil), issue.Labels...)
-	copyValue.BlockedBy = append([]model.BlockerRef(nil), issue.BlockedBy...)
-	return &copyValue
 }
 
 func optionalPtr(value string) *string {

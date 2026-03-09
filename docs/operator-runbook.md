@@ -26,8 +26,8 @@
 
 ### 2.2 必要凭证
 
-- 当 `tracker.kind=linear` 时：注入 `LINEAR_API_KEY`
-- 当 `tracker.kind=github` 时：注入 `GITHUB_TOKEN`
+- 当前版本仅支持 `tracker.kind=linear`：注入 `LINEAR_API_KEY`
+- `GITHUB_TOKEN` / `tracker.kind=github` 属于 Cycle 5 之后的扩展，不适用于当前已发布实现
 - 不要把 token 明文写入日志、命令历史或共享文档
 
 ### 2.3 目录与权限
@@ -37,7 +37,9 @@
 - 若启用 hooks，目标主机 shell 环境中可以执行对应脚本
 - Windows 主机建议安装 Git for Windows；实现层会优先使用 Git Bash，避免误命中 `C:/Windows/System32/bash.exe`（WSL 启动器）
 
-### 2.4 GitHub Issues tracker 接入约定
+### 2.4 GitHub Issues tracker 接入约定（Cycle 5 之后适用，当前版本未实现）
+
+- 以下内容对应 `docs/rfcs/github-issues-tracker.md` 的设计草案，不适用于当前只支持 Linear 的版本
 
 - `tracker.owner` / `tracker.repo` 必须指向目标仓库
 - 状态标签默认使用 `state_label_prefix=symphony:`，例如 `symphony:todo`、`symphony:in-progress`、`symphony:cancelled`
@@ -62,7 +64,7 @@ go run ./cmd/symphony --dry-run
 $env:LINEAR_API_KEY="<your-token>"
 go run ./cmd/symphony --dry-run ./path/to/WORKFLOW.md
 ```
-GitHub Issues tracker 示例：
+GitHub Issues tracker 示例（Cycle 5 之后适用，当前版本不要使用）：
 
 ```powershell
 $env:GITHUB_TOKEN="<your-token>"
@@ -87,7 +89,7 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 
 - `WORKFLOW.md` 路径：可选位置参数；未传时默认 `./WORKFLOW.md`
 - 当前 CLI 基于标准库 `flag`，请将 `--dry-run` / `--port` / `--log-file` / `--log-level` 写在路径参数之前
-- `--dry-run`：执行单次 poll cycle 验证后退出
+- `--dry-run`：执行单次 poll cycle 验证后退出；注意当前实现仍会访问 tracker，并执行 `startupCleanup`
 - `--port`：启用 HTTP server，当前实现绑定 loopback 地址
 - `--log-file`：同时输出到 stderr 与指定文件
 - `--log-level`：`debug` / `info` / `warn` / `error`
@@ -114,7 +116,9 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 其中：
 
 - `/api/v1/state` 会返回 `alerts` 字段，用于汇总 tracker 不可达、重复 stall、workspace hook 失败等需要 operator 关注的问题
+- `/api/v1/state` 也会返回 `service.version`、`service.started_at`、`service.uptime_seconds`，用于快速确认当前进程版本和在线时长
 - `/api/v1/{identifier}` 会返回 `workspace_path`、`last_error`、`attempt_count`，便于按单 issue 排障
+- 服务内部的 `Completed` 集合默认最多保留 `4096` 个 issue ID，仅用于 bookkeeping / 可观测性；它不是完整历史，也不参与重启恢复
 
 建议先检查：
 
@@ -139,8 +143,8 @@ curl http://127.0.0.1:8080/api/v1/state
 
 ### 6.1 配置烟测
 
-- `tracker.kind=linear`：设置 `LINEAR_API_KEY`
-- `tracker.kind=github`：设置 `GITHUB_TOKEN`，并使用 GitHub workflow 示例或自定义 workflow
+- 当前版本仅支持 `tracker.kind=linear`：设置 `LINEAR_API_KEY`
+- 若 `--dry-run` 成功，表示当前 workflow/config 基本可用；但它仍会访问 tracker，并可能执行启动清理副作用
 - 执行 `go run ./cmd/symphony --dry-run`
 - 期望结果：退出码为 0，日志出现“dry-run 校验通过”
 
@@ -207,7 +211,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - `tracker.kind` 缺失或不支持
 - `tracker.kind=linear` 但 `LINEAR_API_KEY` 未注入或 `tracker.project_slug` 缺失
-- `tracker.kind=github` 但 `GITHUB_TOKEN` 未注入或 `tracker.owner` / `tracker.repo` 缺失
+- 若误填 `tracker.kind=github`，当前版本会直接在 preflight 阶段判定为 unsupported tracker kind
 - `codex.command` 为空
 
 处理：
@@ -223,15 +227,12 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - Todo issue 被非终态 blocker 阻塞
 - 并发槽位耗尽
 - issue 已处于 claimed / running / retrying
-- GitHub issue 缺少 `symphony:*` 状态标签
-- GitHub issue 同时存在多个 `symphony:*` 状态标签，已被系统跳过
-- 实际对象是 Pull Request，已被 GitHub tracker 过滤
+- 若你在对照 GitHub tracker 草案排查：注意这些规则尚未在当前版本实现
 
 处理：
 
 - 检查 `/api/v1/state`
 - 检查日志中的 `retrying` / slots / blocker 相关信息
-- 若使用 GitHub tracker，检查 issue labels 是否符合 `symphony:*` 约定，并清理冲突状态标签
 - 手动调用 `/api/v1/refresh`
 
 ### 8.4 工作区问题
@@ -255,6 +256,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - `codex app-server` 不存在
 - response timeout / turn timeout
+- `codex.stall_timeout_ms` 过小，长时间无 Codex 事件时被判定为 stalled session
 - user-input-required 被按策略硬失败
 - Windows 上 `bash` 命中了 WSL 启动器而不是 Git Bash
 - 子进程意外退出
@@ -264,6 +266,9 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 检查 `codex.command`
 - 提升日志级别到 `debug`
 - 检查目标环境对 `codex app-server` 的可执行性
+- 检查 `/api/v1/state` 的 `alerts` 和 issue 级 `last_error`，确认是否出现 repeated stall / `stalled session`
+- 结合日志里的 `session_id`、`turn_id`、最后一条 agent event，判断是真停滞还是 `codex.stall_timeout_ms` 阈值过紧
+- 对确实会长时间无输出的任务，临时调大 `codex.stall_timeout_ms`；若仅用于短时排障，也可设为 `<=0` 暂时关闭 stall detection
 - 在 Windows 上用 `Get-Command bash` 或 `where.exe bash` 确认优先命中 Git Bash；该兼容逻辑为保留项，不应删除
 
 ### 8.6 HTTP / SSE 问题
@@ -280,7 +285,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 检查本机端口占用
 - 在本机访问 `127.0.0.1:<port>` 验证，而不是直接从外部地址访问
 
-### 8.7 GitHub API 权限或限流问题
+### 8.7 GitHub API 权限或限流问题（Cycle 5 之后适用，当前版本未实现）
 
 常见原因：
 
@@ -326,8 +331,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - `docs/release-checklist.md`
 - `docs/cycles/cycle-04-extension-release.md`
-- `docs/rfcs/github-issues-tracker.md`
-- `docs/examples/WORKFLOW.github-issues.md`
+- `docs/rfcs/github-issues-tracker.md`（Cycle 5 草案）
+- `docs/examples/WORKFLOW.github-issues.md`（Cycle 5 示例）
 - `IMPLEMENTATION.md`
 - `REQUIREMENTS.md`
 - `SPEC.md`

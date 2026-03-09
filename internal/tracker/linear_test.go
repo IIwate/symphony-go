@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -178,6 +179,32 @@ func TestFetchCandidateIssuesMapsHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestFetchCandidateIssuesMapsTransportFailure(t *testing.T) {
+	client := newTestLinearClientWithHTTP(t, "http://linear.invalid", &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("dial tcp: boom")
+		}),
+	})
+	_, err := client.FetchCandidateIssues(context.Background())
+	if !errors.Is(err, model.ErrLinearAPIRequest) {
+		t.Fatalf("FetchCandidateIssues() error = %v, want ErrLinearAPIRequest", err)
+	}
+}
+
+func TestFetchCandidateIssuesMapsMalformedPayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":`))
+	}))
+	defer server.Close()
+
+	client := newTestLinearClient(t, server.URL)
+	_, err := client.FetchCandidateIssues(context.Background())
+	if !errors.Is(err, model.ErrLinearUnknownPayload) {
+		t.Fatalf("FetchCandidateIssues() error = %v, want ErrLinearUnknownPayload", err)
+	}
+}
+
 func TestTransitionIssueSuccess(t *testing.T) {
 	var sawStateQuery bool
 	var sawMutation bool
@@ -282,12 +309,18 @@ func TestTransitionIssueMutationFailed(t *testing.T) {
 func newTestLinearClient(t *testing.T, endpoint string) *LinearClient {
 	t.Helper()
 
+	return newTestLinearClientWithHTTP(t, endpoint, serverHTTPClient())
+}
+
+func newTestLinearClientWithHTTP(t *testing.T, endpoint string, httpClient *http.Client) *LinearClient {
+	t.Helper()
+
 	client, err := NewLinearClient(&model.ServiceConfig{
 		TrackerEndpoint:    endpoint,
 		TrackerAPIKey:      "secret",
 		TrackerProjectSlug: "demo",
 		ActiveStates:       []string{"Todo", "In Progress"},
-	}, serverHTTPClient())
+	}, httpClient)
 	if err != nil {
 		t.Fatalf("NewLinearClient() error = %v", err)
 	}
@@ -302,6 +335,12 @@ func serverHTTPClient() *http.Client {
 type capturedRequest struct {
 	Query     string         `json:"query"`
 	Variables map[string]any `json:"variables"`
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
 
 func decodeRequestBody(t *testing.T, body io.ReadCloser) capturedRequest {

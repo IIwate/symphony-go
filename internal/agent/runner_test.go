@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -147,6 +148,97 @@ func TestRunnerReadTimeout(t *testing.T) {
 	})
 	if !errors.Is(err, model.ErrResponseTimeout) {
 		t.Fatalf("Run() error = %v, want ErrResponseTimeout", err)
+	}
+}
+
+func TestRunnerTurnTimeout(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+	}, nil, true)}
+	runner := newTestRunner(factory, 200, 50)
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if !errors.Is(err, model.ErrTurnTimeout) {
+		t.Fatalf("Run() error = %v, want ErrTurnTimeout", err)
+	}
+}
+
+func TestWaitForTurnEndEmitsPlainStderrAsNotification(t *testing.T) {
+	runner := newTestRunner(&fakeProcessFactory{process: newFakeProcess(nil, nil, false)}, 200, 200).(*AppServerRunner)
+	events := make([]AgentEvent, 0)
+	stdoutCh := make(chan string)
+	stdoutErrCh := make(chan error)
+	stderrCh := make(chan string)
+	stderrErrCh := make(chan error)
+	waitCh := make(chan error)
+
+	go func() {
+		stderrCh <- "plain stderr line"
+		stdoutCh <- jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}})
+	}()
+
+	err := runner.waitForTurnEnd(context.Background(), 200, io.Discard, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		OnEvent:        func(event AgentEvent) { events = append(events, event) },
+	}, nil, "thread-1", "turn-1", "thread-1-turn-1")
+	if err != nil {
+		t.Fatalf("waitForTurnEnd() error = %v", err)
+	}
+
+	stderrFound := false
+	completedFound := false
+	for _, event := range events {
+		if event.Event == "notification" && event.Message == "plain stderr line" {
+			stderrFound = true
+		}
+		if event.Event == "turn_completed" {
+			completedFound = true
+		}
+	}
+	if !stderrFound || !completedFound {
+		t.Fatalf("events = %+v, want stderr notification and turn_completed", events)
+	}
+}
+
+func TestStopProcessHandlesNilStdin(t *testing.T) {
+	runner := newTestRunner(&fakeProcessFactory{process: newFakeProcess(nil, nil, false)}, 200, 200).(*AppServerRunner)
+	process := newFakeProcess(nil, nil, false)
+	process.stdin = nil
+
+	runner.stopProcess(process)
+
+	if !process.killed {
+		t.Fatal("process was not killed")
+	}
+}
+
+func TestHandleStreamMessageLogsWriteFailures(t *testing.T) {
+	runner := newTestRunner(&fakeProcessFactory{process: newFakeProcess(nil, nil, false)}, 200, 200).(*AppServerRunner)
+	var logs bytes.Buffer
+	runner.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	writer := &failingWriteCloser{writeErr: errors.New("broken pipe")}
+
+	if err, done := runner.handleStreamMessage(writer, map[string]any{"id": "approval-1", "method": "approval/request"}, RunParams{}, nil, "", "", ""); err != nil || done {
+		t.Fatalf("approval handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
+	}
+	if err, done := runner.handleStreamMessage(writer, map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "unknown_tool"}}, RunParams{}, nil, "", "", ""); err != nil || done {
+		t.Fatalf("tool handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, "failed to write approval response") {
+		t.Fatalf("approval warning missing: %s", output)
+	}
+	if !strings.Contains(output, "failed to write tool response") {
+		t.Fatalf("tool warning missing: %s", output)
 	}
 }
 
@@ -510,6 +602,186 @@ func TestCodexEventTokenCountExtractsNestedTotals(t *testing.T) {
 	}
 }
 
+func TestRateLimitsExtractedFromNotificationPayload(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "thread/tokenUsage/updated", "params": map[string]any{
+			"tokenUsage": map[string]any{"inputTokens": 5, "outputTokens": 7, "totalTokens": 12},
+			"limits": map[string]any{
+				"rateLimits": map[string]any{"remaining": 42, "resetAt": "2026-03-07T10:00:00Z"},
+			},
+		}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	events := make([]AgentEvent, 0)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Done"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		OnEvent:        func(event AgentEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	found := false
+	for _, event := range events {
+		if event.Event != "notification" || event.RateLimits == nil {
+			continue
+		}
+		limits, ok := event.RateLimits.(map[string]any)
+		if !ok {
+			continue
+		}
+		if remaining, ok := int64FromAny(limits["remaining"]); ok && remaining == 42 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("rate limit notification not found: %+v", events)
+	}
+}
+
+func TestRunnerThreadStartOmitsDynamicToolsWithoutLinearAuth(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *model.ServiceConfig
+	}{
+		{
+			name: "non_linear_kind",
+			cfg: &model.ServiceConfig{
+				TrackerKind:            "github",
+				TrackerAPIKey:          "secret-key",
+				CodexCommand:           "codex app-server",
+				CodexApprovalPolicy:    "never",
+				CodexThreadSandbox:     "workspace-write",
+				CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+				CodexReadTimeoutMS:     200,
+				CodexTurnTimeoutMS:     200,
+				MaxTurns:               1,
+			},
+		},
+		{
+			name: "missing_api_key",
+			cfg: &model.ServiceConfig{
+				TrackerKind:            "linear",
+				TrackerAPIKey:          "",
+				CodexCommand:           "codex app-server",
+				CodexApprovalPolicy:    "never",
+				CodexThreadSandbox:     "workspace-write",
+				CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+				CodexReadTimeoutMS:     200,
+				CodexTurnTimeoutMS:     200,
+				MaxTurns:               1,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory := &fakeProcessFactory{process: newFakeProcess([]string{
+				jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+				jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+				jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+				jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+			}, nil, false)}
+			runner := newTestRunnerWithConfig(factory, tt.cfg)
+
+			err := runner.Run(context.Background(), RunParams{
+				Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+				WorkspacePath:  `C:\\work\\ABC-1`,
+				PromptTemplate: "Issue {{ issue.identifier }}",
+			})
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+
+			requests := factory.process.stdinRecorder.lines()
+			threadStart := decodeLine(t, requests[2])
+			paramsMap := threadStart["params"].(map[string]any)
+			if _, ok := paramsMap["dynamicTools"]; ok {
+				t.Fatalf("thread/start should omit dynamicTools when linear auth unavailable: %+v", threadStart)
+			}
+		})
+	}
+}
+
+func TestRunnerLinearGraphQLToolMissingAuth(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "github",
+		TrackerAPIKey:          "",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	})
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsToolError(factory.process.stdinRecorder.lines(), "tool-1", "missing_auth") {
+		t.Fatalf("tool missing_auth response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
+func TestRunnerLinearGraphQLToolTransportFailure(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        "http://linear.invalid",
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	})
+	runner.(*AppServerRunner).httpClient = &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("dial tcp: boom")
+		}),
+	}
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !containsToolError(factory.process.stdinRecorder.lines(), "tool-1", "transport_failure") {
+		t.Fatalf("tool transport_failure response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
 func newTestRunner(factory *fakeProcessFactory, readTimeout int, turnTimeout int) Runner {
 	return newTestRunnerWithConfig(factory, &model.ServiceConfig{
 		TrackerKind:            "linear",
@@ -533,6 +805,12 @@ type fakeProcessFactory struct {
 	process *fakeProcess
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
 func (f *fakeProcessFactory) StartProcess(_ context.Context, _ string, _ string) (Process, error) {
 	f.process.start()
 	return f.process, nil
@@ -543,6 +821,7 @@ type fakeProcess struct {
 	stdoutW       *io.PipeWriter
 	stderrR       *io.PipeReader
 	stderrW       *io.PipeWriter
+	stdin         io.WriteCloser
 	stdinRecorder *recordingWriteCloser
 	stdoutLines   []string
 	stderrLines   []string
@@ -556,12 +835,14 @@ type fakeProcess struct {
 func newFakeProcess(stdoutLines []string, stderrLines []string, holdOpen bool) *fakeProcess {
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
+	recorder := &recordingWriteCloser{}
 	return &fakeProcess{
 		stdoutR:       stdoutR,
 		stdoutW:       stdoutW,
 		stderrR:       stderrR,
 		stderrW:       stderrW,
-		stdinRecorder: &recordingWriteCloser{},
+		stdin:         recorder,
+		stdinRecorder: recorder,
 		stdoutLines:   stdoutLines,
 		stderrLines:   stderrLines,
 		holdOpen:      holdOpen,
@@ -585,7 +866,7 @@ func (p *fakeProcess) start() {
 	}()
 }
 
-func (p *fakeProcess) Stdin() io.WriteCloser { return p.stdinRecorder }
+func (p *fakeProcess) Stdin() io.WriteCloser { return p.stdin }
 func (p *fakeProcess) Stdout() io.ReadCloser { return p.stdoutR }
 func (p *fakeProcess) Stderr() io.ReadCloser { return p.stderrR }
 func (p *fakeProcess) Wait() error {
@@ -618,6 +899,14 @@ func (r *recordingWriteCloser) Write(p []byte) (int, error) {
 }
 
 func (r *recordingWriteCloser) Close() error { return nil }
+
+type failingWriteCloser struct {
+	writeErr error
+}
+
+func (w *failingWriteCloser) Write(_ []byte) (int, error) { return 0, w.writeErr }
+
+func (w *failingWriteCloser) Close() error { return nil }
 
 func (r *recordingWriteCloser) lines() []string {
 	r.mu.Lock()
@@ -768,6 +1057,23 @@ func containsToolInvalidArguments(lines []string, id string) bool {
 			continue
 		}
 		if result["success"] == false && result["error"] == "invalid_arguments" && hasDynamicToolContentItems(result) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsToolError(lines []string, id string, code string) bool {
+	for _, line := range lines {
+		decoded := decodeLineNoTest(line)
+		if decoded["id"] != id {
+			continue
+		}
+		result, ok := decoded["result"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if result["success"] == false && result["error"] == code && hasDynamicToolContentItems(result) {
 			return true
 		}
 	}

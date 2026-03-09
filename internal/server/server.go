@@ -79,21 +79,21 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 			return
 		}
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w)
+			writeMethodNotAllowed(w, logger)
 			return
 		}
 		writeDashboard(w)
 	})
 	mux.HandleFunc("/api/v1/state", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w)
+			writeMethodNotAllowed(w, logger)
 			return
 		}
-		writeJSON(w, http.StatusOK, toStateResponse(runtime.Snapshot()))
+		writeJSON(w, http.StatusOK, toStateResponse(runtime.Snapshot()), logger)
 	})
 	mux.HandleFunc("/api/v1/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			writeMethodNotAllowed(w)
+			writeMethodNotAllowed(w, logger)
 			return
 		}
 		runtime.RequestRefresh()
@@ -102,16 +102,16 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 			"coalesced":    false,
 			"requested_at": time.Now().UTC().Format(time.RFC3339),
 			"operations":   []string{"poll", "reconcile"},
-		})
+		}, logger)
 	})
 	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w)
+			writeMethodNotAllowed(w, logger)
 			return
 		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			writeError(w, http.StatusInternalServerError, "stream_not_supported", "response writer does not support flushing")
+			writeError(w, http.StatusInternalServerError, "stream_not_supported", "response writer does not support flushing", logger)
 			return
 		}
 
@@ -145,7 +145,7 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 	})
 	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w)
+			writeMethodNotAllowed(w, logger)
 			return
 		}
 		identifier := strings.TrimPrefix(r.URL.Path, "/api/v1/")
@@ -155,10 +155,10 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 		}
 		response, ok := findIssueResponse(runtime.Snapshot(), identifier)
 		if !ok {
-			writeError(w, http.StatusNotFound, "issue_not_found", "issue not found")
+			writeError(w, http.StatusNotFound, "issue_not_found", "issue not found", logger)
 			return
 		}
-		writeJSON(w, http.StatusOK, response)
+		writeJSON(w, http.StatusOK, response, logger)
 	})
 
 	return mux
@@ -166,12 +166,19 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 
 type stateResponse struct {
 	GeneratedAt string            `json:"generated_at"`
+	Service     serviceResponse   `json:"service"`
 	Counts      stateCounts       `json:"counts"`
 	Running     []runningResponse `json:"running"`
 	Retrying    []retryResponse   `json:"retrying"`
 	Alerts      []alertResponse   `json:"alerts"`
 	CodexTotals totalsResponse    `json:"codex_totals"`
 	RateLimits  any               `json:"rate_limits"`
+}
+
+type serviceResponse struct {
+	Version       string  `json:"version"`
+	StartedAt     string  `json:"started_at"`
+	UptimeSeconds float64 `json:"uptime_seconds"`
 }
 
 type stateCounts struct {
@@ -228,6 +235,16 @@ type issueResponse struct {
 }
 
 func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
+	serviceStartedAt := ""
+	uptimeSeconds := 0.0
+	if !snapshot.Service.StartedAt.IsZero() {
+		serviceStartedAt = snapshot.Service.StartedAt.UTC().Format(time.RFC3339)
+		uptimeSeconds = snapshot.GeneratedAt.Sub(snapshot.Service.StartedAt).Seconds()
+		if uptimeSeconds < 0 {
+			uptimeSeconds = 0
+		}
+	}
+
 	running := make([]runningResponse, 0, len(snapshot.Running))
 	for _, item := range snapshot.Running {
 		var lastEventAt *string
@@ -278,6 +295,11 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 
 	return stateResponse{
 		GeneratedAt: snapshot.GeneratedAt.UTC().Format(time.RFC3339),
+		Service: serviceResponse{
+			Version:       snapshot.Service.Version,
+			StartedAt:     serviceStartedAt,
+			UptimeSeconds: uptimeSeconds,
+		},
 		Counts: stateCounts{
 			Running:  snapshot.Counts.Running,
 			Retrying: snapshot.Counts.Retrying,
@@ -394,21 +416,26 @@ func writeSSEEvent(w io.Writer, event string, payload any) error {
 	return err
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
+func writeJSON(w http.ResponseWriter, status int, payload any, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		logger.Warn("http response encode failed", "status", status, "error", err.Error())
+	}
 }
 
-func writeError(w http.ResponseWriter, status int, code string, message string) {
+func writeError(w http.ResponseWriter, status int, code string, message string, logger *slog.Logger) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"code":    code,
 			"message": message,
 		},
-	})
+	}, logger)
 }
 
-func writeMethodNotAllowed(w http.ResponseWriter) {
-	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+func writeMethodNotAllowed(w http.ResponseWriter, logger *slog.Logger) {
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", logger)
 }
