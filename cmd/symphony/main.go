@@ -48,6 +48,7 @@ type runtimeState struct {
 var (
 	loadWorkflowDefinition  = workflow.Load
 	watchWorkflowDefinition = workflow.WatchWithErrors
+	buildVersion            = "dev"
 	newLoggerFactory        = logging.NewLogger
 	newTrackerFactory       = func(configFn func() *model.ServiceConfig) (tracker.Client, error) {
 		return tracker.NewDynamicClient(configFn, nil)
@@ -140,6 +141,7 @@ func execute(args []string, stderr io.Writer) error {
 	}
 
 	state := &runtimeState{definition: definition, config: cfg, portOverride: portOverride}
+	orchestrator.BuildVersion = buildVersion
 	trackerClient, err := newTrackerFactory(state.CurrentConfig)
 	if err != nil {
 		return err
@@ -152,6 +154,7 @@ func execute(args []string, stderr io.Writer) error {
 	orch := newOrchestratorFactory(trackerClient, workspaceManager, runner, state.CurrentConfig, state.CurrentWorkflow, logger)
 
 	if dryRun {
+		logger.Warn("dry-run 仍会访问 tracker 并执行 startupCleanup，可能产生副作用", slog.String("workflow_path", workflowPath))
 		orch.RunOnce(context.Background(), false)
 		logger.Info("dry-run 校验通过")
 		return nil

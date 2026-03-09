@@ -92,6 +92,31 @@ func TestHandleWorkerExitSchedulesContinuationAndBackoffRetry(t *testing.T) {
 	}
 }
 
+func TestScheduleRetryLockedCapsBackoffAtConfiguredMaximum(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+		MaxRetryBackoffMS:   25000,
+		WorkspaceRoot:       "/tmp/workspaces",
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.randFloat = func() float64 { return 1 }
+
+	o.mu.Lock()
+	o.scheduleRetryLocked("1", "ABC-1", 10, stringPtr("boom"), false, 0)
+	retry := o.state.RetryAttempts["1"]
+	o.mu.Unlock()
+
+	if retry == nil {
+		t.Fatal("retry entry missing")
+	}
+	if retry.DueAt.Sub(now) != 25*time.Second {
+		t.Fatalf("retry delay = %v, want 25s", retry.DueAt.Sub(now))
+	}
+}
+
 func TestReconcileRunningStopsTerminalAndInactiveIssues(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
@@ -239,6 +264,53 @@ func TestReconcileRunningFirstStallAfterContinuationDoesNotTriggerRepeatedStall(
 	}
 	if hasAlertCode(o.Snapshot().Alerts, "repeated_stall") {
 		t.Fatalf("alerts = %+v, want no repeated_stall", o.Snapshot().Alerts)
+	}
+}
+
+func TestHandleRetryTimerRequeuesWhenNoSlotsAvailable(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+		MaxRetryBackoffMS:   300000,
+		WorkspaceRoot:       "/tmp/workspaces",
+	}
+	tracker := &fakeTracker{
+		candidateIssues: []model.Issue{
+			{ID: "1", Identifier: "ABC-1", Title: "Retry me", State: "Todo"},
+		},
+	}
+	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.randFloat = func() float64 { return 0 }
+	o.state.Running["busy"] = &model.RunningEntry{
+		Issue:      &model.Issue{ID: "busy", Identifier: "ABC-9", State: "Todo"},
+		Identifier: "ABC-9",
+		StartedAt:  now.Add(-time.Second),
+	}
+	o.state.RetryAttempts["1"] = &model.RetryEntry{
+		IssueID:       "1",
+		Identifier:    "ABC-1",
+		WorkspacePath: "/tmp/workspaces/ABC-1",
+		Attempt:       1,
+		DueAt:         now,
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.handleRetryTimer(context.Background(), "1")
+
+	retry := o.state.RetryAttempts["1"]
+	if retry == nil {
+		t.Fatal("retry entry missing after slot exhaustion")
+	}
+	if retry.Attempt != 2 {
+		t.Fatalf("retry attempt = %d, want 2", retry.Attempt)
+	}
+	if retry.Error == nil || *retry.Error != "no available orchestrator slots" {
+		t.Fatalf("retry error = %v, want no available orchestrator slots", retry.Error)
+	}
+	if retry.DueAt.Sub(now) != 10*time.Second {
+		t.Fatalf("retry delay = %v, want 10s", retry.DueAt.Sub(now))
 	}
 }
 
@@ -528,6 +600,40 @@ func TestHandleCodexUpdateAggregatesUsage(t *testing.T) {
 	}
 }
 
+func TestHandleCodexUpdateStoresRateLimitsInSnapshot(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:      &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier: "ABC-1",
+		StartedAt:  now,
+	}
+	rateLimits := map[string]any{"remaining": 12, "resetAt": "2026-03-07T10:05:00Z"}
+
+	o.handleCodexUpdate(CodexUpdate{
+		IssueID: "1",
+		Event: agent.AgentEvent{
+			Event:      "notification",
+			Timestamp:  now,
+			RateLimits: rateLimits,
+		},
+	})
+
+	snapshot := o.Snapshot()
+	got, ok := snapshot.RateLimits.(map[string]any)
+	if !ok {
+		t.Fatalf("snapshot rate limits type = %T, want map[string]any", snapshot.RateLimits)
+	}
+	if got["remaining"] != 12 {
+		t.Fatalf("snapshot rate limits = %+v, want remaining=12", got)
+	}
+}
+
 func TestHandleWorkerExitAlreadyTerminal(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
@@ -737,6 +843,33 @@ func TestHandleWorkerExitHasNewOpenPRDisabledSchedulesContinuation(t *testing.T)
 	}
 }
 
+func TestRememberCompletedLockedCapsCompletedEntries(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.maxCompleted = 2
+
+	o.mu.Lock()
+	o.rememberCompletedLocked("1")
+	o.rememberCompletedLocked("2")
+	o.rememberCompletedLocked("3")
+	o.mu.Unlock()
+
+	if _, ok := o.state.Completed["1"]; ok {
+		t.Fatalf("completed entries = %+v, want oldest evicted", o.state.Completed)
+	}
+	if _, ok := o.state.Completed["2"]; !ok {
+		t.Fatalf("completed entries = %+v, want issue 2 retained", o.state.Completed)
+	}
+	if _, ok := o.state.Completed["3"]; !ok {
+		t.Fatalf("completed entries = %+v, want issue 3 retained", o.state.Completed)
+	}
+}
+
 func TestHandleCodexUpdateTurnCountIncrementsOnTurnChangeOnly(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
@@ -768,6 +901,8 @@ func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient *fakeTracker, w
 		return &model.WorkflowDefinition{PromptTemplate: "Issue {{ issue.identifier }}"}
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	o.now = func() time.Time { return now }
+	o.startedAt = now
+	o.serviceVersion = "test"
 	o.gitBranchFn = func(context.Context, string) (string, error) { return "", nil }
 	o.openPRHeadsFn = func(context.Context, string) (map[string]struct{}, error) { return map[string]struct{}{}, nil }
 	return o

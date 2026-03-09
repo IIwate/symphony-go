@@ -41,12 +41,18 @@ type CodexUpdate struct {
 
 type Snapshot struct {
 	GeneratedAt time.Time
+	Service     ServiceSnapshot
 	Counts      SnapshotCounts
 	Running     []RunningSnapshot
 	Retrying    []RetrySnapshot
 	Alerts      []AlertSnapshot
 	CodexTotals model.TokenTotals
 	RateLimits  any
+}
+
+type ServiceSnapshot struct {
+	Version   string
+	StartedAt time.Time
 }
 
 type SnapshotCounts struct {
@@ -104,7 +110,7 @@ type Orchestrator struct {
 	tickTimer      *time.Timer
 	workerResultCh chan WorkerResult
 	codexUpdateCh  chan CodexUpdate
-	configReloadCh chan *model.WorkflowDefinition
+	configReloadCh chan struct{}
 	refreshCh      chan struct{}
 	retryFireCh    chan string
 	shutdownCh     chan struct{}
@@ -123,7 +129,15 @@ type Orchestrator struct {
 	nextSubscriberID int
 	systemAlerts     map[string]AlertSnapshot
 	pendingCleanup   map[string]string
+	completedOrder   []string
+	maxCompleted     int
+	startedAt        time.Time
+	serviceVersion   string
 }
+
+var BuildVersion = "dev"
+
+const defaultMaxCompletedEntries = 4096
 
 func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, logger *slog.Logger) *Orchestrator {
 	if logger == nil {
@@ -143,7 +157,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		openPRHeadsFn:  defaultOpenPRHeads,
 		workerResultCh: make(chan WorkerResult, 128),
 		codexUpdateCh:  make(chan CodexUpdate, 1024),
-		configReloadCh: make(chan *model.WorkflowDefinition, 8),
+		configReloadCh: make(chan struct{}, 8),
 		refreshCh:      make(chan struct{}, 8),
 		retryFireCh:    make(chan string, 128),
 		shutdownCh:     make(chan struct{}),
@@ -157,6 +171,9 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		subscribers:    map[int]chan Snapshot{},
 		systemAlerts:   map[string]AlertSnapshot{},
 		pendingCleanup: map[string]string{},
+		maxCompleted:   defaultMaxCompletedEntries,
+		startedAt:      time.Now().UTC(),
+		serviceVersion: BuildVersion,
 	}
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
@@ -232,9 +249,9 @@ func (o *Orchestrator) RequestRefresh() {
 	}
 }
 
-func (o *Orchestrator) NotifyWorkflowReload(def *model.WorkflowDefinition) {
+func (o *Orchestrator) NotifyWorkflowReload(_ *model.WorkflowDefinition) {
 	select {
-	case o.configReloadCh <- def:
+	case o.configReloadCh <- struct{}{}:
 	default:
 	}
 }
@@ -382,7 +399,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		normalizedAttempt = *attempt
 	}
 	o.state.Running[issue.ID] = &model.RunningEntry{
-		Issue:         cloneIssue(&issue),
+		Issue:         model.CloneIssue(&issue),
 		Identifier:    issue.Identifier,
 		WorkspacePath: "",
 		RetryAttempt:  normalizedAttempt,
@@ -440,7 +457,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 
 		result.Phase = model.PhaseStreamingTurn
 		runErr := o.runner.Run(workerCtx, agent.RunParams{
-			Issue:          cloneIssue(&issue),
+			Issue:          model.CloneIssue(&issue),
 			Attempt:        attempt,
 			WorkspacePath:  workspaceRef.Path,
 			PromptTemplate: o.currentWorkflow().PromptTemplate,
@@ -453,7 +470,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 				if len(issues) == 0 {
 					return nil, nil
 				}
-				return cloneIssue(&issues[0]), nil
+				return model.CloneIssue(&issues[0]), nil
 			},
 			IsActive: func(state string) bool { return o.isActiveState(state, o.currentConfig()) },
 			OnEvent: func(event agent.AgentEvent) {
@@ -524,7 +541,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		return
 	}
 
-	o.state.Completed[result.IssueID] = struct{}{}
+	o.rememberCompletedLocked(result.IssueID)
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	o.mu.Unlock()
@@ -670,7 +687,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 			continue
 		}
 		if o.isActiveState(issue.State, cfg) {
-			entry.Issue = cloneIssue(&issue)
+			entry.Issue = model.CloneIssue(&issue)
 			continue
 		}
 		o.terminateRunningLocked(ctx, issueID, false, false, "")
@@ -978,6 +995,10 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 
 	o.snapshot = Snapshot{
 		GeneratedAt: now,
+		Service: ServiceSnapshot{
+			Version:   o.serviceVersion,
+			StartedAt: o.startedAt,
+		},
 		Counts: SnapshotCounts{
 			Running:  len(running),
 			Retrying: len(retrying),
@@ -1281,16 +1302,6 @@ func phaseFromError(err error) model.RunPhase {
 	}
 }
 
-func cloneIssue(issue *model.Issue) *model.Issue {
-	if issue == nil {
-		return nil
-	}
-	copyValue := *issue
-	copyValue.Labels = append([]string(nil), issue.Labels...)
-	copyValue.BlockedBy = append([]model.BlockerRef(nil), issue.BlockedBy...)
-	return &copyValue
-}
-
 func optionalError(value string) *string {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -1341,6 +1352,25 @@ func errorString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func (o *Orchestrator) rememberCompletedLocked(issueID string) {
+	if strings.TrimSpace(issueID) == "" {
+		return
+	}
+	if _, exists := o.state.Completed[issueID]; exists {
+		return
+	}
+	o.state.Completed[issueID] = struct{}{}
+	if o.maxCompleted <= 0 {
+		return
+	}
+	o.completedOrder = append(o.completedOrder, issueID)
+	for len(o.completedOrder) > o.maxCompleted {
+		evicted := o.completedOrder[0]
+		o.completedOrder = o.completedOrder[1:]
+		delete(o.state.Completed, evicted)
+	}
 }
 
 func maxInt(left int, right int) int {

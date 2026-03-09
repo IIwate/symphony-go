@@ -83,7 +83,7 @@
   - `docs/release-checklist.md`
   - `docs/operator-runbook.md`
 - 真实环境验证记录
-  - `docs/real-integration-report-2026-03-07.md`
+  - `docs/release-checklist.md`
 - Windows 主机 shell 兼容说明
   - 保留“Windows 下优先解析 Git Bash”的实现与文档说明，避免被误判为多余噪音后删除
 

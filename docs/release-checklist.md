@@ -15,7 +15,7 @@
 
 - 范围：Cycle 4 技术收口，不含发布版本号、发布时间窗口与最终发布批准。
 - 结果：Extension Conformance 与 Real Integration Profile 已完成并通过。
-- 依据：`docs/real-integration-report-2026-03-07.md`
+- 依据：本清单第五节、收口摘要与附录记录
 
 
 ## 一、实现范围确认
@@ -132,9 +132,9 @@
 | 项目 | 结果 | 备注 |
 |---|---|---|
 | Extension Conformance | [x] 通过 | Cycle 4 技术收口完成 |
-| Real Integration Profile | [x] 通过 / [ ] 跳过 | 见 `docs/real-integration-report-2026-03-07.md` |
+| Real Integration Profile | [x] 通过 / [ ] 跳过 | 见本清单第五节与附录记录 |
 | 运维检查 | [x] 通过 | 启动命令、reload、HTTP loopback、真实清理策略已复核 |
-| 文档交付 | [x] 完成 | real integration report / checklist 已更新 |
+| 文档交付 | [x] 完成 | checklist 已更新 |
 
 ## 附：建议记录
 
