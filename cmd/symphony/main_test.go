@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"symphony-go/internal/agent"
 	"symphony-go/internal/logging"
@@ -150,6 +151,223 @@ func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 	}
 }
 
+func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	restore := stubDependencies(t)
+	defer restore()
+
+	workflowPath := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	writeWorkflow(t, workflowPath)
+
+	signalCtx, signalCancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	waitReturned := make(chan struct{})
+	shutdownCalled := make(chan struct{})
+
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+		return &fakeOrchestrator{
+			start: func(context.Context) error {
+				close(started)
+				return nil
+			},
+			wait: func() {
+				<-signalCtx.Done()
+				close(waitReturned)
+			},
+		}
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+		return &fakeHTTPServer{
+			addr: "127.0.0.1:8080",
+			shutdown: func(context.Context) error {
+				select {
+				case <-waitReturned:
+				default:
+					t.Fatal("http shutdown happened before orchestrator.Wait returned")
+				}
+				close(shutdownCalled)
+				return nil
+			},
+		}, nil
+	}
+	watchWorkflowDefinition = func(context.Context, string, func(*model.WorkflowDefinition), func(error)) error { return nil }
+	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+		return signalCtx, func() {}
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- execute([]string{"--port", "8080", workflowPath}, io.Discard)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("orchestrator did not start")
+	}
+
+	signalCancel()
+
+	select {
+	case <-shutdownCalled:
+	case <-time.After(time.Second):
+		t.Fatal("http shutdown was not called")
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("execute() error = %v", err)
+	}
+}
+
+func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	restore := stubDependencies(t)
+	defer restore()
+
+	workflowPath := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	writeWorkflow(t, workflowPath)
+
+	signalCtx, signalCancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	waitEntered := make(chan struct{})
+	releaseWait := make(chan struct{})
+	shutdownCalled := make(chan struct{})
+
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+		return &fakeOrchestrator{
+			start: func(context.Context) error {
+				close(started)
+				return nil
+			},
+			wait: func() {
+				close(waitEntered)
+				<-releaseWait
+			},
+		}
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+		return &fakeHTTPServer{
+			addr: "127.0.0.1:8081",
+			shutdown: func(context.Context) error {
+				close(shutdownCalled)
+				return nil
+			},
+		}, nil
+	}
+	watchWorkflowDefinition = func(context.Context, string, func(*model.WorkflowDefinition), func(error)) error { return nil }
+	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+		return signalCtx, func() {}
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- execute([]string{"--port", "8081", workflowPath}, io.Discard)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("orchestrator did not start")
+	}
+
+	signalCancel()
+
+	select {
+	case <-waitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("orchestrator.Wait was not entered")
+	}
+
+	select {
+	case <-shutdownCalled:
+		t.Fatal("http shutdown happened before workers finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseWait)
+
+	select {
+	case <-shutdownCalled:
+	case <-time.After(time.Second):
+		t.Fatal("http shutdown was not called after workers finished")
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("execute() error = %v", err)
+	}
+}
+
+func TestExecuteShutdownWithHTTPServer(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	restore := stubDependencies(t)
+	defer restore()
+
+	workflowPath := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	writeWorkflow(t, workflowPath)
+
+	signalCtx, signalCancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	shutdownCalled := make(chan struct{})
+	shutdownCount := 0
+	gotPort := -1
+
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+		return &fakeOrchestrator{
+			start: func(context.Context) error {
+				close(started)
+				return nil
+			},
+			wait: func() {
+				<-signalCtx.Done()
+			},
+		}
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+		gotPort = port
+		return &fakeHTTPServer{
+			addr: "127.0.0.1:9090",
+			shutdown: func(context.Context) error {
+				shutdownCount++
+				close(shutdownCalled)
+				return nil
+			},
+		}, nil
+	}
+	watchWorkflowDefinition = func(context.Context, string, func(*model.WorkflowDefinition), func(error)) error { return nil }
+	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+		return signalCtx, func() {}
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- execute([]string{"--port", "9090", workflowPath}, io.Discard)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("orchestrator did not start")
+	}
+
+	signalCancel()
+
+	select {
+	case <-shutdownCalled:
+	case <-time.After(time.Second):
+		t.Fatal("http shutdown was not called")
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("execute() error = %v", err)
+	}
+	if gotPort != 9090 {
+		t.Fatalf("http server port = %d, want 9090", gotPort)
+	}
+	if shutdownCount != 1 {
+		t.Fatalf("http shutdown count = %d, want 1", shutdownCount)
+	}
+}
+
 func stubDependencies(t *testing.T) func() {
 	t.Helper()
 	origWatch := watchWorkflowDefinition
@@ -256,10 +474,18 @@ func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.S
 	return ch, func() { close(ch) }
 }
 
-type fakeHTTPServer struct{ addr string }
+type fakeHTTPServer struct {
+	addr     string
+	shutdown func(context.Context) error
+}
 
-func (f *fakeHTTPServer) Addr() string                   { return f.addr }
-func (f *fakeHTTPServer) Shutdown(context.Context) error { return nil }
+func (f *fakeHTTPServer) Addr() string { return f.addr }
+func (f *fakeHTTPServer) Shutdown(ctx context.Context) error {
+	if f.shutdown != nil {
+		return f.shutdown(ctx)
+	}
+	return nil
+}
 
 func max(left int, right int) int {
 	if left > right {
