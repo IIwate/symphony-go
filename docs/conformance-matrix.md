@@ -97,7 +97,7 @@
 | 默认 workflow 路径 / 显式路径错误 | `cmd/symphony` | 已覆盖 | `cmd/symphony/main_test.go`：`TestRunCLIUsesDefaultWorkflowPath`、`TestRunCLIFailsForMissingExplicitWorkflow`、`TestRunCLIFailsWhenDefaultWorkflowMissing` | `REQUIREMENTS.md`、`docs/operator-runbook.md` |  |
 | reload 保持端口覆盖 | `cmd/symphony` | 已覆盖 | `cmd/symphony/main_test.go`：`TestRuntimeStateApplyReloadKeepsPortOverride` | `FLOW.md` |  |
 | watcher 与 reload 通知链路 | `cmd/symphony` | 已覆盖 | `cmd/symphony/main_test.go`：`TestExecuteStartsWatcherAndNotifiesReload` | `REQUIREMENTS.md` |  |
-| 正常 shutdown / host 异常退出 | `cmd/symphony` | 部分覆盖 | 现有 main 测试 | `docs/release-checklist.md` | 主要依赖 smoke 与 runbook 证据 |
+| 正常 shutdown / HTTP server 关闭顺序 | `cmd/symphony` | 已覆盖 | `cmd/symphony/main_test.go`：`TestExecuteGracefulShutdownOnContextCancel`、`TestExecuteShutdownWaitsForWorkers`、`TestExecuteShutdownWithHTTPServer` | `docs/release-checklist.md` | 本轮补齐关闭链路与时序断言 |
 
 ## Extension Conformance
 
@@ -107,7 +107,7 @@
 |---|---|---|---|---|---|
 | `/` Dashboard、`/api/v1/state`、`/api/v1/{identifier}`、`/api/v1/refresh`、`/api/v1/events` | `internal/server` | 已覆盖 | `internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot`、`TestIssueEndpointReturnsKnownIssueAnd404ForUnknown`、`TestRefreshEndpointAndMethodNotAllowed`、`TestEventsEndpointSendsSnapshotAndUpdate`、`TestDashboardAndMethodNotAllowed` | `docs/operator-runbook.md`、`docs/release-checklist.md` |  |
 | 404 / 405 / SSE `snapshot` + `update` | `internal/server` | 已覆盖 | 同上 | `FLOW.md` |  |
-| timeout / unavailable / rate-limit 展示 | `internal/server` | 部分覆盖 | 现有 server 测试 | `docs/release-checklist.md` | 仍可补更细负例 |
+| SSE 不可用 / 客户端断开 / 并发订阅 / rate-limit 展示 | `internal/server` | 已覆盖 | `internal/server/server_test.go`：`TestStateEndpointReturnsSnapshot`、`TestEventsEndpointClientDisconnect`、`TestEventsEndpointNoFlusherReturns500`、`TestEventsEndpointConcurrentClients` | `docs/release-checklist.md` | 本轮补齐 SSE 负例与并发订阅 |
 
 ### `linear_graphql` Tool
 
@@ -122,15 +122,16 @@
 
 | SPEC 条目 | 实现包 | 现状 | 测试锚点 | 文档锚点 | 备注 |
 |---|---|---|---|---|---|
-| 真实凭据 smoke：`--dry-run`、候选 issue、HTTP/SSE/refresh、真实 issue 调度、dynamic tool | 全链路 | 仅文档 | 无自动化 scaffolding | `docs/release-checklist.md` | 当前以手工验证记录为主 |
+| 真实凭据 seed tests：候选 issue、按 ID 刷新、CLI dry-run | `tracker`、`cmd/symphony` | 已覆盖 | `internal/tracker/linear_integration_test.go`：`TestLinearIntegration_FetchCandidates`、`TestLinearIntegration_FetchByIDs`；`cmd/symphony/main_integration_test.go`：`TestMainIntegration_DryRun` | `docs/release-checklist.md` | 需 `-tags=integration`，缺少环境变量时按 skipped 处理 |
 | 发布前 checklist / operator 操作指引 | 文档 | 仅文档 | 无自动化 | `docs/release-checklist.md`、`docs/operator-runbook.md` | 首版发布主证据 |
 
 ## Known Gaps / Evidence Notes
 
-- 仍建议后续补的自动化锚点主要集中在：
-  - `internal/server` 的 timeout / unavailable 更细负例
-  - `cmd/symphony` 的正常 shutdown / host 异常退出路径
-- `Real Integration Profile` 当前没有自动化 integration scaffolding；首版发布继续以：
+- 此前首版收口遗留的三项测试缺口现已覆盖：
+  - `internal/server`：SSE client disconnect / no flusher / concurrent clients
+  - `cmd/symphony`：graceful shutdown、worker wait 与 HTTP shutdown 顺序
+  - `Real Integration Profile`：env-gated seed tests + `RequireEnv` 跳过约定
+- 发布证据仍以：
   - `docs/release-checklist.md`
   - `docs/operator-runbook.md`
-  作为发布证据。
+  为主，integration build tag 测试作为自动化补充证据。

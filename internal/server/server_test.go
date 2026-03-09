@@ -130,18 +130,19 @@ func TestEventsEndpointSendsSnapshotAndUpdate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
-	rec := httptest.NewRecorder()
+	writer := newStreamingResponseWriter()
 
 	done := make(chan struct{})
 	go func() {
-		handler.ServeHTTP(rec, req)
+		handler.ServeHTTP(writer, req)
 		close(done)
 	}()
 
+	writer.waitForBody(t, "event: snapshot")
 	runtime.publish(sampleSnapshot())
-	time.Sleep(200 * time.Millisecond)
+	writer.waitForBody(t, "event: update")
 
-	body := rec.Body.String()
+	body := writer.bodyString()
 	if !strings.Contains(body, "event: snapshot") {
 		t.Fatalf("body missing snapshot event: %s", body)
 	}
@@ -151,6 +152,95 @@ func TestEventsEndpointSendsSnapshotAndUpdate(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestEventsEndpointClientDisconnect(t *testing.T) {
+	runtime := newFakeRuntime(sampleSnapshot())
+	handler := NewHandler(runtime, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	writer := newStreamingResponseWriter()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(writer, req)
+		close(done)
+	}()
+
+	writer.waitForBody(t, "event: snapshot")
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SSE handler did not exit after client disconnect")
+	}
+}
+
+func TestEventsEndpointNoFlusherReturns500(t *testing.T) {
+	runtime := newFakeRuntime(sampleSnapshot())
+	handler := NewHandler(runtime, nil)
+	writer := &failingResponseWriter{header: make(http.Header)}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	handler.ServeHTTP(writer, req)
+
+	if writer.status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", writer.status)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(writer.buf.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v, body = %q", err, writer.buf.String())
+	}
+	errPayload := payload["error"].(map[string]any)
+	if errPayload["code"] != "stream_not_supported" {
+		t.Fatalf("error.code = %v, want stream_not_supported", errPayload["code"])
+	}
+}
+
+func TestEventsEndpointConcurrentClients(t *testing.T) {
+	runtime := newFakeRuntime(sampleSnapshot())
+	handler := NewHandler(runtime, nil)
+
+	type client struct {
+		cancel func()
+		writer *streamingResponseWriter
+		done   chan struct{}
+	}
+
+	clients := make([]client, 0, 2)
+	for range 2 {
+		ctx, cancel := context.WithCancel(context.Background())
+		writer := newStreamingResponseWriter()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+		done := make(chan struct{})
+		go func() {
+			handler.ServeHTTP(writer, req)
+			close(done)
+		}()
+		clients = append(clients, client{cancel: cancel, writer: writer, done: done})
+	}
+
+	for _, client := range clients {
+		client.writer.waitForBody(t, "event: snapshot")
+	}
+
+	runtime.publish(sampleSnapshot())
+
+	for _, client := range clients {
+		client.writer.waitForBody(t, "event: update")
+		client.cancel()
+	}
+
+	for _, client := range clients {
+		select {
+		case <-client.done:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent SSE client did not exit")
+		}
+	}
 }
 
 func TestDashboardAndMethodNotAllowed(t *testing.T) {
@@ -194,13 +284,14 @@ type fakeRuntime struct {
 	mu           sync.Mutex
 	snapshot     orchestrator.Snapshot
 	refreshCount int
-	ch           chan orchestrator.Snapshot
+	nextID       int
+	subscribers  map[int]chan orchestrator.Snapshot
 }
 
 func newFakeRuntime(snapshot orchestrator.Snapshot) *fakeRuntime {
 	return &fakeRuntime{
-		snapshot: snapshot,
-		ch:       make(chan orchestrator.Snapshot, 8),
+		snapshot:    snapshot,
+		subscribers: make(map[int]chan orchestrator.Snapshot),
 	}
 }
 
@@ -218,17 +309,39 @@ func (f *fakeRuntime) RequestRefresh() {
 
 func (f *fakeRuntime) SubscribeSnapshots(_ int) (<-chan orchestrator.Snapshot, func()) {
 	ch := make(chan orchestrator.Snapshot, 8)
-	ch <- f.Snapshot()
-	go func() {
-		for item := range f.ch {
-			ch <- item
+	f.mu.Lock()
+	id := f.nextID
+	f.nextID++
+	f.subscribers[id] = ch
+	snapshot := f.snapshot
+	f.mu.Unlock()
+
+	ch <- snapshot
+
+	return ch, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		subscriber, ok := f.subscribers[id]
+		if !ok {
+			return
 		}
-	}()
-	return ch, func() { close(ch) }
+		delete(f.subscribers, id)
+		close(subscriber)
+	}
 }
 
 func (f *fakeRuntime) publish(snapshot orchestrator.Snapshot) {
-	f.ch <- snapshot
+	f.mu.Lock()
+	f.snapshot = snapshot
+	subscribers := make([]chan orchestrator.Snapshot, 0, len(f.subscribers))
+	for _, ch := range f.subscribers {
+		subscribers = append(subscribers, ch)
+	}
+	f.mu.Unlock()
+
+	for _, ch := range subscribers {
+		ch <- snapshot
+	}
 }
 
 func sampleSnapshot() orchestrator.Snapshot {
@@ -292,6 +405,7 @@ type failingResponseWriter struct {
 	header   http.Header
 	status   int
 	writeErr error
+	buf      bytes.Buffer
 }
 
 func (w *failingResponseWriter) Header() http.Header {
@@ -305,6 +419,67 @@ func (w *failingResponseWriter) WriteHeader(status int) {
 	w.status = status
 }
 
-func (w *failingResponseWriter) Write(_ []byte) (int, error) {
+func (w *failingResponseWriter) Write(p []byte) (int, error) {
+	if w.writeErr == nil {
+		return w.buf.Write(p)
+	}
 	return 0, w.writeErr
+}
+
+type streamingResponseWriter struct {
+	header  http.Header
+	status  int
+	buf     bytes.Buffer
+	mu      sync.Mutex
+	flushCh chan struct{}
+}
+
+func newStreamingResponseWriter() *streamingResponseWriter {
+	return &streamingResponseWriter{
+		header:  make(http.Header),
+		flushCh: make(chan struct{}, 16),
+	}
+}
+
+func (w *streamingResponseWriter) Header() http.Header { return w.header }
+
+func (w *streamingResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.status = status
+}
+
+func (w *streamingResponseWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *streamingResponseWriter) Flush() {
+	select {
+	case w.flushCh <- struct{}{}:
+	default:
+	}
+}
+
+func (w *streamingResponseWriter) bodyString() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+func (w *streamingResponseWriter) waitForBody(t *testing.T, needle string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		if strings.Contains(w.bodyString(), needle) {
+			return
+		}
+		select {
+		case <-w.flushCh:
+		case <-time.After(10 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("body %q missing %q", w.bodyString(), needle)
+		}
+	}
 }
