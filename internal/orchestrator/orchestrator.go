@@ -765,7 +765,50 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 		return
 	}
 
+	cfg := o.currentConfig()
+	ids := make([]string, 0, len(pending))
+	for issueID := range pending {
+		ids = append(ids, issueID)
+	}
+	refreshed, err := o.tracker.FetchIssueStatesByIDs(ctx, ids)
+	byID := make(map[string]model.Issue, len(refreshed))
+	if err != nil {
+		o.logger.Warn("awaiting-merge state refresh failed", "error", err.Error())
+	} else {
+		for _, issue := range refreshed {
+			byID[issue.ID] = issue
+		}
+	}
+
 	for issueID, entry := range pending {
+		if issue, ok := byID[issueID]; ok {
+			switch {
+			case o.isTerminalState(issue.State, cfg):
+				o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
+				continue
+			case !o.isActiveState(issue.State, cfg):
+				o.mu.Lock()
+				current := o.state.AwaitingMerge[issueID]
+				if current != nil {
+					delete(o.state.AwaitingMerge, issueID)
+					delete(o.state.Claimed, issueID)
+					o.refreshSnapshotLocked()
+					o.publishSnapshotLocked()
+				}
+				o.mu.Unlock()
+				continue
+			default:
+				o.mu.Lock()
+				current := o.state.AwaitingMerge[issueID]
+				if current != nil && current.State != issue.State {
+					current.State = issue.State
+					o.refreshSnapshotLocked()
+					o.publishSnapshotLocked()
+				}
+				o.mu.Unlock()
+			}
+		}
+
 		pr, err := o.lookupPullRequestByHeadBranch(ctx, entry.WorkspacePath, entry.Branch)
 		if err != nil {
 			o.logger.Warn("awaiting-merge PR lookup failed", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "error", err.Error())

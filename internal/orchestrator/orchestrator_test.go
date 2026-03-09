@@ -1028,6 +1028,104 @@ func TestReconcileAwaitingMergeMergedClosesIssue(t *testing.T) {
 	}
 }
 
+func TestReconcileAwaitingMergeTerminalIssueCleansUpAndReleasesClaim(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done", "Cancelled"},
+		MaxConcurrentAgents: 1,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "Done"},
+		},
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-48-await"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 48, URL: "https://example.test/pr/48", HeadBranch: branch, State: PullRequestStateOpen},
+		},
+	}
+	o.state.AwaitingMerge["1"] = &model.AwaitingMergeEntry{
+		Identifier:    "ABC-1",
+		State:         "In Progress",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        branch,
+		RetryAttempt:  0,
+		AwaitingSince: now.Add(-time.Minute),
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	if tracker.stateFetchCalls == 0 {
+		t.Fatal("tracker state refresh was not attempted")
+	}
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatal("awaiting merge entry still exists")
+	}
+	if _, ok := o.state.Claimed["1"]; ok {
+		t.Fatal("claimed entry still exists")
+	}
+	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
+		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
+	}
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+}
+
+func TestReconcileAwaitingMergeNonActiveIssueReleasesClaimWithoutCleanup(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "Backlog"},
+		},
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-48-await"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 48, URL: "https://example.test/pr/48", HeadBranch: branch, State: PullRequestStateOpen},
+		},
+	}
+	o.state.AwaitingMerge["1"] = &model.AwaitingMergeEntry{
+		Identifier:    "ABC-1",
+		State:         "In Progress",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        branch,
+		RetryAttempt:  0,
+		AwaitingSince: now.Add(-time.Minute),
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	if tracker.stateFetchCalls == 0 {
+		t.Fatal("tracker state refresh was not attempted")
+	}
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatal("awaiting merge entry still exists")
+	}
+	if _, ok := o.state.Claimed["1"]; ok {
+		t.Fatal("claimed entry still exists")
+	}
+	if len(workspace.cleaned) != 0 {
+		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
+	}
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+}
+
 func TestReconcileAwaitingMergeClosedSchedulesContinuationRetry(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
