@@ -43,6 +43,9 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 					"oops":   "x",
 				},
 			},
+			"orchestrator": map[string]any{
+				"auto_close_on_pr": false,
+			},
 			"codex": map[string]any{
 				"thread_sandbox":      "workspace-write",
 				"turn_sandbox_policy": map[string]any{"type": "workspaceWrite"},
@@ -82,6 +85,9 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	}
 	if len(cfg.MaxConcurrentAgentsByState) != 1 {
 		t.Fatalf("MaxConcurrentAgentsByState size = %d, want 1", len(cfg.MaxConcurrentAgentsByState))
+	}
+	if cfg.OrchestratorAutoCloseOnPR {
+		t.Fatal("OrchestratorAutoCloseOnPR = true, want false")
 	}
 	if cfg.ServerPort == nil || *cfg.ServerPort != 0 {
 		t.Fatalf("ServerPort = %v, want 0", cfg.ServerPort)
@@ -144,6 +150,35 @@ func TestValidateForDispatch(t *testing.T) {
 			err := ValidateForDispatch(&cfg)
 			if !errors.Is(err, tc.target) {
 				t.Fatalf("ValidateForDispatch() error = %v, want %v", err, tc.target)
+			}
+		})
+	}
+}
+
+func TestNewFromWorkflowFallsBackToDefaultHookTimeoutForNonPositiveValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		rawTime any
+	}{
+		{name: "zero", rawTime: 0},
+		{name: "negative int", rawTime: -1},
+		{name: "negative string", rawTime: "-10"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := NewFromWorkflow(&model.WorkflowDefinition{
+				Config: map[string]any{
+					"hooks": map[string]any{
+						"timeout_ms": tc.rawTime,
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("NewFromWorkflow() error = %v", err)
+			}
+			if cfg.HookTimeoutMS != 60000 {
+				t.Fatalf("HookTimeoutMS = %d, want default 60000", cfg.HookTimeoutMS)
 			}
 		})
 	}

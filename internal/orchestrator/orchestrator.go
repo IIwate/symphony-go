@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ type Snapshot struct {
 	Counts      SnapshotCounts
 	Running     []RunningSnapshot
 	Retrying    []RetrySnapshot
+	Alerts      []AlertSnapshot
 	CodexTotals model.TokenTotals
 	RateLimits  any
 }
@@ -55,6 +57,7 @@ type SnapshotCounts struct {
 type RunningSnapshot struct {
 	IssueID             string
 	IssueIdentifier     string
+	WorkspacePath       string
 	State               string
 	SessionID           string
 	TurnCount           int
@@ -66,14 +69,24 @@ type RunningSnapshot struct {
 	OutputTokens        int64
 	TotalTokens         int64
 	CurrentRetryAttempt int
+	AttemptCount        int
 }
 
 type RetrySnapshot struct {
 	IssueID         string
 	IssueIdentifier string
+	WorkspacePath   string
 	Attempt         int
 	DueAt           time.Time
 	Error           *string
+}
+
+type AlertSnapshot struct {
+	Code            string
+	Level           string
+	Message         string
+	IssueID         string
+	IssueIdentifier string
 }
 
 type Orchestrator struct {
@@ -108,6 +121,8 @@ type Orchestrator struct {
 	started          bool
 	subscribers      map[int]chan Snapshot
 	nextSubscriberID int
+	systemAlerts     map[string]AlertSnapshot
+	pendingCleanup   map[string]string
 }
 
 func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, logger *slog.Logger) *Orchestrator {
@@ -139,7 +154,9 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 			RetryAttempts: map[string]*model.RetryEntry{},
 			Completed:     map[string]struct{}{},
 		},
-		subscribers: map[int]chan Snapshot{},
+		subscribers:    map[int]chan Snapshot{},
+		systemAlerts:   map[string]AlertSnapshot{},
+		pendingCleanup: map[string]string{},
 	}
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
@@ -270,27 +287,45 @@ func (o *Orchestrator) tick(ctx context.Context) {
 }
 
 func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
-	o.reconcileRunning(ctx)
+	stateRefreshAttempted, stateRefreshSucceeded := o.reconcileRunning(ctx)
 
 	cfg := o.currentConfig()
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		o.logger.Warn("dispatch preflight failed", "error", err.Error())
 		o.mu.Lock()
+		o.setSystemAlertLocked(AlertSnapshot{
+			Code:    "dispatch_preflight_failed",
+			Level:   "warn",
+			Message: err.Error(),
+		})
 		o.refreshSnapshotLocked()
 		o.publishSnapshotLocked()
 		o.mu.Unlock()
 		return
 	}
+	o.mu.Lock()
+	o.clearSystemAlertLocked("dispatch_preflight_failed")
+	o.mu.Unlock()
 
 	candidates, err := o.tracker.FetchCandidateIssues(ctx)
 	if err != nil {
 		o.logger.Warn("fetch candidate issues failed", "error", err.Error())
 		o.mu.Lock()
+		o.setSystemAlertLocked(AlertSnapshot{
+			Code:    "tracker_unreachable",
+			Level:   "warn",
+			Message: err.Error(),
+		})
 		o.refreshSnapshotLocked()
 		o.publishSnapshotLocked()
 		o.mu.Unlock()
 		return
 	}
+	o.mu.Lock()
+	if !stateRefreshAttempted || stateRefreshSucceeded {
+		o.clearSystemAlertLocked("tracker_unreachable")
+	}
+	o.mu.Unlock()
 	sort.SliceStable(candidates, func(i int, j int) bool {
 		return compareIssues(candidates[i], candidates[j])
 	})
@@ -334,8 +369,12 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 
 	o.mu.Lock()
 	o.state.Claimed[issue.ID] = struct{}{}
-	if existing := o.state.RetryAttempts[issue.ID]; existing != nil && existing.TimerHandle != nil {
-		existing.TimerHandle.Stop()
+	stallCount := 0
+	if existing := o.state.RetryAttempts[issue.ID]; existing != nil {
+		stallCount = existing.StallCount
+		if existing.TimerHandle != nil {
+			existing.TimerHandle.Stop()
+		}
 	}
 	delete(o.state.RetryAttempts, issue.ID)
 	normalizedAttempt := 0
@@ -343,12 +382,21 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		normalizedAttempt = *attempt
 	}
 	o.state.Running[issue.ID] = &model.RunningEntry{
-		Issue:        cloneIssue(&issue),
-		Identifier:   issue.Identifier,
-		RetryAttempt: normalizedAttempt,
-		StartedAt:    o.now().UTC(),
-		WorkerCancel: cancel,
+		Issue:         cloneIssue(&issue),
+		Identifier:    issue.Identifier,
+		WorkspacePath: "",
+		RetryAttempt:  normalizedAttempt,
+		StallCount:    stallCount,
+		StartedAt:     o.now().UTC(),
+		WorkerCancel:  cancel,
 	}
+	o.logger.Info(
+		"dispatching issue",
+		"issue_id", issue.ID,
+		"issue_identifier", issue.Identifier,
+		"attempt", attemptCountFromRetry(normalizedAttempt),
+		"run_phase", model.PhasePreparingWorkspace.String(),
+	)
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	o.mu.Unlock()
@@ -371,6 +419,13 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			o.sendWorkerResult(result)
 			return
 		}
+		o.mu.Lock()
+		if entry := o.state.Running[issue.ID]; entry != nil {
+			entry.WorkspacePath = workspaceRef.Path
+			o.refreshSnapshotLocked()
+			o.publishSnapshotLocked()
+		}
+		o.mu.Unlock()
 		if preparer, ok := o.workspace.(interface {
 			PrepareForRun(context.Context, *model.Workspace) error
 		}); ok {
@@ -428,6 +483,16 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	o.mu.Lock()
 	entry := o.state.Running[result.IssueID]
 	if entry == nil {
+		identifier, pending := o.pendingCleanup[result.IssueID]
+		if pending {
+			delete(o.pendingCleanup, result.IssueID)
+			o.mu.Unlock()
+			ctx := o.runtimeContext()
+			if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
+				o.logger.Warn("deferred workspace cleanup failed", "issue_id", result.IssueID, "issue_identifier", identifier, "error", err.Error())
+			}
+			return
+		}
 		o.mu.Unlock()
 		return
 	}
@@ -435,6 +500,16 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	delete(o.state.Running, result.IssueID)
 	identifier := entry.Identifier
 	retryAttempt := entry.RetryAttempt
+	stallCount := entry.StallCount
+	o.logger.Info(
+		"worker finished",
+		"issue_id", result.IssueID,
+		"issue_identifier", identifier,
+		"attempt", attemptCountFromRetry(retryAttempt),
+		"run_phase", result.Phase.String(),
+		"success", result.Err == nil,
+		"error", errorString(result.Err),
+	)
 
 	if result.Err != nil {
 		nextAttempt := retryAttempt + 1
@@ -442,7 +517,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 			nextAttempt = 1
 		}
 		errorText := result.Err.Error()
-		o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false)
+		o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false, stallCount)
 		o.refreshSnapshotLocked()
 		o.publishSnapshotLocked()
 		o.mu.Unlock()
@@ -462,7 +537,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		return
 	}
 
-	if result.HasNewOpenPR {
+	if result.HasNewOpenPR && cfg.OrchestratorAutoCloseOnPR {
 		transitioner, ok := o.tracker.(tracker.IssueTransitioner)
 		if ok {
 			transitionErr := transitioner.TransitionIssue(ctx, result.IssueID, "Done")
@@ -481,7 +556,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 			}
 			errorText := "post-worker transition did not reach terminal state"
 			o.mu.Lock()
-			o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false)
+			o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false, stallCount)
 			o.refreshSnapshotLocked()
 			o.publishSnapshotLocked()
 			o.mu.Unlock()
@@ -492,7 +567,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	}
 
 	o.mu.Lock()
-	o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true)
+	o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount)
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	o.mu.Unlock()
@@ -535,7 +610,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 	o.publishSnapshotLocked()
 }
 
-func (o *Orchestrator) reconcileRunning(ctx context.Context) {
+func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	cfg := o.currentConfig()
 
 	o.mu.Lock()
@@ -559,13 +634,22 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) {
 	o.mu.Unlock()
 
 	if len(ids) == 0 {
-		return
+		return false, false
 	}
 
 	refreshed, err := o.tracker.FetchIssueStatesByIDs(ctx, ids)
 	if err != nil {
 		o.logger.Warn("reconcile state refresh failed", "error", err.Error())
-		return
+		o.mu.Lock()
+		o.setSystemAlertLocked(AlertSnapshot{
+			Code:    "tracker_unreachable",
+			Level:   "warn",
+			Message: err.Error(),
+		})
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.mu.Unlock()
+		return true, false
 	}
 
 	byID := make(map[string]model.Issue, len(refreshed))
@@ -575,6 +659,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) {
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.clearSystemAlertLocked("tracker_unreachable")
 	for issueID, entry := range o.state.Running {
 		issue, ok := byID[issueID]
 		if !ok {
@@ -592,6 +677,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) {
 	}
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
+	return true, true
 }
 
 func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
@@ -609,7 +695,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	if err != nil {
 		errorText := "retry poll failed"
 		o.mu.Lock()
-		o.scheduleRetryLocked(issueID, retryEntry.Identifier, retryEntry.Attempt+1, &errorText, false)
+		o.scheduleRetryLocked(issueID, retryEntry.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount)
 		o.refreshSnapshotLocked()
 		o.mu.Unlock()
 		return
@@ -644,7 +730,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	if !o.hasAvailableSlots(*issue, cfg) {
 		errorText := "no available orchestrator slots"
 		o.mu.Lock()
-		o.scheduleRetryLocked(issueID, issue.Identifier, retryEntry.Attempt+1, &errorText, false)
+		o.scheduleRetryLocked(issueID, issue.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount)
 		o.refreshSnapshotLocked()
 		o.mu.Unlock()
 		return
@@ -659,8 +745,20 @@ func (o *Orchestrator) startupCleanup(ctx context.Context) {
 	issues, err := o.tracker.FetchIssuesByStates(ctx, cfg.TerminalStates)
 	if err != nil {
 		o.logger.Warn("startup cleanup fetch failed", "error", err.Error())
+		o.mu.Lock()
+		o.setSystemAlertLocked(AlertSnapshot{
+			Code:    "tracker_terminal_fetch_failed",
+			Level:   "warn",
+			Message: err.Error(),
+		})
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.mu.Unlock()
 		return
 	}
+	o.mu.Lock()
+	o.clearSystemAlertLocked("tracker_terminal_fetch_failed")
+	o.mu.Unlock()
 	for _, issue := range issues {
 		if err := o.workspace.CleanupWorkspace(ctx, issue.Identifier); err != nil {
 			o.logger.Warn("cleanup workspace failed", "issue_identifier", issue.Identifier, "error", err.Error())
@@ -709,8 +807,7 @@ func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID strin
 
 	if cleanup {
 		delete(o.state.Claimed, issueID)
-		identifier := entry.Identifier
-		_ = o.workspace.CleanupWorkspace(ctx, identifier)
+		o.pendingCleanup[issueID] = entry.Identifier
 	} else if !scheduleRetry {
 		delete(o.state.Claimed, issueID)
 	}
@@ -720,12 +817,16 @@ func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID strin
 		if nextAttempt <= 0 {
 			nextAttempt = 1
 		}
+		stallCount := entry.StallCount
+		if isStallErrorText(errText) {
+			stallCount++
+		}
 		errorPtr := optionalError(errText)
-		o.scheduleRetryLocked(issueID, entry.Identifier, nextAttempt, errorPtr, false)
+		o.scheduleRetryLocked(issueID, entry.Identifier, nextAttempt, errorPtr, false, stallCount)
 	}
 }
 
-func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, attempt int, errText *string, continuation bool) {
+func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, attempt int, errText *string, continuation bool, stallCount int) {
 	if existing := o.state.RetryAttempts[issueID]; existing != nil && existing.TimerHandle != nil {
 		existing.TimerHandle.Stop()
 	}
@@ -746,12 +847,14 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 
 	o.state.Claimed[issueID] = struct{}{}
 	o.state.RetryAttempts[issueID] = &model.RetryEntry{
-		IssueID:     issueID,
-		Identifier:  identifier,
-		Attempt:     attempt,
-		DueAt:       dueAt,
-		TimerHandle: timer,
-		Error:       errText,
+		IssueID:       issueID,
+		Identifier:    identifier,
+		WorkspacePath: workspacePathForIdentifier(o.currentConfig().WorkspaceRoot, identifier),
+		Attempt:       attempt,
+		StallCount:    stallCount,
+		DueAt:         dueAt,
+		TimerHandle:   timer,
+		Error:         errText,
 	}
 }
 
@@ -798,6 +901,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		row := RunningSnapshot{
 			IssueID:             issueID,
 			IssueIdentifier:     entry.Identifier,
+			WorkspacePath:       entry.WorkspacePath,
 			State:               entry.Issue.State,
 			SessionID:           entry.Session.SessionID,
 			TurnCount:           entry.Session.TurnCount,
@@ -807,6 +911,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			OutputTokens:        entry.Session.CodexOutputTokens,
 			TotalTokens:         entry.Session.CodexTotalTokens,
 			CurrentRetryAttempt: entry.RetryAttempt,
+			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
 		}
 		if entry.Session.LastCodexEvent != nil {
 			row.LastEvent = *entry.Session.LastCodexEvent
@@ -820,11 +925,51 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		retrying = append(retrying, RetrySnapshot{
 			IssueID:         issueID,
 			IssueIdentifier: entry.Identifier,
+			WorkspacePath:   entry.WorkspacePath,
 			Attempt:         entry.Attempt,
 			DueAt:           entry.DueAt,
 			Error:           entry.Error,
 		})
 	}
+
+	alerts := make([]AlertSnapshot, 0, len(o.systemAlerts)+len(o.state.RetryAttempts))
+	for _, alert := range o.systemAlerts {
+		alerts = append(alerts, alert)
+	}
+	for issueID, entry := range o.state.RetryAttempts {
+		if entry.Error == nil {
+			continue
+		}
+		errorText := *entry.Error
+		lowerError := strings.ToLower(errorText)
+		switch {
+		case isStallErrorText(errorText) && entry.StallCount > 1:
+			alerts = append(alerts, AlertSnapshot{
+				Code:            "repeated_stall",
+				Level:           "warn",
+				Message:         errorText,
+				IssueID:         issueID,
+				IssueIdentifier: entry.Identifier,
+			})
+		case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
+			alerts = append(alerts, AlertSnapshot{
+				Code:            "workspace_hook_failure",
+				Level:           "warn",
+				Message:         errorText,
+				IssueID:         issueID,
+				IssueIdentifier: entry.Identifier,
+			})
+		}
+	}
+	sort.SliceStable(alerts, func(i int, j int) bool {
+		if alerts[i].Code != alerts[j].Code {
+			return alerts[i].Code < alerts[j].Code
+		}
+		if alerts[i].IssueIdentifier != alerts[j].IssueIdentifier {
+			return alerts[i].IssueIdentifier < alerts[j].IssueIdentifier
+		}
+		return alerts[i].Message < alerts[j].Message
+	})
 
 	totals := o.state.CodexTotals
 	for _, entry := range o.state.Running {
@@ -839,6 +984,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		},
 		Running:     running,
 		Retrying:    retrying,
+		Alerts:      alerts,
 		CodexTotals: totals,
 		RateLimits:  o.state.CodexRateLimits,
 	}
@@ -1151,6 +1297,50 @@ func optionalError(value string) *string {
 	}
 	copyValue := value
 	return &copyValue
+}
+
+func isStallErrorText(errText string) bool {
+	return strings.Contains(strings.ToLower(errText), "stalled session")
+}
+
+func (o *Orchestrator) setSystemAlertLocked(alert AlertSnapshot) {
+	if strings.TrimSpace(alert.Code) == "" {
+		return
+	}
+	o.systemAlerts[alert.Code] = alert
+}
+
+func (o *Orchestrator) clearSystemAlertLocked(code string) {
+	if strings.TrimSpace(code) == "" {
+		return
+	}
+	delete(o.systemAlerts, code)
+}
+
+func attemptCountFromRetry(retryAttempt int) int {
+	if retryAttempt <= 0 {
+		return 1
+	}
+	return retryAttempt + 1
+}
+
+func workspacePathForIdentifier(root string, identifier string) string {
+	cleanRoot := strings.TrimSpace(root)
+	if cleanRoot == "" {
+		return ""
+	}
+	absRoot, err := filepath.Abs(cleanRoot)
+	if err != nil {
+		absRoot = filepath.Clean(cleanRoot)
+	}
+	return filepath.Join(absRoot, model.SanitizeWorkspaceKey(identifier))
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func maxInt(left int, right int) int {

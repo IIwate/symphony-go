@@ -661,7 +661,17 @@ func (r *AppServerRunner) emit(params RunParams, event AgentEvent) {
 		params.OnEvent(event)
 	}
 	if r.logger != nil {
-		r.logger.Debug("agent event", "event", event.Event, "message", event.Message)
+		r.logger.Debug(
+			"agent event",
+			"event", event.Event,
+			"message", event.Message,
+			"attempt", attemptNumber(params.Attempt),
+			"run_phase", runPhaseForEvent(event.Event),
+			"session_id", optionalString(event.SessionID),
+			"thread_id", optionalString(event.ThreadID),
+			"turn_id", optionalString(event.TurnID),
+			"codex_pid", optionalString(event.CodexAppServerPID),
+		)
 	}
 }
 
@@ -693,6 +703,13 @@ func optionalPtr(value string) *string {
 func stringPtr(value string) *string {
 	copyValue := value
 	return &copyValue
+}
+
+func optionalString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func writeJSONLine(writer io.Writer, payload any) error {
@@ -769,36 +786,54 @@ func intID(value any) (int, bool) {
 	}
 }
 
-func extractUsage(payload any) *TokenUsage {
-	result, ok := findUsage(payload)
-	if !ok {
+func extractUsage(message map[string]any) *TokenUsage {
+	if len(message) == 0 {
 		return nil
 	}
-	return &result
+	method, _ := message["method"].(string)
+	lowerMethod := strings.ToLower(strings.TrimSpace(method))
+	switch lowerMethod {
+	case "thread/tokenusage/updated", "codex/event/token_count", "turn/completed", "turn/failed", "turn/cancelled":
+		payload := message
+		if params, ok := message["params"].(map[string]any); ok {
+			payload = params
+		}
+		if usage, ok := usageFromKnownTotals(payload); ok {
+			return &usage
+		}
+	}
+	return nil
 }
 
-func findUsage(payload any) (TokenUsage, bool) {
-	switch typed := payload.(type) {
-	case map[string]any:
-		if usage, ok := usageFromMap(typed); ok {
-			return usage, true
-		}
-		for _, value := range typed {
-			if usage, ok := findUsage(value); ok {
-				return usage, true
-			}
-		}
-	case []any:
-		for _, value := range typed {
-			if usage, ok := findUsage(value); ok {
+func usageFromKnownTotals(payload any) (TokenUsage, bool) {
+	mapping, ok := payload.(map[string]any)
+	if !ok {
+		return TokenUsage{}, false
+	}
+	for _, key := range []string{"total_token_usage", "totalTokenUsage", "token_usage", "tokenUsage", "token_count", "tokenCount"} {
+		if raw, ok := mapping[key]; ok {
+			if usage, ok := usageFromKnownTotals(raw); ok {
 				return usage, true
 			}
 		}
 	}
-	return TokenUsage{}, false
+	for key, raw := range mapping {
+		lowerKey := strings.ToLower(strings.TrimSpace(key))
+		if lowerKey == "last_token_usage" || lowerKey == "lasttokenusage" || lowerKey == "last_usage" || lowerKey == "lastusage" {
+			continue
+		}
+		if usage, ok := usageFromKnownTotals(raw); ok {
+			return usage, true
+		}
+	}
+	return usageFromMap(mapping)
 }
 
-func usageFromMap(mapping map[string]any) (TokenUsage, bool) {
+func usageFromMap(payload any) (TokenUsage, bool) {
+	mapping, ok := payload.(map[string]any)
+	if !ok {
+		return TokenUsage{}, false
+	}
 	input, okInput := int64FromAny(firstNonNil(mapping["inputTokens"], mapping["input_tokens"]))
 	output, okOutput := int64FromAny(firstNonNil(mapping["outputTokens"], mapping["output_tokens"]))
 	total, okTotal := int64FromAny(firstNonNil(mapping["totalTokens"], mapping["total_tokens"]))
@@ -855,6 +890,24 @@ func int64FromAny(value any) (int64, bool) {
 		return parsed, true
 	default:
 		return 0, false
+	}
+}
+
+func attemptNumber(attempt *int) int {
+	if attempt == nil || *attempt <= 0 {
+		return 1
+	}
+	return *attempt + 1
+}
+
+func runPhaseForEvent(event string) string {
+	switch event {
+	case "session_started":
+		return model.PhaseInitializingSession.String()
+	case "turn_completed", "turn_failed", "turn_cancelled", "turn_input_required", "approval_auto_approved", "unsupported_tool_call", "notification", "other_message", "malformed":
+		return model.PhaseStreamingTurn.String()
+	default:
+		return model.PhaseStreamingTurn.String()
 	}
 }
 

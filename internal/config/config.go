@@ -83,6 +83,11 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 		cfg.MaxConcurrentAgentsByState = normalizePositiveIntMap(byState)
 	}
 
+	orchestrator := getMap(configMap, "orchestrator")
+	if autoClose, ok := getBool(orchestrator, "auto_close_on_pr"); ok {
+		cfg.OrchestratorAutoCloseOnPR = autoClose
+	}
+
 	codex := getMap(configMap, "codex")
 	if command := strings.TrimSpace(getString(codex, "command", "")); command != "" {
 		cfg.CodexCommand = command
@@ -149,6 +154,7 @@ func defaultServiceConfig() *model.ServiceConfig {
 		MaxTurns:                   20,
 		MaxRetryBackoffMS:          300000,
 		MaxConcurrentAgentsByState: map[string]int{},
+		OrchestratorAutoCloseOnPR:  true,
 		CodexCommand:               "codex app-server",
 		CodexApprovalPolicy:        "never",
 		CodexThreadSandbox:         "workspace-write",
@@ -271,6 +277,33 @@ func getInt(source map[string]any, key string) (int, bool) {
 		return parsed, true
 	default:
 		return 0, false
+	}
+}
+
+func getBool(source map[string]any, key string) (bool, bool) {
+	if source == nil {
+		return false, false
+	}
+	raw, ok := source[key]
+	if !ok || raw == nil {
+		return false, false
+	}
+
+	switch typed := raw.(type) {
+	case bool:
+		return typed, true
+	case string:
+		trimmed := strings.TrimSpace(strings.ToLower(typed))
+		switch trimmed {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
 	}
 }
 

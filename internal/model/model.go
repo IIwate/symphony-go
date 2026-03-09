@@ -53,6 +53,7 @@ type ServiceConfig struct {
 	MaxTurns                   int
 	MaxRetryBackoffMS          int
 	MaxConcurrentAgentsByState map[string]int
+	OrchestratorAutoCloseOnPR  bool
 	CodexCommand               string
 	CodexApprovalPolicy        string
 	CodexThreadSandbox         string
@@ -98,12 +99,14 @@ type LiveSession struct {
 }
 
 type RetryEntry struct {
-	IssueID     string
-	Identifier  string
-	Attempt     int
-	DueAt       time.Time
-	TimerHandle *time.Timer
-	Error       *string
+	IssueID       string
+	Identifier    string
+	WorkspacePath string
+	Attempt       int
+	StallCount    int
+	DueAt         time.Time
+	TimerHandle   *time.Timer
+	Error         *string
 }
 
 type OrchestratorState struct {
@@ -118,12 +121,14 @@ type OrchestratorState struct {
 }
 
 type RunningEntry struct {
-	Issue        *Issue
-	Identifier   string
-	Session      LiveSession
-	RetryAttempt int
-	StartedAt    time.Time
-	WorkerCancel context.CancelFunc
+	Issue         *Issue
+	Identifier    string
+	WorkspacePath string
+	Session       LiveSession
+	RetryAttempt  int
+	StallCount    int
+	StartedAt     time.Time
+	WorkerCancel  context.CancelFunc
 }
 
 type TokenTotals struct {
@@ -158,6 +163,35 @@ const (
 	PhaseStalled
 	PhaseCanceledByReconciliation
 )
+
+func (p RunPhase) String() string {
+	switch p {
+	case PhasePreparingWorkspace:
+		return "preparing_workspace"
+	case PhaseBuildingPrompt:
+		return "building_prompt"
+	case PhaseLaunchingAgent:
+		return "launching_agent"
+	case PhaseInitializingSession:
+		return "initializing_session"
+	case PhaseStreamingTurn:
+		return "streaming_turn"
+	case PhaseFinishing:
+		return "finishing"
+	case PhaseSucceeded:
+		return "succeeded"
+	case PhaseFailed:
+		return "failed"
+	case PhaseTimedOut:
+		return "timed_out"
+	case PhaseStalled:
+		return "stalled"
+	case PhaseCanceledByReconciliation:
+		return "canceled_by_reconciliation"
+	default:
+		return "unknown"
+	}
+}
 
 type WorkflowError struct {
 	Code    string
