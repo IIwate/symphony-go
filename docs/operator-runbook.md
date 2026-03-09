@@ -115,8 +115,9 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 
 其中：
 
-- `/api/v1/state` 会返回 `alerts` 字段，用于汇总 tracker 不可达、重复 stall、workspace hook 失败等需要 operator 关注的问题
+- `/api/v1/state` 会返回 `alerts` 字段，用于汇总 tracker 不可达、重复 stall、workspace hook 失败、PR merge 状态未知等需要 operator 关注的问题
 - `/api/v1/state` 也会返回 `service.version`、`service.started_at`、`service.uptime_seconds`，用于快速确认当前进程版本和在线时长
+- `/api/v1/state` 也会返回 `awaiting_merge` 与 `counts.awaiting_merge`，用于确认哪些 issue 正在等待 PR 合并
 - `/api/v1/{identifier}` 会返回 `workspace_path`、`last_error`、`attempt_count`，便于按单 issue 排障
 - 服务内部的 `Completed` 集合默认最多保留 `4096` 个 issue ID，仅用于 bookkeeping / 可观测性；它不是完整历史，也不参与重启恢复
 
@@ -226,7 +227,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 当前没有活跃状态 issue
 - Todo issue 被非终态 blocker 阻塞
 - 并发槽位耗尽
-- issue 已处于 claimed / running / retrying
+- issue 已处于 claimed / running / awaiting_merge / retrying
 - 若你在对照 GitHub tracker 草案排查：注意这些规则尚未在当前版本实现
 
 处理：
@@ -271,7 +272,22 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 对确实会长时间无输出的任务，临时调大 `codex.stall_timeout_ms`；若仅用于短时排障，也可设为 `<=0` 暂时关闭 stall detection
 - 在 Windows 上用 `Get-Command bash` 或 `where.exe bash` 确认优先命中 Git Bash；该兼容逻辑为保留项，不应删除
 
-### 8.6 HTTP / SSE 问题
+### 8.6 AwaitingMerge / PR merge gating 问题
+
+常见原因：
+
+- 关联 PR 仍为 open，系统正在等待 merge，而不是继续重跑 agent
+- `gh` CLI 不可用、未认证，或当前工作区无法按 head branch 查询 PR
+- PR 状态查询失败，`/api/v1/state` 中出现 `merge_status_unknown` 告警
+
+处理：
+
+- 先看 `/api/v1/state` 的 `awaiting_merge` 列表，确认 `branch`、`pr_state`、`last_error`
+- 在对应工作区内手动执行 `gh pr list --state all --head <branch> --json number,url,state,mergedAt,headRefName`
+- 若 PR 已 merged 但 issue 未收口，检查 tracker 状态流转权限和日志中的 `post-merge transition` 错误
+- 若 PR 已 closed 但未 merged，等待 orchestrator 在后续 tick 回退到 continuation retry
+
+### 8.7 HTTP / SSE 问题
 
 常见原因：
 
@@ -285,7 +301,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 检查本机端口占用
 - 在本机访问 `127.0.0.1:<port>` 验证，而不是直接从外部地址访问
 
-### 8.7 GitHub API 权限或限流问题（Cycle 5 之后适用，当前版本未实现）
+### 8.8 GitHub API 权限或限流问题（Cycle 5 之后适用，当前版本未实现）
 
 常见原因：
 

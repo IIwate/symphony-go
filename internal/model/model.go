@@ -119,10 +119,25 @@ type RetryEntry struct {
 	Error         *string
 }
 
+type AwaitingMergeEntry struct {
+	Identifier    string
+	State         string
+	WorkspacePath string
+	Branch        string
+	PRNumber      int
+	PRURL         string
+	PRState       string
+	RetryAttempt  int
+	StallCount    int
+	AwaitingSince time.Time
+	LastError     *string
+}
+
 type OrchestratorState struct {
 	PollIntervalMS      int
 	MaxConcurrentAgents int
 	Running             map[string]*RunningEntry
+	AwaitingMerge       map[string]*AwaitingMergeEntry
 	Claimed             map[string]struct{}
 	RetryAttempts       map[string]*RetryEntry
 	Completed           map[string]struct{}

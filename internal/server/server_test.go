@@ -45,8 +45,12 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 		t.Fatalf("service.uptime_seconds = %v, want positive", service["uptime_seconds"])
 	}
 	counts := payload["counts"].(map[string]any)
-	if counts["running"].(float64) != 1 || counts["retrying"].(float64) != 1 {
+	if counts["running"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["retrying"].(float64) != 1 {
 		t.Fatalf("counts = %+v", counts)
+	}
+	awaitingMerge := payload["awaiting_merge"].([]any)
+	if len(awaitingMerge) != 1 {
+		t.Fatalf("awaiting_merge = %+v, want 1 entry", awaitingMerge)
 	}
 	alerts := payload["alerts"].([]any)
 	if len(alerts) != 1 {
@@ -353,8 +357,9 @@ func sampleSnapshot() orchestrator.Snapshot {
 			StartedAt: now.Add(-5 * time.Minute),
 		},
 		Counts: orchestrator.SnapshotCounts{
-			Running:  1,
-			Retrying: 1,
+			Running:       1,
+			AwaitingMerge: 1,
+			Retrying:      1,
 		},
 		Running: []orchestrator.RunningSnapshot{
 			{
@@ -372,6 +377,19 @@ func sampleSnapshot() orchestrator.Snapshot {
 				TotalTokens:         15,
 				CurrentRetryAttempt: 1,
 				AttemptCount:        2,
+			},
+		},
+		AwaitingMerge: []orchestrator.AwaitingMergeSnapshot{
+			{
+				IssueID:         "3",
+				IssueIdentifier: "ABC-3",
+				WorkspacePath:   "C:/work/ABC-3",
+				State:           "In Progress",
+				Branch:          "iiwate/linear-symphony-go-abc-3",
+				PRNumber:        99,
+				PRURL:           "https://example.test/pr/99",
+				PRState:         "open",
+				AwaitingSince:   now.Add(-2 * time.Minute),
 			},
 		},
 		Retrying: []orchestrator.RetrySnapshot{

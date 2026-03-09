@@ -670,7 +670,7 @@ func TestHandleWorkerExitAlreadyTerminal(t *testing.T) {
 	}
 }
 
-func TestHandleWorkerExitHasNewOpenPRTransitionsToDone(t *testing.T) {
+func TestHandleWorkerExitHasNewOpenPRMergedTransitionsToDone(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
 		ActiveStates:              []string{"Todo", "In Progress"},
@@ -690,12 +690,19 @@ func TestHandleWorkerExitHasNewOpenPRTransitionsToDone(t *testing.T) {
 	}
 	workspace := &fakeWorkspaceManager{}
 	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-33-test"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 42, URL: "https://example.test/pr/42", HeadBranch: branch, State: PullRequestStateMerged},
+		},
+	}
 	o.state.Running["1"] = &model.RunningEntry{
-		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
-		Identifier:   "ABC-1",
-		RetryAttempt: 0,
-		StartedAt:    now.Add(-time.Second),
-		WorkerCancel: func() {},
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		RetryAttempt:  0,
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
 	}
 	o.state.Claimed["1"] = struct{}{}
 
@@ -705,7 +712,7 @@ func TestHandleWorkerExitHasNewOpenPRTransitionsToDone(t *testing.T) {
 		StartedAt:    now,
 		Phase:        model.PhaseSucceeded,
 		HasNewOpenPR: true,
-		FinalBranch:  "iiwate4268/iiwate-33-test",
+		FinalBranch:  branch,
 	})
 
 	if tracker.transitionCalls != 1 || tracker.transitionTarget != "Done" {
@@ -716,6 +723,64 @@ func TestHandleWorkerExitHasNewOpenPRTransitionsToDone(t *testing.T) {
 	}
 	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
 		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
+	}
+}
+
+func TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:              []string{"Todo", "In Progress"},
+		TerminalStates:            []string{"Done"},
+		MaxConcurrentAgents:       1,
+		OrchestratorAutoCloseOnPR: true,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-48-await"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 48, URL: "https://example.test/pr/48", HeadBranch: branch, State: PullRequestStateOpen},
+		},
+	}
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		RetryAttempt:  0,
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:      "1",
+		Identifier:   "ABC-1",
+		StartedAt:    now,
+		Phase:        model.PhaseSucceeded,
+		HasNewOpenPR: true,
+		FinalBranch:  branch,
+	})
+
+	if tracker.transitionCalls != 0 {
+		t.Fatalf("transition calls = %d, want 0", tracker.transitionCalls)
+	}
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+	if len(workspace.cleaned) != 0 {
+		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
+	}
+	awaiting := o.state.AwaitingMerge["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting merge entry missing")
+	}
+	if awaiting.Branch != branch || awaiting.PRState != string(PullRequestStateOpen) {
+		t.Fatalf("awaiting merge entry = %+v", awaiting)
 	}
 }
 
@@ -751,7 +816,7 @@ func TestHandleWorkerExitNoNewPRSchedulesContinuation(t *testing.T) {
 	}
 }
 
-func TestHandleWorkerExitTransitionFailureSchedulesBackoffRetry(t *testing.T) {
+func TestHandleWorkerExitMergedPRTransitionFailureSchedulesBackoffRetry(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
 		ActiveStates:              []string{"Todo", "In Progress"},
@@ -768,12 +833,19 @@ func TestHandleWorkerExitTransitionFailureSchedulesBackoffRetry(t *testing.T) {
 	}
 	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
 	o.randFloat = func() float64 { return 0 }
+	branch := "iiwate4268/iiwate-33-test"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 42, URL: "https://example.test/pr/42", HeadBranch: branch, State: PullRequestStateMerged},
+		},
+	}
 	o.state.Running["1"] = &model.RunningEntry{
-		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
-		Identifier:   "ABC-1",
-		RetryAttempt: 0,
-		StartedAt:    now.Add(-time.Second),
-		WorkerCancel: func() {},
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		RetryAttempt:  0,
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
 	}
 
 	o.handleWorkerExit(WorkerResult{
@@ -782,7 +854,7 @@ func TestHandleWorkerExitTransitionFailureSchedulesBackoffRetry(t *testing.T) {
 		StartedAt:    now,
 		Phase:        model.PhaseSucceeded,
 		HasNewOpenPR: true,
-		FinalBranch:  "iiwate4268/iiwate-33-test",
+		FinalBranch:  branch,
 	})
 
 	retry := o.state.RetryAttempts["1"]
@@ -840,6 +912,168 @@ func TestHandleWorkerExitHasNewOpenPRDisabledSchedulesContinuation(t *testing.T)
 	}
 	if retry.DueAt.Sub(now) != time.Second {
 		t.Fatalf("continuation retry delay = %v, want 1s", retry.DueAt.Sub(now))
+	}
+}
+
+func TestReconcileAwaitingMergeMergedClosesIssue(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:              []string{"Todo", "In Progress"},
+		TerminalStates:            []string{"Done"},
+		MaxConcurrentAgents:       1,
+		OrchestratorAutoCloseOnPR: true,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	tracker.onTransition = func(issueID string, targetState string) {
+		trackerIssue := tracker.stateByID[issueID]
+		trackerIssue.State = "Done"
+		tracker.stateByID[issueID] = trackerIssue
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-48-await"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 48, URL: "https://example.test/pr/48", HeadBranch: branch, State: PullRequestStateMerged},
+		},
+	}
+	o.state.AwaitingMerge["1"] = &model.AwaitingMergeEntry{
+		Identifier:    "ABC-1",
+		State:         "In Progress",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        branch,
+		RetryAttempt:  0,
+		AwaitingSince: now.Add(-time.Minute),
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	if tracker.transitionCalls != 1 || tracker.transitionTarget != "Done" {
+		t.Fatalf("transition calls = %d target = %q", tracker.transitionCalls, tracker.transitionTarget)
+	}
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatal("awaiting merge entry still exists")
+	}
+	if _, ok := o.state.Claimed["1"]; ok {
+		t.Fatal("claimed entry still exists")
+	}
+	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
+		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
+	}
+}
+
+func TestReconcileAwaitingMergeClosedSchedulesContinuationRetry(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-48-await"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 48, URL: "https://example.test/pr/48", HeadBranch: branch, State: PullRequestStateClosed},
+		},
+	}
+	o.state.AwaitingMerge["1"] = &model.AwaitingMergeEntry{
+		Identifier:    "ABC-1",
+		State:         "In Progress",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        branch,
+		RetryAttempt:  0,
+		StallCount:    2,
+		AwaitingSince: now.Add(-time.Minute),
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatal("awaiting merge entry still exists")
+	}
+	retry := o.state.RetryAttempts["1"]
+	if retry == nil {
+		t.Fatal("continuation retry missing")
+	}
+	if retry.Attempt != 1 {
+		t.Fatalf("retry attempt = %d, want 1", retry.Attempt)
+	}
+	if retry.DueAt.Sub(now) != time.Second {
+		t.Fatalf("continuation retry delay = %v, want 1s", retry.DueAt.Sub(now))
+	}
+}
+
+func TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-48-await"
+	o.prLookup = &fakePRLookup{
+		errByBranch: map[string]error{
+			branch: errors.New("gh unavailable"),
+		},
+	}
+	o.state.AwaitingMerge["1"] = &model.AwaitingMergeEntry{
+		Identifier:    "ABC-1",
+		State:         "In Progress",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        branch,
+		RetryAttempt:  0,
+		AwaitingSince: now.Add(-time.Minute),
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	awaiting := o.state.AwaitingMerge["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting merge entry missing")
+	}
+	if awaiting.LastError == nil || *awaiting.LastError != "gh unavailable" {
+		t.Fatalf("awaiting merge error = %v, want gh unavailable", awaiting.LastError)
+	}
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+	if !hasAlertCode(o.Snapshot().Alerts, "merge_status_unknown") {
+		t.Fatalf("snapshot alerts = %+v, want merge_status_unknown", o.Snapshot().Alerts)
+	}
+}
+
+func TestIsDispatchEligibleRejectsAwaitingMerge(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.AwaitingMerge["1"] = &model.AwaitingMergeEntry{
+		Identifier:    "ABC-1",
+		State:         "In Progress",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        "iiwate4268/iiwate-48-await",
+		AwaitingSince: now.Add(-time.Minute),
+	}
+
+	eligible := o.isDispatchEligible(model.Issue{
+		ID:         "1",
+		Identifier: "ABC-1",
+		Title:      "Awaiting merge",
+		State:      "In Progress",
+	}, cfg, false)
+	if eligible {
+		t.Fatal("awaiting-merge issue should not be dispatch eligible")
 	}
 }
 
@@ -905,6 +1139,7 @@ func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient *fakeTracker, w
 	o.serviceVersion = "test"
 	o.gitBranchFn = func(context.Context, string) (string, error) { return "", nil }
 	o.openPRHeadsFn = func(context.Context, string) (map[string]struct{}, error) { return map[string]struct{}{}, nil }
+	o.prLookup = &fakePRLookup{byBranch: map[string]*PullRequestInfo{}}
 	return o
 }
 
@@ -988,6 +1223,11 @@ type fakeRunner struct {
 	err   error
 }
 
+type fakePRLookup struct {
+	byBranch    map[string]*PullRequestInfo
+	errByBranch map[string]error
+}
+
 func (f *fakeRunner) Run(ctx context.Context, params agent.RunParams) error {
 	if f.runCh != nil {
 		f.runCh <- params.Issue.Identifier
@@ -1000,6 +1240,23 @@ func (f *fakeRunner) Run(ctx context.Context, params agent.RunParams) error {
 		}
 	}
 	return f.err
+}
+
+func (f *fakePRLookup) FindByHeadBranch(_ context.Context, _ string, headBranch string) (*PullRequestInfo, error) {
+	if f.errByBranch != nil {
+		if err := f.errByBranch[headBranch]; err != nil {
+			return nil, err
+		}
+	}
+	if f.byBranch == nil {
+		return nil, nil
+	}
+	pr := f.byBranch[headBranch]
+	if pr == nil {
+		return nil, nil
+	}
+	copyPR := *pr
+	return &copyPR, nil
 }
 
 func stringPtr(value string) *string {
