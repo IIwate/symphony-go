@@ -2,10 +2,10 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: 93f75f5af725
+  project_slug: db0a2d0d6058
 workspace:
   root: H:/code/temp/symphony_workspaces
-  linear_branch_scope: symphony-go
+  linear_branch_scope: symphony-smoke-test
 hooks:
   before_run: |
     repo_url="${SYMPHONY_GIT_REPO:-https://github.com/IIwate/symphony-go}"

@@ -84,6 +84,16 @@ func TestRenderPromptUnknownVariable(t *testing.T) {
 	}
 }
 
+func TestRenderPromptUnknownFilter(t *testing.T) {
+	_, err := RenderPrompt("{{ issue.title | missing_filter }}", &model.Issue{Title: "Test"}, nil)
+	if err == nil {
+		t.Fatal("RenderPrompt() error = nil, want unknown filter error")
+	}
+	if !errors.Is(err, model.ErrTemplateParseError) && !errors.Is(err, model.ErrTemplateRenderError) {
+		t.Fatalf("RenderPrompt() error = %v, want template parse/render error", err)
+	}
+}
+
 func TestWatchReloadsOnChange(t *testing.T) {
 	path := writeWorkflowFile(t, "first")
 	ctx, cancel := context.WithCancel(context.Background())

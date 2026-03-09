@@ -169,6 +169,7 @@ type stateResponse struct {
 	Counts      stateCounts       `json:"counts"`
 	Running     []runningResponse `json:"running"`
 	Retrying    []retryResponse   `json:"retrying"`
+	Alerts      []alertResponse   `json:"alerts"`
 	CodexTotals totalsResponse    `json:"codex_totals"`
 	RateLimits  any               `json:"rate_limits"`
 }
@@ -200,6 +201,14 @@ type retryResponse struct {
 	Error           *string `json:"error"`
 }
 
+type alertResponse struct {
+	Code            string `json:"code"`
+	Level           string `json:"level"`
+	Message         string `json:"message"`
+	IssueID         string `json:"issue_id,omitempty"`
+	IssueIdentifier string `json:"issue_identifier,omitempty"`
+}
+
 type totalsResponse struct {
 	InputTokens    int64   `json:"input_tokens"`
 	OutputTokens   int64   `json:"output_tokens"`
@@ -208,11 +217,14 @@ type totalsResponse struct {
 }
 
 type issueResponse struct {
-	GeneratedAt string           `json:"generated_at"`
-	Identifier  string           `json:"identifier"`
-	Status      string           `json:"status"`
-	Running     *runningResponse `json:"running"`
-	Retry       *retryResponse   `json:"retry"`
+	GeneratedAt   string           `json:"generated_at"`
+	Identifier    string           `json:"identifier"`
+	Status        string           `json:"status"`
+	WorkspacePath string           `json:"workspace_path,omitempty"`
+	LastError     *string          `json:"last_error"`
+	AttemptCount  int              `json:"attempt_count"`
+	Running       *runningResponse `json:"running"`
+	Retry         *retryResponse   `json:"retry"`
 }
 
 func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
@@ -253,6 +265,17 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
+	alerts := make([]alertResponse, 0, len(snapshot.Alerts))
+	for _, item := range snapshot.Alerts {
+		alerts = append(alerts, alertResponse{
+			Code:            item.Code,
+			Level:           item.Level,
+			Message:         item.Message,
+			IssueID:         item.IssueID,
+			IssueIdentifier: item.IssueIdentifier,
+		})
+	}
+
 	return stateResponse{
 		GeneratedAt: snapshot.GeneratedAt.UTC().Format(time.RFC3339),
 		Counts: stateCounts{
@@ -261,6 +284,7 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		},
 		Running:  running,
 		Retrying: retrying,
+		Alerts:   alerts,
 		CodexTotals: totalsResponse{
 			InputTokens:    snapshot.CodexTotals.InputTokens,
 			OutputTokens:   snapshot.CodexTotals.OutputTokens,
@@ -272,26 +296,57 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 }
 
 func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issueResponse, bool) {
-	state := toStateResponse(snapshot)
-	for _, item := range state.Running {
+	for _, item := range snapshot.Running {
+		var runningLastEventAt *string
+		if item.LastEventAt != nil {
+			text := item.LastEventAt.UTC().Format(time.RFC3339)
+			runningLastEventAt = &text
+		}
 		if item.IssueIdentifier == identifier {
-			copyItem := item
+			copyItem := runningResponse{
+				IssueID:             item.IssueID,
+				IssueIdentifier:     item.IssueIdentifier,
+				State:               item.State,
+				SessionID:           item.SessionID,
+				TurnCount:           item.TurnCount,
+				LastEvent:           item.LastEvent,
+				LastMessage:         item.LastMessage,
+				StartedAt:           item.StartedAt.UTC().Format(time.RFC3339),
+				LastEventAt:         runningLastEventAt,
+				CurrentRetryAttempt: item.CurrentRetryAttempt,
+				Tokens: totalsResponse{
+					InputTokens:  item.InputTokens,
+					OutputTokens: item.OutputTokens,
+					TotalTokens:  item.TotalTokens,
+				},
+			}
 			return issueResponse{
-				GeneratedAt: state.GeneratedAt,
-				Identifier:  identifier,
-				Status:      "running",
-				Running:     &copyItem,
+				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),
+				Identifier:    identifier,
+				Status:        "running",
+				WorkspacePath: item.WorkspacePath,
+				AttemptCount:  item.AttemptCount,
+				Running:       &copyItem,
 			}, true
 		}
 	}
-	for _, item := range state.Retrying {
+	for _, item := range snapshot.Retrying {
 		if item.IssueIdentifier == identifier {
-			copyItem := item
+			copyItem := retryResponse{
+				IssueID:         item.IssueID,
+				IssueIdentifier: item.IssueIdentifier,
+				Attempt:         item.Attempt,
+				DueAt:           item.DueAt.UTC().Format(time.RFC3339),
+				Error:           item.Error,
+			}
 			return issueResponse{
-				GeneratedAt: state.GeneratedAt,
-				Identifier:  identifier,
-				Status:      "retrying",
-				Retry:       &copyItem,
+				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),
+				Identifier:    identifier,
+				Status:        "retrying",
+				WorkspacePath: item.WorkspacePath,
+				LastError:     item.Error,
+				AttemptCount:  item.Attempt,
+				Retry:         &copyItem,
 			}, true
 		}
 	}

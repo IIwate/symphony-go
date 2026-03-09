@@ -111,6 +111,11 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 - `POST /api/v1/refresh`：触发一次立即 refresh
 - `GET /api/v1/events`：SSE 流
 
+其中：
+
+- `/api/v1/state` 会返回 `alerts` 字段，用于汇总 tracker 不可达、重复 stall、workspace hook 失败等需要 operator 关注的问题
+- `/api/v1/{identifier}` 会返回 `workspace_path`、`last_error`、`attempt_count`，便于按单 issue 排障
+
 建议先检查：
 
 ```powershell
@@ -123,11 +128,12 @@ curl http://127.0.0.1:8080/api/v1/state
 - 文件变更后会尝试 reload
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
+- `orchestrator.auto_close_on_pr` 也支持热更新；默认值为 `true`
 
 ### 建议操作方式
 
 - 先修改一小处可验证字段，再观察日志是否出现 reload 成功
-- 对高风险字段（tracker、workspace.root、hooks、codex）变更，先用 `--dry-run` 验证再上服务
+- 对高风险字段（tracker、workspace.root、hooks、codex、orchestrator.auto_close_on_pr）变更，先用 `--dry-run` 验证再上服务
 
 ## 6. Smoke Test 操作指南
 

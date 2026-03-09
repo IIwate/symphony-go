@@ -437,6 +437,79 @@ func TestTerminalEventsStillEmittedWithUsage(t *testing.T) {
 	}
 }
 
+func TestDeltaUsagePayloadIsIgnored(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "thread/tokenUsage/updated", "params": map[string]any{"last_token_usage": map[string]any{"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	events := make([]AgentEvent, 0)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Done"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		OnEvent:        func(event AgentEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	for _, event := range events {
+		if event.Usage != nil {
+			t.Fatalf("unexpected usage extracted from delta payload: %+v", event)
+		}
+	}
+}
+
+func TestCodexEventTokenCountExtractsNestedTotals(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "codex/event/token_count", "params": map[string]any{
+			"usage": map[string]any{
+				"total_token_usage": map[string]any{
+					"input_tokens":  11,
+					"output_tokens": 13,
+					"total_tokens":  24,
+				},
+				"last_token_usage": map[string]any{
+					"input_tokens":  1,
+					"output_tokens": 2,
+					"total_tokens":  3,
+				},
+			},
+		}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	events := make([]AgentEvent, 0)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Done"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		OnEvent:        func(event AgentEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	found := false
+	for _, event := range events {
+		if event.Usage != nil && event.Usage.TotalTokens == 24 && event.Usage.InputTokens == 11 && event.Usage.OutputTokens == 13 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("nested total token usage not extracted: %+v", events)
+	}
+}
+
 func newTestRunner(factory *fakeProcessFactory, readTimeout int, turnTimeout int) Runner {
 	return newTestRunnerWithConfig(factory, &model.ServiceConfig{
 		TrackerKind:            "linear",

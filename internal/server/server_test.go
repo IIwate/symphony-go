@@ -35,6 +35,10 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	if counts["running"].(float64) != 1 || counts["retrying"].(float64) != 1 {
 		t.Fatalf("counts = %+v", counts)
 	}
+	alerts := payload["alerts"].([]any)
+	if len(alerts) != 1 {
+		t.Fatalf("alerts = %+v, want 1 alert", alerts)
+	}
 }
 
 func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
@@ -46,6 +50,30 @@ func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var runningPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &runningPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if runningPayload["workspace_path"] != "C:/work/ABC-1" {
+		t.Fatalf("workspace_path = %v, want C:/work/ABC-1", runningPayload["workspace_path"])
+	}
+	if runningPayload["attempt_count"].(float64) != 2 {
+		t.Fatalf("attempt_count = %v, want 2", runningPayload["attempt_count"])
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-2", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var retryPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &retryPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if retryPayload["last_error"] != "workspace_hook_failed: before_run failed" {
+		t.Fatalf("last_error = %v", retryPayload["last_error"])
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/MISSING", nil)
@@ -183,6 +211,7 @@ func sampleSnapshot() orchestrator.Snapshot {
 			{
 				IssueID:             "1",
 				IssueIdentifier:     "ABC-1",
+				WorkspacePath:       "C:/work/ABC-1",
 				State:               "In Progress",
 				SessionID:           "thread-turn",
 				TurnCount:           2,
@@ -193,16 +222,31 @@ func sampleSnapshot() orchestrator.Snapshot {
 				OutputTokens:        5,
 				TotalTokens:         15,
 				CurrentRetryAttempt: 1,
+				AttemptCount:        2,
 			},
 		},
 		Retrying: []orchestrator.RetrySnapshot{
 			{
 				IssueID:         "2",
 				IssueIdentifier: "ABC-2",
+				WorkspacePath:   "C:/work/ABC-2",
 				Attempt:         3,
 				DueAt:           now.Add(time.Minute),
+				Error:           stringPtr("workspace_hook_failed: before_run failed"),
+			},
+		},
+		Alerts: []orchestrator.AlertSnapshot{
+			{
+				Code:    "tracker_unreachable",
+				Level:   "warn",
+				Message: "tracker down",
 			},
 		},
 		CodexTotals: orchestrator.Snapshot{}.CodexTotals,
 	}
+}
+
+func stringPtr(value string) *string {
+	copyValue := value
+	return &copyValue
 }
