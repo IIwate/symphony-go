@@ -100,6 +100,7 @@ type AwaitingMergeSnapshot struct {
 	PRState         string
 	AwaitingSince   time.Time
 	LastError       *string
+	AttemptCount    int
 }
 
 type AlertSnapshot struct {
@@ -622,6 +623,12 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr, nil)
 			return
 		case PullRequestStateClosed:
+			o.mu.Lock()
+			o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount)
+			o.refreshSnapshotLocked()
+			o.publishSnapshotLocked()
+			o.mu.Unlock()
+			return
 		default:
 			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
 			o.logger.Warn("post-run PR state is unsupported", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch, "state", pr.State)
@@ -1090,6 +1097,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			PRState:         entry.PRState,
 			AwaitingSince:   entry.AwaitingSince,
 			LastError:       entry.LastError,
+			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
 		})
 	}
 	sort.SliceStable(awaitingMerge, func(i int, j int) bool {

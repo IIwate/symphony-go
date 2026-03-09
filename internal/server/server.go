@@ -239,14 +239,15 @@ type totalsResponse struct {
 }
 
 type issueResponse struct {
-	GeneratedAt   string           `json:"generated_at"`
-	Identifier    string           `json:"identifier"`
-	Status        string           `json:"status"`
-	WorkspacePath string           `json:"workspace_path,omitempty"`
-	LastError     *string          `json:"last_error"`
-	AttemptCount  int              `json:"attempt_count"`
-	Running       *runningResponse `json:"running"`
-	Retry         *retryResponse   `json:"retry"`
+	GeneratedAt   string                 `json:"generated_at"`
+	Identifier    string                 `json:"identifier"`
+	Status        string                 `json:"status"`
+	WorkspacePath string                 `json:"workspace_path,omitempty"`
+	LastError     *string                `json:"last_error"`
+	AttemptCount  int                    `json:"attempt_count"`
+	Running       *runningResponse       `json:"running"`
+	AwaitingMerge *awaitingMergeResponse `json:"awaiting_merge"`
+	Retry         *retryResponse         `json:"retry"`
 }
 
 func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
@@ -382,6 +383,31 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 				WorkspacePath: item.WorkspacePath,
 				AttemptCount:  item.AttemptCount,
 				Running:       &copyItem,
+			}, true
+		}
+	}
+	for _, item := range snapshot.AwaitingMerge {
+		if item.IssueIdentifier == identifier {
+			copyItem := awaitingMergeResponse{
+				IssueID:         item.IssueID,
+				IssueIdentifier: item.IssueIdentifier,
+				WorkspacePath:   item.WorkspacePath,
+				State:           item.State,
+				Branch:          item.Branch,
+				PRNumber:        item.PRNumber,
+				PRURL:           item.PRURL,
+				PRState:         item.PRState,
+				AwaitingSince:   item.AwaitingSince.UTC().Format(time.RFC3339),
+				LastError:       item.LastError,
+			}
+			return issueResponse{
+				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),
+				Identifier:    identifier,
+				Status:        "awaiting_merge",
+				WorkspacePath: item.WorkspacePath,
+				LastError:     item.LastError,
+				AttemptCount:  item.AttemptCount,
+				AwaitingMerge: &copyItem,
 			}, true
 		}
 	}

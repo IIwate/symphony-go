@@ -784,6 +784,67 @@ func TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge(t *testing.T) {
 	}
 }
 
+func TestHandleWorkerExitClosedPRSchedulesContinuationRetry(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:              []string{"Todo", "In Progress"},
+		TerminalStates:            []string{"Done"},
+		MaxConcurrentAgents:       1,
+		OrchestratorAutoCloseOnPR: true,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-48-closed"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 48, URL: "https://example.test/pr/48", HeadBranch: branch, State: PullRequestStateClosed},
+		},
+	}
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		RetryAttempt:  0,
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:      "1",
+		Identifier:   "ABC-1",
+		StartedAt:    now,
+		Phase:        model.PhaseSucceeded,
+		HasNewOpenPR: true,
+		FinalBranch:  branch,
+	})
+
+	if tracker.transitionCalls != 0 {
+		t.Fatalf("transition calls = %d, want 0", tracker.transitionCalls)
+	}
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatal("awaiting merge entry should not exist for closed PR")
+	}
+	retry := o.state.RetryAttempts["1"]
+	if retry == nil {
+		t.Fatal("continuation retry missing")
+	}
+	if retry.Attempt != 1 {
+		t.Fatalf("retry attempt = %d, want 1", retry.Attempt)
+	}
+	if retry.DueAt.Sub(now) != time.Second {
+		t.Fatalf("continuation retry delay = %v, want 1s", retry.DueAt.Sub(now))
+	}
+	if len(workspace.cleaned) != 0 {
+		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
+	}
+}
+
 func TestHandleWorkerExitNoNewPRSchedulesContinuation(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{

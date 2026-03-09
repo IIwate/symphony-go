@@ -97,6 +97,27 @@ func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
 		t.Fatalf("last_error = %v", retryPayload["last_error"])
 	}
 
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-3", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var awaitingPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &awaitingPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if awaitingPayload["status"] != "awaiting_merge" {
+		t.Fatalf("status = %v, want awaiting_merge", awaitingPayload["status"])
+	}
+	if awaitingPayload["attempt_count"].(float64) != 1 {
+		t.Fatalf("attempt_count = %v, want 1", awaitingPayload["attempt_count"])
+	}
+	awaitingEntry := awaitingPayload["awaiting_merge"].(map[string]any)
+	if awaitingEntry["pr_state"] != "open" {
+		t.Fatalf("awaiting_merge.pr_state = %v, want open", awaitingEntry["pr_state"])
+	}
+
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/MISSING", nil)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -390,6 +411,7 @@ func sampleSnapshot() orchestrator.Snapshot {
 				PRURL:           "https://example.test/pr/99",
 				PRState:         "open",
 				AwaitingSince:   now.Add(-2 * time.Minute),
+				AttemptCount:    1,
 			},
 		},
 		Retrying: []orchestrator.RetrySnapshot{
