@@ -24,6 +24,8 @@ codex:
 - 当前是第 {{ attempt }} 次继续执行/重试。
 {% endif %}
 
+{{ issue.description }}
+
 请先理解问题，再按仓库工作流完成开发任务。
 
 开始修改前，请先创建并切换到工作分支，格式为 `<namespace>/<issue-short>`。
