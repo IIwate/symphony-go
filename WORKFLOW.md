@@ -2,10 +2,10 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: db0a2d0d6058
+  project_slug: 93f75f5af725
 workspace:
   root: H:/code/temp/symphony_workspaces
-  linear_branch_scope: symphony-smoke-test
+  linear_branch_scope: symphony-go
 hooks:
   before_run: |
     repo_url="${SYMPHONY_GIT_REPO:-https://github.com/IIwate/symphony-go}"
@@ -23,6 +23,8 @@ codex:
 {% if attempt %}
 - 当前是第 {{ attempt }} 次继续执行/重试。
 {% endif %}
+
+{{ issue.description }}
 
 请先理解问题，再按仓库工作流完成开发任务。
 

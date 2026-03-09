@@ -14,6 +14,7 @@
 
 ### 高优先级
 
+- PR Merge Gating — [RFC](../rfcs/pr-merge-gating.md)
 - Charm TUI
 - GitHub Issues tracker — [RFC](../rfcs/github-issues-tracker.md)
 
@@ -25,9 +26,9 @@
 
 ### 低优先级
 
-- Reactions 系统
-- Session 持久化
-- Skills 系统
+- Reactions 系统 — [RFC](../rfcs/reactions-system.md)
+- Session 持久化 — [RFC](../rfcs/session-persistence.md)
+- Skills 系统 — [RFC](../rfcs/skills-system.md)
 
 ## 建议拆法
 
