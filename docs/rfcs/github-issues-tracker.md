@@ -270,6 +270,31 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 - 新增 `ErrMissingTrackerOwner` / `ErrMissingTrackerRepo` typed errors。
 - `tracker.kind=github` 时不再复用 Linear 的 `project_slug` 必填约束，改为校验 `owner` + `repo`。
 
+### `ApplyReload` / 热重载规则
+
+本 RFC 继续复用现有 `runtimeState.ApplyReload` gate：
+
+1. `config.NewFromWorkflow`
+2. 重新应用 CLI override（例如 `--port`）
+3. `ValidateForDispatch`
+4. 检测 restart-required 字段
+5. 仅在全部通过后替换 last known good
+
+其中 `tracker.kind` 必须列为 restart-required。原因不是配置语义，而是 `newTrackerFactory -> NewDynamicClient(...)` 只在启动时决定具体 client 类型：
+
+```go
+if s.config.TrackerKind != newCfg.TrackerKind {
+    return nil, fmt.Errorf("tracker.kind changed from %q to %q: restart required", s.config.TrackerKind, newCfg.TrackerKind)
+}
+```
+
+同一 kind 内的字段仍可热更新：
+
+- `owner` / `repo` / `endpoint` / `state_label_prefix`
+- `active_states` / `terminal_states`
+
+因为具体 client 仍通过 `configProvider()` 读取当前配置。
+
 ## 9. 与现有模块兼容性
 
 | 模块 | 影响 | 说明 |
@@ -282,6 +307,7 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 | `workspace` | 无改动 | 工作目录按 issue ID 创建，与 tracker 无关 |
 | `workflow` | 无改动 | Liquid 模板渲染使用 model.Issue 字段 |
 | `logging` | 无改动 | 秘密过滤已覆盖 token/api_key/authorization，新增 GitHub header 仍可复用现有脱敏逻辑 |
+| `cmd/symphony` | 小改 | 在共享 `ApplyReload` gate 中拒绝 `tracker.kind` 跨实现切换 |
 
 **Core Conformance 不受影响** — 新代码仅在 `tracker.kind=github` 时激活。
 
@@ -300,6 +326,7 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 | `TestGitHubClient_Auth` | Bearer token、Accept、API Version header 验证 |
 | `TestConfig_GitHubValidation` | kind=github 必填字段与 kind-aware 默认值验证 |
 | `TestNewClient_GitHub` | 工厂路由到 GitHubClient |
+| `TestApplyReload_TrackerKindReject` | 运行中切换 `tracker.kind` 被拒绝并保留 last known good |
 
 所有单元测试使用 `httptest.NewServer` 模拟 GitHub REST API。
 
@@ -327,6 +354,7 @@ func TestGitHubIntegration(t *testing.T) {
 | 资源消耗 | GitHub API 速率限制：认证用户 5000 req/h；按默认 30s 轮询 + 2 active states = ~240 req/h，远低于上限 |
 | 监控项 | `X-RateLimit-Remaining` 值应纳入日志；可选：低于阈值时告警 |
 | 依赖变化 | 无新增三方依赖 |
+| 热更新限制 | `tracker.kind` 变更需重启；同一 kind 内字段可热更新 |
 
 ### 配套文档落点
 
@@ -359,6 +387,7 @@ func TestGitHubIntegration(t *testing.T) {
 | `internal/tracker/github.go` | 新建 | GitHubClient 实现 |
 | `internal/tracker/github_test.go` | 新建 | 单元测试 + 可跳过集成测试 |
 | `internal/tracker/linear.go` | 微调 | 移除 Client 接口和 NewClient 工厂（已移至 client.go） |
+| `cmd/symphony/main.go` | 小改 | 在 `ApplyReload` 中加入 `tracker.kind` restart-required 检测 |
 | `docs/operator-runbook.md` | 修改 | 补充 GitHub Token、label 约定与 rate limit 排障说明 |
 | `docs/examples/WORKFLOW.github-issues.md` | 新建 | 提供 GitHub Issues tracker 的最小可复制示例 |
 | `docs/cycles/cycle-05-post-mvp.md` | 微调 | 补充 RFC 链接 |
