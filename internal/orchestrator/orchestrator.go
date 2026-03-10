@@ -40,15 +40,16 @@ type CodexUpdate struct {
 }
 
 type Snapshot struct {
-	GeneratedAt   time.Time
-	Service       ServiceSnapshot
-	Counts        SnapshotCounts
-	Running       []RunningSnapshot
-	AwaitingMerge []AwaitingMergeSnapshot
-	Retrying      []RetrySnapshot
-	Alerts        []AlertSnapshot
-	CodexTotals   model.TokenTotals
-	RateLimits    any
+	GeneratedAt          time.Time
+	Service              ServiceSnapshot
+	Counts               SnapshotCounts
+	Running              []RunningSnapshot
+	AwaitingMerge        []AwaitingMergeSnapshot
+	AwaitingIntervention []AwaitingInterventionSnapshot
+	Retrying             []RetrySnapshot
+	Alerts               []AlertSnapshot
+	CodexTotals          model.TokenTotals
+	RateLimits           any
 }
 
 type ServiceSnapshot struct {
@@ -57,9 +58,10 @@ type ServiceSnapshot struct {
 }
 
 type SnapshotCounts struct {
-	Running       int
-	AwaitingMerge int
-	Retrying      int
+	Running              int
+	AwaitingMerge        int
+	AwaitingIntervention int
+	Retrying             int
 }
 
 type RunningSnapshot struct {
@@ -100,6 +102,18 @@ type AwaitingMergeSnapshot struct {
 	PRState         string
 	AwaitingSince   time.Time
 	LastError       *string
+	AttemptCount    int
+}
+
+type AwaitingInterventionSnapshot struct {
+	IssueID         string
+	IssueIdentifier string
+	WorkspacePath   string
+	Branch          string
+	PRNumber        int
+	PRURL           string
+	PRState         string
+	ObservedAt      time.Time
 	AttemptCount    int
 }
 
@@ -199,11 +213,12 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		shutdownCh:     make(chan struct{}),
 		doneCh:         make(chan struct{}),
 		state: model.OrchestratorState{
-			Running:       map[string]*model.RunningEntry{},
-			AwaitingMerge: map[string]*model.AwaitingMergeEntry{},
-			Claimed:       map[string]struct{}{},
-			RetryAttempts: map[string]*model.RetryEntry{},
-			Completed:     map[string]struct{}{},
+			Running:              map[string]*model.RunningEntry{},
+			AwaitingMerge:        map[string]*model.AwaitingMergeEntry{},
+			AwaitingIntervention: map[string]*model.AwaitingInterventionEntry{},
+			Claimed:              map[string]struct{}{},
+			RetryAttempts:        map[string]*model.RetryEntry{},
+			Completed:            map[string]struct{}{},
 		},
 		subscribers:    map[int]chan Snapshot{},
 		systemAlerts:   map[string]AlertSnapshot{},
@@ -344,6 +359,7 @@ func (o *Orchestrator) tick(ctx context.Context) {
 func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	stateRefreshAttempted, stateRefreshSucceeded := o.reconcileRunning(ctx)
 	o.reconcileAwaitingMerge(ctx)
+	o.reconcileAwaitingIntervention(ctx)
 
 	cfg := o.currentConfig()
 	if err := config.ValidateForDispatch(cfg); err != nil {
@@ -623,11 +639,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr, nil)
 			return
 		case PullRequestStateClosed:
-			o.mu.Lock()
-			o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount)
-			o.refreshSnapshotLocked()
-			o.publishSnapshotLocked()
-			o.mu.Unlock()
+			o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr)
 			return
 		default:
 			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
@@ -858,17 +870,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 		case PullRequestStateMerged:
 			o.tryCompleteMergedPullRequest(ctx, issueID, entry.Identifier, entry.Branch, entry.RetryAttempt, entry.StallCount)
 		case PullRequestStateClosed:
-			o.mu.Lock()
-			current := o.state.AwaitingMerge[issueID]
-			if current == nil {
-				o.mu.Unlock()
-				continue
-			}
-			delete(o.state.AwaitingMerge, issueID)
-			o.scheduleRetryLocked(issueID, current.Identifier, 1, nil, true, current.StallCount)
-			o.refreshSnapshotLocked()
-			o.publishSnapshotLocked()
-			o.mu.Unlock()
+			o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, pr)
 		default:
 			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
 			o.logger.Warn("awaiting-merge PR state is unsupported", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "state", pr.State)
@@ -879,6 +881,58 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				current.PRURL = pr.URL
 				current.PRState = string(pr.State)
 				current.LastError = optionalError(errorText)
+				o.refreshSnapshotLocked()
+				o.publishSnapshotLocked()
+			}
+			o.mu.Unlock()
+		}
+	}
+}
+
+func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
+	o.mu.RLock()
+	pending := make(map[string]model.AwaitingInterventionEntry, len(o.state.AwaitingIntervention))
+	for issueID, entry := range o.state.AwaitingIntervention {
+		if entry == nil {
+			continue
+		}
+		pending[issueID] = *entry
+	}
+	o.mu.RUnlock()
+	if len(pending) == 0 {
+		return
+	}
+
+	cfg := o.currentConfig()
+	ids := make([]string, 0, len(pending))
+	for issueID := range pending {
+		ids = append(ids, issueID)
+	}
+	refreshed, err := o.tracker.FetchIssueStatesByIDs(ctx, ids)
+	if err != nil {
+		o.logger.Warn("awaiting-intervention state refresh failed", "error", err.Error())
+		return
+	}
+
+	byID := make(map[string]model.Issue, len(refreshed))
+	for _, issue := range refreshed {
+		byID[issue.ID] = issue
+	}
+
+	for issueID, entry := range pending {
+		issue, ok := byID[issueID]
+		if !ok {
+			continue
+		}
+		switch {
+		case o.isTerminalState(issue.State, cfg):
+			o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
+		case !o.isActiveState(issue.State, cfg):
+			o.mu.Lock()
+			current := o.state.AwaitingIntervention[issueID]
+			if current != nil {
+				delete(o.state.AwaitingIntervention, issueID)
+				delete(o.state.Claimed, issueID)
 				o.refreshSnapshotLocked()
 				o.publishSnapshotLocked()
 			}
@@ -1150,6 +1204,27 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return awaitingMerge[i].IssueID < awaitingMerge[j].IssueID
 	})
 
+	awaitingIntervention := make([]AwaitingInterventionSnapshot, 0, len(o.state.AwaitingIntervention))
+	for issueID, entry := range o.state.AwaitingIntervention {
+		awaitingIntervention = append(awaitingIntervention, AwaitingInterventionSnapshot{
+			IssueID:         issueID,
+			IssueIdentifier: entry.Identifier,
+			WorkspacePath:   entry.WorkspacePath,
+			Branch:          entry.Branch,
+			PRNumber:        entry.PRNumber,
+			PRURL:           entry.PRURL,
+			PRState:         entry.PRState,
+			ObservedAt:      entry.ObservedAt,
+			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
+		})
+	}
+	sort.SliceStable(awaitingIntervention, func(i int, j int) bool {
+		if awaitingIntervention[i].IssueIdentifier != awaitingIntervention[j].IssueIdentifier {
+			return awaitingIntervention[i].IssueIdentifier < awaitingIntervention[j].IssueIdentifier
+		}
+		return awaitingIntervention[i].IssueID < awaitingIntervention[j].IssueID
+	})
+
 	retrying := make([]RetrySnapshot, 0, len(o.state.RetryAttempts))
 	for issueID, entry := range o.state.RetryAttempts {
 		retrying = append(retrying, RetrySnapshot{
@@ -1225,16 +1300,18 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			StartedAt: o.startedAt,
 		},
 		Counts: SnapshotCounts{
-			Running:       len(running),
-			AwaitingMerge: len(awaitingMerge),
-			Retrying:      len(retrying),
+			Running:              len(running),
+			AwaitingMerge:        len(awaitingMerge),
+			AwaitingIntervention: len(awaitingIntervention),
+			Retrying:             len(retrying),
 		},
-		Running:       running,
-		AwaitingMerge: awaitingMerge,
-		Retrying:      retrying,
-		Alerts:        alerts,
-		CodexTotals:   totals,
-		RateLimits:    o.state.CodexRateLimits,
+		Running:              running,
+		AwaitingMerge:        awaitingMerge,
+		AwaitingIntervention: awaitingIntervention,
+		Retrying:             retrying,
+		Alerts:               alerts,
+		CodexTotals:          totals,
+		RateLimits:           o.state.CodexRateLimits,
 	}
 }
 
@@ -1295,6 +1372,9 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 		return false
 	}
 	if _, ok := o.state.AwaitingMerge[issue.ID]; ok {
+		return false
+	}
+	if _, ok := o.state.AwaitingIntervention[issue.ID]; ok {
 		return false
 	}
 	if !ignoreClaim {
@@ -1406,6 +1486,32 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	o.mu.Unlock()
 }
 
+func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, pr *PullRequestInfo) {
+	entry := &model.AwaitingInterventionEntry{
+		Identifier:    identifier,
+		WorkspacePath: workspacePath,
+		Branch:        branch,
+		RetryAttempt:  retryAttempt,
+		StallCount:    stallCount,
+		ObservedAt:    o.now().UTC(),
+	}
+	if pr != nil {
+		entry.PRNumber = pr.Number
+		entry.PRURL = pr.URL
+		entry.PRState = string(pr.State)
+	}
+
+	o.logger.Warn("issue awaiting manual intervention after PR closed", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "pr_state", entry.PRState)
+
+	o.mu.Lock()
+	delete(o.state.AwaitingMerge, issueID)
+	o.state.Claimed[issueID] = struct{}{}
+	o.state.AwaitingIntervention[issueID] = entry
+	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
+	o.mu.Unlock()
+}
+
 func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, branch string, retryAttempt int, stallCount int) bool {
 	transitioner, ok := o.tracker.(tracker.IssueTransitioner)
 	errorText := ""
@@ -1435,6 +1541,7 @@ func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID
 	}
 	o.mu.Lock()
 	delete(o.state.AwaitingMerge, issueID)
+	delete(o.state.AwaitingIntervention, issueID)
 	o.scheduleRetryLocked(issueID, identifier, nextAttempt, optionalError(errorText), false, stallCount)
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
@@ -1460,6 +1567,7 @@ func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID stri
 
 	o.mu.Lock()
 	delete(o.state.AwaitingMerge, issueID)
+	delete(o.state.AwaitingIntervention, issueID)
 	delete(o.state.Claimed, issueID)
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()

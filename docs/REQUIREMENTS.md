@@ -178,6 +178,7 @@ type ServiceConfig struct {
     TrackerEndpoint   string   // 默认 "https://api.linear.app/graphql"
     TrackerAPIKey     string   // 支持 $VAR 间接引用
     TrackerProjectSlug string  // tracker.kind=linear 时必填
+    TrackerLinearChildrenBlockParent bool // 默认 true；Linear 父任务被未终态子任务阻塞
     ActiveStates      []string // 默认 ["Todo", "In Progress"]
     TerminalStates    []string // 默认 ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
 
@@ -523,8 +524,15 @@ type Client interface {
 **Issue 归一化**（SPEC §11.3）：
 - `labels` → `strings.ToLower`
 - `blocked_by` → 从 inverse relations 中提取 type=`blocks` 的记录
+- `[实现扩展]` `tracker.linear.children_block_parent=true` 时，将未终态 children 也归一化为父任务的 `blocked_by`
 - `priority` → 仅整数，非整数变 nil
 - `created_at`/`updated_at` → 解析 ISO-8601
+
+**层级阻塞语义**：
+- 默认开启 `tracker.linear.children_block_parent=true`
+- 只在父任务仍处于 `Todo`、尚未被调度时生效
+- 它复用现有 `BlockedBy` 判定，不新增独立状态机
+- 若父任务已经进入 `In Progress` / `Running`，后续再出现子任务不回头中断或回收
 
 **空输入处理**：
 - `FetchIssuesByStates([])` → 直接返回空切片，不发 API 请求
@@ -550,6 +558,8 @@ type Client interface {
 - [ ] 空 states 列表不发 API 请求
 - [ ] 分页跨多页保持顺序
 - [ ] Blockers 从 type=blocks 的 inverse relations 归一化
+- [ ] `tracker.linear.children_block_parent=true` 时，未终态 children 会阻塞父任务调度
+- [ ] children 全部终态时，不再阻塞父任务调度
 - [ ] Labels 归一化为小写
 - [ ] Issue 状态刷新查询使用 `[ID!]` 类型
 - [ ] 各种 HTTP/GraphQL 错误正确映射

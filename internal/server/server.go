@@ -165,15 +165,16 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 }
 
 type stateResponse struct {
-	GeneratedAt   string                  `json:"generated_at"`
-	Service       serviceResponse         `json:"service"`
-	Counts        stateCounts             `json:"counts"`
-	Running       []runningResponse       `json:"running"`
-	AwaitingMerge []awaitingMergeResponse `json:"awaiting_merge"`
-	Retrying      []retryResponse         `json:"retrying"`
-	Alerts        []alertResponse         `json:"alerts"`
-	CodexTotals   totalsResponse          `json:"codex_totals"`
-	RateLimits    any                     `json:"rate_limits"`
+	GeneratedAt          string                         `json:"generated_at"`
+	Service              serviceResponse                `json:"service"`
+	Counts               stateCounts                    `json:"counts"`
+	Running              []runningResponse              `json:"running"`
+	AwaitingMerge        []awaitingMergeResponse        `json:"awaiting_merge"`
+	AwaitingIntervention []awaitingInterventionResponse `json:"awaiting_intervention"`
+	Retrying             []retryResponse                `json:"retrying"`
+	Alerts               []alertResponse                `json:"alerts"`
+	CodexTotals          totalsResponse                 `json:"codex_totals"`
+	RateLimits           any                            `json:"rate_limits"`
 }
 
 type serviceResponse struct {
@@ -183,9 +184,10 @@ type serviceResponse struct {
 }
 
 type stateCounts struct {
-	Running       int `json:"running"`
-	AwaitingMerge int `json:"awaiting_merge"`
-	Retrying      int `json:"retrying"`
+	Running              int `json:"running"`
+	AwaitingMerge        int `json:"awaiting_merge"`
+	AwaitingIntervention int `json:"awaiting_intervention"`
+	Retrying             int `json:"retrying"`
 }
 
 type runningResponse struct {
@@ -223,6 +225,17 @@ type awaitingMergeResponse struct {
 	LastError       *string `json:"last_error"`
 }
 
+type awaitingInterventionResponse struct {
+	IssueID         string `json:"issue_id"`
+	IssueIdentifier string `json:"issue_identifier"`
+	WorkspacePath   string `json:"workspace_path"`
+	Branch          string `json:"branch"`
+	PRNumber        int    `json:"pr_number"`
+	PRURL           string `json:"pr_url"`
+	PRState         string `json:"pr_state"`
+	ObservedAt      string `json:"observed_at"`
+}
+
 type alertResponse struct {
 	Code            string `json:"code"`
 	Level           string `json:"level"`
@@ -239,15 +252,16 @@ type totalsResponse struct {
 }
 
 type issueResponse struct {
-	GeneratedAt   string                 `json:"generated_at"`
-	Identifier    string                 `json:"identifier"`
-	Status        string                 `json:"status"`
-	WorkspacePath string                 `json:"workspace_path,omitempty"`
-	LastError     *string                `json:"last_error"`
-	AttemptCount  int                    `json:"attempt_count"`
-	Running       *runningResponse       `json:"running"`
-	AwaitingMerge *awaitingMergeResponse `json:"awaiting_merge"`
-	Retry         *retryResponse         `json:"retry"`
+	GeneratedAt          string                        `json:"generated_at"`
+	Identifier           string                        `json:"identifier"`
+	Status               string                        `json:"status"`
+	WorkspacePath        string                        `json:"workspace_path,omitempty"`
+	LastError            *string                       `json:"last_error"`
+	AttemptCount         int                           `json:"attempt_count"`
+	Running              *runningResponse              `json:"running"`
+	AwaitingMerge        *awaitingMergeResponse        `json:"awaiting_merge"`
+	AwaitingIntervention *awaitingInterventionResponse `json:"awaiting_intervention"`
+	Retry                *retryResponse                `json:"retry"`
 }
 
 func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
@@ -303,6 +317,20 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
+	awaitingIntervention := make([]awaitingInterventionResponse, 0, len(snapshot.AwaitingIntervention))
+	for _, item := range snapshot.AwaitingIntervention {
+		awaitingIntervention = append(awaitingIntervention, awaitingInterventionResponse{
+			IssueID:         item.IssueID,
+			IssueIdentifier: item.IssueIdentifier,
+			WorkspacePath:   item.WorkspacePath,
+			Branch:          item.Branch,
+			PRNumber:        item.PRNumber,
+			PRURL:           item.PRURL,
+			PRState:         item.PRState,
+			ObservedAt:      item.ObservedAt.UTC().Format(time.RFC3339),
+		})
+	}
+
 	retrying := make([]retryResponse, 0, len(snapshot.Retrying))
 	for _, item := range snapshot.Retrying {
 		retrying = append(retrying, retryResponse{
@@ -333,14 +361,16 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 			UptimeSeconds: uptimeSeconds,
 		},
 		Counts: stateCounts{
-			Running:       snapshot.Counts.Running,
-			AwaitingMerge: snapshot.Counts.AwaitingMerge,
-			Retrying:      snapshot.Counts.Retrying,
+			Running:              snapshot.Counts.Running,
+			AwaitingMerge:        snapshot.Counts.AwaitingMerge,
+			AwaitingIntervention: snapshot.Counts.AwaitingIntervention,
+			Retrying:             snapshot.Counts.Retrying,
 		},
-		Running:       running,
-		AwaitingMerge: awaitingMerge,
-		Retrying:      retrying,
-		Alerts:        alerts,
+		Running:              running,
+		AwaitingMerge:        awaitingMerge,
+		AwaitingIntervention: awaitingIntervention,
+		Retrying:             retrying,
+		Alerts:               alerts,
 		CodexTotals: totalsResponse{
 			InputTokens:    snapshot.CodexTotals.InputTokens,
 			OutputTokens:   snapshot.CodexTotals.OutputTokens,
@@ -408,6 +438,28 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 				LastError:     item.LastError,
 				AttemptCount:  item.AttemptCount,
 				AwaitingMerge: &copyItem,
+			}, true
+		}
+	}
+	for _, item := range snapshot.AwaitingIntervention {
+		if item.IssueIdentifier == identifier {
+			copyItem := awaitingInterventionResponse{
+				IssueID:         item.IssueID,
+				IssueIdentifier: item.IssueIdentifier,
+				WorkspacePath:   item.WorkspacePath,
+				Branch:          item.Branch,
+				PRNumber:        item.PRNumber,
+				PRURL:           item.PRURL,
+				PRState:         item.PRState,
+				ObservedAt:      item.ObservedAt.UTC().Format(time.RFC3339),
+			}
+			return issueResponse{
+				GeneratedAt:          snapshot.GeneratedAt.UTC().Format(time.RFC3339),
+				Identifier:           identifier,
+				Status:               "awaiting_intervention",
+				WorkspacePath:        item.WorkspacePath,
+				AttemptCount:         item.AttemptCount,
+				AwaitingIntervention: &copyItem,
 			}, true
 		}
 	}

@@ -14,7 +14,7 @@
 
 ### 高优先级
 
-- PR Merge Gating（已落地：merge-aware auto-close + `AwaitingMerge`；当前实现见 `../FLOW.md`，后续演进见 [RFC](../rfcs/pr-merge-gating.md)）
+- PR Merge Gating（已落地：merge-aware auto-close + `AwaitingMerge` / `AwaitingIntervention`；当前实现见 `../FLOW.md`，后续演进见 [RFC](../rfcs/archive/pr-merge-gating.md)）
 - Charm TUI
 - GitHub Issues tracker — [RFC](../rfcs/github-issues-tracker.md)
 

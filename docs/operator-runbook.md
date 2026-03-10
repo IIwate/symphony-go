@@ -117,8 +117,8 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 
 - `/api/v1/state` 会返回 `alerts` 字段，用于汇总 tracker 不可达、重复 stall、workspace hook 失败、PR merge 状态未知等需要 operator 关注的问题
 - `/api/v1/state` 也会返回 `service.version`、`service.started_at`、`service.uptime_seconds`，用于快速确认当前进程版本和在线时长
-- `/api/v1/state` 也会返回 `awaiting_merge` 与 `counts.awaiting_merge`，用于确认哪些 issue 正在等待 PR 合并
-- `/api/v1/{identifier}` 会返回 `workspace_path`、`last_error`、`attempt_count`，便于按单 issue 排障
+- `/api/v1/state` 也会返回 `awaiting_merge`、`awaiting_intervention` 以及对应计数，用于确认哪些 issue 正在等待 PR 合并或等待人工介入
+- `/api/v1/{identifier}` 会返回 `status`、`workspace_path`、`last_error`、`attempt_count`，便于按单 issue 排障
 - 服务内部的 `Completed` 集合默认最多保留 `4096` 个 issue ID，仅用于 bookkeeping / 可观测性；它不是完整历史，也不参与重启恢复
 
 建议先检查：
@@ -226,14 +226,16 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - 当前没有活跃状态 issue
 - Todo issue 被非终态 blocker 阻塞
+- Linear 默认开启 `tracker.linear.children_block_parent=true`，因此父任务也可能被未完成子任务阻塞
 - 并发槽位耗尽
-- issue 已处于 claimed / running / awaiting_merge / retrying
+- issue 已处于 claimed / running / awaiting_merge / awaiting_intervention / retrying
 - 若你在对照 GitHub tracker 草案排查：注意这些规则尚未在当前版本实现
 
 处理：
 
 - 检查 `/api/v1/state`
 - 检查日志中的 `retrying` / slots / blocker 相关信息
+- 若是 Linear 父任务未被调度，检查 UI / GraphQL 中该 issue 是否仍有未终态 children
 - 手动调用 `/api/v1/refresh`
 
 ### 8.4 工作区问题
@@ -272,20 +274,21 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 对确实会长时间无输出的任务，临时调大 `codex.stall_timeout_ms`；若仅用于短时排障，也可设为 `<=0` 暂时关闭 stall detection
 - 在 Windows 上用 `Get-Command bash` 或 `where.exe bash` 确认优先命中 Git Bash；该兼容逻辑为保留项，不应删除
 
-### 8.6 AwaitingMerge / PR merge gating 问题
+### 8.6 AwaitingMerge / AwaitingIntervention / PR merge gating 问题
 
 常见原因：
 
 - 关联 PR 仍为 open，系统正在等待 merge，而不是继续重跑 agent
 - `gh` CLI 不可用、未认证，或当前工作区无法按 head branch 查询 PR
 - PR 状态查询失败，`/api/v1/state` 中出现 `merge_status_unknown` 告警
+- PR 已 closed 但未 merged，issue 被转入 `awaiting_intervention`，不会自动 retry / re-dispatch
 
 处理：
 
-- 先看 `/api/v1/state` 的 `awaiting_merge` 列表，确认 `branch`、`pr_state`、`last_error`
+- 先看 `/api/v1/state` 的 `awaiting_merge` / `awaiting_intervention` 列表，确认 `branch`、`pr_state`、`last_error`
 - 在对应工作区内手动执行 `gh pr list --state all --head <branch> --json number,url,state,mergedAt,headRefName`
 - 若 PR 已 merged 但 issue 未收口，检查 tracker 状态流转权限和日志中的 `post-merge transition` 错误
-- 若 PR 已 closed 但未 merged，等待 orchestrator 在后续 tick 回退到 continuation retry
+- 若 PR 已 closed 但未 merged，按人工决策处理：手动收口 issue，或先把 issue 调整到非 active state 释放 claim，再恢复到 active state 重新参与调度
 
 ### 8.7 HTTP / SSE 问题
 

@@ -22,6 +22,7 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 				"kind":            "linear",
 				"api_key":         "$LINEAR_API_KEY",
 				"project_slug":    "demo",
+				"linear":          map[string]any{"children_block_parent": false},
 				"repo":            "ignored-repo",
 				"active_states":   "Todo, In Progress",
 				"terminal_states": []any{"Closed", "Done"},
@@ -61,6 +62,9 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 
 	if cfg.TrackerAPIKey != "secret-key" {
 		t.Fatalf("TrackerAPIKey = %q, want secret-key", cfg.TrackerAPIKey)
+	}
+	if cfg.TrackerLinearChildrenBlockParent {
+		t.Fatal("TrackerLinearChildrenBlockParent = true, want false")
 	}
 	if cfg.PollIntervalMS != 45000 {
 		t.Fatalf("PollIntervalMS = %d, want 45000", cfg.PollIntervalMS)
@@ -179,6 +183,9 @@ func TestNewFromWorkflowFallsBackToDefaultHookTimeoutForNonPositiveValues(t *tes
 			}
 			if cfg.HookTimeoutMS != 60000 {
 				t.Fatalf("HookTimeoutMS = %d, want default 60000", cfg.HookTimeoutMS)
+			}
+			if !cfg.TrackerLinearChildrenBlockParent {
+				t.Fatal("TrackerLinearChildrenBlockParent = false, want default true")
 			}
 		})
 	}

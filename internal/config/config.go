@@ -33,6 +33,10 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	}
 	cfg.TrackerAPIKey = resolveEnvString(strings.TrimSpace(getString(tracker, "api_key", "")))
 	cfg.TrackerProjectSlug = strings.TrimSpace(getString(tracker, "project_slug", ""))
+	linear := getMap(tracker, "linear")
+	if enabled, ok := getBool(linear, "children_block_parent"); ok {
+		cfg.TrackerLinearChildrenBlockParent = enabled
+	}
 	cfg.TrackerRepo = strings.TrimSpace(getString(tracker, "repo", ""))
 	if states, ok := getStringSlice(tracker, "active_states"); ok && len(states) > 0 {
 		cfg.ActiveStates = states
@@ -144,24 +148,25 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 
 func defaultServiceConfig() *model.ServiceConfig {
 	return &model.ServiceConfig{
-		TrackerEndpoint:            "https://api.linear.app/graphql",
-		ActiveStates:               []string{"Todo", "In Progress"},
-		TerminalStates:             []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"},
-		PollIntervalMS:             30000,
-		WorkspaceRoot:              filepath.Join(os.TempDir(), "symphony_workspaces"),
-		HookTimeoutMS:              60000,
-		MaxConcurrentAgents:        10,
-		MaxTurns:                   20,
-		MaxRetryBackoffMS:          300000,
-		MaxConcurrentAgentsByState: map[string]int{},
-		OrchestratorAutoCloseOnPR:  true,
-		CodexCommand:               "codex app-server",
-		CodexApprovalPolicy:        "never",
-		CodexThreadSandbox:         "workspace-write",
-		CodexTurnSandboxPolicy:     `{"type":"workspaceWrite"}`,
-		CodexTurnTimeoutMS:         3600000,
-		CodexReadTimeoutMS:         5000,
-		CodexStallTimeoutMS:        300000,
+		TrackerEndpoint:                  "https://api.linear.app/graphql",
+		TrackerLinearChildrenBlockParent: true,
+		ActiveStates:                     []string{"Todo", "In Progress"},
+		TerminalStates:                   []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"},
+		PollIntervalMS:                   30000,
+		WorkspaceRoot:                    filepath.Join(os.TempDir(), "symphony_workspaces"),
+		HookTimeoutMS:                    60000,
+		MaxConcurrentAgents:              10,
+		MaxTurns:                         20,
+		MaxRetryBackoffMS:                300000,
+		MaxConcurrentAgentsByState:       map[string]int{},
+		OrchestratorAutoCloseOnPR:        true,
+		CodexCommand:                     "codex app-server",
+		CodexApprovalPolicy:              "never",
+		CodexThreadSandbox:               "workspace-write",
+		CodexTurnSandboxPolicy:           `{"type":"workspaceWrite"}`,
+		CodexTurnTimeoutMS:               3600000,
+		CodexReadTimeoutMS:               5000,
+		CodexStallTimeoutMS:              300000,
 	}
 }
 

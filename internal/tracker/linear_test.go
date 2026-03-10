@@ -119,6 +119,103 @@ func TestFetchCandidateIssuesPaginatesAndNormalizes(t *testing.T) {
 	}
 }
 
+func TestFetchCandidateIssuesTreatsUnfinishedChildrenAsBlockers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBody(t, r.Body)
+		if !strings.Contains(body.Query, "children") {
+			t.Fatalf("query missing children field: %s", body.Query)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"issues": {
+					"nodes": [
+						{
+							"id": "1",
+							"identifier": "ABC-1",
+							"title": "Parent",
+							"state": {"name": "Todo"},
+							"labels": {"nodes": []},
+							"inverseRelations": {"nodes": []},
+							"children": {"nodes": [
+								{"id": "2", "identifier": "ABC-2", "state": {"name": "In Progress"}},
+								{"id": "3", "identifier": "ABC-3", "state": {"name": "Done"}}
+							]}
+						}
+					],
+					"pageInfo": {"hasNextPage": false, "endCursor": null}
+				}
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	client := newTestLinearClient(t, server.URL)
+	issues, err := client.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues() error = %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("issues len = %d, want 1", len(issues))
+	}
+	if len(issues[0].BlockedBy) != 1 {
+		t.Fatalf("blockedBy len = %d, want 1", len(issues[0].BlockedBy))
+	}
+	if issues[0].BlockedBy[0].Identifier == nil || *issues[0].BlockedBy[0].Identifier != "ABC-2" {
+		t.Fatalf("blockedBy = %+v, want child ABC-2", issues[0].BlockedBy)
+	}
+}
+
+func TestFetchCandidateIssuesCanDisableChildBlockers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"issues": {
+					"nodes": [
+						{
+							"id": "1",
+							"identifier": "ABC-1",
+							"title": "Parent",
+							"state": {"name": "Todo"},
+							"labels": {"nodes": []},
+							"inverseRelations": {"nodes": []},
+							"children": {"nodes": [
+								{"id": "2", "identifier": "ABC-2", "state": {"name": "Todo"}}
+							]}
+						}
+					],
+					"pageInfo": {"hasNextPage": false, "endCursor": null}
+				}
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	client, err := NewLinearClient(&model.ServiceConfig{
+		TrackerEndpoint:                  server.URL,
+		TrackerAPIKey:                    "secret",
+		TrackerProjectSlug:               "demo",
+		TrackerLinearChildrenBlockParent: false,
+		ActiveStates:                     []string{"Todo", "In Progress"},
+		TerminalStates:                   []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"},
+	}, serverHTTPClient())
+	if err != nil {
+		t.Fatalf("NewLinearClient() error = %v", err)
+	}
+
+	issues, err := client.FetchCandidateIssues(context.Background())
+	if err != nil {
+		t.Fatalf("FetchCandidateIssues() error = %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("issues len = %d, want 1", len(issues))
+	}
+	if len(issues[0].BlockedBy) != 0 {
+		t.Fatalf("blockedBy = %+v, want empty when disabled", issues[0].BlockedBy)
+	}
+}
+
 func TestFetchIssueStatesByIDsUsesIDType(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := decodeRequestBody(t, r.Body)
@@ -316,10 +413,12 @@ func newTestLinearClientWithHTTP(t *testing.T, endpoint string, httpClient *http
 	t.Helper()
 
 	client, err := NewLinearClient(&model.ServiceConfig{
-		TrackerEndpoint:    endpoint,
-		TrackerAPIKey:      "secret",
-		TrackerProjectSlug: "demo",
-		ActiveStates:       []string{"Todo", "In Progress"},
+		TrackerEndpoint:                  endpoint,
+		TrackerAPIKey:                    "secret",
+		TrackerProjectSlug:               "demo",
+		TrackerLinearChildrenBlockParent: true,
+		ActiveStates:                     []string{"Todo", "In Progress"},
+		TerminalStates:                   []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"},
 	}, httpClient)
 	if err != nil {
 		t.Fatalf("NewLinearClient() error = %v", err)

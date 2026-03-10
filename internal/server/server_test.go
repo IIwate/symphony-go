@@ -45,12 +45,16 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 		t.Fatalf("service.uptime_seconds = %v, want positive", service["uptime_seconds"])
 	}
 	counts := payload["counts"].(map[string]any)
-	if counts["running"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["retrying"].(float64) != 1 {
+	if counts["running"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["awaiting_intervention"].(float64) != 1 || counts["retrying"].(float64) != 1 {
 		t.Fatalf("counts = %+v", counts)
 	}
 	awaitingMerge := payload["awaiting_merge"].([]any)
 	if len(awaitingMerge) != 1 {
 		t.Fatalf("awaiting_merge = %+v, want 1 entry", awaitingMerge)
+	}
+	awaitingIntervention := payload["awaiting_intervention"].([]any)
+	if len(awaitingIntervention) != 1 {
+		t.Fatalf("awaiting_intervention = %+v, want 1 entry", awaitingIntervention)
 	}
 	alerts := payload["alerts"].([]any)
 	if len(alerts) != 1 {
@@ -116,6 +120,27 @@ func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
 	awaitingEntry := awaitingPayload["awaiting_merge"].(map[string]any)
 	if awaitingEntry["pr_state"] != "open" {
 		t.Fatalf("awaiting_merge.pr_state = %v, want open", awaitingEntry["pr_state"])
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-4", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var interventionPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &interventionPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if interventionPayload["status"] != "awaiting_intervention" {
+		t.Fatalf("status = %v, want awaiting_intervention", interventionPayload["status"])
+	}
+	if interventionPayload["attempt_count"].(float64) != 2 {
+		t.Fatalf("attempt_count = %v, want 2", interventionPayload["attempt_count"])
+	}
+	interventionEntry := interventionPayload["awaiting_intervention"].(map[string]any)
+	if interventionEntry["pr_state"] != "closed" {
+		t.Fatalf("awaiting_intervention.pr_state = %v, want closed", interventionEntry["pr_state"])
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/MISSING", nil)
@@ -378,9 +403,10 @@ func sampleSnapshot() orchestrator.Snapshot {
 			StartedAt: now.Add(-5 * time.Minute),
 		},
 		Counts: orchestrator.SnapshotCounts{
-			Running:       1,
-			AwaitingMerge: 1,
-			Retrying:      1,
+			Running:              1,
+			AwaitingMerge:        1,
+			AwaitingIntervention: 1,
+			Retrying:             1,
 		},
 		Running: []orchestrator.RunningSnapshot{
 			{
@@ -412,6 +438,19 @@ func sampleSnapshot() orchestrator.Snapshot {
 				PRState:         "open",
 				AwaitingSince:   now.Add(-2 * time.Minute),
 				AttemptCount:    1,
+			},
+		},
+		AwaitingIntervention: []orchestrator.AwaitingInterventionSnapshot{
+			{
+				IssueID:         "4",
+				IssueIdentifier: "ABC-4",
+				WorkspacePath:   "C:/work/ABC-4",
+				Branch:          "iiwate/linear-symphony-go-abc-4",
+				PRNumber:        100,
+				PRURL:           "https://example.test/pr/100",
+				PRState:         "closed",
+				ObservedAt:      now.Add(-3 * time.Minute),
+				AttemptCount:    2,
 			},
 		},
 		Retrying: []orchestrator.RetrySnapshot{

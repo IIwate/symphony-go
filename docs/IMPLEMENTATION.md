@@ -114,6 +114,12 @@ cmd/symphony → orchestrator → tracker (interface)
 - **OrchState**: Unclaimed → Claimed → Running → RetryQueued → Released
 - **RunPhase**: PreparingWorkspace → BuildingPrompt → LaunchingAgent → ... → Succeeded/Failed/TimedOut/Stalled
 
+补充约定：
+
+- 当前 `BlockedBy` 不只承载显式 `blocks` relation
+- 在 `Linear` 且 `tracker.linear.children_block_parent=true` 时，父任务的未终态 children 也会投影为 `BlockedBy`
+- orchestrator 仍只在 dispatch 前使用这组 blocker 信息，不回头干预已运行任务
+
 ---
 
 ## 核心流程

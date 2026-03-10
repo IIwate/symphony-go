@@ -784,7 +784,7 @@ func TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge(t *testing.T) {
 	}
 }
 
-func TestHandleWorkerExitClosedPRSchedulesContinuationRetry(t *testing.T) {
+func TestHandleWorkerExitClosedPRMovesToAwaitingIntervention(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
 		ActiveStates:              []string{"Todo", "In Progress"},
@@ -830,15 +830,18 @@ func TestHandleWorkerExitClosedPRSchedulesContinuationRetry(t *testing.T) {
 	if _, ok := o.state.AwaitingMerge["1"]; ok {
 		t.Fatal("awaiting merge entry should not exist for closed PR")
 	}
-	retry := o.state.RetryAttempts["1"]
-	if retry == nil {
-		t.Fatal("continuation retry missing")
+	awaiting := o.state.AwaitingIntervention["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting intervention entry missing")
 	}
-	if retry.Attempt != 1 {
-		t.Fatalf("retry attempt = %d, want 1", retry.Attempt)
+	if awaiting.Branch != branch || awaiting.PRState != string(PullRequestStateClosed) {
+		t.Fatalf("awaiting intervention entry = %+v", awaiting)
 	}
-	if retry.DueAt.Sub(now) != time.Second {
-		t.Fatalf("continuation retry delay = %v, want 1s", retry.DueAt.Sub(now))
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+	if _, ok := o.state.Claimed["1"]; !ok {
+		t.Fatal("claimed entry should be retained while awaiting intervention")
 	}
 	if len(workspace.cleaned) != 0 {
 		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
@@ -1126,7 +1129,7 @@ func TestReconcileAwaitingMergeNonActiveIssueReleasesClaimWithoutCleanup(t *test
 	}
 }
 
-func TestReconcileAwaitingMergeClosedSchedulesContinuationRetry(t *testing.T) {
+func TestReconcileAwaitingMergeClosedMovesToAwaitingIntervention(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
 		ActiveStates:        []string{"Todo", "In Progress"},
@@ -1156,15 +1159,18 @@ func TestReconcileAwaitingMergeClosedSchedulesContinuationRetry(t *testing.T) {
 	if _, ok := o.state.AwaitingMerge["1"]; ok {
 		t.Fatal("awaiting merge entry still exists")
 	}
-	retry := o.state.RetryAttempts["1"]
-	if retry == nil {
-		t.Fatal("continuation retry missing")
+	awaiting := o.state.AwaitingIntervention["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting intervention entry missing")
 	}
-	if retry.Attempt != 1 {
-		t.Fatalf("retry attempt = %d, want 1", retry.Attempt)
+	if awaiting.PRState != string(PullRequestStateClosed) {
+		t.Fatalf("awaiting intervention entry = %+v", awaiting)
 	}
-	if retry.DueAt.Sub(now) != time.Second {
-		t.Fatalf("continuation retry delay = %v, want 1s", retry.DueAt.Sub(now))
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+	if _, ok := o.state.Claimed["1"]; !ok {
+		t.Fatal("claimed entry should be retained while awaiting intervention")
 	}
 }
 
@@ -1233,6 +1239,80 @@ func TestIsDispatchEligibleRejectsAwaitingMerge(t *testing.T) {
 	}, cfg, false)
 	if eligible {
 		t.Fatal("awaiting-merge issue should not be dispatch eligible")
+	}
+}
+
+func TestIsDispatchEligibleRejectsAwaitingIntervention(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.AwaitingIntervention["1"] = &model.AwaitingInterventionEntry{
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        "iiwate4268/iiwate-48-await",
+		PRNumber:      48,
+		PRURL:         "https://example.test/pr/48",
+		PRState:       string(PullRequestStateClosed),
+		ObservedAt:    now.Add(-time.Minute),
+	}
+
+	eligible := o.isDispatchEligible(model.Issue{
+		ID:         "1",
+		Identifier: "ABC-1",
+		Title:      "Awaiting intervention",
+		State:      "In Progress",
+	}, cfg, false)
+	if eligible {
+		t.Fatal("awaiting-intervention issue should not be dispatch eligible")
+	}
+}
+
+func TestReconcileAwaitingInterventionReleasesInactiveIssue(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "Backlog"},
+		},
+	}
+	workspace := &fakeWorkspaceManager{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	o.state.AwaitingIntervention["1"] = &model.AwaitingInterventionEntry{
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		Branch:        "iiwate4268/iiwate-48-await",
+		PRNumber:      48,
+		PRURL:         "https://example.test/pr/48",
+		PRState:       string(PullRequestStateClosed),
+		RetryAttempt:  1,
+		ObservedAt:    now.Add(-time.Minute),
+	}
+	o.state.Claimed["1"] = struct{}{}
+
+	o.reconcileAwaitingIntervention(context.Background())
+
+	if tracker.stateFetchCalls == 0 {
+		t.Fatal("tracker state refresh was not attempted")
+	}
+	if _, ok := o.state.AwaitingIntervention["1"]; ok {
+		t.Fatal("awaiting intervention entry still exists")
+	}
+	if _, ok := o.state.Claimed["1"]; ok {
+		t.Fatal("claimed entry still exists")
+	}
+	if len(workspace.cleaned) != 0 {
+		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
+	}
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
 	}
 }
 
