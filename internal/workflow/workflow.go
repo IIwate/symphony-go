@@ -130,16 +130,16 @@ func WatchWithErrors(ctx context.Context, path string, onChange func(*model.Work
 	return nil
 }
 
-func RenderPrompt(tmpl string, issue *model.Issue, attempt *int) (string, error) {
-	source := strings.TrimSpace(tmpl)
-	if source == "" {
-		source = DefaultPrompt
+func RenderPrompt(tmpl string, issue *model.Issue, attempt *int, source map[string]any) (string, error) {
+	templateSource := strings.TrimSpace(tmpl)
+	if templateSource == "" {
+		templateSource = DefaultPrompt
 	}
 
 	engine := liquid.NewEngine()
 	engine.StrictVariables()
 
-	template, err := engine.ParseString(source)
+	template, err := engine.ParseString(templateSource)
 	if err != nil {
 		return "", model.NewWorkflowError(model.ErrTemplateParseError, "parse liquid template", err)
 	}
@@ -147,6 +147,7 @@ func RenderPrompt(tmpl string, issue *model.Issue, attempt *int) (string, error)
 	rendered, err := template.RenderString(liquid.Bindings{
 		"issue":   issueBindings(issue),
 		"attempt": attemptValue(attempt),
+		"source":  sourceBindings(source),
 	})
 	if err != nil {
 		return "", model.NewWorkflowError(model.ErrTemplateRenderError, "render liquid template", err)
@@ -310,6 +311,22 @@ func attemptValue(attempt *int) any {
 	}
 
 	return *attempt
+}
+
+func sourceBindings(source map[string]any) liquid.Bindings {
+	bindings := liquid.Bindings{
+		"kind":            nil,
+		"project_slug":    nil,
+		"owner":           nil,
+		"repo":            nil,
+		"branch_scope":    nil,
+		"active_states":   nil,
+		"terminal_states": nil,
+	}
+	for key, value := range source {
+		bindings[key] = value
+	}
+	return bindings
 }
 
 func matchesWatchedPath(watchedPath string, eventPath string) bool {

@@ -516,6 +516,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			Attempt:        attempt,
 			WorkspacePath:  workspaceRef.Path,
 			PromptTemplate: o.currentWorkflow().PromptTemplate,
+			Source:         o.currentWorkflow().Source,
 			MaxTurns:       o.currentConfig().MaxTurns,
 			RefetchIssue: func(ctx context.Context, issueID string) (*model.Issue, error) {
 				issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{issueID})

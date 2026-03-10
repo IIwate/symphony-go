@@ -21,9 +21,9 @@
 ### 2.1 基础环境
 
 - 操作系统已具备运行 Go 二进制和 `codex app-server` 的条件
-- 当前已发布版本：当前工作目录或显式传入路径下存在可用的 `WORKFLOW.md`
-- Cycle 5 草案目录模式：仓库根部存在 `automation/project.yaml`
-- 使用哪种模式启动，就要保证对应配置中的 tracker / source / hooks / codex 参数与目标环境匹配
+- 仓库根部或显式 `--config-dir` 指向的目录下存在可用的 `automation/project.yaml`
+- 当前实现只接受 `automation/` 目录模式，不再接受 `WORKFLOW.md` 位置参数
+- 使用目录模式启动时，要保证对应配置中的 runtime / source / flow / hooks / codex 参数与目标环境匹配
 
 ### 2.2 必要凭证
 
@@ -61,14 +61,14 @@ $env:LINEAR_API_KEY="<your-token>"
 go run ./cmd/symphony --dry-run
 ```
 
-若 `WORKFLOW.md` 不在当前目录：
+若配置目录不在当前目录：
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony --dry-run ./path/to/WORKFLOW.md
+go run ./cmd/symphony --dry-run --config-dir ./path/to/automation
 ```
 
-Cycle 5 草案目录模式下，建议的本地 secrets 形式为：
+推荐的本地 secrets 形式为：
 
 ```powershell
 # automation/local/env.local
@@ -76,32 +76,29 @@ LINEAR_API_KEY=<your-token>
 GITHUB_TOKEN=<your-token>
 ```
 
-> 当前已发布版本尚未支持 `automation/` 目录模式，因此这里没有可直接执行的 `--config-dir` 示例命令。
-> `docs/examples/automation-github-issues.md` 是目录模式参考文档，不是可直接作为位置参数传入的单文件 workflow 示例。
-
 ### 3.2 正常启动（无 HTTP server）
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony --log-level info --log-file ./logs/symphony.log ./WORKFLOW.md
+go run ./cmd/symphony --log-level info --log-file ./logs/symphony.log
 ```
 
 ### 3.3 正常启动（启用 HTTP server）
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.log ./WORKFLOW.md
+go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.log
 ```
 
 ### 3.4 常用参数
 
-- `WORKFLOW.md` 路径：可选位置参数；未传时默认 `./WORKFLOW.md`
-- 当前 CLI 基于标准库 `flag`，请将 `--dry-run` / `--port` / `--log-file` / `--log-level` 写在路径参数之前
+- `--config-dir`：配置目录路径；未传时默认 `./automation`
+- `--profile`：选择 `automation/profiles/<name>.yaml`
+- 当前 CLI 基于标准库 `flag`
 - `--dry-run`：执行单次 poll cycle 验证后退出；注意当前实现仍会访问 tracker，并执行 `startupCleanup`
 - `--port`：启用 HTTP server，当前实现绑定 loopback 地址
 - `--log-file`：同时输出到 stderr 与指定文件
 - `--log-level`：`debug` / `info` / `warn` / `error`
-- Cycle 5 草案中预期会新增 `--config-dir` 与 `--profile`，用于 `automation/` 目录模式；当前已发布版本尚未实现
 
 ## 4. 启动后应观察什么
 
@@ -138,13 +135,11 @@ curl http://127.0.0.1:8080/api/v1/state
 
 ## 5. Workflow 热加载操作
 
-- 当前已发布版本启动后会监听 `WORKFLOW.md`
-- 文件变更后会尝试 reload
+- 当前版本启动后会监听 `automation/` 下的活动配置文件
+- 变更后会尝试 reload
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
 - `orchestrator.auto_close_on_pr` 也支持热更新；默认值为 `true`
-
-Cycle 5 草案目录模式下，预期监听对象会扩展为：
 
 - `automation/project.yaml`
 - 当前激活的 `automation/profiles/*.yaml`

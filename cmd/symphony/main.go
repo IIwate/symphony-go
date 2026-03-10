@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -15,12 +16,13 @@ import (
 
 	"symphony-go/internal/agent"
 	"symphony-go/internal/config"
+	"symphony-go/internal/envfile"
+	"symphony-go/internal/loader"
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
 	"symphony-go/internal/orchestrator"
 	"symphony-go/internal/server"
 	"symphony-go/internal/tracker"
-	"symphony-go/internal/workflow"
 	"symphony-go/internal/workspace"
 )
 
@@ -40,17 +42,21 @@ type httpServer interface {
 
 type runtimeState struct {
 	mu           sync.RWMutex
+	repoDef      *model.AutomationDefinition
 	definition   *model.WorkflowDefinition
 	config       *model.ServiceConfig
 	portOverride *int
+	configDir    string
 }
 
 var (
-	loadWorkflowDefinition  = workflow.Load
-	watchWorkflowDefinition = workflow.WatchWithErrors
-	buildVersion            = "dev"
-	newLoggerFactory        = logging.NewLogger
-	newTrackerFactory       = func(configFn func() *model.ServiceConfig) (tracker.Client, error) {
+	loadEnvFile               = envfile.Load
+	loadAutomationDefinition  = loader.Load
+	resolveActiveWorkflow     = loader.ResolveActiveWorkflow
+	watchAutomationDefinition = loader.WatchWithErrors
+	buildVersion              = "dev"
+	newLoggerFactory          = logging.NewLogger
+	newTrackerFactory         = func(configFn func() *model.ServiceConfig) (tracker.Client, error) {
 		return tracker.NewDynamicClient(configFn, nil)
 	}
 	newWorkspaceFactory = func(configFn func() *model.ServiceConfig, logger *slog.Logger) (workspace.Manager, error) {
@@ -95,11 +101,15 @@ func execute(args []string, stderr io.Writer) error {
 	dryRun := false
 	logFile := ""
 	logLevel := "info"
+	configDir := "automation"
+	profile := ""
 
 	flags.IntVar(&port, "port", -1, "HTTP server port")
 	flags.BoolVar(&dryRun, "dry-run", false, "run a single validation cycle and exit")
 	flags.StringVar(&logFile, "log-file", "", "path to log file")
 	flags.StringVar(&logLevel, "log-level", "info", "debug/info/warn/error")
+	flags.StringVar(&configDir, "config-dir", "automation", "path to automation config directory")
+	flags.StringVar(&profile, "profile", "", "runtime profile name")
 
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -109,16 +119,19 @@ func execute(args []string, stderr io.Writer) error {
 	}
 
 	remaining := flags.Args()
-	if len(remaining) > 1 {
-		return fmt.Errorf("expected at most one workflow path argument, got %d", len(remaining))
+	if len(remaining) > 0 {
+		return fmt.Errorf("workflow path argument is no longer supported; use --config-dir")
 	}
 
-	workflowPath := "./WORKFLOW.md"
-	if len(remaining) == 1 {
-		workflowPath = remaining[0]
+	if err := loadEnvFile(filepath.Join(configDir, "local", "env.local")); err != nil {
+		return err
 	}
 
-	definition, err := loadWorkflowDefinition(workflowPath)
+	repoDef, err := loadAutomationDefinition(configDir, profile)
+	if err != nil {
+		return err
+	}
+	definition, err := resolveActiveWorkflow(repoDef)
 	if err != nil {
 		return err
 	}
@@ -134,13 +147,13 @@ func execute(args []string, stderr io.Writer) error {
 		return err
 	}
 	defer closer.Close()
-	logger.Info("workflow loaded", slog.String("workflow_path", workflowPath))
+	logger.Info("automation loaded", slog.String("config_dir", repoDef.RootDir))
 
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		return err
 	}
 
-	state := &runtimeState{definition: definition, config: cfg, portOverride: portOverride}
+	state := &runtimeState{repoDef: repoDef, definition: definition, config: cfg, portOverride: portOverride, configDir: repoDef.RootDir}
 	orchestrator.BuildVersion = buildVersion
 	trackerClient, err := newTrackerFactory(state.CurrentConfig)
 	if err != nil {
@@ -154,7 +167,7 @@ func execute(args []string, stderr io.Writer) error {
 	orch := newOrchestratorFactory(trackerClient, workspaceManager, runner, state.CurrentConfig, state.CurrentWorkflow, logger)
 
 	if dryRun {
-		logger.Warn("dry-run 仍会访问 tracker 并执行 startupCleanup，可能产生副作用", slog.String("workflow_path", workflowPath))
+		logger.Warn("dry-run 仍会访问 tracker 并执行 startupCleanup，可能产生副作用", slog.String("config_dir", repoDef.RootDir))
 		orch.RunOnce(context.Background(), false)
 		logger.Info("dry-run 校验通过")
 		return nil
@@ -163,15 +176,16 @@ func execute(args []string, stderr io.Writer) error {
 	ctx, cancel := notifySignalContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := watchWorkflowDefinition(ctx, workflowPath, func(def *model.WorkflowDefinition) {
-		if _, reloadErr := state.ApplyReload(def); reloadErr != nil {
-			logger.Warn("workflow reload rejected", "error", reloadErr.Error())
+	if err := watchAutomationDefinition(ctx, repoDef.RootDir, profile, func(newRepoDef *model.AutomationDefinition) {
+		newDefinition, reloadErr := state.ApplyReload(newRepoDef)
+		if reloadErr != nil {
+			logger.Warn("automation reload rejected", "error", reloadErr.Error())
 			return
 		}
-		orch.NotifyWorkflowReload(def)
-		logger.Info("workflow reloaded", slog.String("workflow_path", workflowPath))
+		orch.NotifyWorkflowReload(newDefinition)
+		logger.Info("automation reloaded", slog.String("config_dir", newRepoDef.RootDir))
 	}, func(watchErr error) {
-		logger.Warn("workflow reload failed", "error", watchErr.Error())
+		logger.Warn("automation reload failed", "error", watchErr.Error())
 	}); err != nil {
 		return err
 	}
@@ -193,7 +207,7 @@ func execute(args []string, stderr io.Writer) error {
 		}
 		return err
 	}
-	logger.Info("symphony started", slog.String("workflow_path", workflowPath))
+	logger.Info("symphony started", slog.String("config_dir", repoDef.RootDir))
 	orch.Wait()
 	if httpSrv != nil {
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 2*time.Second)
@@ -218,8 +232,12 @@ func (s *runtimeState) CurrentWorkflow() *model.WorkflowDefinition {
 	return s.definition
 }
 
-func (s *runtimeState) ApplyReload(def *model.WorkflowDefinition) (*model.ServiceConfig, error) {
-	newCfg, err := config.NewFromWorkflow(def)
+func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.WorkflowDefinition, error) {
+	newDefinition, err := resolveActiveWorkflow(repoDef)
+	if err != nil {
+		return nil, err
+	}
+	newCfg, err := config.NewFromWorkflow(newDefinition)
 	if err != nil {
 		return nil, err
 	}
@@ -227,16 +245,43 @@ func (s *runtimeState) ApplyReload(def *model.WorkflowDefinition) (*model.Servic
 		port := *s.portOverride
 		newCfg.ServerPort = &port
 	}
+
+	s.mu.RLock()
+	currentRepoDef := s.repoDef
+	currentCfg := s.config
+	s.mu.RUnlock()
+
+	if currentRepoDef != nil {
+		if strings.TrimSpace(currentRepoDef.Profile) != strings.TrimSpace(repoDef.Profile) {
+			return nil, fmt.Errorf("profile selection changed: restart required")
+		}
+		if selectedSourceKind(currentRepoDef) != selectedSourceKind(repoDef) {
+			return nil, fmt.Errorf("source.kind changed: restart required")
+		}
+		if !enabledSourcesEqual(currentRepoDef, repoDef) {
+			return nil, fmt.Errorf("selection.enabled_sources changed: restart required")
+		}
+	}
+	if currentCfg != nil {
+		if currentCfg.WorkspaceRoot != newCfg.WorkspaceRoot {
+			return nil, fmt.Errorf("runtime.workspace.root changed: restart required")
+		}
+		if !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort) {
+			return nil, fmt.Errorf("runtime.server.port changed: restart required")
+		}
+	}
 	if err := config.ValidateForDispatch(newCfg); err != nil {
 		return nil, err
 	}
 
 	s.mu.Lock()
-	s.definition = def
+	s.repoDef = repoDef
+	s.definition = newDefinition
 	s.config = newCfg
+	s.configDir = repoDef.RootDir
 	s.mu.Unlock()
 
-	return newCfg, nil
+	return newDefinition, nil
 }
 
 func applyPortOverride(cfg *model.ServiceConfig, port int) *int {
@@ -254,4 +299,56 @@ func validateLogLevel(value string) error {
 	default:
 		return fmt.Errorf("unsupported log level %q", value)
 	}
+}
+
+func serverPortEqual(left *int, right *int) bool {
+	switch {
+	case left == nil && right == nil:
+		return true
+	case left == nil || right == nil:
+		return false
+	default:
+		return *left == *right
+	}
+}
+
+func enabledSourcesEqual(left *model.AutomationDefinition, right *model.AutomationDefinition) bool {
+	leftSources := nilSafeSources(left)
+	rightSources := nilSafeSources(right)
+	if len(leftSources) != len(rightSources) {
+		return false
+	}
+	for i := range leftSources {
+		if leftSources[i] != rightSources[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func nilSafeSources(def *model.AutomationDefinition) []string {
+	if def == nil {
+		return nil
+	}
+	sources := append([]string(nil), def.Selection.EnabledSources...)
+	for i := range sources {
+		sources[i] = strings.TrimSpace(sources[i])
+	}
+	return sources
+}
+
+func selectedSourceKind(def *model.AutomationDefinition) string {
+	if def == nil || len(def.Selection.EnabledSources) != 1 {
+		return ""
+	}
+	sourceName := strings.TrimSpace(def.Selection.EnabledSources[0])
+	if sourceName == "" {
+		return ""
+	}
+	sourceDef := def.Sources[sourceName]
+	if sourceDef == nil {
+		return ""
+	}
+	value, _ := sourceDef.Raw["kind"].(string)
+	return model.NormalizeState(value)
 }

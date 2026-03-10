@@ -1,0 +1,11 @@
+你正在处理一个来自任务源的 issue。
+
+- 任务源：{{ source.kind }}
+- 编号：{{ issue.identifier }}
+- 标题：{{ issue.title }}
+
+{% if attempt %}
+- 当前是第 {{ attempt }} 次继续执行/重试。
+{% endif %}
+
+{{ issue.description }}

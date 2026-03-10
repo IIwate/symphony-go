@@ -1,0 +1,22 @@
+runtime:
+  polling:
+    interval_ms: 30000
+  workspace:
+    root: ~/symphony_workspaces
+  agent:
+    max_concurrent_agents: 10
+    max_turns: 20
+  orchestrator:
+    auto_close_on_pr: true
+  codex:
+    command: codex app-server
+  server:
+    port: null
+
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+
+defaults:
+  profile: null

@@ -11,3 +11,5 @@ bin/
 dist/
 .ace-tool/
 logs/
+automation/local/*
+!automation/local/.gitkeep

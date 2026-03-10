@@ -68,7 +68,7 @@ body
 }
 
 func TestRenderPromptUsesDefaultPrompt(t *testing.T) {
-	rendered, err := RenderPrompt("", &model.Issue{Title: "Test"}, nil)
+	rendered, err := RenderPrompt("", &model.Issue{Title: "Test"}, nil, nil)
 	if err != nil {
 		t.Fatalf("RenderPrompt() error = %v", err)
 	}
@@ -78,14 +78,14 @@ func TestRenderPromptUsesDefaultPrompt(t *testing.T) {
 }
 
 func TestRenderPromptUnknownVariable(t *testing.T) {
-	_, err := RenderPrompt("{{ issue.unknown }}", &model.Issue{Title: "Test"}, nil)
+	_, err := RenderPrompt("{{ issue.unknown }}", &model.Issue{Title: "Test"}, nil, nil)
 	if !errors.Is(err, model.ErrTemplateRenderError) {
 		t.Fatalf("RenderPrompt() error = %v, want ErrTemplateRenderError", err)
 	}
 }
 
 func TestRenderPromptUnknownFilter(t *testing.T) {
-	_, err := RenderPrompt("{{ issue.title | missing_filter }}", &model.Issue{Title: "Test"}, nil)
+	_, err := RenderPrompt("{{ issue.title | missing_filter }}", &model.Issue{Title: "Test"}, nil, nil)
 	if err == nil {
 		t.Fatal("RenderPrompt() error = nil, want unknown filter error")
 	}
@@ -95,7 +95,7 @@ func TestRenderPromptUnknownFilter(t *testing.T) {
 }
 
 func TestRenderPromptAttemptVariable(t *testing.T) {
-	rendered, err := RenderPrompt("{% if attempt %}Attempt {{ attempt }}{% else %}No attempt{% endif %}", &model.Issue{Title: "Test"}, nil)
+	rendered, err := RenderPrompt("{% if attempt %}Attempt {{ attempt }}{% else %}No attempt{% endif %}", &model.Issue{Title: "Test"}, nil, nil)
 	if err != nil {
 		t.Fatalf("RenderPrompt() error = %v", err)
 	}
@@ -104,12 +104,25 @@ func TestRenderPromptAttemptVariable(t *testing.T) {
 	}
 
 	attempt := 2
-	rendered, err = RenderPrompt("{% if attempt %}Attempt {{ attempt }}{% else %}No attempt{% endif %}", &model.Issue{Title: "Test"}, &attempt)
+	rendered, err = RenderPrompt("{% if attempt %}Attempt {{ attempt }}{% else %}No attempt{% endif %}", &model.Issue{Title: "Test"}, &attempt, nil)
 	if err != nil {
 		t.Fatalf("RenderPrompt() error = %v", err)
 	}
 	if rendered != "Attempt 2" {
 		t.Fatalf("RenderPrompt() with attempt=2 = %q, want Attempt 2", rendered)
+	}
+}
+
+func TestRenderPromptSourceVariable(t *testing.T) {
+	rendered, err := RenderPrompt("{{ source.kind }} {{ source.project_slug }}", &model.Issue{Title: "Test"}, nil, map[string]any{
+		"kind":         "linear",
+		"project_slug": "demo",
+	})
+	if err != nil {
+		t.Fatalf("RenderPrompt() error = %v", err)
+	}
+	if rendered != "linear demo" {
+		t.Fatalf("RenderPrompt() = %q, want linear demo", rendered)
 	}
 }
 

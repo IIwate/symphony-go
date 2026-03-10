@@ -41,6 +41,37 @@ type BlockerRef struct {
 type WorkflowDefinition struct {
 	Config         map[string]any
 	PromptTemplate string
+	Source         map[string]any
+}
+
+type AutomationDefinition struct {
+	RootDir   string
+	Profile   string
+	Runtime   map[string]any
+	Selection AutomationSelection
+	Defaults  AutomationDefaults
+	Sources   map[string]*SourceDefinition
+	Flows     map[string]*FlowDefinition
+	Policies  map[string]map[string]any
+}
+
+type AutomationSelection struct {
+	DispatchFlow   string
+	EnabledSources []string
+}
+
+type AutomationDefaults struct {
+	Profile *string
+}
+
+type SourceDefinition struct {
+	Name string
+	Raw  map[string]any
+}
+
+type FlowDefinition struct {
+	Name string
+	Raw  map[string]any
 }
 
 type ServiceConfig struct {

@@ -1,0 +1,4 @@
+prompt: prompts/implement.md.liquid
+hooks:
+  before_run: hooks/before_run.sh
+policy: null

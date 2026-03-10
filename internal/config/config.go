@@ -102,7 +102,7 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	if threadSandbox := strings.TrimSpace(getString(codex, "thread_sandbox", "")); threadSandbox != "" {
 		cfg.CodexThreadSandbox = threadSandbox
 	}
-	if sandboxPolicy, ok := codex["turn_sandbox_policy"]; ok {
+	if sandboxPolicy, ok := codex["turn_sandbox_policy"]; ok && sandboxPolicy != nil {
 		cfg.CodexTurnSandboxPolicy = stringifyValue(sandboxPolicy)
 	}
 	if turnTimeout, ok := getInt(codex, "turn_timeout_ms"); ok && turnTimeout > 0 {
