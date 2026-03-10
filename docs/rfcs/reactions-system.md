@@ -1,7 +1,7 @@
 # RFC: Reactions 系统
 
 > **状态**: 草案
-> **对应**: REQUIREMENTS.md §11.3 "Reactions 系统" / Cycle 5 扩展池
+> **对应**: ../REQUIREMENTS.md §11.3 "Reactions 系统" / Cycle 5 扩展池
 > **前置**: Cycle 1-4 首版交付完成
 
 ---
@@ -97,6 +97,7 @@ type ReactionTrigger struct {
 
 - `issue_failed`
 - `issue_completed`
+- `issue_intervention_required`
 - `system_alert`
 - `system_alert_cleared`
 
@@ -133,6 +134,12 @@ type ReactionAction struct {
 
 若 `TriggerRerun` 无法在不破坏现有 orchestrator 边界的前提下实现，则 `rerun_issue` 应降级为 `request_refresh`，不要直接篡改 retry 队列。
 
+同时：
+
+- `issue_intervention_required` 的语义是“等待人工介入”，不是“允许自动继续执行”
+- 因此首版禁止 `on=issue_intervention_required` 与 `action=rerun_issue` 的组合
+- 对该 trigger，推荐动作是 `notify`
+
 ## 6. 配置设计
 
 ### 6.1 `WORKFLOW.md` 示例
@@ -145,11 +152,16 @@ reactions:
       on: ci_failed
       action: rerun_issue
       max_runs: 2
-    - name: alert-ops
-      on: system_alert
+    - name: review-needs-human
+      on: review_changes_requested
       action: notify
       channels: [ops-webhook]
 ```
+
+说明：
+
+- 若某通知 channel 已直接订阅同一 orchestrator event，不应再用 reaction 对同一事件重复 `notify`
+- `issue_intervention_required` 更适合由通知系统直接发送给 operator；reaction 仅保留其作为可选 trigger source 的能力
 
 ### 6.2 字段
 
@@ -195,6 +207,7 @@ Reactions ReactionsConfig
 - `action` 必须是已知 action
 - `max_runs` 必须 `> 0`
 - `notify` 动作引用的 channel 必须存在于通知配置中
+- `on=issue_intervention_required` 时，`action` 不得为 `rerun_issue`
 
 ## 7. Reactions 引擎设计
 
@@ -327,6 +340,7 @@ if !reflect.DeepEqual(s.config.Reactions, newCfg.Reactions) {
 |---|---|
 | `TestReactionConfigValidation` | trigger/action/max_runs 校验 |
 | `TestReactionNotifyReferencesNotificationChannel` | `notify` 动作和通知配置联动校验 |
+| `TestReactionInterventionCannotAutoRerun` | `issue_intervention_required + rerun_issue` 被校验拒绝 |
 
 ### 12.3 `cmd/symphony/main_test.go`
 

@@ -236,7 +236,7 @@ archives:
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     files:
-      - SPEC.md
+      - docs/SPEC.md
       - docs/operator-runbook.md
 
 checksum:
@@ -281,7 +281,7 @@ checksums.txt
 
 ### 随附文件
 
-每个 archive 包含 `SPEC.md` 和 `docs/operator-runbook.md`，用户下载后即有文档参考。
+每个 archive 包含 `docs/SPEC.md` 和 `docs/operator-runbook.md`，用户下载后即有文档参考。
 
 ### 发布策略
 

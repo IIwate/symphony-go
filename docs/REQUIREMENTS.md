@@ -81,8 +81,11 @@ symphony-go/
 │   └── logging/             # 日志配置辅助
 ├── go.mod
 ├── go.sum
-├── SPEC.md
-├── REQUIREMENTS.md
+├── docs/
+│   ├── SPEC.md
+│   ├── REQUIREMENTS.md
+│   ├── IMPLEMENTATION.md
+│   └── FLOW.md
 └── WORKFLOW.md              # 示例/测试用
 ```
 

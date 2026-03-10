@@ -2,7 +2,7 @@
 
 ## 周期定位
 
-本周期对应 `REQUIREMENTS.md` 的“阶段 3：核心引擎”。目标是交付 Symphony-Go 的核心价值：自动轮询、调度 issue、驱动 agent、执行重试与对账，并具备完整的主机生命周期管理。
+本周期对应 `../REQUIREMENTS.md` 的“阶段 3：核心引擎”。目标是交付 Symphony-Go 的核心价值：自动轮询、调度 issue、驱动 agent、执行重试与对账，并具备完整的主机生命周期管理。
 
 ## 周期目标
 
@@ -70,7 +70,7 @@
 
 ## 验收标准
 
-### 对应 `SPEC.md`
+### 对应 `../SPEC.md`
 
 - 覆盖 §17.4 `Orchestrator Dispatch, Reconciliation, and Retry`
 - 覆盖 §17.5 `Coding-Agent App-Server Client`

@@ -2,7 +2,7 @@
 
 ## 周期定位
 
-本周期对应 `REQUIREMENTS.md` 的“阶段 1：基础框架”，目标是先把系统契约层稳定下来，形成一个可编译、可解析 `WORKFLOW.md`、可执行启动前校验的最小可运行骨架。
+本周期对应 `../REQUIREMENTS.md` 的“阶段 1：基础框架”，目标是先把系统契约层稳定下来，形成一个可编译、可解析 `WORKFLOW.md`、可执行启动前校验的最小可运行骨架。
 
 ## 周期目标
 
@@ -75,7 +75,7 @@
 
 ## 验收标准
 
-### 对应 `SPEC.md`
+### 对应 `../SPEC.md`
 
 - 覆盖 §17.1 `Workflow and Config Parsing`
 - 覆盖 §17.7 `CLI and Host Lifecycle` 的基础启动/退出行为
