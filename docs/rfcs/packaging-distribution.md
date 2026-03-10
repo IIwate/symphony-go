@@ -252,7 +252,7 @@ changelog:
 
 release:
   github:
-    owner: IIwate
+    owner: your-org-or-user
     name: symphony-go
   draft: true
   prerelease: auto
@@ -459,8 +459,8 @@ GoReleaser 会将当前平台的构建产物自动放入 Docker 构建上下文�
 ```yaml
 dockers:
   - image_templates:
-      - "ghcr.io/iiwate/symphony-go:{{ .Version }}"
-      - "ghcr.io/iiwate/symphony-go:latest"
+      - "ghcr.io/your-org-or-user/symphony-go:{{ .Version }}"
+      - "ghcr.io/your-org-or-user/symphony-go:latest"
     dockerfile: Dockerfile.goreleaser
     build_flag_templates:
       - "--label=org.opencontainers.image.version={{.Version}}"
@@ -674,7 +674,7 @@ Service: serviceResponse{
 
 ```bash
 # 下载（以 Linux amd64 为例）
-curl -LO https://github.com/IIwate/symphony-go/releases/download/v0.1.0/symphony-go_0.1.0_linux_amd64.tar.gz
+curl -LO https://github.com/your-org-or-user/symphony-go/releases/download/v0.1.0/symphony-go_0.1.0_linux_amd64.tar.gz
 
 # 校验
 sha256sum -c checksums.txt --ignore-missing

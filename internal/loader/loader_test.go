@@ -112,8 +112,8 @@ func TestResolveActiveWorkflowSingleSource(t *testing.T) {
 	if got := trackerConfig["kind"]; got != "linear" {
 		t.Fatalf("tracker.kind = %v, want linear", got)
 	}
-	if got := workflowDef.Source["branch_scope"]; got != "symphony-go" {
-		t.Fatalf("source.branch_scope = %v, want symphony-go", got)
+	if got := workflowDef.Source["branch_scope"]; got != "demo-scope" {
+		t.Fatalf("source.branch_scope = %v, want demo-scope", got)
 	}
 	if workflowDef.PromptTemplate != "hello {{ source.kind }} {{ issue.title }}" {
 		t.Fatalf("PromptTemplate = %q", workflowDef.PromptTemplate)
@@ -187,8 +187,8 @@ hooks:
 	if got := getMapValue(workflowDef.Config, "polling")["interval_ms"]; got != 15000 {
 		t.Fatalf("polling.interval_ms = %v, want 15000", got)
 	}
-	if got := getMapValue(workflowDef.Config, "workspace")["linear_branch_scope"]; got != "symphony-go" {
-		t.Fatalf("workspace.linear_branch_scope = %v, want symphony-go", got)
+	if got := getMapValue(workflowDef.Config, "workspace")["linear_branch_scope"]; got != "demo-scope" {
+		t.Fatalf("workspace.linear_branch_scope = %v, want demo-scope", got)
 	}
 	if got := getMapValue(workflowDef.Config, "tracker")["project_slug"]; got != "demo" {
 		t.Fatalf("tracker.project_slug = %v, want demo", got)
@@ -199,6 +199,42 @@ hooks:
 	value, ok := getMapValue(workflowDef.Config, "hooks")["after_run"]
 	if !ok || value != nil {
 		t.Fatalf("hooks.after_run = %v, want explicit nil", value)
+	}
+}
+
+func TestResolveActiveWorkflowResolvesSourceEnvStrings(t *testing.T) {
+	t.Setenv("LINEAR_PROJECT_SLUG", "demo-from-env")
+	t.Setenv("LINEAR_BRANCH_SCOPE", "Demo Scope")
+
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	writeLoaderFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
+api_key: $LINEAR_API_KEY
+project_slug: $LINEAR_PROJECT_SLUG
+branch_scope: $LINEAR_BRANCH_SCOPE
+active_states: ["Todo", "In Progress"]
+terminal_states: ["Closed", "Done"]
+`)
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	workflowDef, err := ResolveActiveWorkflow(def)
+	if err != nil {
+		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
+	}
+
+	if got := getMapValue(workflowDef.Config, "tracker")["project_slug"]; got != "demo-from-env" {
+		t.Fatalf("tracker.project_slug = %v, want demo-from-env", got)
+	}
+	if got := getMapValue(workflowDef.Config, "workspace")["linear_branch_scope"]; got != "Demo Scope" {
+		t.Fatalf("workspace.linear_branch_scope = %v, want Demo Scope", got)
+	}
+	if got := workflowDef.Source["project_slug"]; got != "demo-from-env" {
+		t.Fatalf("source.project_slug = %v, want demo-from-env", got)
+	}
+	if got := workflowDef.Source["branch_scope"]; got != "Demo Scope" {
+		t.Fatalf("source.branch_scope = %v, want Demo Scope", got)
 	}
 }
 
@@ -338,7 +374,7 @@ defaults:
 	writeLoaderFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
 api_key: $LINEAR_API_KEY
 project_slug: demo
-branch_scope: symphony-go
+branch_scope: demo-scope
 active_states: ["Todo", "In Progress"]
 terminal_states: ["Closed", "Done"]
 `)

@@ -1,8 +1,8 @@
 kind: linear
 api_key: $LINEAR_API_KEY
 endpoint: https://api.linear.app/graphql
-project_slug: 93f75f5af725
-branch_scope: symphony-go
+project_slug: $LINEAR_PROJECT_SLUG
+branch_scope: $LINEAR_BRANCH_SCOPE
 active_states:
   - Todo
   - In Progress

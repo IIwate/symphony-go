@@ -120,16 +120,16 @@ func TestPrepareForRunTimeout(t *testing.T) {
 func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git config user.name":                                     "IIwate4268\n",
-			"git branch --show-current":                                "main\n",
-			"git for-each-ref refs/heads --format='%(refname:short)'":  "main\n",
-			"git ls-remote --heads origin":                             "",
-			"git switch -c iiwate4268/linear-symphony-smoke-iiwate-37": "",
+			"git config user.name":                                    "testuser\n",
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "",
+			"git switch -c testuser/linear-demo-scope-demo-37":        "",
 		},
 	}
 	manager := newTestManager(t, runner)
 
-	workspace, err := manager.CreateForIssue(context.Background(), "IIWATE-37")
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
 	if err != nil {
 		t.Fatalf("CreateForIssue() error = %v", err)
 	}
@@ -140,7 +140,7 @@ func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c iiwate4268/linear-symphony-smoke-iiwate-37"); got != 1 {
+	if got := runner.callCount("git switch -c testuser/linear-demo-scope-demo-37"); got != 1 {
 		t.Fatalf("branch create call count = %d, want 1", got)
 	}
 }
@@ -148,16 +148,16 @@ func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 func TestPrepareForRunAddsSuffixWhenRemoteBranchExists(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git config user.name":                                       "IIwate4268\n",
-			"git branch --show-current":                                  "main\n",
-			"git for-each-ref refs/heads --format='%(refname:short)'":    "main\n",
-			"git ls-remote --heads origin":                               "abc\trefs/heads/iiwate4268/linear-symphony-smoke-iiwate-37\n",
-			"git switch -c iiwate4268/linear-symphony-smoke-iiwate-37-2": "",
+			"git config user.name":                                    "testuser\n",
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "abc\trefs/heads/testuser/linear-demo-scope-demo-37\n",
+			"git switch -c testuser/linear-demo-scope-demo-37-2":      "",
 		},
 	}
 	manager := newTestManager(t, runner)
 
-	workspace, err := manager.CreateForIssue(context.Background(), "IIWATE-37")
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
 	if err != nil {
 		t.Fatalf("CreateForIssue() error = %v", err)
 	}
@@ -168,7 +168,7 @@ func TestPrepareForRunAddsSuffixWhenRemoteBranchExists(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c iiwate4268/linear-symphony-smoke-iiwate-37-2"); got != 1 {
+	if got := runner.callCount("git switch -c testuser/linear-demo-scope-demo-37-2"); got != 1 {
 		t.Fatalf("branch create call count = %d, want 1", got)
 	}
 }
@@ -176,18 +176,18 @@ func TestPrepareForRunAddsSuffixWhenRemoteBranchExists(t *testing.T) {
 func TestPrepareForRunUsesGitHubIssueNumberShortName(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git config user.name":                                    "IIwate4268\n",
+			"git config user.name":                                    "testuser\n",
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "",
-			"git switch -c iiwate4268/github-linear-test-123":         "",
+			"git switch -c testuser/github-linear-test-123":           "",
 		},
 	}
 	manager := newTestManager(t, runner)
 	manager.currentConfig().TrackerKind = "github"
 	manager.currentConfig().TrackerRepo = "linear-test"
 
-	workspace, err := manager.CreateForIssue(context.Background(), "IIwate/linear-test#123")
+	workspace, err := manager.CreateForIssue(context.Background(), "test-org/linear-test#123")
 	if err != nil {
 		t.Fatalf("CreateForIssue() error = %v", err)
 	}
@@ -198,7 +198,7 @@ func TestPrepareForRunUsesGitHubIssueNumberShortName(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c iiwate4268/github-linear-test-123"); got != 1 {
+	if got := runner.callCount("git switch -c testuser/github-linear-test-123"); got != 1 {
 		t.Fatalf("branch create call count = %d, want 1", got)
 	}
 }
@@ -239,7 +239,7 @@ func newTestManager(t *testing.T, runner HookRunner) *LocalManager {
 		TrackerKind:                "linear",
 		TrackerRepo:                "linear-test",
 		WorkspaceRoot:              filepath.Join(t.TempDir(), "workspaces"),
-		WorkspaceLinearBranchScope: "symphony-smoke",
+		WorkspaceLinearBranchScope: "demo-scope",
 		HookTimeoutMS:              200,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), runner)
 	if err != nil {

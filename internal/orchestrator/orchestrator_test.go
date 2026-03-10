@@ -379,13 +379,14 @@ func TestSnapshotIncludesAlertsAndWorkspaceContext(t *testing.T) {
 func TestRunOnceSetsAndClearsTrackerAlert(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
-		TrackerKind:         "linear",
-		TrackerAPIKey:       "secret",
-		TrackerProjectSlug:  "demo",
-		ActiveStates:        []string{"Todo", "In Progress"},
-		TerminalStates:      []string{"Done"},
-		MaxConcurrentAgents: 1,
-		CodexCommand:        "codex app-server",
+		TrackerKind:                "linear",
+		TrackerAPIKey:              "secret",
+		TrackerProjectSlug:         "demo",
+		WorkspaceLinearBranchScope: "demo-scope",
+		ActiveStates:               []string{"Todo", "In Progress"},
+		TerminalStates:             []string{"Done"},
+		MaxConcurrentAgents:        1,
+		CodexCommand:               "codex app-server",
 	}
 	tracker := &fakeTracker{candidateErr: errors.New("tracker down")}
 	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
@@ -408,13 +409,14 @@ func TestRunOnceSetsAndClearsTrackerAlert(t *testing.T) {
 func TestRunOnceKeepsTrackerAlertWhenReconcileFails(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
-		TrackerKind:         "linear",
-		TrackerAPIKey:       "secret",
-		TrackerProjectSlug:  "demo",
-		ActiveStates:        []string{"Todo", "In Progress"},
-		TerminalStates:      []string{"Done"},
-		MaxConcurrentAgents: 1,
-		CodexCommand:        "codex app-server",
+		TrackerKind:                "linear",
+		TrackerAPIKey:              "secret",
+		TrackerProjectSlug:         "demo",
+		WorkspaceLinearBranchScope: "demo-scope",
+		ActiveStates:               []string{"Todo", "In Progress"},
+		TerminalStates:             []string{"Done"},
+		MaxConcurrentAgents:        1,
+		CodexCommand:               "codex app-server",
 	}
 	tracker := &fakeTracker{
 		candidateIssues: []model.Issue{},

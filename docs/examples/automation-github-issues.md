@@ -92,7 +92,7 @@ policy: null
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-repo_url="${SYMPHONY_GIT_REPO:-https://github.com/your-org-or-user/your-repo}"
+repo_url="${SYMPHONY_GIT_REPO:?SYMPHONY_GIT_REPO is required}"
 find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 git clone --depth 1 "$repo_url" .
 ```

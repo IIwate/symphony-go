@@ -570,7 +570,7 @@ defaults:
 	writeFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
 api_key: $LINEAR_API_KEY
 project_slug: demo
-branch_scope: symphony-go
+branch_scope: demo-scope
 active_states: ["Todo", "In Progress"]
 terminal_states: ["Closed", "Done"]
 `)

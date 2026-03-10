@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -15,6 +16,8 @@ import (
 )
 
 const defaultDispatchFlow = "implement"
+
+var envValuePattern = regexp.MustCompile(`^\$(\w+)$`)
 
 func Load(dir string, profile string) (*model.AutomationDefinition, error) {
 	rootDir, err := filepath.Abs(normalizeConfigDir(dir))
@@ -101,6 +104,7 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	if !ok || sourceDef == nil {
 		return nil, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("selected source %q not found", sourceName), nil)
 	}
+	resolvedSource := resolveEnvMap(sourceDef.Raw)
 
 	flowName := strings.TrimSpace(def.Selection.DispatchFlow)
 	if flowName == "" {
@@ -119,7 +123,7 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	copyMapField(configMap, "orchestrator", def.Runtime)
 
 	workspaceMap := cloneStringMap(getMapValue(def.Runtime, "workspace"))
-	if branchScope, ok := sourceDef.Raw["branch_scope"]; ok {
+	if branchScope, ok := resolvedSource["branch_scope"]; ok {
 		workspaceMap["linear_branch_scope"] = cloneValue(branchScope)
 	}
 	if len(workspaceMap) > 0 {
@@ -128,11 +132,11 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 
 	trackerMap := map[string]any{}
 	for _, key := range []string{"kind", "api_key", "endpoint", "project_slug", "owner", "repo", "state_label_prefix", "active_states", "terminal_states"} {
-		if value, ok := sourceDef.Raw[key]; ok {
+		if value, ok := resolvedSource[key]; ok {
 			trackerMap[key] = cloneValue(value)
 		}
 	}
-	if linearConfig, ok := sourceDef.Raw["linear"]; ok {
+	if linearConfig, ok := resolvedSource["linear"]; ok {
 		trackerMap["linear"] = cloneValue(linearConfig)
 	}
 	configMap["tracker"] = trackerMap
@@ -171,7 +175,7 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	return &model.WorkflowDefinition{
 		Config:         configMap,
 		PromptTemplate: promptTemplate,
-		Source:         sourceBindings(sourceDef.Raw),
+		Source:         sourceBindings(resolvedSource),
 	}, nil
 }
 
@@ -526,6 +530,57 @@ func sourceBindings(source map[string]any) map[string]any {
 		}
 	}
 	return bindings
+}
+
+func resolveEnvMap(source map[string]any) map[string]any {
+	if source == nil {
+		return map[string]any{}
+	}
+
+	resolved := make(map[string]any, len(source))
+	for key, value := range source {
+		resolved[key] = resolveEnvValue(value)
+	}
+	return resolved
+}
+
+func resolveEnvValue(value any) any {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		return resolveEnvString(typed)
+	case map[string]any:
+		return resolveEnvMap(typed)
+	case []string:
+		items := make([]string, len(typed))
+		for i, item := range typed {
+			items[i] = resolveEnvString(item)
+		}
+		return items
+	case []any:
+		items := make([]any, len(typed))
+		for i, item := range typed {
+			items[i] = resolveEnvValue(item)
+		}
+		return items
+	default:
+		return cloneValue(value)
+	}
+}
+
+func resolveEnvString(value string) string {
+	matches := envValuePattern.FindStringSubmatch(value)
+	if len(matches) != 2 {
+		return value
+	}
+
+	resolved, ok := os.LookupEnv(matches[1])
+	if !ok {
+		return ""
+	}
+
+	return strings.TrimSpace(resolved)
 }
 
 func mustStringMap(value any) map[string]any {

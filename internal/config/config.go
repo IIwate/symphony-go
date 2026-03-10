@@ -12,7 +12,10 @@ import (
 	"symphony-go/internal/model"
 )
 
-var envValuePattern = regexp.MustCompile(`^\$(\w+)$`)
+var (
+	envValuePattern        = regexp.MustCompile(`^\$(\w+)$`)
+	requiredHookEnvPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\:\?[^}]*\}`)
+)
 
 func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error) {
 	if def == nil {
@@ -31,7 +34,7 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	if endpoint := strings.TrimSpace(getString(tracker, "endpoint", "")); endpoint != "" {
 		cfg.TrackerEndpoint = endpoint
 	}
-	cfg.TrackerAPIKey = resolveEnvString(strings.TrimSpace(getString(tracker, "api_key", "")))
+	cfg.TrackerAPIKey = strings.TrimSpace(getString(tracker, "api_key", ""))
 	cfg.TrackerProjectSlug = strings.TrimSpace(getString(tracker, "project_slug", ""))
 	linear := getMap(tracker, "linear")
 	if enabled, ok := getBool(linear, "children_block_parent"); ok {
@@ -139,8 +142,14 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 	if strings.TrimSpace(cfg.TrackerProjectSlug) == "" {
 		return model.NewTrackerError(model.ErrMissingTrackerProjectSlug, "tracker.project_slug is required", nil)
 	}
+	if strings.TrimSpace(cfg.WorkspaceLinearBranchScope) == "" {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "source.branch_scope is required for linear tracker", nil)
+	}
 	if strings.TrimSpace(cfg.CodexCommand) == "" {
 		return model.NewWorkflowError(model.ErrInvalidCodexCommand, "codex.command is required", nil)
+	}
+	if err := validateRequiredHookEnvs(cfg); err != nil {
+		return err
 	}
 
 	return nil
@@ -201,7 +210,7 @@ func getString(source map[string]any, key string, fallback string) string {
 		return fallback
 	}
 	if typed, ok := raw.(string); ok {
-		return typed
+		return resolveEnvString(typed)
 	}
 
 	return fallback
@@ -227,7 +236,7 @@ func getStringSlice(source map[string]any, key string) ([]string, bool) {
 
 	switch typed := raw.(type) {
 	case string:
-		items := splitAndTrim(typed)
+		items := splitAndTrim(resolveEnvString(typed))
 		return items, len(items) > 0
 	case []string:
 		items := make([]string, 0, len(typed))
@@ -271,7 +280,7 @@ func getInt(source map[string]any, key string) (int, bool) {
 	case float64:
 		return int(typed), true
 	case string:
-		trimmed := strings.TrimSpace(typed)
+		trimmed := strings.TrimSpace(resolveEnvString(typed))
 		if trimmed == "" {
 			return 0, false
 		}
@@ -298,7 +307,7 @@ func getBool(source map[string]any, key string) (bool, bool) {
 	case bool:
 		return typed, true
 	case string:
-		trimmed := strings.TrimSpace(strings.ToLower(typed))
+		trimmed := strings.TrimSpace(strings.ToLower(resolveEnvString(typed)))
 		switch trimmed {
 		case "true":
 			return true, true
@@ -338,7 +347,7 @@ func intFromValue(value any) (int, bool) {
 	case float64:
 		return int(typed), true
 	case string:
-		trimmed := strings.TrimSpace(typed)
+		trimmed := strings.TrimSpace(resolveEnvString(typed))
 		if trimmed == "" {
 			return 0, false
 		}
@@ -364,6 +373,49 @@ func resolveEnvString(value string) string {
 	}
 
 	return strings.TrimSpace(resolved)
+}
+
+func validateRequiredHookEnvs(cfg *model.ServiceConfig) error {
+	for hookName, script := range requiredHookScripts(cfg) {
+		matches := requiredHookEnvPattern.FindAllStringSubmatch(script, -1)
+		for _, match := range matches {
+			if len(match) != 2 {
+				continue
+			}
+			envName := match[1]
+			value, ok := os.LookupEnv(envName)
+			if ok && strings.TrimSpace(value) != "" {
+				continue
+			}
+			return model.NewWorkflowError(
+				model.ErrWorkflowParseError,
+				fmt.Sprintf("hooks.%s requires environment variable %s", hookName, envName),
+				nil,
+			)
+		}
+	}
+
+	return nil
+}
+
+func requiredHookScripts(cfg *model.ServiceConfig) map[string]string {
+	scripts := map[string]string{}
+	if cfg == nil {
+		return scripts
+	}
+	if cfg.HookAfterCreate != nil {
+		scripts["after_create"] = *cfg.HookAfterCreate
+	}
+	if cfg.HookBeforeRun != nil {
+		scripts["before_run"] = *cfg.HookBeforeRun
+	}
+	if cfg.HookAfterRun != nil {
+		scripts["after_run"] = *cfg.HookAfterRun
+	}
+	if cfg.HookBeforeRemove != nil {
+		scripts["before_remove"] = *cfg.HookBeforeRemove
+	}
+	return scripts
 }
 
 func expandHomePath(value string) string {

@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,14 +25,18 @@ func TestMainIntegration_DryRun(t *testing.T) {
 		WorkspaceRoot:  workspaceRoot,
 		PromptTemplate: "integration dry run",
 	})
-	writeFile(t, filepath.Join(configDir, "sources", "linear-main.yaml"), fmt.Sprintf(`kind: linear
+	writeFile(t, filepath.Join(configDir, "sources", "linear-main.yaml"), `kind: linear
 api_key: $LINEAR_API_KEY
-project_slug: %s
-branch_scope: symphony-go
+project_slug: $LINEAR_PROJECT_SLUG
+branch_scope: $LINEAR_BRANCH_SCOPE
 active_states: ["Todo", "In Progress"]
 terminal_states: ["Closed", "Done"]
-`, projectSlug))
-	writeFile(t, filepath.Join(configDir, "local", "env.local"), "LINEAR_API_KEY="+apiKey+"\n")
+`)
+	writeFile(
+		t,
+		filepath.Join(configDir, "local", "env.local"),
+		"LINEAR_API_KEY="+apiKey+"\n"+"LINEAR_PROJECT_SLUG="+projectSlug+"\n"+"LINEAR_BRANCH_SCOPE=integration-scope\n",
+	)
 
 	originalValue, hadValue := os.LookupEnv("LINEAR_API_KEY")
 	if err := os.Unsetenv("LINEAR_API_KEY"); err != nil {
@@ -73,7 +76,11 @@ func integrationProjectSlug(t *testing.T) string {
 			continue
 		}
 		if projectSlug, ok := sourceDef.Raw["project_slug"].(string); ok && strings.TrimSpace(projectSlug) != "" {
-			return strings.TrimSpace(projectSlug)
+			projectSlug = strings.TrimSpace(projectSlug)
+			if strings.HasPrefix(projectSlug, "$") {
+				t.Fatalf("LINEAR_PROJECT_SLUG is required when repo automation config uses %q", projectSlug)
+			}
+			return projectSlug
 		}
 	}
 	t.Fatal("project_slug not found in repo automation config")
