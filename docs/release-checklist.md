@@ -36,10 +36,10 @@
 
 ### 3.1 Workflow 与 Config
 
-- [x] 显式 workflow 路径和默认 `./WORKFLOW.md` 路径行为正确
-- [x] YAML front matter、严格模板渲染、`$VAR`、`~` 路径展开验证通过
-- [x] `WORKFLOW.md` 热加载生效，且无效 reload 保持最后一次有效配置
-- [x] dispatch preflight 失败时会阻止新调度，但不影响对账逻辑
+- [ ] `automation/project.yaml`、active profile、active source、active flow 选择行为正确
+- [ ] 目录化配置、严格模板渲染、`$VAR`、`~` 路径展开验证通过
+- [ ] `automation/` 热加载生效，且无效 reload 保持最后一次有效配置
+- [ ] dispatch preflight 失败时会阻止新调度，但不影响对账逻辑
 
 ### 3.2 Workspace / Tracker / Logging
 
@@ -82,7 +82,7 @@
 ## 五、Real Integration Profile
 
 - [x] 已在真实凭证环境中设置 `LINEAR_API_KEY`
-- [x] 已在目标主机环境验证 `WORKFLOW.md` 路径解析行为
+- [ ] 已在目标主机环境验证 `automation/project.yaml` 路径解析行为
 - [x] 已在目标 shell / OS 上验证 hooks 能正常执行
 - [x] 已完成一次真实 tracker smoke test
 - [x] 已使用隔离测试标识符 / 工作区，避免污染真实业务数据
@@ -91,7 +91,7 @@
 
 ## 六、运行与运维核对
 
-- [x] 启动命令已确认（含 workflow 路径、`--port`、`--log-file`、`--log-level`；与 runbook 一致，flag 写在路径参数之前）
+- [ ] 启动命令已确认（含 `--config-dir`、`--profile`、`--port`、`--log-file`、`--log-level`；与 runbook 一致）
 - [x] 日志输出路径、权限、追加写行为已确认
 - [x] 工作区根目录、磁盘空间、权限已确认
 - [x] 目标环境已具备 `codex app-server` 运行条件
@@ -103,8 +103,8 @@
 ### 7.1 Headless 基础烟测
 
 - [x] `go run ./cmd/symphony --dry-run` 在目标环境下通过
-- [x] 正常启动后日志中可看到 workflow 加载、服务启动等关键事件
-- [x] 修改 `WORKFLOW.md` 后可观察到 reload 日志
+- [ ] 正常启动后日志中可看到 automation 配置加载、服务启动等关键事件
+- [ ] 修改 `automation/` 后可观察到 reload 日志
 
 ### 7.2 调度烟测
 
@@ -138,10 +138,10 @@
 
 ## 附：建议记录
 
-- Workflow 路径：`./WORKFLOW.md`
+- Config 目录：`./automation`
 - 目标环境：Windows 11 / PowerShell / Git Bash / `codex-cli 0.111.0`
 - 是否启用 HTTP server：是
 - 是否启用 `linear_graphql`：是
-- 真实验证结果摘要：2026-03-07 已完成真实 Linear smoke；修正 `WORKFLOW.md` 中 `codex.read_timeout_ms=15000` 后，dry-run、reload、HTTP/SSE/refresh、真实 issue 调度与动态工具链路通过，隔离工作区清理策略已复核
+- 真实验证结果摘要：记录 active source、profile、dry-run、reload、HTTP/SSE/refresh、真实 issue 调度与动态工具链路验证结果
 - 已知问题：token totals 在 session 初期可能短暂为 `0`，待绝对 usage 事件到达后更新；不阻塞本轮收口
-- 回滚方案：如需回退本轮配置，仅回退 `WORKFLOW.md` 中 `codex.read_timeout_ms` 这一行，并重新做真实 smoke 验证
+- 回滚方案：如需回退本轮配置，回退 `automation/` 中对应配置文件并重新做真实 smoke 验证

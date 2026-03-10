@@ -30,7 +30,7 @@ Symphony 是一个长运行自动化服务，持续从 issue tracker（Linear）
 
 - 将 issue 执行转为可重复的守护进程工作流
 - 在隔离的 per-issue 工作区中执行 agent 命令
-- 将工作流策略保存在仓库内（`WORKFLOW.md`），团队可版本化管理
+- 将运行时契约保存在仓库内（`automation/` 目录），团队可版本化管理
 - 提供足够的可观测性来操作和调试多个并发 agent 运行
 
 **关键边界**：Symphony 是调度器/运行器和 tracker 读取器。Ticket 写入（状态转换、评论、PR 链接）由 coding agent 通过工作流环境中的工具执行。
@@ -71,14 +71,16 @@ symphony-go/
 │       └── main.go
 ├── internal/
 │   ├── model/              # 共享领域模型（纯数据结构，无业务逻辑）
-│   ├── workflow/            # Workflow Loader + 模板渲染
-│   ├── config/              # Config Layer（类型化配置 + 校验）
-│   ├── tracker/             # Issue Tracker Client（Linear 适配器）
-│   ├── orchestrator/        # Orchestrator（状态机 + 调度 + 重试 + 对账）
-│   ├── workspace/           # Workspace Manager（路径管理 + 钩子）
-│   ├── agent/               # Agent Runner（app-server 子进程协议客户端）
-│   ├── server/              # HTTP Server（可选扩展）
-│   └── logging/             # 日志配置辅助
+│   ├── loader/             # automation/ 目录加载 + active workflow 物化 + watcher
+│   ├── workflow/           # Liquid 模板渲染
+│   ├── config/             # Config Layer（类型化配置 + 校验）
+│   ├── tracker/            # Issue Tracker Client（Linear 适配器）
+│   ├── orchestrator/       # Orchestrator（状态机 + 调度 + 重试 + 对账）
+│   ├── workspace/          # Workspace Manager（路径管理 + 钩子）
+│   ├── agent/              # Agent Runner（app-server 子进程协议客户端）
+│   ├── server/             # HTTP Server（可选扩展）
+│   └── logging/            # 日志配置辅助
+├── automation/             # 运行时契约目录
 ├── go.mod
 ├── go.sum
 ├── docs/
@@ -86,7 +88,6 @@ symphony-go/
 │   ├── REQUIREMENTS.md
 │   ├── IMPLEMENTATION.md
 │   └── FLOW.md
-└── WORKFLOW.md              # 示例/测试用
 ```
 
 ### 2.2 包依赖方向
@@ -115,7 +116,7 @@ cmd/symphony
 
 | 领域 | 选型 | 理由 | SPEC 需求映射 |
 |---|---|---|---|
-| YAML 解析 | `gopkg.in/yaml.v3` | 成熟稳定，支持 map 解码 | §5.2 front matter 解析 |
+| YAML 解析 | `gopkg.in/yaml.v3` | 成熟稳定，支持 project/profile/source/flow 配置解码 | §5.2 仓库契约解析 |
 | 模板引擎 | `github.com/osteele/liquid` | Liquid 兼容语义；与官方 Elixir 实现模板语法一致 | §5.4 严格模板渲染 |
 | GraphQL 客户端 | 手写 HTTP + `encoding/json` | 查询字段可控，无代码生成维护负担 | §11.2 Linear GraphQL |
 | HTTP 框架 | `net/http`（Go 1.22+ 路由模式匹配） | 仅 4 端点，标准库足够 | §13.7 可选 HTTP Server |
@@ -127,7 +128,7 @@ cmd/symphony
 | 并发控制 | goroutine + channel | event loop 模式，状态变更序列化 | §7.4 幂等性/恢复 |
 | 测试框架 | `testing` + `github.com/stretchr/testify` | 断言辅助，不引入重型框架 | §17 测试矩阵 |
 
-**模板引擎说明**：SPEC 要求 "Liquid-compatible semantics"（§5.4）。采用 `github.com/osteele/liquid`（纯 Go Liquid 实现），与官方 Elixir 参考实现和 Go 竞品 contrabass 的模板语法完全兼容（`{{ issue.title }}`、`{% if attempt %}`）。这意味着可直接复用官方 WORKFLOW.md 模板，无需改写语法。该库支持严格模式（未知变量/过滤器报错）。
+**模板引擎说明**：SPEC 要求 "Liquid-compatible semantics"（§5.4）。采用 `github.com/osteele/liquid`（纯 Go Liquid 实现），与官方 Elixir 参考实现和 Go 竞品 contrabass 的模板语法完全兼容（`{{ issue.title }}`、`{% if attempt %}`）。这意味着可直接复用 Liquid 风格的仓库内 prompt 模板，无需改写语法。该库支持严格模式（未知变量/过滤器报错）。
 
 ---
 
@@ -164,8 +165,8 @@ type BlockerRef struct {
 
 ```go
 type WorkflowDefinition struct {
-    Config         map[string]any // YAML front matter 根对象
-    PromptTemplate string         // front matter 后的 Markdown body（已 trim）
+    Config         map[string]any // active workflow 的 bridge config map
+    PromptTemplate string         // active flow 对应的 prompt 模板内容（已 trim）
 }
 ```
 
@@ -348,67 +349,74 @@ const (
 
 ## 5. 模块需求详述
 
-### 5.1 workflow — Workflow Loader
+### 5.1 loader — Automation Loader
 
-**包路径**：`internal/workflow`
+**包路径**：`internal/loader`
 
-**职责**：读取 `WORKFLOW.md`，解析 YAML front matter + prompt body，渲染模板，监控文件变更。（参见 SPEC §5）
+**职责**：读取 `automation/` 目录，合并 `project.yaml` / profile / local overrides，注册 source 与 flow，物化当前 active `WorkflowDefinition`，并监控目录变更。（参见 SPEC §5）
 
 #### 5.1.1 接口
 
 ```go
-// Load 读取并解析 WORKFLOW.md
-func Load(path string) (*model.WorkflowDefinition, error)
+// Load 读取并解析 automation/ 目录
+func Load(dir string, profile string) (*model.AutomationDefinition, error)
 
-// Watch 启动文件监控，变更时调用 onChange 回调
-func Watch(ctx context.Context, path string, onChange func(*model.WorkflowDefinition)) error
+// ResolveActiveWorkflow 将当前激活的 source/flow 物化为现有运行时可消费的 WorkflowDefinition
+func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefinition, error)
 
-// RenderPrompt 使用严格模式渲染模板
-func RenderPrompt(tmpl string, issue *model.Issue, attempt *int) (string, error)
+// Watch 启动目录监控，变更时调用 onChange 回调
+func Watch(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition)) error
 ```
 
 #### 5.1.2 实现要点
 
-**文件解析**（SPEC §5.2）：
-- 若文件以 `---` 开头，逐行扫描至下一个 `---`，中间内容作为 YAML front matter
-- 剩余行作为 prompt body
-- 无 front matter 时，整个文件为 prompt body，config 为空 map
-- YAML 解码目标为 `map[string]any`；非 map 返回 `ErrFrontMatterNotMap`
-- Prompt body 执行 `strings.TrimSpace`
+**目录加载**（SPEC §5.2）：
+- 读取 `automation/project.yaml`
+- 解析默认 profile 与 CLI `--profile`
+- 合并 `automation/profiles/<name>.yaml`
+- 合并 `automation/local/overrides.yaml`
+- 读取 `automation/sources/*.yaml`
+- 读取 `automation/flows/*.yaml`
+- 根据 `selection.enabled_sources` 与 `selection.dispatch_flow` 选出当前激活配置
+- 首版要求最终仅启用 1 个 source；多 source 直接报错
+- `ResolveActiveWorkflow()` 负责把 `runtime.* / source.* / flow.*` 映射为当前 `WorkflowDefinition{Config, PromptTemplate}`
 
 **模板渲染**（SPEC §5.4）：
-- 使用 `github.com/osteele/liquid` Liquid 模板引擎
+- `internal/workflow.RenderPrompt` 使用 `github.com/osteele/liquid` Liquid 模板引擎
 - 启用严格模式：未知变量和未知过滤器均报错
-- 输入变量：`issue`（`map[string]any` 形式，key 为小写蛇形）和 `attempt`（`*int`，nil 在模板中为 falsy）
+- 输入变量：`issue`、`attempt`、`source`
 - 保留嵌套数组/map（labels, blockers），使模板可用 `{% for %}` 遍历
-- 模板语法与官方 Elixir 实现一致：`{{ issue.title }}`、`{% if attempt %}`
+- `source` 至少暴露 `kind`、`project_slug`、`owner`、`repo`、`branch_scope`、`active_states`、`terminal_states`
 - 空 prompt body 时使用默认提示词：`"You are working on an issue from Linear."`
-- 文件读取/解析失败是配置错误，**不**静默回退到默认提示词
+- prompt 文件读取/解析失败是配置错误，**不**静默回退到默认提示词
 
-**文件监控**（SPEC §6.2）：
-- 使用 `fsnotify.Watcher` 监听 WORKFLOW.md
+**目录监控**（SPEC §6.2）：
+- 使用 `fsnotify.Watcher` 监听 `automation/project.yaml`、active profile、`sources/*.yaml`、`flows/*.yaml`、`prompts/*.md.liquid`、`hooks/*.sh`、`local/overrides.yaml`
 - 变更事件 debounce（避免保存时多次触发）
 - 失败的 reload 保持上次有效配置，发出 operator-visible 错误日志
 - 不崩溃服务
+- `automation/local/env.local` 与 `automation/local/session-state.json` 不参与热重载
 
 #### 5.1.3 错误类型
 
 | 错误 | 触发条件 | SPEC 引用 |
 |---|---|---|
-| `ErrMissingWorkflowFile` | 文件不存在或无法读取 | §5.5 |
+| `ErrMissingWorkflowFile` | `automation/project.yaml` 不存在或无法读取 | §5.5 |
 | `ErrWorkflowParseError` | YAML 解析失败 | §5.5 |
-| `ErrFrontMatterNotMap` | YAML 解码结果非 map | §5.5 |
+| `ErrFrontMatterNotMap` | 仅内部 bridge 仍使用旧解析器时保留 | §5.5 |
 | `ErrTemplateParseError` | 模板语法错误 | §5.5 |
 | `ErrTemplateRenderError` | 未知变量/过滤器 | §5.5 |
 
 #### 5.1.4 验证标准
 
-- [ ] 正常解析含 front matter 的文件
-- [ ] 无 front matter 时返回空 config + 完整 prompt body
-- [ ] 非 map front matter 返回 `ErrFrontMatterNotMap`
-- [ ] 空 prompt body 使用默认提示词
+- [ ] 正常解析 `automation/project.yaml`
+- [ ] 正常合并 profile 与 `automation/local/overrides.yaml`
+- [ ] 正常注册多个 source / flow 文件
+- [ ] `enabled_sources > 1` 时返回错误
+- [ ] `ResolveActiveWorkflow()` 物化结果符合映射契约
+- [ ] 模板可访问 `issue`、`attempt`、`source`
 - [ ] 未知模板变量触发 `ErrTemplateRenderError`
-- [ ] 文件变更触发 reload 回调
+- [ ] 目录变更触发 reload 回调
 - [ ] 无效 reload 保持上次有效配置
 
 ---
@@ -951,7 +959,7 @@ type TokenUsage struct {
 
 **启用条件**：
 - CLI `--port` 参数提供时启动
-- `server.port` 在 WORKFLOW.md front matter 中存在时启动
+- `runtime.server.port` 在目录化配置中存在时启动
 - 优先级：CLI `--port` > `server.port`
 - `server.port` 必须为整数；正整数绑定该端口，`0` 用于临时端口
 
@@ -1074,7 +1082,8 @@ type TokenUsage struct {
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| 位置参数（可选） | string | `./WORKFLOW.md` | Workflow 文件路径 |
+| `--config-dir` | string | `automation` | automation 契约目录 |
+| `--profile` | string | 空 | runtime profile 名称 |
 | `--port` | int | 无（不启动 HTTP server） | HTTP server 端口 |
 | `--dry-run` | bool | false | 执行第一个 poll cycle 后退出，用于验证配置 |
 | `--log-file` | string | 无（仅 stderr） | 日志文件路径 |
@@ -1085,14 +1094,17 @@ type TokenUsage struct {
 ```
 1. 解析 CLI 参数
 2. 配置日志
-3. 加载 WORKFLOW.md（显式路径或 cwd 默认）
-4. 解析类型化配置
-5. 运行 dispatch preflight 校验 → 失败则退出
-6. 启动文件监控（WORKFLOW.md）
-7. 执行启动终态工作区清理
-8. 创建并启动 Orchestrator
-9. 若配置了端口 → 启动 HTTP Server
-10. 阻塞等待关闭信号
+3. 校验不存在 workflow 位置参数
+4. 加载 `automation/local/env.local`
+5. 加载 `automation/project.yaml`
+6. 合并 profile / local overrides，解析 active source / flow
+7. 物化 `WorkflowDefinition` 并解析类型化配置
+8. 运行 dispatch preflight 校验 → 失败则退出
+9. 启动目录监控（automation/）
+10. 执行启动终态工作区清理
+11. 创建并启动 Orchestrator
+12. 若配置了端口 → 启动 HTTP Server
+13. 阻塞等待关闭信号
 ```
 
 ### 6.3 关闭流程
@@ -1109,10 +1121,10 @@ type TokenUsage struct {
 
 ### 6.5 验证标准
 
-- [ ] CLI 接受可选位置参数作为 workflow 路径
-- [ ] 无参数时使用 `./WORKFLOW.md`
-- [ ] 显式路径不存在时报错退出
-- [ ] 默认 `./WORKFLOW.md` 不存在时报错退出
+- [ ] CLI 支持 `--config-dir` 与 `--profile`
+- [ ] 传入 workflow 位置参数时报错退出
+- [ ] 缺失 `automation/project.yaml` 时启动失败
+- [ ] `automation/local/env.local` 会在启动时加载
 - [ ] 启动失败时清晰输出错误
 - [ ] 正常关闭退出码为 0
 - [ ] 启动失败退出码为非零
@@ -1145,7 +1157,7 @@ type TokenUsage struct {
 |---|---|---|
 | **主 goroutine**（Orchestrator 事件循环） | 持有全部调度状态；通过 select 接收 tick timer / worker result / codex update / config reload / shutdown 事件 | select on channels |
 | **Worker goroutine**（每个活跃 issue 一个） | 运行 `agent.Runner.Run()`；通过 channel 向 orchestrator 报告事件和退出结果 | `workerResultCh`, `codexUpdateCh` |
-| **File watcher goroutine** | 监听 WORKFLOW.md 变更；变更事件发送到 orchestrator 的 config reload channel | `configReloadCh` |
+| **File watcher goroutine** | 监听 `automation/` 目录中受支持的配置文件变更；变更事件发送到 orchestrator 的 config reload channel | `configReloadCh` |
 | **HTTP server goroutine**（可选） | 处理 HTTP 请求；通过只读快照接口读取状态 | `sync.RWMutex` 保护快照 |
 
 ### 7.4 Channel 定义
@@ -1261,7 +1273,7 @@ type TrackerError struct {
 
 | SPEC 章节 | 包 | 关键测试点 |
 |---|---|---|
-| §17.1 | `workflow`, `config` | 文件解析、front matter、默认值、$VAR、模板渲染、文件监控热加载 |
+| §17.1 | `loader`, `workflow`, `config` | automation 契约解析、默认值、$VAR、模板渲染、目录热加载 |
 | §17.2 | `workspace` | 路径确定性、创建/复用、路径逃逸、钩子语义、安全不变量 |
 | §17.3 | `tracker` | 候选获取、分页、归一化、空输入、错误映射 |
 | §17.4 | `orchestrator` | 排序、阻塞规则、对账、retry、停滞检测、槽位耗尽 |

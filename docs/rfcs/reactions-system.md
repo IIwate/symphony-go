@@ -12,7 +12,7 @@
 
 完成后：
 
-- reaction 规则以声明式配置保存于 `WORKFLOW.md`
+- reaction 规则以声明式配置保存于 `automation/project.yaml` 的 `runtime.reactions` 段
 - internal event 与 external signal 先归一化，再统一进入规则引擎
 - reaction 动作必须有清晰边界，不能绕过 orchestrator 主状态机
 - reaction 失败不影响 orchestrator 存活
@@ -142,20 +142,21 @@ type ReactionAction struct {
 
 ## 6. 配置设计
 
-### 6.1 `WORKFLOW.md` 示例
+### 6.1 `automation/project.yaml` 示例
 
 ```yaml
-reactions:
-  enabled: true
-  rules:
-    - name: retry-on-ci-failed
-      on: ci_failed
-      action: rerun_issue
-      max_runs: 2
-    - name: review-needs-human
-      on: review_changes_requested
-      action: notify
-      channels: [ops-webhook]
+runtime:
+  reactions:
+    enabled: true
+    rules:
+      - name: retry-on-ci-failed
+        on: ci_failed
+        action: rerun_issue
+        max_runs: 2
+      - name: review-needs-human
+        on: review_changes_requested
+        action: notify
+        channels: [ops-webhook]
 ```
 
 说明：

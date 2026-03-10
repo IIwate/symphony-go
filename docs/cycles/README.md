@@ -30,7 +30,7 @@
 
 - **高信任运行姿态不变**：命令审批自动批准、文件改动自动批准、`user-input-required` 视为硬失败。
 - **单权威状态机不变**：运行时状态统一由 orchestrator 主 goroutine 串行修改。
-- **`WORKFLOW.md` 是运行时契约源**：显式路径优先，默认读取当前工作目录下的 `WORKFLOW.md`。
+- **`automation/` 是运行时契约源**：默认读取仓库根部的 `automation/project.yaml`，并按 profile/source/flow 解析 active 配置。
 - **可选能力延后实现**：HTTP API、SSE、Dashboard、`linear_graphql` tool 不进入 Cycle 1~3 的必达范围。
 - **测试随功能落地**：每个周期都要同步交付对应的单测/集成测试，不接受“功能先上、测试补写”的策略。
 

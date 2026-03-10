@@ -36,33 +36,34 @@
 
 ## 3. 配置字段
 
-`WORKFLOW.md` 中 `agent:` 块新增 `kind` 字段，各 agent 后端配置保持独立段落：
+目录模式下，配置位于 `automation/project.yaml`（或 active profile 覆盖）中的 `runtime.*`：
 
 ```yaml
-agent:
-  kind: codex
-  max_concurrent_agents: 2
-  max_turns: 10
+runtime:
+  agent:
+    kind: codex
+    max_concurrent_agents: 2
+    max_turns: 10
 
-codex:
-  command: codex app-server
-  approval_policy: never
-  thread_sandbox: workspace-write
-  read_timeout_ms: 15000
-  turn_timeout_ms: 600000
+  codex:
+    command: codex app-server
+    approval_policy: never
+    thread_sandbox: workspace-write
+    read_timeout_ms: 15000
+    turn_timeout_ms: 600000
 
-claude_code:
-  command: claude
-  model: ""
-  permission: dangerously-skip-permissions
-  max_turns: 0
-  read_timeout_ms: 15000
+  claude_code:
+    command: claude
+    model: ""
+    permission: dangerously-skip-permissions
+    max_turns: 0
+    read_timeout_ms: 15000
 
-opencode:
-  command: opencode
-  model: ""
-  agent: ""
-  max_turns: 0
+  opencode:
+    command: opencode
+    model: ""
+    agent: ""
+    max_turns: 0
 ```
 
 ### 字段说明
@@ -136,7 +137,7 @@ ErrAgentConfigConflict  = &AgentError{Code: "agent_config_conflict"}
 
 当前 `execProcessFactory.StartProcess(ctx, cwd, command)` 将整条命令字符串交给 `bash -lc` 执行（`shell.BashCommand`）。这对 `codex app-server` 是安全的，因为命令固定，不含用户输入。
 
-但 CLI 适配器需要传递 prompt 内容。Prompt 来自 `WORKFLOW.md` Liquid 模板渲染，可能包含引号、换行、反引号和 shell 元字符。通过 `bash -lc` 传递这些内容存在 shell 注入风险。
+但 CLI 适配器需要传递 prompt 内容。Prompt 来自 active flow 选中的 Liquid 模板渲染结果，可能包含引号、换行、反引号和 shell 元字符。通过 `bash -lc` 传递这些内容存在 shell 注入风险。
 
 ### 解决方案
 
@@ -668,7 +669,7 @@ func TestOpenCodeIntegration(t *testing.T) {
 ### 配套文档落点
 
 - `docs/operator-runbook.md`：补充安装前置、凭证配置、常见故障
-- `WORKFLOW.md`：补充 `agent.kind` 注释说明
+- `automation/project.yaml`：补充 `runtime.agent.kind` 与各后端配置说明
 
 ## 14. 风险与回滚
 
@@ -711,6 +712,6 @@ func TestOpenCodeIntegration(t *testing.T) {
 | `internal/agent/runner_test.go` | 修改 | 新增工厂路由测试；现有 helper 适配新签名 |
 | `cmd/symphony/main.go` | 修改 | runner 工厂签名变更 + `ApplyReload` 检测 |
 | `cmd/symphony/main_test.go` | 修改 | stub 适配新签名 + reload 拒绝测试 |
-| `WORKFLOW.md` | 修改 | 注释区补充 `agent.kind` 配置说明 |
+| `automation/project.yaml` | 修改 | 补充 `runtime.agent.kind` 配置说明 |
 | `docs/operator-runbook.md` | 修改 | 补充各 agent 安装与凭证说明 |
 | `docs/cycles/cycle-05-post-mvp.md` | 微调 | “多 agent runner” 补 RFC 链接 |

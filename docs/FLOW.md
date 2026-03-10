@@ -55,7 +55,7 @@
 ### 3.1 根目录
 
 - `cmd/symphony/main.go`：CLI 入口，负责参数解析、依赖装配、启动与关闭。
-- `WORKFLOW.md`：运行时契约源，front matter 提供配置，正文提供 prompt 模板。
+- `automation/`：运行时契约目录，承载 project/profile/source/flow/prompt/policy/hook/local。
 - `docs/SPEC.md`：语言无关规格。
 - `docs/REQUIREMENTS.md`：Go 版本的需求与模块要求。
 - `docs/IMPLEMENTATION.md`：实现分层和阶段结果。
@@ -66,8 +66,9 @@
 | 模块 | 作用 |
 |---|---|
 | `internal/model` | 共享领域模型、运行状态、typed error、`CloneIssue` 拷贝辅助 |
-| `internal/workflow` | 读取 `WORKFLOW.md`、解析 front matter、渲染 prompt、监听热更新 |
-| `internal/config` | front matter → `ServiceConfig`，并执行 dispatch preflight 校验 |
+| `internal/loader` | 读取 `automation/`、合并配置、注册 source/flow、物化 active workflow、监听热更新 |
+| `internal/workflow` | Liquid 模板渲染与 prompt 绑定构造 |
+| `internal/config` | bridge config map → `ServiceConfig`，并执行 dispatch preflight 校验 |
 | `internal/tracker` | 当前为 Linear GraphQL 客户端，实现 issue 查询、状态刷新、可选状态流转 |
 | `internal/workspace` | 工作区创建/复用/清理、hooks、工作分支准备 |
 | `internal/agent` | `codex app-server` 子进程协议客户端，多 turn 会话控制 |
@@ -134,88 +135,111 @@
 
 ---
 
-## 4. 运行时契约：`WORKFLOW.md`
+## 4. 运行时契约：`automation/`
 
-`WORKFLOW.md` 是运行时唯一配置源，结构分为两部分：
+当前设计方向下，运行时契约不再使用单文件 `WORKFLOW.md`，而是使用 `automation/` 目录。
 
-1. YAML front matter：配置 tracker、workspace、hooks、agent、codex、server 等。
-2. Markdown 正文：作为首轮 turn 的 prompt 模板。
+目录结构按职责拆分为：
 
-### 4.1 当前仓库根部示例
+1. `project.yaml`：仓库默认运行配置与默认选择。
+2. `profiles/*.yaml`：环境差异。
+3. `sources/*.yaml`：任务源定义。
+4. `flows/*.yaml`：流程定义。
+5. `prompts/*.md.liquid`：prompt 模板。
+6. `policies/*.yaml`：gate / allow / deny 规则。
+7. `hooks/*.sh`：hook 脚本。
+8. `local/overrides.yaml`、`local/env.local`、`local/session-state.json`：本地覆盖、本地 secrets 与本地状态。
 
-当前根目录 `WORKFLOW.md` 的有效信息可以概括为：
+### 4.1 当前主设计下的 active 配置
 
-- tracker 使用 Linear。
-- API key 从 `$LINEAR_API_KEY` 注入。
-- 项目标识使用 `project_slug`。
-- 工作区根目录为 `H:/code/temp/symphony_workspaces`。
-- `before_run` hook 会清空工作区并重新 clone 仓库。
-- codex 命令是 `codex app-server`。
-- prompt 明确要求：
-  - 先创建并切换工作分支。
-  - 完成开发后推送分支并创建 PR。
-  - 不要自行 merge PR。
-  - 创建/更新 PR 后，使用 `linear_graphql` 将 issue 设为完成态。
+当前主设计下，一次运行会从 `automation/` 中解析出：
 
-### 4.2 front matter 解析规则
+- 一个 active profile
+- 一个 active flow
+- 一个 active source
+- 一组 runtime 配置
 
-- `[核心规范]` 若文件以 `---` 开头，则把下一段 `---` 之前内容解析为 YAML front matter。
-- `[核心规范]` 若没有 front matter，则整份文件正文都作为 prompt body，配置为空 map。
-- `[核心规范]` front matter 必须解码成 `map[string]any`；非 map 会返回 `workflow_front_matter_not_a_map`。
-- `[核心规范]` prompt body 在使用前会做 trim。
-- `[核心规范]` 未知顶层 key 应忽略，以保持前向兼容。
-- `[实现扩展]` `server.port` 是当前实现支持的扩展顶层键。
+首版 bridge 约束仍然是：
 
-需要明确：
+- 允许仓库里存在多个 `sources/*.yaml`
+- 但 `selection.enabled_sources` 最终只能选中 1 个 source
+- loader 会把该 active source/flow 物化为现有运行时可消费的 `WorkflowDefinition`
 
-- `[核心规范]` 文件读取失败、YAML 解析失败、front matter 非 map 都不会静默回退到默认 prompt，而是直接返回 workflow 级错误并阻断新调度。
-- `[实现决策]` 只有在 **模板内容为空** 时，渲染阶段才会回退到内置默认提示词。
+### 4.2 目录解析规则
+
+- `[核心规范]` `automation/project.yaml` 缺失或不可读时，启动直接失败。
+- `[核心规范]` profile / source / flow / prompt 文件 YAML 或模板解析失败时，视为配置错误。
+- `[核心规范]` `automation/local/env.local` 仅在启动时加载，用于补充环境变量来源。
+- `[核心规范]` source 文件按文件名注册，不参与“同名 merge”。
+- `[实现决策]` `ResolveActiveWorkflow()` 是唯一允许把 `runtime.* / source.* / flow.*` bridge 为旧形状 config map 的地方。
 
 ### 4.3 内置默认提示词
 
-当前 `internal/workflow` 的 `DefaultPrompt` 文案为：
+当前 `internal/workflow` 的 `DefaultPrompt` 文案仍为：
 
 - `You are working on an issue from Linear.`
 
+它只在模板内容为空时作为渲染阶段兜底，不替代目录加载失败。
+
 ### 4.4 模板严格模式
 
-`internal/workflow.RenderPrompt` 当前行为：
+`internal/workflow.RenderPrompt` 的目标行为：
 
 - `[核心规范]` 使用 Liquid 模板引擎。
 - `[核心规范]` 开启 `StrictVariables`。
-- `[核心规范]` 对未知变量和未知 filter 都视为 `template_render_error` / `template_parse_error` 范畴处理。
-- `[核心规范]` 当前仅注入：
+- `[核心规范]` 对未知变量和未知 filter 都视为 `template_render_error` / `template_parse_error`。
+- `[核心规范]` 目录模式下 prompt 绑定至少包含：
   - `issue`
   - `attempt`
+  - `source`
 
-### 4.5 Workflow 错误面与调度语义
+其中 `source` 至少暴露：
 
-当前实现与 SPEC 的关系如下：
+- `kind`
+- `project_slug`
+- `owner`
+- `repo`
+- `branch_scope`
+- `active_states`
+- `terminal_states`
 
-- `[核心规范]` workflow 文件读错 / YAML 解析错：
+### 4.5 契约错误面与调度语义
+
+- `[核心规范]` `automation/` 目录加载错误：
   - 启动时：启动失败。
   - 运行中 reload：保留最后一次有效配置，输出可见错误。
 - `[核心规范]` 模板渲染错误：
   - 只影响当前 run attempt。
   - 由 worker 失败路径接管，进入 orchestrator 的重试策略。
 
-### 4.6 Workflow 监听与热更新
+### 4.6 目录监听与热更新
 
-`internal/workflow.WatchWithErrors` 的行为：
+`internal/loader.Watch` 的目标行为：
 
-- 监听目标 workflow 文件所在目录。
-- 通过 debounce 合并频繁文件事件。
-- 仅在变更命中目标文件路径时触发 reload。
+- 监听 `automation/project.yaml`
+- 监听当前激活的 `automation/profiles/*.yaml`
+- 监听 `automation/sources/*.yaml`
+- 监听 `automation/flows/*.yaml`
+- 监听 `automation/prompts/*.md.liquid`
+- 监听 `automation/policies/*.yaml`
+- 监听 `automation/hooks/*.sh`
+- 监听 `automation/local/overrides.yaml`
+
+不监听：
+
+- `automation/local/env.local`
+- `automation/local/session-state.json`
 
 热更新进入 CLI 的链路：
 
 1. watcher 读到变更。
-2. 重新 `Load` 新 workflow。
-3. `runtimeState.ApplyReload` 调用 `config.NewFromWorkflow`。
-4. 若 CLI 启动时传了 `--port`，该值会继续覆盖新配置。
-5. 再次执行 `ValidateForDispatch`。
-6. 只有校验通过时，才替换当前 `definition/config`。
-7. orchestrator 收到 `NotifyWorkflowReload` 后刷新当前配置快照。
+2. 重新 `Load` 仓库级定义。
+3. `ResolveActiveWorkflow()` 物化 active workflow。
+4. `runtimeState.ApplyReload` 调用 `config.NewFromWorkflow`。
+5. 若 CLI 启动时传了 `--port`，该值会继续覆盖新配置。
+6. 再次执行 `ValidateForDispatch`。
+7. 只有校验通过且未命中 restart-required 字段时，才替换当前 `definition/config`。
+8. orchestrator 收到 reload 通知后刷新当前配置快照。
 
 补充说明：
 
@@ -231,17 +255,17 @@
 
 当前 `internal/config` 已处理的字段包括：
 
-- `tracker.kind`
-- `tracker.endpoint`
-- `tracker.api_key`
-- `tracker.project_slug`
+- `tracker.kind` `[bridge 结果]`
+- `tracker.endpoint` `[bridge 结果]`
+- `tracker.api_key` `[bridge 结果]`
+- `tracker.project_slug` `[bridge 结果]`
 - `tracker.linear.children_block_parent` `[实现扩展]`
-- `tracker.repo` `[实现扩展]`
-- `tracker.active_states`
-- `tracker.terminal_states`
-- `polling.interval_ms`
-- `workspace.root`
-- `workspace.linear_branch_scope` `[实现扩展]`
+- `tracker.repo` `[bridge 结果]`
+- `tracker.active_states` `[bridge 结果]`
+- `tracker.terminal_states` `[bridge 结果]`
+- `polling.interval_ms` `[来自 runtime]`
+- `workspace.root` `[来自 runtime]`
+- `workspace.linear_branch_scope` `[bridge 结果，来自 source.branch_scope]`
 - `hooks.after_create`
 - `hooks.before_run`
 - `hooks.after_run`
@@ -323,7 +347,8 @@
 
 CLI 当前支持：
 
-- 位置参数：`WORKFLOW.md` 路径，默认 `./WORKFLOW.md`
+- `--config-dir`：默认 `automation`
+- `--profile`
 - `--port`
 - `--dry-run`
 - `--log-file`
@@ -340,19 +365,22 @@ CLI 当前支持：
 
 `cmd/symphony/main.go` 中的 `execute` 会按以下顺序执行：
 
-1. 解析 flag 和位置参数。
+1. 解析 flag。
 2. 校验日志级别。
-3. 加载 `WORKFLOW.md`。
-4. 调用 `config.NewFromWorkflow` 生成类型化配置。
-5. 应用 CLI `--port` 覆盖。
-6. 初始化 logger。
-7. 执行 `config.ValidateForDispatch`。
-8. 构造 `runtimeState`，把 workflow 与 config 封装成可热更新状态。
-9. 创建 tracker、workspace manager、agent runner、orchestrator。
-10. 如果是 `--dry-run`，执行一次 `orch.RunOnce(context.Background(), false)` 后退出。
-11. 如果是正常运行：
+3. 拒绝 workflow 位置参数。
+4. 加载 `automation/local/env.local`。
+5. 加载 `automation/project.yaml` 并合并 profile / local overrides。
+6. 解析 active source / flow，并通过 `ResolveActiveWorkflow()` 物化 `WorkflowDefinition`。
+7. 调用 `config.NewFromWorkflow` 生成类型化配置。
+8. 应用 CLI `--port` 覆盖。
+9. 初始化 logger。
+10. 执行 `config.ValidateForDispatch`。
+11. 构造 `runtimeState`，把 repository definition、workflow definition 与 config 封装成可热更新状态。
+12. 创建 tracker、workspace manager、agent runner、orchestrator。
+13. 如果是 `--dry-run`，执行一次 `orch.RunOnce(context.Background(), false)` 后退出。
+14. 如果是正常运行：
     - 建立信号上下文（`os.Interrupt`、`SIGTERM`）。
-    - 注册 workflow watcher。
+    - 注册 `automation/` watcher。
     - 如果有 `server.port`，启动 HTTP server。
     - 启动 orchestrator。
     - 阻塞等待 orchestrator 结束。
@@ -446,8 +474,8 @@ CLI 当前支持：
 
 1. 读取 `git config user.name` 作为 `<namespace>`。
 2. 根据 tracker 类型生成 `<issue-short>`：
-   - `linear`：`linear-<workspace.linear_branch_scope>-<issue-identifier>`
-   - `github`：`github-<tracker.repo>-<issue-number>`
+   - `linear`：`linear-<source.branch_scope>-<issue-identifier>`（首版内部 bridge 仍经由 `workspace.linear_branch_scope`）
+   - `github`：`github-<source.repo>-<issue-number>`（首版内部 bridge 仍经由 `tracker.repo`）
    - 其他：退化为 identifier slug
 3. 读取当前分支、本地分支、远端分支。
 4. 选择已有分支或创建新分支。
@@ -524,7 +552,7 @@ CLI 当前支持：
 
 当前 `runner.Run` 不是单 turn：
 
-- 第 1 个 turn 使用 `WORKFLOW.md` 正文模板渲染 prompt。
+- 第 1 个 turn 使用 active flow 对应的 prompt 模板渲染 prompt。
 - 第 2 个 turn 开始，prompt 变成固定 continuation 文案。
 
 每个 turn 完成后：
@@ -1311,7 +1339,7 @@ Dashboard 页面当前是一个简单 HTML：
 
 根据当前实现与 SPEC，hooks 需要这样理解：
 
-- hooks 来自 `WORKFLOW.md`
+- hooks 来自 active flow 引用的 `automation/hooks/*.sh`
 - hooks 是**完全受信任配置**
 - hooks 在工作区目录内运行
 - hook 输出应截断后写日志
@@ -1379,7 +1407,7 @@ SPEC 没有强制统一安全姿态，但明确建议按部署风险加固。适
 ### 14.3 真实集成测试要求
 
 - 需要真实凭据，例如 `LINEAR_API_KEY`
-- 可选用 `LINEAR_PROJECT_SLUG` 覆盖 `WORKFLOW.md` 中的默认项目
+- 可选通过 active source 覆盖 `project_slug`
 - 应使用隔离测试标识符 / 工作区
 - 应在可能时清理 tracker 侧产物
 - `[核心规范]` skipped 的真实集成测试必须报告为 skipped，不能被静默当作 passed
@@ -1393,8 +1421,8 @@ SPEC 没有强制统一安全姿态，但明确建议按部署风险加固。适
 ### 15.1 启动阶段
 
 1. 用户执行 `go run ./cmd/symphony ...`
-2. CLI 读取 `WORKFLOW.md`
-3. front matter 被解析为 `ServiceConfig`
+2. CLI 读取 `automation/project.yaml`、profile、source、flow 与 local 配置
+3. `ResolveActiveWorkflow()` 物化 active `WorkflowDefinition`，再解析为 `ServiceConfig`
 4. logger 初始化
 5. tracker / workspace / runner / orchestrator 被构造
 6. orchestrator 做启动终态工作区清理
@@ -1427,7 +1455,7 @@ SPEC 没有强制统一安全姿态，但明确建议按部署风险加固。适
 
 1. 启动 `codex app-server`
 2. 完成 `initialize -> initialized -> thread/start -> turn/start`
-3. 第 1 个 turn 使用 `WORKFLOW.md` 的 prompt 模板
+3. 第 1 个 turn 使用 active flow 对应的 prompt 模板
 4. 若发生 approval 请求，自动批准
 5. 若发生 `linear_graphql` 工具请求，由 runner 直接代为访问 Linear
 6. 若 agent 请求用户输入，立刻视为失败
@@ -1492,7 +1520,7 @@ SPEC 没有强制统一安全姿态，但明确建议按部署风险加固。适
 
 当前这套代码已经形成一条完整闭环：
 
-- **配置层**：`WORKFLOW.md` → `WorkflowDefinition` → `ServiceConfig`
+- **配置层**：`automation/` → `AutomationDefinition` → `WorkflowDefinition` → `ServiceConfig`
 - **调度层**：`orchestrator` 轮询、筛选、dispatch、重试、对账
 - **执行层**：`workspace` + `agent runner`
 - **集成层**：Linear GraphQL + 可选 HTTP 状态面

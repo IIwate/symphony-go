@@ -21,13 +21,15 @@
 ### 2.1 基础环境
 
 - 操作系统已具备运行 Go 二进制和 `codex app-server` 的条件
-- 当前工作目录或显式传入路径下存在可用的 `WORKFLOW.md`
-- `WORKFLOW.md` 中配置的 tracker / hooks / codex 参数与目标环境匹配
+- 当前已发布版本：当前工作目录或显式传入路径下存在可用的 `WORKFLOW.md`
+- Cycle 5 草案目录模式：仓库根部存在 `automation/project.yaml`
+- 使用哪种模式启动，就要保证对应配置中的 tracker / source / hooks / codex 参数与目标环境匹配
 
 ### 2.2 必要凭证
 
 - 当前版本仅支持 `tracker.kind=linear`：注入 `LINEAR_API_KEY`
-- `GITHUB_TOKEN` / `tracker.kind=github` 属于 Cycle 5 之后的扩展，不适用于当前已发布实现
+- Cycle 5 草案目录模式下，推荐把本地 secrets 放在 `automation/local/env.local`
+- `GITHUB_TOKEN` / GitHub source 属于 Cycle 5 之后的扩展，不适用于当前已发布实现
 - 不要把 token 明文写入日志、命令历史或共享文档
 
 ### 2.3 目录与权限
@@ -41,11 +43,12 @@
 
 - 以下内容对应 `docs/rfcs/github-issues-tracker.md` 的设计草案，不适用于当前只支持 Linear 的版本
 
-- `tracker.owner` / `tracker.repo` 必须指向目标仓库
+- GitHub source 应定义在 `automation/sources/*.yaml`
+- `owner` / `repo` 必须指向目标仓库
 - 状态标签默认使用 `state_label_prefix=symphony:`，例如 `symphony:todo`、`symphony:in-progress`、`symphony:cancelled`
 - 同一 issue 若存在多个 `symphony:*` 状态标签，系统应记录告警并跳过该 issue；先人工清理标签冲突
 - GitHub `/issues` 接口返回的 PR 条目会被过滤，不会参与调度
-- 参考示例：`docs/examples/WORKFLOW.github-issues.md`
+- 参考示例：`docs/examples/automation-github-issues.md`（目录模式示例文档）
 
 ## 3. 启动命令
 
@@ -64,12 +67,17 @@ go run ./cmd/symphony --dry-run
 $env:LINEAR_API_KEY="<your-token>"
 go run ./cmd/symphony --dry-run ./path/to/WORKFLOW.md
 ```
-GitHub Issues tracker 示例（Cycle 5 之后适用，当前版本不要使用）：
+
+Cycle 5 草案目录模式下，建议的本地 secrets 形式为：
 
 ```powershell
-$env:GITHUB_TOKEN="<your-token>"
-go run ./cmd/symphony --dry-run ./docs/examples/WORKFLOW.github-issues.md
+# automation/local/env.local
+LINEAR_API_KEY=<your-token>
+GITHUB_TOKEN=<your-token>
 ```
+
+> 当前已发布版本尚未支持 `automation/` 目录模式，因此这里没有可直接执行的 `--config-dir` 示例命令。
+> `docs/examples/automation-github-issues.md` 是目录模式参考文档，不是可直接作为位置参数传入的单文件 workflow 示例。
 
 ### 3.2 正常启动（无 HTTP server）
 
@@ -93,6 +101,7 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 - `--port`：启用 HTTP server，当前实现绑定 loopback 地址
 - `--log-file`：同时输出到 stderr 与指定文件
 - `--log-level`：`debug` / `info` / `warn` / `error`
+- Cycle 5 草案中预期会新增 `--config-dir` 与 `--profile`，用于 `automation/` 目录模式；当前已发布版本尚未实现
 
 ## 4. 启动后应观察什么
 
@@ -129,11 +138,27 @@ curl http://127.0.0.1:8080/api/v1/state
 
 ## 5. Workflow 热加载操作
 
-- Symphony-Go 启动后会监听 `WORKFLOW.md`
+- 当前已发布版本启动后会监听 `WORKFLOW.md`
 - 文件变更后会尝试 reload
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
 - `orchestrator.auto_close_on_pr` 也支持热更新；默认值为 `true`
+
+Cycle 5 草案目录模式下，预期监听对象会扩展为：
+
+- `automation/project.yaml`
+- 当前激活的 `automation/profiles/*.yaml`
+- `automation/sources/*.yaml`
+- `automation/flows/*.yaml`
+- `automation/prompts/*.md.liquid`
+- `automation/policies/*.yaml`
+- `automation/hooks/*.sh`
+- `automation/local/overrides.yaml`
+
+以下文件不参与热重载：
+
+- `automation/local/env.local`
+- `automation/local/session-state.json`
 
 ### 建议操作方式
 
@@ -148,6 +173,7 @@ curl http://127.0.0.1:8080/api/v1/state
 - 若 `--dry-run` 成功，表示当前 workflow/config 基本可用；但它仍会访问 tracker，并可能执行启动清理副作用
 - 执行 `go run ./cmd/symphony --dry-run`
 - 期望结果：退出码为 0，日志出现“dry-run 校验通过”
+- 若你在对照 Cycle 5 草案目录模式排查，请先确认 `automation/project.yaml`、active source 和 `automation/local/env.local` 的内容一致
 
 ### 6.2 调度烟测
 
@@ -205,6 +231,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - 检查位置参数路径是否正确
 - 检查当前工作目录是否存在 `./WORKFLOW.md`
+- 若你在阅读 Cycle 5 草案：等价错误会出现在 `automation/project.yaml` 缺失或配置目录路径错误时
 
 ### 8.2 dispatch preflight 校验失败
 
@@ -213,6 +240,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - `tracker.kind` 缺失或不支持
 - `tracker.kind=linear` 但 `LINEAR_API_KEY` 未注入或 `tracker.project_slug` 缺失
 - 若误填 `tracker.kind=github`，当前版本会直接在 preflight 阶段判定为 unsupported tracker kind
+- 若对照 Cycle 5 草案目录模式：active source 缺失、source key 选择错误，或 source 中缺少 `api_key` / `owner` / `repo` 也会导致等价 preflight 失败
 - `codex.command` 为空
 
 处理：
@@ -310,14 +338,14 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - `GITHUB_TOKEN` scope / fine-grained 权限不足
 - `X-RateLimit-Remaining` 过低或命中 secondary rate limit
-- `tracker.owner` / `tracker.repo` 指向了错误仓库
+- GitHub source 中的 `owner` / `repo` 指向了错误仓库
 
 处理：
 
 - 检查 token 是否具备仓库 `Issues: Read` 权限
 - 提高 `polling.interval_ms`，避免高频轮询
 - 观察日志中的 rate limit 告警与 GitHub 返回头
-- 用示例文件 `docs/examples/WORKFLOW.github-issues.md` 对照当前配置
+- 用示例文档 `docs/examples/automation-github-issues.md` 对照 `automation/sources/*.yaml`、`automation/project.yaml` 与 `automation/local/env.local`
 
 ## 9. 关闭与回滚
 
@@ -335,7 +363,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 - 记录当前版本号 / 提交哈希
 - 确认工作区目录和日志路径无需额外迁移
-- 确认回滚版本与当前 `WORKFLOW.md` 契约兼容
+- 若当前仍运行 legacy 模式：确认回滚版本与 `WORKFLOW.md` 契约兼容
+- 若后续已切到目录模式：确认回滚版本是否仍支持 `automation/`；若不支持，则需准备 legacy `WORKFLOW.md` 兼容配置
 
 ## 10. 发布前建议操作顺序
 
@@ -351,7 +380,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - `docs/release-checklist.md`
 - `docs/cycles/cycle-04-extension-release.md`
 - `docs/rfcs/github-issues-tracker.md`（Cycle 5 草案）
-- `docs/examples/WORKFLOW.github-issues.md`（Cycle 5 示例）
+- `docs/examples/automation-github-issues.md`（Cycle 5 目录模式示例）
 - `IMPLEMENTATION.md`
 - `REQUIREMENTS.md`
 - `SPEC.md`
