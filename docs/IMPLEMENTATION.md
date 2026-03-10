@@ -15,12 +15,13 @@ Symphony-Go 是一个长运行自动化服务的 Go 实现，用于编排 coding
 
 ```
                           ┌─────────────────────┐
-                          │   WORKFLOW.md        │
-                          │  (YAML + Liquid)     │
+                          │    automation/       │
+                          │ (project/source/     │
+                          │  flow/prompt/hooks)  │
                           └──────────┬──────────┘
                                      │ 加载/监控
                           ┌──────────▼──────────┐
-                          │  Workflow Loader     │
+                          │ Automation Loader    │
                           │  + Config Layer      │
                           └──────────┬──────────┘
                                      │ 类型化配置
@@ -47,7 +48,8 @@ symphony-go/
 ├── cmd/symphony/main.go          # CLI 入口
 ├── internal/
 │   ├── model/                    # 纯数据结构 + 枚举 + typed errors
-│   ├── workflow/                 # WORKFLOW.md 解析 + Liquid 模板渲染 + 文件监控
+│   ├── loader/                   # automation/ 目录加载 + active workflow 物化 + watcher
+│   ├── workflow/                 # Liquid 模板渲染
 │   ├── config/                   # 类型化配置解析 + 默认值 + 环境变量 + 校验
 │   ├── tracker/                  # Linear GraphQL 适配器（interface 可扩展）
 │   ├── orchestrator/             # 状态机 + 轮询调度 + 重试 + 对账（核心引擎）
@@ -61,7 +63,7 @@ symphony-go/
 │   ├── REQUIREMENTS.md
 │   ├── IMPLEMENTATION.md
 │   └── FLOW.md
-└── WORKFLOW.md                   # 示例/测试用
+└── automation/                   # 运行时契约目录
 ```
 
 ### 依赖方向
@@ -248,12 +250,13 @@ for {
 ## CLI 入口
 
 ```bash
-symphony [WORKFLOW.md路径] [--port PORT] [--dry-run] [--log-file PATH] [--log-level LEVEL]
+symphony [--config-dir automation] [--profile NAME] [--port PORT] [--dry-run] [--log-file PATH] [--log-level LEVEL]
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| 位置参数 | `./WORKFLOW.md` | 工作流文件路径 |
+| `--config-dir` | `automation` | automation 契约目录 |
+| `--profile` | 空 | runtime profile 名 |
 | `--port` | 不启动 server | HTTP 端口 |
 | `--dry-run` | false | 执行一个 poll cycle 后退出 |
 | `--log-file` | 仅 stderr | 日志文件路径 |

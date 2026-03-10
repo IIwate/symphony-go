@@ -25,7 +25,7 @@
 - orchestrator durable state 的导出与恢复
 - retry 队列、暂停态、system alerts、claimed/running 元数据、token totals 的持久化
 - 启动恢复逻辑：把中断中的运行转换为可继续调度的状态
-- `WORKFLOW.md` 中 `session_persistence:` 配置块
+- `automation/project.yaml` 中 `runtime.session_persistence:` 配置块
 - 文件损坏、版本不兼容、部分状态丢失时的降级语义
 
 ### Out of Scope
@@ -231,15 +231,16 @@ type FileStore struct {
 
 ## 7. 配置设计
 
-### 7.1 `WORKFLOW.md` 示例
+### 7.1 `automation/project.yaml` 示例
 
 ```yaml
-session_persistence:
-  enabled: true
-  backend: file
-  path: ./.symphony/session-state.json
-  flush_interval_ms: 1000
-  fsync_on_critical: true
+runtime:
+  session_persistence:
+    enabled: true
+    backend: file
+    path: ./automation/local/session-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
 ```
 
 ### 7.2 字段
@@ -248,7 +249,7 @@ session_persistence:
 |---|---|---|---|
 | `enabled` | 否 | `false` | 是否启用 session 持久化 |
 | `backend` | 否 | `file` | 首版仅支持 `file` |
-| `path` | `enabled=true` 时是 | `./.symphony/session-state.json` | 状态文件路径 |
+| `path` | `enabled=true` 时是 | `./automation/local/session-state.json` | 状态文件路径 |
 | `flush_interval_ms` | 否 | `1000` | 脏状态 flush 周期 |
 | `fsync_on_critical` | 否 | `true` | 关键状态变化时是否强制刷盘 |
 
@@ -273,11 +274,12 @@ SessionPersistence SessionPersistenceConfig
 ### 7.4 `config` 层解析
 
 ```go
-sp := getMap(configMap, "session_persistence")
+runtime := getMap(configMap, "runtime")
+sp := getMap(runtime, "session_persistence")
 cfg.SessionPersistence = model.SessionPersistenceConfig{
     Enabled:         getBool(sp, "enabled", false),
     Backend:         getString(sp, "backend", "file"),
-    Path:            getString(sp, "path", "./.symphony/session-state.json"),
+    Path:            getString(sp, "path", "./automation/local/session-state.json"),
     FlushIntervalMS: getInt(sp, "flush_interval_ms", 1000),
     FsyncOnCritical: getBool(sp, "fsync_on_critical", true),
 }
@@ -432,6 +434,7 @@ if !reflect.DeepEqual(s.config.SessionPersistence, newCfg.SessionPersistence) {
 | I/O | 定期刷盘，取决于 flush 频率 |
 | 备份策略 | 建议排除临时文件，仅备份正式 state 文件 |
 | 排障点 | 状态文件损坏、权限、路径不可写 |
+| 默认位置 | `automation/local/session-state.json`，与 `env.local` 同属本地目录，不进仓库 |
 
 ### 关键运维建议
 

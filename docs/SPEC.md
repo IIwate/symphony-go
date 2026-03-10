@@ -15,8 +15,8 @@ The service solves four operational problems:
 - It turns issue execution into a repeatable daemon workflow instead of manual scripts.
 - It isolates agent execution in per-issue workspaces so agent commands run only inside per-issue
   workspace directories.
-- It keeps the workflow policy in-repo (`WORKFLOW.md`) so teams version the agent prompt and runtime
-  settings with their code.
+- It keeps the runtime contract in-repo (`automation/`) so teams version prompt templates, source
+  definitions, and runtime settings with their code.
 - It provides enough observability to operate and debug multiple concurrent agent runs.
 
 Implementations are expected to document their trust and safety posture explicitly. This
@@ -41,7 +41,7 @@ Important boundary:
 - Create deterministic per-issue workspaces and preserve them across runs.
 - Stop active runs when issue state changes make them ineligible.
 - Recover from transient failures with exponential backoff.
-- Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
+- Load runtime behavior from a repository-owned `automation/` contract.
 - Expose operator-visible observability (at minimum structured logs).
 - Support restart recovery without requiring a persistent database.
 
@@ -60,10 +60,10 @@ Important boundary:
 
 ### 3.1 Main Components
 
-1. `Workflow Loader`
-   - Reads `WORKFLOW.md`.
-   - Parses YAML front matter and prompt body.
-   - Returns `{config, prompt_template}`.
+1. `Automation Loader`
+   - Reads `automation/project.yaml` and related repository-owned files.
+   - Resolves runtime settings, active source, active flow, and prompt template.
+   - Returns an effective runtime contract for dispatch.
 
 2. `Config Layer`
    - Exposes typed getters for workflow config values.
@@ -106,11 +106,11 @@ Important boundary:
 Symphony is easiest to port when kept in these layers:
 
 1. `Policy Layer` (repo-defined)
-   - `WORKFLOW.md` prompt body.
+   - `automation/prompts/*.md.liquid`, `automation/flows/*.yaml`, `automation/policies/*.yaml`.
    - Team-specific rules for ticket handling, validation, and handoff.
 
 2. `Configuration Layer` (typed getters)
-   - Parses front matter into typed runtime settings.
+   - Parses `automation/project.yaml`, profile overrides, source definitions, and local overrides.
    - Handles defaults, environment tokens, and path normalization.
 
 3. `Coordination Layer` (orchestrator)
@@ -168,12 +168,12 @@ Fields:
 
 #### 4.1.2 Workflow Definition
 
-Parsed `WORKFLOW.md` payload:
+Resolved active workflow payload derived from the `automation/` contract:
 
 - `config` (map)
-  - YAML front matter root object.
+  - Effective bridge config map derived from runtime/profile/source/flow resolution.
 - `prompt_template` (string)
-  - Markdown body after front matter, trimmed.
+  - The resolved prompt template text, trimmed.
 
 #### 4.1.3 Service Config (Typed View)
 
@@ -277,64 +277,79 @@ Fields:
 - `Session ID`
   - Compose from coding-agent `thread_id` and `turn_id` as `<thread_id>-<turn_id>`.
 
-## 5. Workflow Specification (Repository Contract)
+## 5. Repository Contract Specification
 
 ### 5.1 File Discovery and Path Resolution
 
-Workflow file path precedence:
+Contract path precedence:
 
-1. Explicit application/runtime setting (set by CLI startup path).
-2. Default: `WORKFLOW.md` in the current process working directory.
+1. Explicit application/runtime setting via `--config-dir`.
+2. Default: `automation/project.yaml` in the current process working directory.
 
 Loader behavior:
 
-- If the file cannot be read, return `missing_workflow_file` error.
-- The workflow file is expected to be repository-owned and version-controlled.
+- If `automation/project.yaml` cannot be read, return `missing_workflow_file` or implementation-equivalent typed error.
+- The contract files are expected to be repository-owned and version-controlled.
 
 ### 5.2 File Format
 
-`WORKFLOW.md` is a Markdown file with optional YAML front matter.
+The repository contract is a directory rooted at `automation/`.
 
-Design note:
+Expected layout:
 
-- `WORKFLOW.md` should be self-contained enough to describe and run different workflows (prompt,
-  runtime settings, hooks, and tracker selection/config) without requiring out-of-band
-  service-specific configuration.
+```text
+automation/
+  project.yaml
+  profiles/*.yaml
+  sources/*.yaml
+  flows/*.yaml
+  prompts/*.md.liquid
+  policies/*.yaml
+  hooks/*.sh
+  local/overrides.yaml
+  local/env.local
+  local/session-state.json
+```
 
 Parsing rules:
 
-- If file starts with `---`, parse lines until the next `---` as YAML front matter.
-- Remaining lines become the prompt body.
-- If front matter is absent, treat the entire file as prompt body and use an empty config map.
-- YAML front matter must decode to a map/object; non-map YAML is an error.
-- Prompt body is trimmed before use.
+- `project.yaml` is required.
+- `profiles/*.yaml` are optional overlays selected by CLI/runtime default.
+- `sources/*.yaml` register candidate task sources by file name.
+- `flows/*.yaml` select prompt templates, hooks, and future policies.
+- `prompts/*.md.liquid` provide Liquid prompt templates.
+- `local/overrides.yaml` is optional and machine-local.
+- `local/env.local` is optional, startup-only, and not hot-reloaded.
 
 Returned workflow object:
 
-- `config`: front matter root object (not nested under a `config` key).
-- `prompt_template`: trimmed Markdown body.
+- An implementation may internally resolve the directory contract into:
+  - a repository-level definition (`AutomationDefinition` or equivalent)
+  - an active dispatch-time view (`WorkflowDefinition` or equivalent)
 
 ### 5.3 Front Matter Schema
 
-Top-level keys:
+Top-level contract components:
 
-- `tracker`
-- `polling`
-- `workspace`
-- `hooks`
-- `agent`
-- `codex`
+- `project.yaml`
+- `profiles/*.yaml`
+- `sources/*.yaml`
+- `flows/*.yaml`
+- `prompts/*.md.liquid`
+- `policies/*.yaml`
+- `hooks/*.sh`
 
 Unknown keys should be ignored for forward compatibility.
 
 Note:
 
-- The workflow front matter is extensible. Optional extensions may define additional top-level keys
-  (for example `server`) without changing the core schema above.
+- `project.yaml` is the repository-owned root config.
+- `profiles/*.yaml` override runtime behavior only; they do not define source identity.
+- `sources/*.yaml` define source identity and source-specific fields such as `kind`, credentials,
+  state schema, and branch scope.
+- `flows/*.yaml` define which prompt, hooks, and future policies apply to a class of work.
 - Extensions should document their field schema, defaults, validation rules, and whether changes
   apply dynamically or require restart.
-- Common extension: `server.port` (integer) enables the optional HTTP server described in Section
-  13.7.
 
 #### 5.3.1 `tracker` (object)
 
@@ -445,7 +460,7 @@ fields locally if they want stricter startup checks.
 
 ### 5.4 Prompt Template Contract
 
-The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
+The flow-referenced `automation/prompts/*.md.liquid` file is the per-issue prompt template.
 
 Rendering requirements:
 
@@ -460,12 +475,15 @@ Template input variables:
 - `attempt` (integer or null)
   - `null`/absent on first attempt.
   - Integer on retry or continuation run.
+- `source` (object)
+  - Includes the active source's public prompt fields such as `kind`, `project_slug`, `owner`,
+    `repo`, `branch_scope`, `active_states`, and `terminal_states`.
 
 Fallback prompt behavior:
 
 - If the workflow prompt body is empty, the runtime may use a minimal default prompt
   (`You are working on an issue from Linear.`).
-- Workflow file read/parse failures are configuration/validation errors and should not silently fall
+- Contract read/parse failures are configuration/validation errors and should not silently fall
   back to a prompt.
 
 ### 5.5 Workflow Validation and Error Surface
@@ -489,9 +507,9 @@ Dispatch gating behavior:
 
 Configuration precedence:
 
-1. Workflow file path selection (runtime setting -> cwd default).
-2. YAML front matter values.
-3. Environment indirection via `$VAR_NAME` inside selected YAML values.
+1. Config directory selection (`--config-dir` -> cwd default `automation/`).
+2. Repository-owned config values from `project.yaml`, selected profile, selected source, and selected flow.
+3. Local overrides and environment indirection via `$VAR_NAME` inside selected YAML values.
 4. Built-in defaults.
 
 Value coercion semantics:
@@ -506,8 +524,8 @@ Value coercion semantics:
 
 Dynamic reload is required:
 
-- The software should watch `WORKFLOW.md` for changes.
-- On change, it should re-read and re-apply workflow config and prompt template without restart.
+- The software should watch the effective `automation/` contract files for changes.
+- On change, it should re-read and re-apply effective config and prompt template without restart.
 - The software should attempt to adjust live behavior to the new config (for example polling
   cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
   prompt content for future runs).
@@ -541,7 +559,7 @@ Per-tick dispatch validation:
 
 Validation checks:
 
-- Workflow file can be loaded and parsed.
+- Repository contract can be loaded and parsed.
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when required by the selected tracker kind.
@@ -1225,9 +1243,10 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 
 Inputs to prompt rendering:
 
-- `workflow.prompt_template`
+- active flow prompt template
 - normalized `issue` object
 - optional `attempt` integer (retry/continuation metadata)
+- active `source` object
 
 ### 12.2 Rendering Rules
 
@@ -1365,9 +1384,9 @@ If implemented:
 Enablement (extension):
 
 - Start the HTTP server when a CLI `--port` argument is provided.
-- Start the HTTP server when `server.port` is present in `WORKFLOW.md` front matter.
-- `server.port` is extension configuration and is intentionally not part of the core front-matter
-  schema in Section 5.3.
+- Start the HTTP server when `runtime.server.port` is present in the effective repository contract.
+- `server.port` is extension configuration and is intentionally not part of the minimal core
+  contract summary in Section 5.3.
 - Precedence: CLI `--port` overrides `server.port` when both are present.
 - `server.port` must be an integer. Positive values bind that port. `0` may be used to request an
   ephemeral port for local development and tests.
@@ -1525,8 +1544,8 @@ API design notes:
 ### 14.1 Failure Classes
 
 1. `Workflow/Config Failures`
-   - Missing `WORKFLOW.md`
-   - Invalid YAML front matter
+   - Missing `automation/project.yaml`
+   - Invalid YAML or template files in the repository contract
    - Unsupported tracker kind or missing tracker credentials/project slug
    - Missing coding-agent executable
 
@@ -1593,8 +1612,9 @@ After restart:
 
 Operators can control behavior by:
 
-- Editing `WORKFLOW.md` (prompt and most runtime settings).
-- `WORKFLOW.md` changes should be detected and re-applied automatically without restart.
+- Editing the effective `automation/` contract files (prompt, most runtime settings, sources,
+  flows, policies, hooks).
+- Supported `automation/` changes should be detected and re-applied automatically without restart.
 - Changing issue states in the tracker:
   - terminal state -> running session is stopped and workspace cleaned when reconciled
   - non-active state -> running session is stopped without cleanup
@@ -1638,7 +1658,8 @@ Recommended additional hardening for ports:
 
 ### 15.4 Hook Script Safety
 
-Workspace hooks are arbitrary shell scripts from `WORKFLOW.md`.
+Workspace hooks are arbitrary shell scripts referenced from `automation/flows/*.yaml` and stored
+under `automation/hooks/`.
 
 Implications:
 
@@ -1683,7 +1704,7 @@ treat harness hardening as part of the core safety model rather than an optional
 function start_service():
   configure_logging()
   start_observability_outputs()
-  start_workflow_watch(on_change=reload_and_reapply_workflow)
+  start_contract_watch(on_change=reload_and_reapply_contract)
 
   state = {
     poll_interval_ms: get_config_poll_interval_ms(),
@@ -1824,7 +1845,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   turn_number = 1
 
   while true:
-    prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
+    prompt = build_turn_prompt(prompt_template, issue, source, attempt, turn_number, max_turns)
     if prompt failed:
       app_server.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
@@ -1932,15 +1953,14 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.1 Workflow and Config Parsing
 
-- Workflow file path precedence:
-  - explicit runtime path is used when provided
-  - cwd default is `WORKFLOW.md` when no explicit runtime path is provided
-- Workflow file changes are detected and trigger re-read/re-apply without restart
-- Invalid workflow reload keeps last known good effective configuration and emits an
+- Repository contract path precedence:
+  - explicit `--config-dir` is used when provided
+  - cwd default is `automation/project.yaml` when no explicit config dir is provided
+- Supported `automation/` file changes are detected and trigger re-read/re-apply without restart
+- Invalid contract reload keeps last known good effective configuration and emits an
   operator-visible error
-- Missing `WORKFLOW.md` returns typed error
-- Invalid YAML front matter returns typed error
-- Front matter non-map returns typed error
+- Missing `automation/project.yaml` returns typed error
+- Invalid YAML or template files return typed errors
 - Config defaults apply when optional values are missing
 - `tracker.kind` validation enforces currently supported kind (`linear`)
 - `tracker.api_key` works (including `$VAR` indirection)
@@ -2040,9 +2060,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.7 CLI and Host Lifecycle
 
-- CLI accepts an optional positional workflow path argument (`path-to-WORKFLOW.md`)
-- CLI uses `./WORKFLOW.md` when no workflow path argument is provided
-- CLI errors on nonexistent explicit workflow path or missing default `./WORKFLOW.md`
+- CLI uses `automation` as the default config directory
+- CLI may allow `--config-dir` and `--profile` as explicit runtime selectors
+- CLI rejects unsupported positional workflow path arguments
+- CLI errors on missing `automation/project.yaml`
 - CLI surfaces startup failure cleanly
 - CLI exits with success when application starts and shuts down normally
 - CLI exits nonzero when startup fails or the host process exits abnormally
@@ -2070,10 +2091,10 @@ Use the same validation profiles as Section 17:
 
 ### 18.1 Required for Conformance
 
-- Workflow path selection supports explicit runtime path and cwd default
-- `WORKFLOW.md` loader with YAML front matter + prompt body split
+- Config directory selection supports explicit `--config-dir` and cwd default `automation/`
+- `automation/` loader with project/profile/source/flow/prompt resolution
 - Typed config layer with defaults and `$` resolution
-- Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt
+- Dynamic `automation/` watch/reload/re-apply for config and prompt
 - Polling orchestrator with single-authority mutable state
 - Issue tracker client with candidate fetch + state refresh + terminal fetch
 - Workspace manager with sanitized per-issue workspaces
@@ -2081,7 +2102,7 @@ Use the same validation profiles as Section 17:
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
 - Coding-agent app-server subprocess client with JSON line protocol
 - Codex launch command config (`codex.command`, default `codex app-server`)
-- Strict prompt rendering with `issue` and `attempt` variables
+- Strict prompt rendering with `issue`, `attempt`, and `source` variables
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
 - Reconciliation that stops runs on terminal/non-active tracker states
@@ -2096,7 +2117,7 @@ Use the same validation profiles as Section 17:
 - Optional `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
 - TODO: Persist retry queue and session metadata across process restarts.
-- TODO: Make observability settings configurable in workflow front matter without prescribing UI
+- TODO: Make observability settings configurable in the repository contract without prescribing UI
   implementation details.
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
   of only via agent tools.

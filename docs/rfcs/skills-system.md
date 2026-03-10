@@ -24,7 +24,7 @@
 - `.codex/skills/<name>/SKILL.md` 规范
 - `internal/skills/` 的 catalog / resolver
 - prompt 构建阶段注入 skill 摘要与必要引用
-- `WORKFLOW.md` 中 `skills:` 配置块
+- `automation/project.yaml` 中 `runtime.skills:` 配置块
 - skill 根目录、大小预算和路径安全校验
 
 ### Out of Scope
@@ -127,17 +127,18 @@ scripts:
 
 ## 5. 配置设计
 
-### 5.1 `WORKFLOW.md` 示例
+### 5.1 `automation/project.yaml` 示例
 
 ```yaml
-skills:
-  enabled: true
-  roots:
-    - ./.codex/skills
-  required:
-    - commit
-    - push
-  max_inline_bytes: 32768
+runtime:
+  skills:
+    enabled: true
+    roots:
+      - ./.codex/skills
+    required:
+      - commit
+      - push
+    max_inline_bytes: 32768
 ```
 
 ### 5.2 字段
@@ -169,7 +170,8 @@ Skills SkillsConfig
 ### 5.4 `config` 层解析
 
 ```go
-skillsMap := getMap(configMap, "skills")
+runtime := getMap(configMap, "runtime")
+skillsMap := getMap(runtime, "skills")
 cfg.Skills = model.SkillsConfig{
     Enabled:        getBool(skillsMap, "enabled", false),
     Roots:          getStringSlice(skillsMap, "roots", []string{"./.codex/skills"}),

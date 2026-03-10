@@ -44,7 +44,7 @@
 ### 3. 发布前验证
 
 - 跑通 `Real Integration Profile`
-- 在目标主机环境验证 hook、shell、路径解析与 `WORKFLOW.md` 默认路径行为
+- 在目标主机环境验证 hook、shell、`automation/project.yaml` 路径解析与目录热更新行为
 - 整理 operator runbook：启动参数、常见故障、日志定位方式、推荐 smoke test
 
 ### 4. 文档与交付整理
@@ -98,7 +98,7 @@
 
 - 已完成 HTTP API、SSE、Dashboard、`linear_graphql`、operator runbook、release checklist 与真实验证记录。
 - 已在真实 Linear 凭证环境完成 smoke test：dry-run、候选 issue 查询、HTTP/SSE/refresh、真实 issue 调度与动态工具链路验证通过。
-- 根据实测结果，仓库 `WORKFLOW.md` 已新增 `codex.read_timeout_ms: 15000`，用于适配当前主机上 `codex-cli 0.111.0` 的 `thread/start` 启动时延。
+- 根据实测结果，后续目录模式应在 `automation/project.yaml` 或 active profile 中设置 `codex.read_timeout_ms: 15000`，用于适配当前主机上 `codex-cli 0.111.0` 的 `thread/start` 启动时延。
 - 本周期收口结论：**完成**。后续进入 Cycle 5 / Post-MVP 扩展，不再阻塞首版。
 
 ## 下一周期输入

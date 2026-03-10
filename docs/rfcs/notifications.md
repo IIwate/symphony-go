@@ -12,7 +12,7 @@
 
 完成后：
 
-- 操作者在 `WORKFLOW.md` 中配置 `notifications:` 段即可启用通知，默认行为不变
+- 操作者在 `automation/project.yaml` 中配置 `runtime.notifications:` 段即可启用通知，默认行为不变
 - 支持 Webhook（通用 HTTP POST）和 Slack（Incoming Webhook）两种内置通道
 - 事件由 orchestrator 在精确业务节点直接发射，避免基于快照 diff 的误报
 - 通知发送是纯旁路能力，不阻塞 orchestrator 主循环
@@ -24,7 +24,7 @@
 
 - `internal/notifier/` 包：`Notifier` 核心、`Channel` 接口、Webhook/Slack 通道
 - orchestrator 新增通知事件 channel（`orchEventCh`）与事件发射辅助函数
-- `notifications:` `WORKFLOW.md` 配置段解析
+- `runtime.notifications:` 配置段解析
 - `ValidateForDispatch` 扩展：校验通知配置的语义有效性
 - 通知事件类型（首版 6 种，可扩展）
 - 发送失败重试与 best-effort 关闭语义
@@ -77,7 +77,7 @@
 
 ### 3.3 配置错误在校验阶段失败，而不是运行时静默跳过
 
-通知配置属于 `WORKFLOW.md` 契约的一部分。
+通知配置属于 `automation/` 契约的一部分。
 
 首版策略：
 
@@ -517,28 +517,29 @@ Emoji 映射：
 
 ## 7. 配置设计
 
-### 7.1 `WORKFLOW.md` 示例
+### 7.1 `automation/project.yaml` 示例
 
 ```yaml
-notifications:
-  channels:
-    - name: slack-team
-      kind: slack
-      url: $SLACK_WEBHOOK_URL
-      events: [issue_completed, issue_failed]
-    - name: ops-webhook
-      kind: webhook
-      url: https://hooks.example.com/symphony
-      headers:
-        Authorization: $WEBHOOK_AUTH_HEADER
-      events: [system_alert, issue_failed, issue_intervention_required]
-    - name: all-events
-      kind: webhook
-      url: https://monitor.example.com/events
-  defaults:
-    timeout_ms: 5000
-    retry_count: 2
-    retry_delay_ms: 1000
+runtime:
+  notifications:
+    channels:
+      - name: slack-team
+        kind: slack
+        url: $SLACK_WEBHOOK_URL
+        events: [issue_completed, issue_failed]
+      - name: ops-webhook
+        kind: webhook
+        url: https://hooks.example.com/symphony
+        headers:
+          Authorization: $WEBHOOK_AUTH_HEADER
+        events: [system_alert, issue_failed, issue_intervention_required]
+      - name: all-events
+        kind: webhook
+        url: https://monitor.example.com/events
+    defaults:
+      timeout_ms: 5000
+      retry_count: 2
+      retry_delay_ms: 1000
 ```
 
 注意：

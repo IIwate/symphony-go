@@ -10,7 +10,7 @@
 
 为 symphony-go 的 `tracker.Client` 接口新增 GitHub Issues 适配器，使编排器可以从 GitHub Issues 拉取候选任务并跟踪状态。这是首版 Linear-only tracker 的第一个平台扩展。
 
-完成后，用户只需把 `tracker.kind` 改为 `github` 并提供 GitHub Token，即可将 GitHub Issues 作为任务源驱动 agent 派发。
+完成后，用户只需在 `automation/sources/*.yaml` 中定义 `kind: github` 的 source，并在 `selection.enabled_sources` 中选择它，即可将 GitHub Issues 作为任务源驱动 agent 派发。
 
 ## 2. 范围
 
@@ -20,7 +20,7 @@
 - GitHub REST API v3 调用（纯 `net/http`，不引入 GitHub SDK）
 - 过滤 `pull_request` 条目，仅读取真正的 Issue
 - Labels 模拟状态映射（`symphony:` 前缀约定）
-- 配置解析与验证（`tracker.kind=github`）
+- source 配置解析与验证（active source 为 `kind=github`）
 - 单元测试（`httptest` mock）
 - 集成测试可跳过策略
 
@@ -32,21 +32,27 @@
 - 依赖关系解析（`BlockedBy` 保持 nil）
 - `agent.Runner` 扩展（属于下一个主题周期）
 
-## 3. 配置字段
+## 3. Source 配置字段
 
-`WORKFLOW.md` 中 `tracker:` 块新增以下字段：
+目录模式下，GitHub 任务源定义在 `automation/sources/github-<name>.yaml`。
 
 ```yaml
-tracker:
-  kind: github
-  api_key: $GITHUB_TOKEN          # PAT，Bearer 认证
-  endpoint: https://api.github.com # 可选，默认值；支持 GHES
-  owner: octocat                   # 仓库所有者
-  repo: my-project                 # 仓库名
-  state_label_prefix: "symphony:"  # 可选，默认 "symphony:"
-  active_states: [todo, in-progress]
-  terminal_states: [closed, cancelled]
+# automation/sources/github-core.yaml
+kind: github
+api_key: $GITHUB_TOKEN            # PAT，Bearer 认证
+endpoint: https://api.github.com # 可选，默认值；支持 GHES
+owner: octocat                   # 仓库所有者
+repo: my-project                 # 仓库名
+state_label_prefix: "symphony:"  # 可选，默认 "symphony:"
+active_states: [todo, in-progress]
+terminal_states: [closed, cancelled]
 ```
+
+补充约束：
+
+- `kind` / `api_key` / `owner` / `repo` 属于 `source`，不属于 `profile`
+- `profile` 只覆盖运行参数，不切换任务源身份
+- 首版 runtime 仍只允许 `selection.enabled_sources` 最终选中 1 个 source；多任务源聚合由后续 RFC 放宽
 
 ### 字段说明
 
@@ -63,11 +69,11 @@ tracker:
 
 ### 默认值策略
 
-- 当 `tracker.kind=github` 时，`endpoint` 默认值为 `https://api.github.com`
+- 当 active source 为 `kind=github` 时，`endpoint` 默认值为 `https://api.github.com`
 - `active_states` 默认值为 `["todo", "in-progress"]`
 - `terminal_states` 默认值为 `["closed", "cancelled"]`
 - `state_label_prefix` 默认值为 `symphony:`
-- 以上默认值必须按 `tracker.kind` 分支选择，不能沿用 Linear 的 GraphQL endpoint 和状态默认值
+- 以上默认值必须按 active source kind 分支选择，不能沿用 Linear 的 GraphQL endpoint 和状态默认值
 
 ### ServiceConfig 新增字段
 
@@ -78,9 +84,9 @@ TrackerRepo             string   // GitHub repo name
 TrackerStateLabelPrefix string   // label 前缀，默认 "symphony:"
 ```
 
-`project_slug` 字段在 `kind=github` 时不使用（`owner` + `repo` 替代）。
+active source 为 `kind=github` 时，`project_slug` 不使用，改由 `owner` + `repo` 替代。
 
-完整示例见 `docs/examples/WORKFLOW.github-issues.md`。
+目录化示例应放在 `automation/sources/github-<name>.yaml`。参考文档见 `docs/examples/automation-github-issues.md`。
 
 ### Typed Errors 新增
 
@@ -268,7 +274,7 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 ```
 
 - 新增 `ErrMissingTrackerOwner` / `ErrMissingTrackerRepo` typed errors。
-- `tracker.kind=github` 时不再复用 Linear 的 `project_slug` 必填约束，改为校验 `owner` + `repo`。
+- active source 为 `kind=github` 时不再复用 Linear 的 `project_slug` 必填约束，改为校验 `owner` + `repo`。
 
 ### `ApplyReload` / 热重载规则
 
@@ -280,7 +286,7 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 4. 检测 restart-required 字段
 5. 仅在全部通过后替换 last known good
 
-其中 `tracker.kind` 必须列为 restart-required。原因不是配置语义，而是 `newTrackerFactory -> NewDynamicClient(...)` 只在启动时决定具体 client 类型：
+在目录模式下，这条规则应理解为“当前选中的 active source kind 必须列为 restart-required”。原因不是配置语义，而是 `newTrackerFactory -> NewDynamicClient(...)` 只在启动时决定具体 client 类型：
 
 ```go
 if s.config.TrackerKind != newCfg.TrackerKind {
@@ -299,6 +305,7 @@ if s.config.TrackerKind != newCfg.TrackerKind {
 
 | 模块 | 影响 | 说明 |
 |---|---|---|
+| `loader` | 中改 | 需支持从 `automation/sources/*.yaml` 读取并物化 active source |
 | `model` | 兼容 | 新增 3 个 ServiceConfig 字段和 2 个 typed errors，不改已有字段 |
 | `config` | 兼容 | 新增 github 解析分支、kind-aware 默认值与校验，linear 逻辑不变 |
 | `orchestrator` | 无改动 | 通过 `tracker.Client` 接口调用，与具体实现解耦 |
@@ -309,7 +316,7 @@ if s.config.TrackerKind != newCfg.TrackerKind {
 | `logging` | 无改动 | 秘密过滤已覆盖 token/api_key/authorization，新增 GitHub header 仍可复用现有脱敏逻辑 |
 | `cmd/symphony` | 小改 | 在共享 `ApplyReload` gate 中拒绝 `tracker.kind` 跨实现切换 |
 
-**Core Conformance 不受影响** — 新代码仅在 `tracker.kind=github` 时激活。
+**Core Conformance 不受影响** — 新代码仅在 active source 为 `kind=github` 时激活。
 
 ## 10. 测试计划
 
@@ -349,17 +356,18 @@ func TestGitHubIntegration(t *testing.T) {
 
 | 项目 | 说明 |
 |---|---|
-| 新增凭证 | `GITHUB_TOKEN` 环境变量 |
+| 新增凭证 | `GITHUB_TOKEN` 环境变量；推荐放入 `automation/local/env.local` |
 | 端口 | 无新增 |
 | 资源消耗 | GitHub API 速率限制：认证用户 5000 req/h；按默认 30s 轮询 + 2 active states = ~240 req/h，远低于上限 |
 | 监控项 | `X-RateLimit-Remaining` 值应纳入日志；可选：低于阈值时告警 |
 | 依赖变化 | 无新增三方依赖 |
-| 热更新限制 | `tracker.kind` 变更需重启；同一 kind 内字段可热更新 |
+| 热更新限制 | active source kind 变更需重启；同一 kind/source 内字段可热更新 |
 
 ### 配套文档落点
 
 - `docs/operator-runbook.md`：补充 GitHub tracker 的凭证、label 约定、rate limit 与常见故障处理。
-- `docs/examples/WORKFLOW.github-issues.md`：提供可直接复制的最小 `WORKFLOW.md` 示例。
+- `automation/sources/github-*.yaml`：提供目录模式下的最小 source 示例。
+- `docs/examples/automation-github-issues.md`：提供目录模式参考文档。
 
 ## 12. 风险与回滚
 
@@ -373,7 +381,7 @@ func TestGitHubIntegration(t *testing.T) {
 
 ### 回滚方式
 
-1. 将 `tracker.kind` 改回 `linear` 即可完全回退
+1. 将 active source 改回 `kind=linear`，或从 `selection.enabled_sources` 中移除 github source，即可回退
 2. GitHub 适配器代码仅在 `kind=github` 分支中激活，不影响 Linear 路径
 3. 若需彻底移除：删除 `github.go`、`github_test.go`，还原 `NewClient` 工厂即可
 
@@ -387,7 +395,8 @@ func TestGitHubIntegration(t *testing.T) {
 | `internal/tracker/github.go` | 新建 | GitHubClient 实现 |
 | `internal/tracker/github_test.go` | 新建 | 单元测试 + 可跳过集成测试 |
 | `internal/tracker/linear.go` | 微调 | 移除 Client 接口和 NewClient 工厂（已移至 client.go） |
+| `internal/loader/loader.go` | 小改 | 支持从 `automation/sources/*.yaml` 解析 active source |
 | `cmd/symphony/main.go` | 小改 | 在 `ApplyReload` 中加入 `tracker.kind` restart-required 检测 |
 | `docs/operator-runbook.md` | 修改 | 补充 GitHub Token、label 约定与 rate limit 排障说明 |
-| `docs/examples/WORKFLOW.github-issues.md` | 新建 | 提供 GitHub Issues tracker 的最小可复制示例 |
+| `automation/sources/github-core.yaml` | 新建 | 提供目录模式下 GitHub source 示例 |
 | `docs/cycles/cycle-05-post-mvp.md` | 微调 | 补充 RFC 链接 |
