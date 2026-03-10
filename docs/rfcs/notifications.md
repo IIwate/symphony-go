@@ -1,7 +1,7 @@
 # RFC: Notifications
 
 > **状态**: 草案
-> **对应**: REQUIREMENTS.md §11.3 "通知系统" / Cycle 5 扩展池
+> **对应**: ../REQUIREMENTS.md §11.3 "通知系统" / Cycle 5 扩展池
 > **前置**: Cycle 1-4 首版交付完成
 
 ---
@@ -26,7 +26,7 @@
 - orchestrator 新增通知事件 channel（`orchEventCh`）与事件发射辅助函数
 - `notifications:` `WORKFLOW.md` 配置段解析
 - `ValidateForDispatch` 扩展：校验通知配置的语义有效性
-- 5 种通知事件类型
+- 通知事件类型（首版 6 种，可扩展）
 - 发送失败重试与 best-effort 关闭语义
 - `cmd/symphony/main.go` 初始化与生命周期集成
 
@@ -58,11 +58,12 @@
 
 ### 3.2 仅通知一等业务事件，不通知派生 issue 告警
 
-首版只发 5 种一等事件：
+首版发 6 种一等事件（后续可扩展）：
 
 - `issue_dispatched`
 - `issue_completed`
 - `issue_failed`
+- `issue_intervention_required`
 - `system_alert`
 - `system_alert_cleared`
 
@@ -102,6 +103,7 @@
 | `issue_dispatched` | `dispatchIssue` | issue 已加入 `Running` map，worker 即将启动 | `info` |
 | `issue_completed` | `completeSuccessfulIssue` | tracker 已确认终态，completion path 收口 | `info` |
 | `issue_failed` | `handleWorkerExit` / `terminateRunningLocked` | issue 执行失败并进入 failure retry 路径 | `warn` |
+| `issue_intervention_required` | `moveToAwaitingIntervention` | issue 首次转入 `AwaitingIntervention`（例如 PR closed/unmerged） | `warn` |
 | `system_alert` | `setSystemAlertLocked` | 系统级告警被设置 | 取告警自身 `Level` |
 | `system_alert_cleared` | `clearSystemAlertLocked` | 系统级告警被清除 | `info` |
 
@@ -144,6 +146,7 @@ type OrchestratorEvent struct {
 | `issue_dispatched` | `state`, `attempt` |
 | `issue_completed` | `identifier` |
 | `issue_failed` | `error`, `attempt`, `run_phase`, `failure_kind` |
+| `issue_intervention_required` | `pr_number`, `pr_url`, `branch`, `pr_state`, `observed_at` |
 | `system_alert` | `code`, `alert_level`, `alert_message` |
 | `system_alert_cleared` | `code` |
 
@@ -243,7 +246,7 @@ func (o *Orchestrator) emitEvent(event OrchestratorEvent) {
 
 ### 5.4 发射点
 
-共有 7 个插入点，产出 5 类事件。
+共有 8 个插入点，产出 6 类事件。
 
 #### 1. `dispatchIssue` 发射 `issue_dispatched`
 
@@ -350,7 +353,35 @@ o.emitEvent(OrchestratorEvent{
 })
 ```
 
-#### 6. `setSystemAlertLocked` 发射 `system_alert`
+#### 6. `moveToAwaitingIntervention` 发射 `issue_intervention_required`
+
+位置：issue 首次进入 `AwaitingIntervention` 的状态迁移函数中。
+
+约束：
+
+- 只在首次转入 `AwaitingIntervention` 时发射一次
+- 只携带可验证事实字段（不承诺“为何关闭”）
+
+```go
+ts := o.now().UTC()
+o.emitEvent(OrchestratorEvent{
+    Type:       "issue_intervention_required",
+    Level:      "warn",
+    Timestamp:  ts,
+    IssueID:    issueID,
+    Identifier: identifier,
+    Message:    "issue requires intervention",
+    Details: map[string]any{
+        "pr_number":   pr.Number,
+        "pr_url":      pr.URL,
+        "branch":      branch,
+        "pr_state":    "closed",
+        "observed_at": ts,
+    },
+})
+```
+
+#### 7. `setSystemAlertLocked` 发射 `system_alert`
 
 位置：`o.systemAlerts[alert.Code] = alert` 之后。
 
@@ -370,7 +401,7 @@ o.emitEvent(OrchestratorEvent{
 })
 ```
 
-#### 7. `clearSystemAlertLocked` 发射 `system_alert_cleared`
+#### 8. `clearSystemAlertLocked` 发射 `system_alert_cleared`
 
 位置：删除前先读取旧值，再发射清除事件。
 
@@ -480,6 +511,7 @@ Emoji 映射：
 | `issue_dispatched` | `:rocket:` |
 | `issue_completed` | `:white_check_mark:` |
 | `issue_failed` | `:x:` |
+| `issue_intervention_required` | `:warning:` |
 | `system_alert` | `:rotating_light:` |
 | `system_alert_cleared` | `:large_green_circle:` |
 
@@ -499,7 +531,7 @@ notifications:
       url: https://hooks.example.com/symphony
       headers:
         Authorization: $WEBHOOK_AUTH_HEADER
-      events: [system_alert, issue_failed]
+      events: [system_alert, issue_failed, issue_intervention_required]
     - name: all-events
       kind: webhook
       url: https://monitor.example.com/events
@@ -858,7 +890,7 @@ orch.Wait() -> notify.Stop() -> unsubscribeEvents() -> httpSrv.Shutdown()
 
 | 模块 | 影响 | 说明 |
 |---|---|---|
-| `internal/orchestrator/orchestrator.go` | 小改 | +`OrchestratorEvent`、+事件订阅者表、+`emitEvent`、+`SubscribeEvents(buffer, unsubscribe)`、+7 个发射点 |
+| `internal/orchestrator/orchestrator.go` | 小改 | +`OrchestratorEvent`、+事件订阅者表、+`emitEvent`、+`SubscribeEvents(buffer, unsubscribe)`、+8 个发射点 |
 | `internal/model/model.go` | 小改 | +3 个通知配置结构体，`ServiceConfig` +1 字段 |
 | `internal/config/config.go` | 小改 | +`parseNotificationConfig`，`ValidateForDispatch` 扩展 |
 | `cmd/symphony/main.go` | 小改 | +`notifierService` / `newNotifierFactory` seam，订阅初始化、unsubscribe 清理与关闭 |
@@ -899,6 +931,7 @@ Core Conformance 不受影响。通知系统是纯扩展能力；未配置 `noti
 | `TestEmitOnWorkerFailure` | `handleWorkerExit(result.Err != nil)` 发射 `issue_failed` |
 | `TestEmitOnTransitionFailure` | post-worker transition failure 发射 `issue_failed` |
 | `TestEmitOnStallTermination` | stall retry 发射 `issue_failed` |
+| `TestEmitOnInterventionRequired` | 转入 `AwaitingIntervention` 发射 `issue_intervention_required` |
 | `TestNoEmitOnContinuationRetry` | continuation retry 不发 `issue_failed` |
 | `TestNoEmitOnRetryPollFailure` | `retry poll failed` 不发 `issue_failed` |
 | `TestNoEmitOnSlotExhaustion` | `no available orchestrator slots` 不发 `issue_failed` |
@@ -980,7 +1013,7 @@ Core Conformance 不受影响。通知系统是纯扩展能力；未配置 `noti
 
 ## 15. 实现步骤
 
-1. `internal/orchestrator/orchestrator.go`：新增 `OrchestratorEvent`、事件订阅者表、`emitEvent`、`SubscribeEvents(buffer, unsubscribe)`、7 个发射点
+1. `internal/orchestrator/orchestrator.go`：新增 `OrchestratorEvent`、事件订阅者表、`emitEvent`、`SubscribeEvents(buffer, unsubscribe)`、8 个发射点
 2. `internal/model/model.go`：新增 3 个通知配置结构体与 `ServiceConfig.Notifications`
 3. `internal/config/config.go`：新增 `parseNotificationConfig`，扩展 `ValidateForDispatch`
 4. `internal/notifier/notifier.go`：实现 `Notifier` 核心与 `Channel` 接口

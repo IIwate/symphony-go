@@ -56,10 +56,10 @@
 
 - `cmd/symphony/main.go`：CLI 入口，负责参数解析、依赖装配、启动与关闭。
 - `WORKFLOW.md`：运行时契约源，front matter 提供配置，正文提供 prompt 模板。
-- `SPEC.md`：语言无关规格。
-- `REQUIREMENTS.md`：Go 版本的需求与模块要求。
-- `IMPLEMENTATION.md`：实现分层和阶段结果。
-- `FLOW.md`：本文档。
+- `docs/SPEC.md`：语言无关规格。
+- `docs/REQUIREMENTS.md`：Go 版本的需求与模块要求。
+- `docs/IMPLEMENTATION.md`：实现分层和阶段结果。
+- `docs/FLOW.md`：本文档。
 
 ### 3.2 `internal/` 模块
 

@@ -7,7 +7,7 @@ Symphony-Go 是一个长运行自动化服务的 Go 实现，用于编排 coding
 **源文档**：
 - `SPEC.md` — 语言无关规范 (Draft v1)，定义完整的系统行为
 - `REQUIREMENTS.md` — Go 实现需求，含领域模型、模块接口、技术选型、测试策略
-- `docs/cycles/README.md` — 基于需求与技术文档拆分的开发周期与交付文档索引
+- `cycles/README.md` — 基于需求与技术文档拆分的开发周期与交付文档索引
 
 ---
 
@@ -56,8 +56,11 @@ symphony-go/
 │   ├── server/                   # HTTP API + SSE + Dashboard（可选）
 │   └── logging/                  # slog 配置 + 日志文件 + 秘密过滤
 ├── go.mod / go.sum
-├── SPEC.md
-├── REQUIREMENTS.md
+├── docs/
+│   ├── SPEC.md
+│   ├── REQUIREMENTS.md
+│   ├── IMPLEMENTATION.md
+│   └── FLOW.md
 └── WORKFLOW.md                   # 示例/测试用
 ```
 
@@ -308,4 +311,3 @@ LINEAR_API_KEY=xxx go test -tags=integration ./...
 ```
 
 每个模块对应 SPEC 测试矩阵的验证项，Mock 外部依赖（httptest.Server、stdio pipe、t.TempDir）。
-

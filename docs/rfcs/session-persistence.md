@@ -1,14 +1,14 @@
 # RFC: Session 持久化
 
 > **状态**: 草案
-> **对应**: REQUIREMENTS.md §11.3 "Session 持久化" / Cycle 5 扩展池
+> **对应**: ../REQUIREMENTS.md §11.3 "Session 持久化" / Cycle 5 扩展池
 > **前置**: Cycle 1-4 首版交付完成
 
 ---
 
 ## 1. 目标
 
-为 `symphony-go` 增加跨进程重启的运行时状态持久化能力，使服务在异常退出、主机重启或人工重启后，能够恢复 retry 队列、系统告警、运行中会话元数据和累计用量，并以可预测方式继续调度。
+为 `symphony-go` 增加跨进程重启的运行时状态持久化能力，使服务在异常退出、主机重启或人工重启后，能够恢复 retry 队列、暂停态（如等待 PR merge / 等待人工介入）、系统告警、运行中会话元数据和累计用量，并以可预测方式继续调度。
 
 完成后：
 
@@ -23,7 +23,7 @@
 
 - `internal/sessionstore/` 包：持久化抽象、文件后端、原子写入
 - orchestrator durable state 的导出与恢复
-- retry 队列、system alerts、claimed/running 元数据、token totals 的持久化
+- retry 队列、暂停态、system alerts、claimed/running 元数据、token totals 的持久化
 - 启动恢复逻辑：把中断中的运行转换为可继续调度的状态
 - `WORKFLOW.md` 中 `session_persistence:` 配置块
 - 文件损坏、版本不兼容、部分状态丢失时的降级语义
@@ -94,11 +94,13 @@ type PersistedRuntimeState struct {
     SavedAt      time.Time
     WorkflowPath string
 
-    Retrying   []PersistedRetryEntry
-    Claimed    []PersistedClaim
-    Running    []PersistedRunningEntry
-    Alerts     []PersistedAlert
-    TokenTotal model.TokenTotals
+    Retrying             []PersistedRetryEntry
+    Claimed              []PersistedClaim
+    Running              []PersistedRunningEntry
+    AwaitingMerge        []PersistedAwaitingMergeEntry
+    AwaitingIntervention []PersistedAwaitingInterventionEntry
+    Alerts               []PersistedAlert
+    TokenTotal           model.TokenTotals
 }
 ```
 
@@ -124,7 +126,25 @@ type PersistedRuntimeState struct {
 - open file descriptor
 - in-memory callback
 
-### 4.3 schema version
+### 4.3 `AwaitingMerge` / `AwaitingIntervention` 的保存边界
+
+两类暂停态只保存恢复和可观测所需元数据，例如：
+
+- `issue_id`
+- `identifier`
+- `workspace_path`
+- `branch`
+- `pr_number`
+- `pr_url`
+- `pr_state`
+- `waiting_since` / `observed_at`
+
+不保存：
+
+- 派生 UI 字段
+- 已经可以由 tracker / PR lookup 重新观测得到的瞬时状态缓存
+
+### 4.4 schema version
 
 状态文件必须带 `Version`：
 
@@ -147,6 +167,8 @@ type PersistedRuntimeState struct {
 |---|---|
 | `Retrying` | `due_at <= now` 的条目立即变为可调度；未来时间的条目重新建 timer |
 | `Running` | 不恢复旧会话，统一视为“interrupted previous run” |
+| `AwaitingMerge` | 恢复为暂停态；启动后优先执行 PR reconcile，未 merge 前不得自动 dispatch |
+| `AwaitingIntervention` | 恢复为暂停态；不自动 dispatch，仅在 issue 进入 non-active / terminal 时释放 |
 | `Claimed` | 仅作为恢复提示；若 tracker 当前状态不匹配，以 tracker 为准 |
 | `Alerts` | 恢复后继续可见，待后续逻辑清除 |
 | `TokenTotal` | 直接恢复，用于累计统计 |
@@ -287,6 +309,8 @@ type NewOptions struct {
 
 - `dispatchIssue`
 - `handleWorkerExit`
+- `moveToAwaitingMerge`
+- `moveToAwaitingIntervention`
 - `scheduleRetryLocked`
 - `terminateRunningLocked`
 - `setSystemAlertLocked`
@@ -299,6 +323,7 @@ type NewOptions struct {
 
 - tracker 当前状态仍有效
 - interrupted running 不会被误判为仍在运行
+- `AwaitingMerge` / `AwaitingIntervention` 不会在未对账前误回到可调度集合
 - 过期 retry timer 重新建好
 
 ## 9. `cmd/symphony/main.go` 集成

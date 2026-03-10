@@ -2,7 +2,7 @@
 
 ## 周期定位
 
-本周期对应 `REQUIREMENTS.md` 中“阶段 5 扩展路线图（P2 项，不阻塞首版）”。它不是首版交付的一部分，而是首版上线后按价值逐步兑现的扩展池。
+本周期对应 `../REQUIREMENTS.md` 中“阶段 5 扩展路线图（P2 项，不阻塞首版）”。它不是首版交付的一部分，而是首版上线后按价值逐步兑现的扩展池。
 
 ## 周期目标
 
@@ -14,7 +14,7 @@
 
 ### 高优先级
 
-- PR Merge Gating（已落地：merge-aware auto-close + `AwaitingMerge`）— [RFC](../rfcs/pr-merge-gating.md)
+- PR Merge Gating（已落地：merge-aware auto-close + `AwaitingMerge`；当前实现见 `../FLOW.md`，后续演进见 [RFC](../rfcs/pr-merge-gating.md)）
 - Charm TUI
 - GitHub Issues tracker — [RFC](../rfcs/github-issues-tracker.md)
 

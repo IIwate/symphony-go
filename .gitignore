@@ -10,4 +10,5 @@ coverage.out
 bin/
 dist/
 .ace-tool/
+.codex-review/
 logs/

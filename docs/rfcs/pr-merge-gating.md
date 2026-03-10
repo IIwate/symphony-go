@@ -1,10 +1,12 @@
 # RFC: PR Merge Gating
 
-> **状态**: 已实现（2026-03-10）
+> **状态**: 草案（2026-03-10 修订）
 > **对应**: Cycle 5 扩展池 "PR Merge Gating" / `docs/cycles/cycle-05-post-mvp.md`
 > **前置**: Cycle 1-4 首版交付完成
 
 ---
+
+> 说明：当前仓库已落地的实现是 merge-aware auto-close + `AwaitingMerge`。本文中 `AwaitingIntervention` 及其配套通知/恢复语义属于后续设计，尚未在当前代码中实现。
 
 ## 1. 目标
 
@@ -132,7 +134,19 @@ type AwaitingMergeEntry struct {
 }
 ```
 
-### 5.3 快照暴露
+### 5.3 `AwaitingInterventionEntry`
+
+```go
+type AwaitingInterventionEntry struct {
+    IssueID       string
+    Identifier    string
+    Branch        string
+    PR            PullRequestInfo // 仅依赖可验证字段：number/url/state
+    ObservedAt    time.Time       // 首次观察到 PR closed/unmerged 的时间
+}
+```
+
+### 5.4 快照暴露
 
 建议在 orchestrator `Snapshot` 中新增：
 
@@ -149,7 +163,21 @@ type AwaitingMergeSnapshot struct {
 }
 ```
 
-并在 `Snapshot.Counts` 中新增 `AwaitingMerge` 计数。
+并新增：
+
+```go
+type AwaitingInterventionSnapshot struct {
+    IssueID     string
+    Identifier  string
+    Branch      string
+    PRNumber    int
+    PRURL       string
+    PRState     string // "closed"
+    ObservedAt  time.Time
+}
+```
+
+并在 `Snapshot.Counts` 中新增 `AwaitingMerge`、`AwaitingIntervention` 计数。
 
 ## 6. PR 查询抽象
 
@@ -190,7 +218,7 @@ worker 成功退出后：
 2. 若检测到关联 PR 且 `auto_close_on_pr=true`：
    - 若 PR 已 merged：立即尝试收口
    - 若 PR 仍 open：进入 `AwaitingMerge`
-   - 若 PR 已 closed 且未 merged：回退到 continuation retry
+   - 若 PR 已 closed 且未 merged：进入 `AwaitingIntervention`（等待人工介入）
 3. 否则：保持现有 continuation retry
 
 ### 7.2 `AwaitingMerge` 状态语义
@@ -218,9 +246,13 @@ worker 成功退出后：
 
 - 清除 `AwaitingMerge`
 - 不自动关闭 issue
-- 回退到 continuation retry（attempt=1, no error）
+- 转入 `AwaitingIntervention`
+- 不自动 retry / 不自动重新 dispatch（等待 operator 决策）
 
-这样 agent 可以在下一次运行中处理“PR 被关掉了，需要继续修改或重新提 PR”的情形。
+退出条件：
+
+- 若 issue 不再处于 active states：释放 claim（后续若重新进入 active states，可再次参与调度）
+- 若 issue 进入终态：按正常 completion path 收口
 
 ### 7.5 查询失败路径
 
@@ -238,6 +270,7 @@ worker 成功退出后：
 在现有资格判定基础上新增一条：
 
 - issue 不得处于 `AwaitingMerge`
+- issue 不得处于 `AwaitingIntervention`
 
 这条规则的作用不是 gate 下游 issue，而是避免“自己已经开 PR 只等 merge 的 issue”被再次调度。
 
@@ -294,6 +327,7 @@ orchestrator:
 
 ```go
 AwaitingMerge map[string]*AwaitingMergeEntry
+AwaitingIntervention map[string]*AwaitingInterventionEntry
 ```
 
 ### 10.2 `handleWorkerExit` 收口变化
@@ -314,6 +348,7 @@ AwaitingMerge map[string]*AwaitingMergeEntry
 ```text
 reconcileRunning
 -> reconcileAwaitingMerge
+-> reconcileAwaitingIntervention
 -> ValidateForDispatch
 -> FetchCandidateIssues
 -> dispatchEligibleIssues
@@ -341,11 +376,11 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 
 | 模块 / RFC | 关系 | 说明 |
 |---|---|---|
-| `internal/orchestrator` | 核心改动 | 新增 `AwaitingMerge` 状态和 reconcile 路径 |
-| `internal/server` | 扩展 | `/api/v1/state` 新增 awaiting-merge 只读数据 |
-| TUI RFC | 受益 | 可直接展示 `AwaitingMerge` 面板或计数 |
-| Notifications RFC | 受益 | 后续可新增 `issue_waiting_for_merge` / `issue_merged` 事件 |
-| Session 持久化 RFC | 受益 | 可把 `AwaitingMerge` 作为 durable state 的一部分 |
+| `internal/orchestrator` | 核心改动 | 新增 `AwaitingMerge` / `AwaitingIntervention` 状态与对应 reconcile 路径 |
+| `internal/server` | 扩展 | `/api/v1/state` 新增 awaiting-merge / awaiting-intervention 只读数据 |
+| TUI RFC | 受益 | 可直接展示 `AwaitingMerge` / `AwaitingIntervention` 面板或计数 |
+| Notifications RFC | 受益 | 可对 `AwaitingIntervention` 发射 `issue_intervention_required` 事件 |
+| Session 持久化 RFC | 受益 | 可把 `AwaitingMerge` / `AwaitingIntervention` 作为 durable state 的一部分 |
 | Reactions RFC | 受益 | 可把 merge 相关状态作为 trigger source |
 
 这也是本 RFC 适合作为前置能力先落地的原因。
@@ -358,9 +393,11 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 |---|---|
 | `TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge` | 成功运行后进入 `AwaitingMerge`，不直接 close |
 | `TestReconcileAwaitingMergeMergedClosesIssue` | PR merged 后触发 `TransitionIssue` 并清理 |
-| `TestReconcileAwaitingMergeClosedSchedulesContinuationRetry` | PR closed/unmerged 回退 continuation retry |
+| `TestReconcileAwaitingMergeClosedMovesToAwaitingIntervention` | PR closed/unmerged 转入 `AwaitingIntervention` |
 | `TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert` | PR 查询失败时保留 `AwaitingMerge` 并暴露告警 |
 | `TestIsDispatchEligibleRejectsAwaitingMerge` | `AwaitingMerge` issue 不会被重新 dispatch |
+| `TestIsDispatchEligibleRejectsAwaitingIntervention` | `AwaitingIntervention` issue 不会被重新 dispatch |
+| `TestReconcileAwaitingInterventionReleasesInactiveIssue` | issue 进入 non-active 后释放 intervention hold |
 | `TestHandleWorkerExitHasNewOpenPRDisabledSchedulesContinuation` | feature flag 关闭时保持现有行为 |
 
 ### 13.2 `internal/server/server_test.go`
@@ -386,15 +423,15 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 
 | 项目 | 说明 |
 |---|---|
-| 新增运行时状态 | `AwaitingMerge` |
+| 新增运行时状态 | `AwaitingMerge`、`AwaitingIntervention` |
 | 新增外部依赖假设 | workspace 内需可查询 PR 状态（当前为 `gh`） |
-| 排障点 | `gh` 不可用、认证失效、PR 状态查询失败 |
-| 调度行为变化 | 开 PR 后不会立刻自动关闭 issue，而是等待 merge |
+| 排障点 | `gh` 不可用、认证失效、PR 状态查询失败、closed/unmerged 后等待人工决策 |
+| 调度行为变化 | 开 PR 后不会立刻自动关闭 issue；closed/unmerged 时暂停自动调度并等待人工介入 |
 
 ### 配套文档落点
 
 - `docs/operator-runbook.md`：补充 AwaitingMerge 排障与 `gh` 依赖说明
-- `FLOW.md`：更新成功路径与 `auto_close_on_pr` 语义
+- `../FLOW.md`：更新成功路径与 `auto_close_on_pr` 语义
 - `docs/conformance-matrix.md`：新增 awaiting-merge 测试项
 
 ## 15. 风险与回滚
@@ -403,7 +440,7 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 |---|---|---|---|
 | PR 状态查询失败 | 中 | issue 长时间停在 AwaitingMerge | warn + alert + runbook 排障 |
 | `gh` 输出 schema 变化 | 低 | merge 检测失败 | 抽象查询层 + 单元测试 |
-| PR 被关闭未合并 | 中 | issue 可能需要继续人工/agent 跟进 | 明确回退 continuation retry |
+| PR 被关闭未合并 | 中 | issue 长时间等待人工决策 | 明确转入 `AwaitingIntervention` + 通知 operator |
 | 语义切换带来行为变化 | 中 | 与旧“open PR 即 close”预期不一致 | 文档明确、保留 feature flag |
 
 ### 回滚方式
@@ -414,9 +451,9 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 ## 16. 实现步骤
 
 1. 抽取 PR 查询抽象，补 `FindByHeadBranch`
-2. 引入 `AwaitingMergeEntry` 与 snapshot 暴露
+2. 引入 `AwaitingMergeEntry`、`AwaitingInterventionEntry` 与 snapshot 暴露
 3. 修改 `handleWorkerExit` 成功路径
-4. 新增 `reconcileAwaitingMerge`
+4. 新增 `reconcileAwaitingMerge`、`reconcileAwaitingIntervention`
 5. 补齐 server / orchestrator 测试
 6. 更新 runbook / flow / conformance 文档
 
@@ -424,7 +461,7 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 
 - merge queue / checks green / review-approved 等更细粒度 gate
 - 与 Notifications / Reactions 联动的 merge 事件
-- AwaitingMerge 的持久化恢复
+- `AwaitingMerge` / `AwaitingIntervention` 的持久化恢复
 - GitHub 以外 PR provider
 
 ## 附录：文件改动清单
@@ -441,5 +478,5 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 - `internal/server/server_test.go`
 - `docs/operator-runbook.md`
 - `docs/conformance-matrix.md`
-- `FLOW.md`
+- `../FLOW.md`
 - `docs/cycles/cycle-05-post-mvp.md`

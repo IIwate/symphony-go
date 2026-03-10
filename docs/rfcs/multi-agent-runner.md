@@ -1,7 +1,7 @@
 # RFC: 多 Agent Runner
 
 > **状态**: 草案
-> **对应**: REQUIREMENTS.md §11.3 "多 agent runner" / Cycle 5 扩展池
+> **对应**: ../REQUIREMENTS.md §11.3 "多 agent runner" / Cycle 5 扩展池
 > **前置**: Cycle 1-4 首版交付完成
 
 ---

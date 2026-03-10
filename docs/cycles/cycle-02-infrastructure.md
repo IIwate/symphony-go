@@ -2,7 +2,7 @@
 
 ## 周期定位
 
-本周期对应 `REQUIREMENTS.md` 的“阶段 2：基础设施层”。目标是让系统具备运行 orchestration 所需的三类底座能力：工作区、Tracker、日志。
+本周期对应 `../REQUIREMENTS.md` 的“阶段 2：基础设施层”。目标是让系统具备运行 orchestration 所需的三类底座能力：工作区、Tracker、日志。
 
 ## 周期目标
 
@@ -65,7 +65,7 @@
 
 ## 验收标准
 
-### 对应 `SPEC.md`
+### 对应 `../SPEC.md`
 
 - 覆盖 §17.2 `Workspace Manager and Safety`
 - 覆盖 §17.3 `Issue Tracker Client`

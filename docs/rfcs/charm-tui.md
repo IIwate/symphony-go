@@ -1,14 +1,14 @@
 # RFC: Charm TUI
 
 > **状态**: 草案
-> **对应**: REQUIREMENTS.md §11.3 "Charm TUI" / Cycle 5 扩展池
+> **对应**: ../REQUIREMENTS.md §11.3 "Charm TUI" / Cycle 5 扩展池
 > **前置**: Cycle 1-4 首版交付完成
 
 ---
 
 ## 1. 目标
 
-为 symphony-go 添加基于 Charm Bubble Tea 的终端用户界面，使操作者在交互式终端中无需浏览器即可实时监控编排器状态——包括正在运行的 agent 会话、重试队列、告警、token 消耗和服务信息。
+为 symphony-go 添加基于 Charm Bubble Tea 的终端用户界面，使操作者在交互式终端中无需浏览器即可实时监控编排器状态——包括正在运行的 agent 会话、暂停中的 issue（如等待 PR merge / 等待人工介入）、重试队列、告警、token 消耗和服务信息。
 
 完成后：
 
@@ -23,7 +23,7 @@
 - `internal/tui/` 包：Bubble Tea Model + Views + Messages
 - `--tui` CLI 标志显式启用
 - 从 `SubscribeSnapshots` 消费 `Snapshot` 数据驱动界面更新
-- 五区面板布局：Header Bar、Running Table、Retry Queue、Alerts、Token Totals
+- 六区面板布局：Header Bar、Running Table、Paused Issues、Retry Queue、Alerts、Token Totals
 - 键盘快捷键：退出、滚动、手动刷新、切换日志面板
 - 日志输出集成：TUI 模式下将 slog 输出重定向到内存 ring buffer（可在 TUI 内查看）
 - `cmd/symphony/main.go` 调用 TUI 的入口修改
@@ -40,13 +40,18 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Symphony-Go v0.1.0 | Up 2h 13m | Running: 3 | Retrying: 1         │
+│  Symphony-Go v0.1.0 | Up 2h 13m | Running: 3 | Paused: 2 | Retry: 1│
 ├──────────────────────────────────────────────────────────────────────┤
 │  RUNNING ISSUES                                          [1/3]      │
 │  Identifier   State        Turns  Last Event       Tokens  Duration │
 │  PROJ-42      In Progress  5/20   turn_completed   12.4k   8m 32s  │
 │  PROJ-17      Todo         1/20   session_started  1.2k    42s     │
 │  PROJ-88      In Progress  3/20   notification     8.7k    3m 10s  │
+├──────────────────────────────────────────────────────────────────────┤
+│  PAUSED ISSUES                                                       │
+│  Identifier   Kind           Branch        PR      Since             │
+│  PROJ-91      AwaitingMerge  feat/proj-91  #214    18m               │
+│  PROJ-37      Intervention   feat/proj-37  #198    2h 05m            │
 ├──────────────────────────────────────────────────────────────────────┤
 │  RETRY QUEUE                                                        │
 │  Identifier   Attempt   Due In     Error                            │
@@ -67,6 +72,7 @@
 |---|---|---|
 | Header Bar | `Snapshot.Service` + `Snapshot.Counts` | 固定 1 行 |
 | Running Issues | `Snapshot.Running[]` | 弹性，最小 3 行，最大占终端 40% |
+| Paused Issues | `Snapshot.AwaitingMerge[]` + `Snapshot.AwaitingIntervention[]` | 弹性，可折叠（0 条时折叠为 1 行标题） |
 | Retry Queue | `Snapshot.Retrying[]` | 弹性，可折叠（0 条时折叠为 1 行标题） |
 | Alerts | `Snapshot.Alerts[]` | 弹性，可折叠 |
 | Token Totals | `Snapshot.CodexTotals` | 固定 1 行 |
@@ -95,6 +101,16 @@
 | Attempt | `RetrySnapshot.Attempt` | 整数 |
 | Due In | `RetrySnapshot.DueAt - now` | `2m 14s` |
 | Error | `RetrySnapshot.Error` | 截断至 40 字符 |
+
+**Paused Issues 表格**：
+
+| 列 | 来源 | 格式 |
+|---|---|---|
+| Identifier | `AwaitingMergeSnapshot.Identifier` / `AwaitingInterventionSnapshot.Identifier` | 原样 |
+| Kind | 暂停态类型 | `AwaitingMerge` / `Intervention` |
+| Branch | `Branch` | 截断至 18 字符 |
+| PR | `PRNumber` | `#214` |
+| Since | `WaitingSince` / `ObservedAt` | `18m` / `2h 05m` |
 
 ## 4. 配置与 CLI
 
@@ -204,6 +220,7 @@ type Model struct {
 type Pane int
 const (
     PaneRunning Pane = iota
+    PanePaused
     PaneRetry
     PaneAlerts
 )
