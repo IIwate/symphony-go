@@ -6,7 +6,7 @@
 
 ---
 
-> 说明：当前仓库已落地的实现是 merge-aware auto-close + `AwaitingMerge`。本文中 `AwaitingIntervention` 及其配套通知/恢复语义属于后续设计，尚未在当前代码中实现。
+> 说明：当前仓库已落地 merge-aware auto-close、`AwaitingMerge` 与 `AwaitingIntervention`。通知事件、持久化恢复等后续联动能力仍分别归属 Notifications / Session 持久化等 RFC。
 
 ## 1. 目标
 
@@ -26,7 +26,7 @@
 - merge-aware auto-close：仅在 PR merged 后调用 `TransitionIssue("Done")`
 - `AwaitingMerge` 作为 orchestrator 一等运行时状态
 - PR 状态查询抽象与 GitHub CLI 默认实现
-- 运行时快照中暴露 awaiting-merge 信息
+- 运行时快照中暴露 awaiting-merge / awaiting-intervention 信息
 - 合并后收口、未合并关闭、状态查询失败的处理语义
 - 对现有 `auto_close_on_pr` 行为的语义修正和文档更新
 
@@ -404,7 +404,7 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 
 | 测试 | 覆盖点 |
 |---|---|
-| `TestStateEndpointReturnsSnapshot` | `/api/v1/state` 返回 awaiting-merge 信息 |
+| `TestStateEndpointReturnsSnapshot` | `/api/v1/state` 返回 awaiting-merge / awaiting-intervention 信息 |
 
 ### 13.3 `cmd/symphony/main_test.go`
 
@@ -468,7 +468,7 @@ var newPRLookupFactory = func(logger *slog.Logger) orchestrator.PullRequestLooku
 
 ### 新建文件
 
-- `docs/rfcs/pr-merge-gating.md`
+- `docs/rfcs/archive/pr-merge-gating.md`
 
 ### 修改文件
 

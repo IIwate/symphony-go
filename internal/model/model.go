@@ -44,34 +44,35 @@ type WorkflowDefinition struct {
 }
 
 type ServiceConfig struct {
-	TrackerKind                string
-	TrackerEndpoint            string
-	TrackerAPIKey              string
-	TrackerProjectSlug         string
-	TrackerRepo                string
-	ActiveStates               []string
-	TerminalStates             []string
-	PollIntervalMS             int
-	WorkspaceRoot              string
-	WorkspaceLinearBranchScope string
-	HookAfterCreate            *string
-	HookBeforeRun              *string
-	HookAfterRun               *string
-	HookBeforeRemove           *string
-	HookTimeoutMS              int
-	MaxConcurrentAgents        int
-	MaxTurns                   int
-	MaxRetryBackoffMS          int
-	MaxConcurrentAgentsByState map[string]int
-	OrchestratorAutoCloseOnPR  bool
-	CodexCommand               string
-	CodexApprovalPolicy        string
-	CodexThreadSandbox         string
-	CodexTurnSandboxPolicy     string
-	CodexTurnTimeoutMS         int
-	CodexReadTimeoutMS         int
-	CodexStallTimeoutMS        int
-	ServerPort                 *int
+	TrackerKind                      string
+	TrackerEndpoint                  string
+	TrackerAPIKey                    string
+	TrackerProjectSlug               string
+	TrackerLinearChildrenBlockParent bool
+	TrackerRepo                      string
+	ActiveStates                     []string
+	TerminalStates                   []string
+	PollIntervalMS                   int
+	WorkspaceRoot                    string
+	WorkspaceLinearBranchScope       string
+	HookAfterCreate                  *string
+	HookBeforeRun                    *string
+	HookAfterRun                     *string
+	HookBeforeRemove                 *string
+	HookTimeoutMS                    int
+	MaxConcurrentAgents              int
+	MaxTurns                         int
+	MaxRetryBackoffMS                int
+	MaxConcurrentAgentsByState       map[string]int
+	OrchestratorAutoCloseOnPR        bool
+	CodexCommand                     string
+	CodexApprovalPolicy              string
+	CodexThreadSandbox               string
+	CodexTurnSandboxPolicy           string
+	CodexTurnTimeoutMS               int
+	CodexReadTimeoutMS               int
+	CodexStallTimeoutMS              int
+	ServerPort                       *int
 }
 
 type Workspace struct {
@@ -133,16 +134,29 @@ type AwaitingMergeEntry struct {
 	LastError     *string
 }
 
+type AwaitingInterventionEntry struct {
+	Identifier    string
+	WorkspacePath string
+	Branch        string
+	PRNumber      int
+	PRURL         string
+	PRState       string
+	RetryAttempt  int
+	StallCount    int
+	ObservedAt    time.Time
+}
+
 type OrchestratorState struct {
-	PollIntervalMS      int
-	MaxConcurrentAgents int
-	Running             map[string]*RunningEntry
-	AwaitingMerge       map[string]*AwaitingMergeEntry
-	Claimed             map[string]struct{}
-	RetryAttempts       map[string]*RetryEntry
-	Completed           map[string]struct{}
-	CodexTotals         TokenTotals
-	CodexRateLimits     any
+	PollIntervalMS       int
+	MaxConcurrentAgents  int
+	Running              map[string]*RunningEntry
+	AwaitingMerge        map[string]*AwaitingMergeEntry
+	AwaitingIntervention map[string]*AwaitingInterventionEntry
+	Claimed              map[string]struct{}
+	RetryAttempts        map[string]*RetryEntry
+	Completed            map[string]struct{}
+	CodexTotals          TokenTotals
+	CodexRateLimits      any
 }
 
 type RunningEntry struct {

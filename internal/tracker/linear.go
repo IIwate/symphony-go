@@ -38,6 +38,7 @@ const candidateIssuesQuery = `query CandidateIssues($projectSlug: String!, $stat
       state { name }
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
+      children { nodes { id identifier state { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -65,6 +66,7 @@ const issuesByStatesQuery = `query IssuesByStates($projectSlug: String!, $states
       state { name }
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
+      children { nodes { id identifier state { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -274,8 +276,9 @@ func (c *LinearClient) fetchIssues(ctx context.Context, query string, baseVariab
 			return nil, err
 		}
 
+		cfg := c.currentConfig()
 		for _, node := range connection.Nodes {
-			issues = append(issues, normalizeIssue(node))
+			issues = append(issues, normalizeIssue(node, cfg))
 		}
 
 		if !connection.PageInfo.HasNextPage {
@@ -366,14 +369,18 @@ func (c *LinearClient) currentConfig() *model.ServiceConfig {
 	return cfg
 }
 
-func normalizeIssue(node issueNode) model.Issue {
+func normalizeIssue(node issueNode, cfg *model.ServiceConfig) model.Issue {
+	blockedBy := normalizeBlockers(node.InverseRelations)
+	if cfg != nil && cfg.TrackerLinearChildrenBlockParent {
+		blockedBy = append(blockedBy, normalizeChildrenAsBlockers(node.Children, cfg.TerminalStates)...)
+	}
 	issue := model.Issue{
 		ID:         node.ID,
 		Identifier: node.Identifier,
 		Title:      node.Title,
 		State:      node.State.Name,
 		Labels:     normalizeLabels(node.Labels),
-		BlockedBy:  normalizeBlockers(node.InverseRelations),
+		BlockedBy:  blockedBy,
 		Priority:   normalizePriority(node.Priority),
 		CreatedAt:  parseTime(node.CreatedAt),
 		UpdatedAt:  parseTime(node.UpdatedAt),
@@ -423,6 +430,41 @@ func normalizeBlockers(connection *inverseRelationConnection) []model.BlockerRef
 			blocker.Identifier = &text
 		}
 		if text := strings.TrimSpace(node.Issue.State.Name); text != "" {
+			blocker.State = &text
+		}
+		blockers = append(blockers, blocker)
+	}
+
+	return blockers
+}
+
+func normalizeChildrenAsBlockers(connection *childIssueConnection, terminalStates []string) []model.BlockerRef {
+	if connection == nil {
+		return nil
+	}
+	terminal := make(map[string]struct{}, len(terminalStates))
+	for _, state := range terminalStates {
+		normalized := model.NormalizeState(state)
+		if normalized != "" {
+			terminal[normalized] = struct{}{}
+		}
+	}
+	blockers := make([]model.BlockerRef, 0, len(connection.Nodes))
+	for _, node := range connection.Nodes {
+		normalizedState := model.NormalizeState(node.State.Name)
+		if normalizedState != "" {
+			if _, ok := terminal[normalizedState]; ok {
+				continue
+			}
+		}
+		blocker := model.BlockerRef{}
+		if text := strings.TrimSpace(node.ID); text != "" {
+			blocker.ID = &text
+		}
+		if text := strings.TrimSpace(node.Identifier); text != "" {
+			blocker.Identifier = &text
+		}
+		if text := strings.TrimSpace(node.State.Name); text != "" {
 			blocker.State = &text
 		}
 		blockers = append(blockers, blocker)
@@ -549,6 +591,7 @@ type issueNode struct {
 	State            nameNode                   `json:"state"`
 	Labels           *labelConnection           `json:"labels"`
 	InverseRelations *inverseRelationConnection `json:"inverseRelations"`
+	Children         *childIssueConnection      `json:"children"`
 }
 
 type nameNode struct {
@@ -573,6 +616,16 @@ type inverseRelationNode struct {
 }
 
 type blockerIssueNode struct {
+	ID         string   `json:"id"`
+	Identifier string   `json:"identifier"`
+	State      nameNode `json:"state"`
+}
+
+type childIssueConnection struct {
+	Nodes []childIssueNode `json:"nodes"`
+}
+
+type childIssueNode struct {
 	ID         string   `json:"id"`
 	Identifier string   `json:"identifier"`
 	State      nameNode `json:"state"`

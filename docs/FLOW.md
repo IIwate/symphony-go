@@ -39,7 +39,7 @@
 - `[实现扩展]` agent 会话支持动态工具 `linear_graphql`。
 - `[实现扩展]` HTTP 服务是可选能力，监听 `127.0.0.1:<port>`。
 - `[实现扩展]` Git 分支准备逻辑已落在 workspace 层。
-- `[实现扩展 — 超出 SPEC 边界]` orchestrator 可在特定条件下检测关联 PR，并在 `orchestrator.auto_close_on_pr=true` 时采用 merge-aware 收口：open PR 进入 `AwaitingMerge`，merged PR 才尝试把 issue 转成 `Done`。
+- `[实现扩展 — 超出 SPEC 边界]` orchestrator 可在特定条件下检测关联 PR，并在 `orchestrator.auto_close_on_pr=true` 时采用 merge-aware 收口：open PR 进入 `AwaitingMerge`，closed/unmerged PR 进入 `AwaitingIntervention`，merged PR 才尝试把 issue 转成 `Done`。
 
 ### 2.2 与 SPEC 的关键关系
 
@@ -235,6 +235,7 @@
 - `tracker.endpoint`
 - `tracker.api_key`
 - `tracker.project_slug`
+- `tracker.linear.children_block_parent` `[实现扩展]`
 - `tracker.repo` `[实现扩展]`
 - `tracker.active_states`
 - `tracker.terminal_states`
@@ -265,6 +266,7 @@
 未显式配置时，当前代码中的默认值包括：
 
 - `tracker.endpoint = https://api.linear.app/graphql`
+- `tracker.linear.children_block_parent = true`
 - `active_states = ["Todo", "In Progress"]`
 - `terminal_states = ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms = 30000`
@@ -669,8 +671,15 @@ tracker 当前做的归一化包括：
 
 - `labels` 转小写
 - `blocked_by` 从 inverse relations 中 `type=blocks` 提取
+- `[实现扩展]` 当 `tracker.linear.children_block_parent=true` 时，父任务的未终态 children 也会归一化进 `blocked_by`
 - `priority` 只保留整数
 - `createdAt/updatedAt` 解析为时间
+
+层级阻塞边界：
+
+- 只影响 `Todo` issue 的 dispatch eligibility
+- 它复用现有 `BlockedBy` 判定，不新增独立“父子依赖状态”
+- 若父任务已经开始运行，后续新增或发现 children 不会回头中断当前 run
 
 ### 9.5 tracker 错误体系
 
@@ -900,7 +909,7 @@ worker goroutine 的真实顺序是：
 3. 若 PR 已 merged：尝试 `TransitionIssue("Done")`
 4. 再刷新 issue 状态；若已进入终态，则清理工作区并释放 claim
 5. 若 merge 后仍未进入终态，则进入错误重试
-6. 若 PR 已 closed 但未 merged，则回退到标准 continuation retry
+6. 若 PR 已 closed 但未 merged，则进入 `AwaitingIntervention`，停止自动 retry / re-dispatch，等待 operator 决策
 
 若 `orchestrator.auto_close_on_pr=false`：
 
@@ -1438,7 +1447,7 @@ SPEC 没有强制统一安全姿态，但明确建议按部署风险加固。适
 - 若发现关联 PR：
   - PR open：进入 `AwaitingMerge`
   - PR merged：`[实现扩展 — 超出 SPEC 边界]` orchestrator 尝试把 issue 转为 `Done`
-  - PR closed/unmerged：回退 continuation retry
+  - PR closed/unmerged：进入 `AwaitingIntervention`
 - 若 issue 仍是活跃态：
   - `[核心规范]` 安排 continuation retry
 
