@@ -79,7 +79,7 @@ policy: null
 请先理解问题，再按仓库工作流完成开发任务。
 
 开始修改前，请先创建并切换到工作分支，格式为 `<namespace>/<issue-short>`。
-- `<namespace>` 使用当前 worker 工作区里 `git config user.name` 的结果，并规范化为适合 git branch 的小写 slug。
+- `<namespace>` 优先使用显式配置的 `runtime.workspace.branch_namespace`；若未配置，则使用本地稳定 alias fallback。
 - `<issue-short>` 按任务源生成并保持稳定：`source.kind=linear` 时使用 `linear-<source.branch_scope>-<issue-identifier-lower>`；`source.kind=github` 时使用 `github-<source.repo>-<issue-number>`。
 - 若远端已存在同名分支，可在末尾追加简短后缀（如 `-2`、`-3`）。
 - 总长度尽量不超过 64 个字符。
@@ -92,7 +92,7 @@ policy: null
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-repo_url="${SYMPHONY_GIT_REPO:?SYMPHONY_GIT_REPO is required}"
+repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"
 find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 git clone --depth 1 "$repo_url" .
 ```
@@ -101,7 +101,7 @@ git clone --depth 1 "$repo_url" .
 
 ```env
 GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
-SYMPHONY_GIT_REPO=https://github.com/your-org-or-user/your-repo
+SYMPHONY_GIT_REPO_URL=https://github.com/your-org-or-user/your-repo
 ```
 
 ## 使用说明

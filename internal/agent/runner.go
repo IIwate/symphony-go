@@ -34,6 +34,7 @@ type RunParams struct {
 	WorkspacePath  string
 	PromptTemplate string
 	Source         map[string]any
+	ProcessEnv     map[string]string
 	MaxTurns       int
 	RefetchIssue   func(context.Context, string) (*model.Issue, error)
 	IsActive       func(string) bool
@@ -60,7 +61,7 @@ type TokenUsage struct {
 }
 
 type ProcessFactory interface {
-	StartProcess(ctx context.Context, cwd string, command string) (Process, error)
+	StartProcess(ctx context.Context, cwd string, command string, env map[string]string) (Process, error)
 }
 
 type Process interface {
@@ -106,7 +107,7 @@ func (r *AppServerRunner) Run(ctx context.Context, params RunParams) error {
 	}
 
 	cfg := r.config()
-	process, err := r.processFactory.StartProcess(ctx, params.WorkspacePath, cfg.CodexCommand)
+	process, err := r.processFactory.StartProcess(ctx, params.WorkspacePath, cfg.CodexCommand, params.ProcessEnv)
 	if err != nil {
 		return model.NewAgentError(model.ErrCodexNotFound, "start codex app-server", err)
 	}
@@ -910,10 +911,13 @@ func runPhaseForEvent(event string) string {
 
 type execProcessFactory struct{}
 
-func (execProcessFactory) StartProcess(ctx context.Context, cwd string, command string) (Process, error) {
+func (execProcessFactory) StartProcess(ctx context.Context, cwd string, command string, env map[string]string) (Process, error) {
 	cmd, err := shell.BashCommand(ctx, cwd, command)
 	if err != nil {
 		return nil, err
+	}
+	if len(env) > 0 {
+		cmd.Env = mergeProcessEnv(os.Environ(), env)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -955,4 +959,30 @@ func (p *execProcess) Kill() error {
 		return nil
 	}
 	return err
+}
+
+func mergeProcessEnv(base []string, overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+
+	indexByKey := make(map[string]int, len(base))
+	merged := append([]string(nil), base...)
+	for index, item := range merged {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		indexByKey[key] = index
+	}
+	for key, value := range overrides {
+		entry := key + "=" + value
+		if index, ok := indexByKey[key]; ok {
+			merged[index] = entry
+			continue
+		}
+		indexByKey[key] = len(merged)
+		merged = append(merged, entry)
+	}
+	return merged
 }

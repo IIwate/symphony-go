@@ -517,6 +517,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			WorkspacePath:  workspaceRef.Path,
 			PromptTemplate: o.currentWorkflow().PromptTemplate,
 			Source:         o.currentWorkflow().Source,
+			ProcessEnv:     workspaceProcessEnv(workspaceRef),
 			MaxTurns:       o.currentConfig().MaxTurns,
 			RefetchIssue: func(ctx context.Context, issueID string) (*model.Issue, error) {
 				issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{issueID})
@@ -550,6 +551,23 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		}
 		o.sendWorkerResult(result)
 	}()
+}
+
+func workspaceProcessEnv(workspace *model.Workspace) map[string]string {
+	if workspace == nil {
+		return nil
+	}
+	name := strings.TrimSpace(workspace.GitAuthorName)
+	email := strings.TrimSpace(workspace.GitAuthorEmail)
+	if name == "" || email == "" {
+		return nil
+	}
+	return map[string]string{
+		"GIT_AUTHOR_NAME":     name,
+		"GIT_AUTHOR_EMAIL":    email,
+		"GIT_COMMITTER_NAME":  name,
+		"GIT_COMMITTER_EMAIL": email,
+	}
 }
 
 func (o *Orchestrator) handleWorkerExit(result WorkerResult) {

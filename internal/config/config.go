@@ -29,6 +29,7 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	}
 
 	cfg := defaultServiceConfig()
+	cfg.AutomationRootDir = strings.TrimSpace(def.RootDir)
 
 	tracker := getMap(configMap, "tracker")
 	cfg.TrackerKind = model.NormalizeState(getString(tracker, "kind", ""))
@@ -59,6 +60,10 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 		cfg.WorkspaceRoot = root
 	}
 	cfg.WorkspaceLinearBranchScope = slugifyScopeValue(getString(workspace, "linear_branch_scope", ""))
+	cfg.WorkspaceBranchNamespace = strings.TrimSpace(getString(workspace, "branch_namespace", ""))
+	workspaceGit := getMap(workspace, "git")
+	cfg.WorkspaceGitAuthorName = strings.TrimSpace(getString(workspaceGit, "author_name", ""))
+	cfg.WorkspaceGitAuthorEmail = strings.TrimSpace(getString(workspaceGit, "author_email", ""))
 
 	hooks := getMap(configMap, "hooks")
 	if value, ok := getOptionalString(hooks, "after_create"); ok {

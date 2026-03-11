@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"symphony-go/internal/model"
@@ -120,14 +121,16 @@ func TestPrepareForRunTimeout(t *testing.T) {
 func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git config user.name":                                    "testuser\n",
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "",
-			"git switch -c testuser/linear-demo-scope-demo-37":        "",
 		},
 	}
 	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "testuser"
+	manager.currentConfig().WorkspaceGitAuthorName = "commit-bot"
+	manager.currentConfig().WorkspaceGitAuthorEmail = "commit-bot@symphony.invalid"
+	runner.stdoutByScript["git switch -c testuser/linear-demo-scope-demo-37"] = ""
 
 	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
 	if err != nil {
@@ -143,19 +146,28 @@ func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 	if got := runner.callCount("git switch -c testuser/linear-demo-scope-demo-37"); got != 1 {
 		t.Fatalf("branch create call count = %d, want 1", got)
 	}
+	if workspace.BranchNamespace != "testuser" {
+		t.Fatalf("BranchNamespace = %q, want testuser", workspace.BranchNamespace)
+	}
+	if workspace.GitAuthorName != "commit-bot" {
+		t.Fatalf("GitAuthorName = %q, want commit-bot", workspace.GitAuthorName)
+	}
+	if workspace.GitAuthorEmail != "commit-bot@symphony.invalid" {
+		t.Fatalf("GitAuthorEmail = %q, want commit-bot@symphony.invalid", workspace.GitAuthorEmail)
+	}
 }
 
-func TestPrepareForRunAddsSuffixWhenRemoteBranchExists(t *testing.T) {
+func TestPrepareForRunReusesUniqueRemoteBranchWhenNoBindingExists(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git config user.name":                                    "testuser\n",
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "abc\trefs/heads/testuser/linear-demo-scope-demo-37\n",
-			"git switch -c testuser/linear-demo-scope-demo-37-2":      "",
+			"git switch -c testuser/linear-demo-scope-demo-37 --track origin/testuser/linear-demo-scope-demo-37": "",
 		},
 	}
 	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "testuser"
 
 	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
 	if err != nil {
@@ -168,15 +180,17 @@ func TestPrepareForRunAddsSuffixWhenRemoteBranchExists(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c testuser/linear-demo-scope-demo-37-2"); got != 1 {
-		t.Fatalf("branch create call count = %d, want 1", got)
+	if got := runner.callCount("git switch -c testuser/linear-demo-scope-demo-37 --track origin/testuser/linear-demo-scope-demo-37"); got != 1 {
+		t.Fatalf("remote branch reuse call count = %d, want 1", got)
+	}
+	if workspace.BranchNamespace != "testuser" {
+		t.Fatalf("BranchNamespace = %q, want testuser", workspace.BranchNamespace)
 	}
 }
 
 func TestPrepareForRunUsesGitHubIssueNumberShortName(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git config user.name":                                    "testuser\n",
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "",
@@ -186,6 +200,7 @@ func TestPrepareForRunUsesGitHubIssueNumberShortName(t *testing.T) {
 	manager := newTestManager(t, runner)
 	manager.currentConfig().TrackerKind = "github"
 	manager.currentConfig().TrackerRepo = "linear-test"
+	manager.currentConfig().WorkspaceBranchNamespace = "testuser"
 
 	workspace, err := manager.CreateForIssue(context.Background(), "test-org/linear-test#123")
 	if err != nil {
@@ -200,6 +215,262 @@ func TestPrepareForRunUsesGitHubIssueNumberShortName(t *testing.T) {
 	}
 	if got := runner.callCount("git switch -c testuser/github-linear-test-123"); got != 1 {
 		t.Fatalf("branch create call count = %d, want 1", got)
+	}
+}
+
+func TestPrepareForRunUsesBoundRemoteBranch(t *testing.T) {
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "abc\trefs/heads/legacy/linear-demo-scope-demo-37\n",
+			"git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37": "",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "newns"
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := manager.saveBranchBinding(workspace.WorkspaceKey, workspace.Identifier, "legacy/linear-demo-scope-demo-37"); err != nil {
+		t.Fatalf("saveBranchBinding() error = %v", err)
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37"); got != 1 {
+		t.Fatalf("remote tracking switch call count = %d, want 1", got)
+	}
+}
+
+func TestPrepareForRunRecreatesBoundBranchWhenMissingLocallyAndRemotely(t *testing.T) {
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "",
+			"git switch -c legacy/linear-demo-scope-demo-37":          "",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "newns"
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := manager.saveBranchBinding(workspace.WorkspaceKey, workspace.Identifier, "legacy/linear-demo-scope-demo-37"); err != nil {
+		t.Fatalf("saveBranchBinding() error = %v", err)
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("git switch -c legacy/linear-demo-scope-demo-37"); got != 1 {
+		t.Fatalf("recreate bound branch call count = %d, want 1", got)
+	}
+}
+
+func TestPrepareForRunDiscoversUniqueLegacyBranchWithoutBinding(t *testing.T) {
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "abc\trefs/heads/legacy/linear-demo-scope-demo-37\n",
+			"git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37": "",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "newns"
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37"); got != 1 {
+		t.Fatalf("legacy remote switch call count = %d, want 1", got)
+	}
+	binding, ok, err := manager.loadBranchBinding(workspace.WorkspaceKey)
+	if err != nil {
+		t.Fatalf("loadBranchBinding() error = %v", err)
+	}
+	if !ok || binding.Branch != "legacy/linear-demo-scope-demo-37" {
+		t.Fatalf("binding = %+v, ok = %t, want legacy branch binding", binding, ok)
+	}
+}
+
+func TestPrepareForRunFailsOnMultipleLegacyBranchCandidates(t *testing.T) {
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin": "abc\trefs/heads/legacy-a/linear-demo-scope-demo-37\n" +
+				"def\trefs/heads/legacy-b/linear-demo-scope-demo-37\n",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "newns"
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+
+	err = manager.PrepareForRun(context.Background(), workspace)
+	if !errors.Is(err, model.ErrWorkspaceHookFailed) {
+		t.Fatalf("PrepareForRun() error = %v, want ErrWorkspaceHookFailed", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "multiple candidate branches") {
+		t.Fatalf("PrepareForRun() error = %v, want multiple candidate branches detail", err)
+	}
+}
+
+func TestPrepareForRunUsesStableRunnerAliasFallback(t *testing.T) {
+	originalGenerateRunnerAlias := generateRunnerAlias
+	generateRunnerAlias = func() (string, error) { return "runner-abc123", nil }
+	t.Cleanup(func() { generateRunnerAlias = originalGenerateRunnerAlias })
+
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "",
+			"git switch -c runner-abc123/linear-demo-scope-demo-37":   "",
+			"git switch -c runner-abc123/linear-demo-scope-demo-38":   "",
+		},
+	}
+	manager := newTestManager(t, runner)
+
+	workspace1, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace1.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := manager.PrepareForRun(context.Background(), workspace1); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+
+	generateRunnerAlias = func() (string, error) { return "runner-zzz999", nil }
+	workspace2, err := manager.CreateForIssue(context.Background(), "DEMO-38")
+	if err != nil {
+		t.Fatalf("CreateForIssue() second error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace2.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) second error = %v", err)
+	}
+	if err := manager.PrepareForRun(context.Background(), workspace2); err != nil {
+		t.Fatalf("PrepareForRun() second error = %v", err)
+	}
+
+	if workspace1.BranchNamespace != "runner-abc123" || workspace2.BranchNamespace != "runner-abc123" {
+		t.Fatalf("branch namespaces = %q, %q, want stable runner-abc123", workspace1.BranchNamespace, workspace2.BranchNamespace)
+	}
+	if workspace2.GitAuthorName != "symphony-runner" {
+		t.Fatalf("GitAuthorName = %q, want symphony-runner", workspace2.GitAuthorName)
+	}
+	if workspace2.GitAuthorEmail != "runner-abc123@symphony.invalid" {
+		t.Fatalf("GitAuthorEmail = %q, want runner-abc123@symphony.invalid", workspace2.GitAuthorEmail)
+	}
+}
+
+func TestPrepareForRunUsesRepoLocalGitIdentity(t *testing.T) {
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "",
+			"git switch -c testuser/linear-demo-scope-demo-37":        "",
+			"git config --local --get user.name 2>/dev/null || true":  "repo-user\n",
+			"git config --local --get user.email 2>/dev/null || true": "repo-user@example.com\n",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "testuser"
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if workspace.GitAuthorName != "repo-user" {
+		t.Fatalf("GitAuthorName = %q, want repo-user", workspace.GitAuthorName)
+	}
+	if workspace.GitAuthorEmail != "repo-user@example.com" {
+		t.Fatalf("GitAuthorEmail = %q, want repo-user@example.com", workspace.GitAuthorEmail)
+	}
+}
+
+func TestPrepareForRunIgnoresHalfConfiguredIdentityAndFallsBack(t *testing.T) {
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "",
+			"git switch -c testuser/linear-demo-scope-demo-37":        "",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "testuser"
+	manager.currentConfig().WorkspaceGitAuthorName = "bot-only"
+	manager.currentConfig().WorkspaceGitAuthorEmail = "   "
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if workspace.GitAuthorName != "symphony-runner" {
+		t.Fatalf("GitAuthorName = %q, want fallback symphony-runner", workspace.GitAuthorName)
+	}
+	if workspace.GitAuthorEmail != "testuser@symphony.invalid" {
+		t.Fatalf("GitAuthorEmail = %q, want fallback testuser@symphony.invalid", workspace.GitAuthorEmail)
+	}
+}
+
+func TestCleanupWorkspaceRemovesBindingWhenWorkspaceMissing(t *testing.T) {
+	manager := newTestManager(t, &fakeRunner{})
+	if err := manager.saveBranchBinding("DEMO-37", "DEMO-37", "legacy/linear-demo-scope-demo-37"); err != nil {
+		t.Fatalf("saveBranchBinding() error = %v", err)
+	}
+
+	if err := manager.CleanupWorkspace(context.Background(), "DEMO-37"); err != nil {
+		t.Fatalf("CleanupWorkspace() error = %v", err)
+	}
+	if _, ok, err := manager.loadBranchBinding("DEMO-37"); err != nil {
+		t.Fatalf("loadBranchBinding() error = %v", err)
+	} else if ok {
+		t.Fatal("branch binding still exists after cleanup")
 	}
 }
 
@@ -238,6 +509,7 @@ func newTestManager(t *testing.T, runner HookRunner) *LocalManager {
 	manager, err := NewManager(&model.ServiceConfig{
 		TrackerKind:                "linear",
 		TrackerRepo:                "linear-test",
+		AutomationRootDir:          filepath.Join(t.TempDir(), "automation"),
 		WorkspaceRoot:              filepath.Join(t.TempDir(), "workspaces"),
 		WorkspaceLinearBranchScope: "demo-scope",
 		HookTimeoutMS:              200,
@@ -270,7 +542,7 @@ func (f *fakeRunner) Run(ctx context.Context, _ string, script string) (string, 
 		return stdout, f.stderrByScript[script], nil
 	}
 
-	return "stdout", "", nil
+	return "", "", nil
 }
 
 func (f *fakeRunner) callCount(script string) int {

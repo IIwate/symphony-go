@@ -472,14 +472,16 @@ CLI 当前支持：
 
 `ensureWorkBranch` 的规则：
 
-1. 读取 `git config user.name` 作为 `<namespace>`。
+1. 优先使用显式配置的 `runtime.workspace.branch_namespace`；若未配置，则回退到本地稳定 alias 作为 `<namespace>`。
 2. 根据 tracker 类型生成 `<issue-short>`：
    - `linear`：`linear-<source.branch_scope>-<issue-identifier>`（首版内部 bridge 仍经由 `workspace.linear_branch_scope`）
    - `github`：`github-<source.repo>-<issue-number>`（首版内部 bridge 仍经由 `tracker.repo`）
    - 其他：退化为 identifier slug
-3. 读取当前分支、本地分支、远端分支。
-4. 选择已有分支或创建新分支。
-5. 使用 `git switch` / `git switch -c` 切换。
+3. 解析当前 run 的 commit identity：显式配置优先，其次 repo-local/global git config，最后回退到 `symphony-runner <namespace@symphony.invalid>`。
+4. 优先读取 issue 对应的 branch binding；若已绑定，则继续复用该分支。
+5. 若尚未绑定，则按 `<issue-short>` 在本地/远端发现唯一候选旧分支；命中后写入 binding。
+6. 若没有候选旧分支，再按当前命名规则生成新分支并写入 binding。
+7. 使用 `git switch` / `git switch -c` 切换。
 
 边界说明：
 
@@ -498,6 +500,7 @@ CLI 当前支持：
 - 路径不存在则视为成功。
 - 若配置了 `hooks.before_remove`，以 best-effort 执行。
 - 最终执行 `os.RemoveAll` 删除工作区目录。
+- 工作区删除成功后，同时删除 issue 对应的 branch binding。
 
 ---
 

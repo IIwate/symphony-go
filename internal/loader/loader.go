@@ -174,6 +174,7 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	}
 
 	return &model.WorkflowDefinition{
+		RootDir:        def.RootDir,
 		Config:         configMap,
 		PromptTemplate: promptTemplate,
 		Source:         sourceBindings(resolvedSource),

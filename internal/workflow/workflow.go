@@ -35,6 +35,7 @@ func Load(path string) (*model.WorkflowDefinition, error) {
 	}
 
 	return &model.WorkflowDefinition{
+		RootDir:        filepath.Dir(workflowPath),
 		Config:         config,
 		PromptTemplate: prompt,
 	}, nil

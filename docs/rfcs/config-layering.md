@@ -321,7 +321,7 @@ runtime:
 LINEAR_API_KEY=lin_api_xxxxxxxxxxxxxxxxxxxx
 LINEAR_PROJECT_SLUG=your-linear-project-slug
 LINEAR_BRANCH_SCOPE=your-branch-scope
-SYMPHONY_GIT_REPO=https://github.com/your-org-or-user/your-repo
+SYMPHONY_GIT_REPO_URL=https://github.com/your-org-or-user/your-repo
 ```
 
 这就是“本地持久化 key”的位置：
@@ -330,7 +330,7 @@ SYMPHONY_GIT_REPO=https://github.com/your-org-or-user/your-repo
 - 启动时自动加载
 - 配置文件中只写 `$LINEAR_API_KEY`、`$LINEAR_PROJECT_SLUG`、`$LINEAR_BRANCH_SCOPE`
 - 不要求每次交互重新提供 key
-- hook 中对外部必填值使用 `${VAR:?message}`，例如 `SYMPHONY_GIT_REPO`
+- hook 中对外部必填值使用 `${VAR:?message}`，例如 `SYMPHONY_GIT_REPO_URL`
 
 ## 4. 核心设计决策
 

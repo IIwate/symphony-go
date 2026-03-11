@@ -35,6 +35,11 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 			"workspace": map[string]any{
 				"root":                "~/symphony",
 				"linear_branch_scope": "$LINEAR_BRANCH_SCOPE",
+				"branch_namespace":    " Runner Alias ",
+				"git": map[string]any{
+					"author_name":  " runner-bot ",
+					"author_email": " runner-bot@symphony.invalid ",
+				},
 			},
 			"hooks": map[string]any{
 				"before_run": "echo hi",
@@ -81,6 +86,15 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	}
 	if cfg.WorkspaceLinearBranchScope != "demo-scope" {
 		t.Fatalf("WorkspaceLinearBranchScope = %q, want demo-scope", cfg.WorkspaceLinearBranchScope)
+	}
+	if cfg.WorkspaceBranchNamespace != "Runner Alias" {
+		t.Fatalf("WorkspaceBranchNamespace = %q, want Runner Alias", cfg.WorkspaceBranchNamespace)
+	}
+	if cfg.WorkspaceGitAuthorName != "runner-bot" {
+		t.Fatalf("WorkspaceGitAuthorName = %q, want runner-bot", cfg.WorkspaceGitAuthorName)
+	}
+	if cfg.WorkspaceGitAuthorEmail != "runner-bot@symphony.invalid" {
+		t.Fatalf("WorkspaceGitAuthorEmail = %q, want runner-bot@symphony.invalid", cfg.WorkspaceGitAuthorEmail)
 	}
 	if cfg.HookBeforeRun == nil || *cfg.HookBeforeRun != "echo hi" {
 		t.Fatalf("HookBeforeRun = %v, want echo hi", cfg.HookBeforeRun)
@@ -175,20 +189,20 @@ func TestValidateForDispatch(t *testing.T) {
 }
 
 func TestValidateForDispatchFailsWhenHookRequiresMissingEnv(t *testing.T) {
-	t.Setenv("SYMPHONY_GIT_REPO", "")
+	t.Setenv("SYMPHONY_GIT_REPO_URL", "")
 
 	cfg := defaultServiceConfig()
 	cfg.TrackerKind = "linear"
 	cfg.TrackerAPIKey = "secret"
 	cfg.TrackerProjectSlug = "demo"
 	cfg.WorkspaceLinearBranchScope = "demo-scope"
-	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO:?SYMPHONY_GIT_REPO is required}"`)
+	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"`)
 
 	err := ValidateForDispatch(cfg)
 	if !errors.Is(err, model.ErrWorkflowParseError) {
 		t.Fatalf("ValidateForDispatch() error = %v, want ErrWorkflowParseError", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), "SYMPHONY_GIT_REPO") {
+	if err == nil || !strings.Contains(err.Error(), "SYMPHONY_GIT_REPO_URL") {
 		t.Fatalf("ValidateForDispatch() error = %v, want missing env detail", err)
 	}
 }
@@ -255,7 +269,7 @@ func TestNewFromWorkflowUsesDefaultResolver(t *testing.T) {
 func TestValidateForDispatchUsesDefaultResolverForHookEnv(t *testing.T) {
 	originalResolver := secret.DefaultResolver
 	secret.DefaultResolver = func(key string) (string, bool) {
-		if key == "SYMPHONY_GIT_REPO" {
+		if key == "SYMPHONY_GIT_REPO_URL" {
 			return "https://example.com/repo.git", true
 		}
 		return "", false
@@ -267,7 +281,7 @@ func TestValidateForDispatchUsesDefaultResolverForHookEnv(t *testing.T) {
 	cfg.TrackerAPIKey = "secret"
 	cfg.TrackerProjectSlug = "demo"
 	cfg.WorkspaceLinearBranchScope = "demo-scope"
-	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO:?SYMPHONY_GIT_REPO is required}"`)
+	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"`)
 
 	if err := ValidateForDispatch(cfg); err != nil {
 		t.Fatalf("ValidateForDispatch() error = %v, want nil", err)

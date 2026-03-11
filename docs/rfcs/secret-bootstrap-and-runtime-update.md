@@ -257,7 +257,7 @@ func (d *ConfigDiagnosis) Error() string
    - `LINEAR_API_KEY` -> 敏感
    - `LINEAR_PROJECT_SLUG` -> 非敏感
    - `LINEAR_BRANCH_SCOPE` -> 非敏感
-   - `SYMPHONY_GIT_REPO` -> 非敏感
+   - `SYMPHONY_GIT_REPO_URL` -> 非敏感
 
 ### 3.3 新增函数
 

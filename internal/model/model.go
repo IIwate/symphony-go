@@ -39,6 +39,7 @@ type BlockerRef struct {
 }
 
 type WorkflowDefinition struct {
+	RootDir        string
 	Config         map[string]any
 	PromptTemplate string
 	Source         map[string]any
@@ -84,8 +85,12 @@ type ServiceConfig struct {
 	ActiveStates                     []string
 	TerminalStates                   []string
 	PollIntervalMS                   int
+	AutomationRootDir                string
 	WorkspaceRoot                    string
 	WorkspaceLinearBranchScope       string
+	WorkspaceBranchNamespace         string
+	WorkspaceGitAuthorName           string
+	WorkspaceGitAuthorEmail          string
 	HookAfterCreate                  *string
 	HookBeforeRun                    *string
 	HookAfterRun                     *string
@@ -107,10 +112,13 @@ type ServiceConfig struct {
 }
 
 type Workspace struct {
-	Path         string
-	WorkspaceKey string
-	Identifier   string
-	CreatedNow   bool
+	Path            string
+	WorkspaceKey    string
+	Identifier      string
+	CreatedNow      bool
+	BranchNamespace string
+	GitAuthorName   string
+	GitAuthorEmail  string
 }
 
 type RunAttempt struct {

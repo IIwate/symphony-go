@@ -169,6 +169,43 @@ func TestRunnerTurnTimeout(t *testing.T) {
 	}
 }
 
+func TestRunnerInjectsProcessEnvIntoAgentProcess(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		ProcessEnv: map[string]string{
+			"GIT_AUTHOR_NAME":     "symphony-runner",
+			"GIT_AUTHOR_EMAIL":    "runner-a1b2c3@symphony.invalid",
+			"GIT_COMMITTER_NAME":  "symphony-runner",
+			"GIT_COMMITTER_EMAIL": "runner-a1b2c3@symphony.invalid",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if factory.lastEnv["GIT_AUTHOR_NAME"] != "symphony-runner" {
+		t.Fatalf("GIT_AUTHOR_NAME = %q, want symphony-runner", factory.lastEnv["GIT_AUTHOR_NAME"])
+	}
+	if factory.lastEnv["GIT_AUTHOR_EMAIL"] != "runner-a1b2c3@symphony.invalid" {
+		t.Fatalf("GIT_AUTHOR_EMAIL = %q, want runner-a1b2c3@symphony.invalid", factory.lastEnv["GIT_AUTHOR_EMAIL"])
+	}
+	if factory.lastEnv["GIT_COMMITTER_NAME"] != "symphony-runner" {
+		t.Fatalf("GIT_COMMITTER_NAME = %q, want symphony-runner", factory.lastEnv["GIT_COMMITTER_NAME"])
+	}
+	if factory.lastEnv["GIT_COMMITTER_EMAIL"] != "runner-a1b2c3@symphony.invalid" {
+		t.Fatalf("GIT_COMMITTER_EMAIL = %q, want runner-a1b2c3@symphony.invalid", factory.lastEnv["GIT_COMMITTER_EMAIL"])
+	}
+}
+
 func TestWaitForTurnEndEmitsPlainStderrAsNotification(t *testing.T) {
 	runner := newTestRunner(&fakeProcessFactory{process: newFakeProcess(nil, nil, false)}, 200, 200).(*AppServerRunner)
 	events := make([]AgentEvent, 0)
@@ -803,6 +840,7 @@ func newTestRunnerWithConfig(factory *fakeProcessFactory, cfg *model.ServiceConf
 
 type fakeProcessFactory struct {
 	process *fakeProcess
+	lastEnv map[string]string
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -811,7 +849,13 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
 
-func (f *fakeProcessFactory) StartProcess(_ context.Context, _ string, _ string) (Process, error) {
+func (f *fakeProcessFactory) StartProcess(_ context.Context, _ string, _ string, env map[string]string) (Process, error) {
+	if len(env) > 0 {
+		f.lastEnv = make(map[string]string, len(env))
+		for key, value := range env {
+			f.lastEnv[key] = value
+		}
+	}
 	f.process.start()
 	return f.process, nil
 }

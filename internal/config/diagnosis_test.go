@@ -25,7 +25,7 @@ func TestExtractRequiredEnvVarsStableOrder(t *testing.T) {
 		},
 	}
 	cfg := &model.ServiceConfig{
-		HookBeforeRun: stringPointer(`repo_url="${SYMPHONY_GIT_REPO:?required}"`),
+		HookBeforeRun: stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?required}"`),
 	}
 
 	got := ExtractRequiredEnvVars(def, cfg)
@@ -35,7 +35,7 @@ func TestExtractRequiredEnvVarsStableOrder(t *testing.T) {
 		"LINEAR_LABEL",
 		"LABEL_TOKEN",
 		"LINEAR_PROJECT_SLUG",
-		"SYMPHONY_GIT_REPO",
+		"SYMPHONY_GIT_REPO_URL",
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("ExtractRequiredEnvVars() = %v, want %v", got, want)
@@ -112,14 +112,14 @@ func TestDiagnoseConfigDetectsHookSecrets(t *testing.T) {
 	cfg.TrackerAPIKey = "key"
 	cfg.TrackerProjectSlug = "demo"
 	cfg.WorkspaceLinearBranchScope = "demo-scope"
-	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO:?required}"`)
+	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?required}"`)
 
 	diagnosis := DiagnoseConfig(cfg, def)
 	if len(diagnosis.MissingSecrets) != 1 {
 		t.Fatalf("MissingSecrets size = %d, want 1", len(diagnosis.MissingSecrets))
 	}
-	if diagnosis.MissingSecrets[0].EnvVar != "SYMPHONY_GIT_REPO" {
-		t.Fatalf("MissingSecrets[0].EnvVar = %q, want SYMPHONY_GIT_REPO", diagnosis.MissingSecrets[0].EnvVar)
+	if diagnosis.MissingSecrets[0].EnvVar != "SYMPHONY_GIT_REPO_URL" {
+		t.Fatalf("MissingSecrets[0].EnvVar = %q, want SYMPHONY_GIT_REPO_URL", diagnosis.MissingSecrets[0].EnvVar)
 	}
 	if diagnosis.MissingSecrets[0].Source != "hooks.before_run" {
 		t.Fatalf("MissingSecrets[0].Source = %q, want hooks.before_run", diagnosis.MissingSecrets[0].Source)
