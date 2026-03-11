@@ -320,7 +320,7 @@ jobs:
 
 **设计要点**：
 - 三平台矩阵：验证 Windows Git Bash 兼容性、macOS/Linux 行为一致性
-- `go-version-file: go.mod` 直接读取 `go 1.25.0`，无需硬编码版本
+- `go-version-file: go.mod` 直接读取 `go 1.25.8`，无需硬编码版本
 - `-race` 竞态检测（CI 环境有足够资源）
 - 不运行任何 provider-specific 集成测试（如 `LINEAR_API_KEY`、`GITHUB_TOKEN` 或第三方 agent CLI），仅本地按需运行
 
@@ -387,7 +387,7 @@ jobs:
 用于 `docker build` 手动构建，包含完整的编译阶段：
 
 ```dockerfile
-# 构建阶段
+# 构建阶段（镜像标签需满足 go.mod 的 Go >= 1.25.8 要求）
 FROM golang:1.25-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./

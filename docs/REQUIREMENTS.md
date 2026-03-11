@@ -47,8 +47,8 @@ Symphony 是一个长运行自动化服务，持续从 issue tracker（Linear）
 
 ### 1.3 Go 版本
 
-- **Go 1.23+**
-- 利用：`log/slog` 结构化日志（1.21+）、`net/http` 路由模式匹配（1.22+）、增强的标准库特性
+- **Go 1.25.8+**
+- 利用：`log/slog` 结构化日志（1.21+）、`net/http` 路由模式匹配（1.22+）、`charm.land/huh/v2` 的最低 Go 版本要求（1.25.8+）以及增强的标准库特性
 
 ### 1.4 不做的事项（对齐 SPEC §2.2 Non-Goals）
 

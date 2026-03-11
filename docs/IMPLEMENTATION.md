@@ -84,7 +84,7 @@ cmd/symphony → orchestrator → tracker (interface)
 
 | 领域 | 选型 | 理由 |
 |---|---|---|
-| Go 版本 | 1.23+ | slog (1.21+)、http 路由 (1.22+) |
+| Go 版本 | 1.25.8+ | slog (1.21+)、http 路由 (1.22+)、`charm.land/huh/v2` 最低版本要求 |
 | YAML | `gopkg.in/yaml.v3` | 成熟稳定 |
 | 模板 | `github.com/osteele/liquid` | Liquid 兼容，与官方 Elixir 实现一致 |
 | GraphQL | 手写 HTTP + `encoding/json` | 查询可控，无代码生成负担 |
