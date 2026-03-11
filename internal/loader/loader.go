@@ -115,6 +115,10 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	if !ok || flowDef == nil {
 		return nil, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("selected flow %q not found", flowName), nil)
 	}
+	completion, err := parseCompletionContract(flowDef.Raw)
+	if err != nil {
+		return nil, err
+	}
 
 	configMap := map[string]any{}
 	copyMapField(configMap, "polling", def.Runtime)
@@ -142,14 +146,15 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	}
 	configMap["tracker"] = trackerMap
 
+	hooksMap := cloneStringMap(getMapValue(def.Runtime, "hooks"))
+
 	if hooksValue, ok := flowDef.Raw["hooks"]; ok {
-		hooksMap, ok := asStringMap(hooksValue)
+		flowHooks, ok := asStringMap(hooksValue)
 		if !ok {
 			return nil, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("flow %q hooks must be a map", flowName), nil)
 		}
-		resolvedHooks := make(map[string]any, len(hooksMap))
-		for _, hookName := range []string{"after_create", "before_run", "after_run", "before_remove"} {
-			value, exists := hooksMap[hookName]
+		for _, hookName := range []string{"after_create", "before_run", "before_run_continuation", "after_run", "before_remove"} {
+			value, exists := flowHooks[hookName]
 			if !exists {
 				continue
 			}
@@ -157,11 +162,11 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 			if err != nil {
 				return nil, err
 			}
-			resolvedHooks[hookName] = resolvedValue
+			hooksMap[hookName] = resolvedValue
 		}
-		if len(resolvedHooks) > 0 {
-			configMap["hooks"] = resolvedHooks
-		}
+	}
+	if len(hooksMap) > 0 {
+		configMap["hooks"] = hooksMap
 	}
 
 	promptPath, ok := flowDef.Raw["prompt"].(string)
@@ -178,7 +183,72 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 		Config:         configMap,
 		PromptTemplate: promptTemplate,
 		Source:         sourceBindings(resolvedSource),
+		Completion:     completion,
 	}, nil
+}
+
+func parseCompletionContract(flowRaw map[string]any) (model.CompletionContract, error) {
+	contract := model.CompletionContract{
+		Mode:        model.CompletionModeNone,
+		OnMissingPR: model.CompletionActionContinue,
+		OnClosedPR:  model.CompletionActionContinue,
+	}
+	if flowRaw == nil {
+		return contract, nil
+	}
+
+	completionRaw, exists := flowRaw["completion"]
+	if !exists || completionRaw == nil {
+		return contract, nil
+	}
+	completionMap, ok := asStringMap(completionRaw)
+	if !ok {
+		return contract, model.NewWorkflowError(model.ErrWorkflowParseError, "flow completion must be a map", nil)
+	}
+
+	modeValue := strings.TrimSpace(getStringValue(completionMap, "mode"))
+	if modeValue == "" {
+		return contract, nil
+	}
+	switch modeValue {
+	case string(model.CompletionModeNone):
+		contract.Mode = model.CompletionModeNone
+		return contract, nil
+	case string(model.CompletionModePullRequest):
+		contract.Mode = model.CompletionModePullRequest
+	default:
+		return contract, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("unsupported completion.mode %q", modeValue), nil)
+	}
+
+	contract.OnMissingPR = model.CompletionActionIntervention
+	contract.OnClosedPR = model.CompletionActionIntervention
+	if actionValue := strings.TrimSpace(getStringValue(completionMap, "on_missing_pr")); actionValue != "" {
+		action, err := parseCompletionAction(actionValue)
+		if err != nil {
+			return contract, err
+		}
+		contract.OnMissingPR = action
+	}
+	if actionValue := strings.TrimSpace(getStringValue(completionMap, "on_closed_pr")); actionValue != "" {
+		action, err := parseCompletionAction(actionValue)
+		if err != nil {
+			return contract, err
+		}
+		contract.OnClosedPR = action
+	}
+
+	return contract, nil
+}
+
+func parseCompletionAction(value string) (model.CompletionAction, error) {
+	switch strings.TrimSpace(value) {
+	case string(model.CompletionActionContinue):
+		return model.CompletionActionContinue, nil
+	case string(model.CompletionActionIntervention):
+		return model.CompletionActionIntervention, nil
+	default:
+		return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("unsupported completion action %q", value), nil)
+	}
 }
 
 func normalizeConfigDir(dir string) string {
@@ -474,6 +544,18 @@ func getOptionalStringValue(source map[string]any, key string) (string, bool) {
 		return "", false
 	}
 	return text, true
+}
+
+func getStringValue(source map[string]any, key string) string {
+	if source == nil {
+		return ""
+	}
+	raw, ok := source[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	text, _ := raw.(string)
+	return strings.TrimSpace(text)
 }
 
 func getStringSliceValue(source map[string]any, key string) []string {

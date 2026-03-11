@@ -34,6 +34,7 @@ type RunParams struct {
 	WorkspacePath  string
 	PromptTemplate string
 	Source         map[string]any
+	Dispatch       *model.DispatchContext
 	ProcessEnv     map[string]string
 	MaxTurns       int
 	RefetchIssue   func(context.Context, string) (*model.Issue, error)
@@ -685,7 +686,7 @@ func (r *AppServerRunner) emit(params RunParams, event AgentEvent) {
 
 func buildTurnPrompt(params RunParams, issue *model.Issue, turnNumber int, maxTurns int) (string, error) {
 	if turnNumber == 1 {
-		return workflow.RenderPrompt(params.PromptTemplate, issue, params.Attempt, params.Source)
+		return workflow.RenderPrompt(params.PromptTemplate, issue, params.Attempt, params.Source, params.Dispatch)
 	}
 
 	return fmt.Sprintf("Continue working on issue %s (%d/%d turns). Re-check progress and finish only if the issue no longer needs active work.", issue.Identifier, turnNumber, maxTurns), nil

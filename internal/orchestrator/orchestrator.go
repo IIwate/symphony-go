@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +68,9 @@ type RunningSnapshot struct {
 	IssueIdentifier     string
 	WorkspacePath       string
 	State               string
+	DispatchKind        string
+	ExpectedOutcome     string
+	ContinuationReason  *string
 	SessionID           string
 	TurnCount           int
 	LastEvent           string
@@ -83,12 +85,15 @@ type RunningSnapshot struct {
 }
 
 type RetrySnapshot struct {
-	IssueID         string
-	IssueIdentifier string
-	WorkspacePath   string
-	Attempt         int
-	DueAt           time.Time
-	Error           *string
+	IssueID            string
+	IssueIdentifier    string
+	WorkspacePath      string
+	DispatchKind       string
+	ExpectedOutcome    string
+	ContinuationReason *string
+	Attempt            int
+	DueAt              time.Time
+	Error              *string
 }
 
 type AwaitingMergeSnapshot struct {
@@ -106,15 +111,19 @@ type AwaitingMergeSnapshot struct {
 }
 
 type AwaitingInterventionSnapshot struct {
-	IssueID         string
-	IssueIdentifier string
-	WorkspacePath   string
-	Branch          string
-	PRNumber        int
-	PRURL           string
-	PRState         string
-	ObservedAt      time.Time
-	AttemptCount    int
+	IssueID             string
+	IssueIdentifier     string
+	WorkspacePath       string
+	Branch              string
+	PRNumber            int
+	PRURL               string
+	PRState             string
+	Reason              string
+	ExpectedOutcome     string
+	PreviousBranch      string
+	LastKnownIssueState string
+	ObservedAt          time.Time
+	AttemptCount        int
 }
 
 type AlertSnapshot struct {
@@ -140,22 +149,39 @@ type PullRequestInfo struct {
 	State      PullRequestState
 }
 
+type SuccessfulRunDisposition string
+
+const (
+	DispositionCompleted            SuccessfulRunDisposition = "completed"
+	DispositionTryCompleteMergedPR  SuccessfulRunDisposition = "try_complete_merged_pr"
+	DispositionAwaitingMerge        SuccessfulRunDisposition = "awaiting_merge"
+	DispositionAwaitingIntervention SuccessfulRunDisposition = "awaiting_intervention"
+	DispositionContinuation         SuccessfulRunDisposition = "continuation"
+)
+
+type SuccessfulRunDecision struct {
+	Disposition     SuccessfulRunDisposition
+	Reason          *model.ContinuationReason
+	ExpectedOutcome model.CompletionMode
+	PR              *model.PRContext
+	FinalBranch     string
+}
+
 type PullRequestLookup interface {
 	FindByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error)
 }
 
 type Orchestrator struct {
-	tracker       tracker.Client
-	workspace     workspace.Manager
-	runner        agent.Runner
-	configFn      func() *model.ServiceConfig
-	workflowFn    func() *model.WorkflowDefinition
-	logger        *slog.Logger
-	now           func() time.Time
-	randFloat     func() float64
-	gitBranchFn   func(context.Context, string) (string, error)
-	openPRHeadsFn func(context.Context, string) (map[string]struct{}, error)
-	prLookup      PullRequestLookup
+	tracker     tracker.Client
+	workspace   workspace.Manager
+	runner      agent.Runner
+	configFn    func() *model.ServiceConfig
+	workflowFn  func() *model.WorkflowDefinition
+	logger      *slog.Logger
+	now         func() time.Time
+	randFloat   func() float64
+	gitBranchFn func(context.Context, string) (string, error)
+	prLookup    PullRequestLookup
 
 	tickTimer      *time.Timer
 	workerResultCh chan WorkerResult
@@ -204,7 +230,6 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		now:            time.Now,
 		randFloat:      func() float64 { return 0.5 },
 		gitBranchFn:    defaultGitBranch,
-		openPRHeadsFn:  defaultOpenPRHeads,
 		workerResultCh: make(chan WorkerResult, 128),
 		codexUpdateCh:  make(chan CodexUpdate, 1024),
 		configReloadCh: make(chan struct{}, 8),
@@ -227,7 +252,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		startedAt:      time.Now().UTC(),
 		serviceVersion: BuildVersion,
 	}
-	o.prLookup = ghPRLookup{}
+	o.prLookup = newGitHubPRLookup()
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
 	return o
@@ -438,20 +463,30 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		workerCtx = o.runCtx
 	}
 	workerCtx, cancel := context.WithCancel(workerCtx)
+	completion := normalizeCompletionContract(o.currentWorkflow().Completion)
 
 	o.mu.Lock()
 	o.state.Claimed[issue.ID] = struct{}{}
 	stallCount := 0
+	var dispatch *model.DispatchContext
 	if existing := o.state.RetryAttempts[issue.ID]; existing != nil {
 		stallCount = existing.StallCount
 		if existing.TimerHandle != nil {
 			existing.TimerHandle.Stop()
 		}
+		dispatch = model.CloneDispatchContext(existing.Dispatch)
 	}
 	delete(o.state.RetryAttempts, issue.ID)
 	normalizedAttempt := 0
 	if attempt != nil {
 		normalizedAttempt = *attempt
+	}
+	if dispatch == nil {
+		dispatch = freshDispatchContext(completion)
+	}
+	if dispatch.RetryAttempt == nil && normalizedAttempt > 0 {
+		retryAttempt := normalizedAttempt
+		dispatch.RetryAttempt = &retryAttempt
 	}
 	o.state.Running[issue.ID] = &model.RunningEntry{
 		Issue:         model.CloneIssue(&issue),
@@ -461,6 +496,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		StallCount:    stallCount,
 		StartedAt:     o.now().UTC(),
 		WorkerCancel:  cancel,
+		Dispatch:      model.CloneDispatchContext(dispatch),
 	}
 	o.logger.Info(
 		"dispatching issue",
@@ -491,9 +527,11 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			o.sendWorkerResult(result)
 			return
 		}
+		workspaceRef.Dispatch = model.CloneDispatchContext(dispatch)
 		o.mu.Lock()
 		if entry := o.state.Running[issue.ID]; entry != nil {
 			entry.WorkspacePath = workspaceRef.Path
+			entry.Dispatch = model.CloneDispatchContext(dispatch)
 			o.refreshSnapshotLocked()
 			o.publishSnapshotLocked()
 		}
@@ -508,15 +546,16 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			}
 		}
 
-		preBranch, preOpenPRHeads, hasPRContext := o.capturePRContext(workerCtx, workspaceRef.Path)
+		workflowDef := o.currentWorkflow()
 
 		result.Phase = model.PhaseStreamingTurn
 		runErr := o.runner.Run(workerCtx, agent.RunParams{
 			Issue:          model.CloneIssue(&issue),
 			Attempt:        attempt,
 			WorkspacePath:  workspaceRef.Path,
-			PromptTemplate: o.currentWorkflow().PromptTemplate,
-			Source:         o.currentWorkflow().Source,
+			PromptTemplate: workflowDef.PromptTemplate,
+			Source:         workflowDef.Source,
+			Dispatch:       model.CloneDispatchContext(dispatch),
 			ProcessEnv:     workspaceProcessEnv(workspaceRef),
 			MaxTurns:       o.currentConfig().MaxTurns,
 			RefetchIssue: func(ctx context.Context, issueID string) (*model.Issue, error) {
@@ -545,9 +584,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			result.Phase = phaseFromError(runErr)
 		} else {
 			result.Phase = model.PhaseSucceeded
-			if hasPRContext {
-				result.HasNewOpenPR, result.FinalBranch = o.detectNewOpenPR(workerCtx, workspaceRef.Path, preBranch, preOpenPRHeads)
-			}
+			result.FinalBranch = o.currentBranch(workerCtx, workspaceRef.Path)
 		}
 		o.sendWorkerResult(result)
 	}()
@@ -567,6 +604,232 @@ func workspaceProcessEnv(workspace *model.Workspace) map[string]string {
 		"GIT_AUTHOR_EMAIL":    email,
 		"GIT_COMMITTER_NAME":  name,
 		"GIT_COMMITTER_EMAIL": email,
+	}
+}
+
+func normalizeCompletionContract(contract model.CompletionContract) model.CompletionContract {
+	if contract.Mode == "" {
+		contract.Mode = model.CompletionModeNone
+	}
+	if contract.Mode == model.CompletionModePullRequest {
+		if contract.OnMissingPR == "" {
+			contract.OnMissingPR = model.CompletionActionIntervention
+		}
+		if contract.OnClosedPR == "" {
+			contract.OnClosedPR = model.CompletionActionIntervention
+		}
+		return contract
+	}
+	if contract.OnMissingPR == "" {
+		contract.OnMissingPR = model.CompletionActionContinue
+	}
+	if contract.OnClosedPR == "" {
+		contract.OnClosedPR = model.CompletionActionContinue
+	}
+	return contract
+}
+
+func freshDispatchContext(contract model.CompletionContract) *model.DispatchContext {
+	contract = normalizeCompletionContract(contract)
+	return &model.DispatchContext{
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: contract.Mode,
+		OnMissingPR:     contract.OnMissingPR,
+		OnClosedPR:      contract.OnClosedPR,
+	}
+}
+
+func dispatchCompletionAction(dispatch *model.DispatchContext, key string) model.CompletionAction {
+	if dispatch == nil {
+		return model.CompletionActionContinue
+	}
+	switch key {
+	case "missing":
+		if dispatch.OnMissingPR != "" {
+			return dispatch.OnMissingPR
+		}
+	case "closed":
+		if dispatch.OnClosedPR != "" {
+			return dispatch.OnClosedPR
+		}
+	}
+	return model.CompletionActionContinue
+}
+
+func continuationDispatchContext(base *model.DispatchContext, fallback model.CompletionContract, reason model.ContinuationReason, branch string, pr *PullRequestInfo, issueState string) *model.DispatchContext {
+	fallback = normalizeCompletionContract(fallback)
+	dispatch := model.CloneDispatchContext(base)
+	if dispatch == nil {
+		dispatch = freshDispatchContext(fallback)
+	}
+	dispatch.Kind = model.DispatchKindContinuation
+	if dispatch.ExpectedOutcome == "" {
+		dispatch.ExpectedOutcome = fallback.Mode
+	}
+	if dispatch.OnMissingPR == "" {
+		dispatch.OnMissingPR = fallback.OnMissingPR
+	}
+	if dispatch.OnClosedPR == "" {
+		dispatch.OnClosedPR = fallback.OnClosedPR
+	}
+	dispatch.Reason = reasonPtr(reason)
+	if strings.TrimSpace(branch) != "" {
+		dispatch.PreviousBranch = dispatchStringPtr(strings.TrimSpace(branch))
+	}
+	dispatch.PreviousPR = pullRequestContext(pr)
+	if strings.TrimSpace(issueState) != "" {
+		dispatch.PreviousIssueState = dispatchStringPtr(strings.TrimSpace(issueState))
+	}
+	return dispatch
+}
+
+func reasonPtr(value model.ContinuationReason) *model.ContinuationReason {
+	copyValue := value
+	return &copyValue
+}
+
+func dispatchStringPtr(value string) *string {
+	copyValue := value
+	return &copyValue
+}
+
+func pullRequestContext(pr *PullRequestInfo) *model.PRContext {
+	if pr == nil {
+		return nil
+	}
+	return &model.PRContext{
+		Number:     pr.Number,
+		URL:        pr.URL,
+		State:      string(pr.State),
+		Merged:     pr.State == PullRequestStateMerged,
+		HeadBranch: pr.HeadBranch,
+	}
+}
+
+func pullRequestInfoFromContext(pr *model.PRContext) *PullRequestInfo {
+	if pr == nil {
+		return nil
+	}
+	return &PullRequestInfo{
+		Number:     pr.Number,
+		URL:        pr.URL,
+		HeadBranch: pr.HeadBranch,
+		State:      PullRequestState(pr.State),
+	}
+}
+
+func (o *Orchestrator) currentBranch(ctx context.Context, workspacePath string) string {
+	if o.gitBranchFn == nil {
+		return ""
+	}
+	branch, err := o.gitBranchFn(ctx, workspacePath)
+	if err != nil {
+		o.logger.Warn("post-run branch detection failed", "workspace_path", workspacePath, "error", err.Error())
+		return ""
+	}
+	return strings.TrimSpace(branch)
+}
+
+func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath string, finalBranch string, dispatch *model.DispatchContext, autoCloseOnPR bool, issueState string) (*SuccessfulRunDecision, error) {
+	contract := normalizeCompletionContract(model.CompletionContract{
+		Mode:        model.CompletionModeNone,
+		OnMissingPR: dispatchCompletionAction(dispatch, "missing"),
+		OnClosedPR:  dispatchCompletionAction(dispatch, "closed"),
+	})
+	if dispatch != nil {
+		if dispatch.ExpectedOutcome != "" {
+			contract.Mode = dispatch.ExpectedOutcome
+		}
+		if dispatch.OnMissingPR != "" {
+			contract.OnMissingPR = dispatch.OnMissingPR
+		}
+		if dispatch.OnClosedPR != "" {
+			contract.OnClosedPR = dispatch.OnClosedPR
+		}
+	}
+	branch := strings.TrimSpace(finalBranch)
+	if contract.Mode != model.CompletionModePullRequest {
+		reason := model.ContinuationReasonUnfinishedIssue
+		return &SuccessfulRunDecision{
+			Disposition:     DispositionContinuation,
+			Reason:          &reason,
+			ExpectedOutcome: contract.Mode,
+			FinalBranch:     branch,
+		}, nil
+	}
+	if branch == "" {
+		return decisionForMissingPullRequest(contract, branch), nil
+	}
+	pr, err := o.lookupPullRequestByHeadBranch(ctx, workspacePath, branch)
+	if err != nil {
+		return nil, err
+	}
+	if pr == nil {
+		return decisionForMissingPullRequest(contract, branch), nil
+	}
+	switch pr.State {
+	case PullRequestStateOpen:
+		return &SuccessfulRunDecision{
+			Disposition:     DispositionAwaitingMerge,
+			ExpectedOutcome: contract.Mode,
+			PR:              pullRequestContext(pr),
+			FinalBranch:     branch,
+		}, nil
+	case PullRequestStateMerged:
+		if autoCloseOnPR {
+			return &SuccessfulRunDecision{
+				Disposition:     DispositionTryCompleteMergedPR,
+				ExpectedOutcome: contract.Mode,
+				PR:              pullRequestContext(pr),
+				FinalBranch:     branch,
+			}, nil
+		}
+		reason := model.ContinuationReasonMergedPRAutoCloseOff
+		return &SuccessfulRunDecision{
+			Disposition:     DispositionAwaitingIntervention,
+			Reason:          &reason,
+			ExpectedOutcome: contract.Mode,
+			PR:              pullRequestContext(pr),
+			FinalBranch:     branch,
+		}, nil
+	case PullRequestStateClosed:
+		reason := model.ContinuationReasonClosedUnmergedPR
+		if contract.OnClosedPR == model.CompletionActionContinue {
+			return &SuccessfulRunDecision{
+				Disposition:     DispositionContinuation,
+				Reason:          &reason,
+				ExpectedOutcome: contract.Mode,
+				PR:              pullRequestContext(pr),
+				FinalBranch:     branch,
+			}, nil
+		}
+		return &SuccessfulRunDecision{
+			Disposition:     DispositionAwaitingIntervention,
+			Reason:          &reason,
+			ExpectedOutcome: contract.Mode,
+			PR:              pullRequestContext(pr),
+			FinalBranch:     branch,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported pull request state %q", pr.State)
+	}
+}
+
+func decisionForMissingPullRequest(contract model.CompletionContract, branch string) *SuccessfulRunDecision {
+	reason := model.ContinuationReasonMissingPR
+	if contract.OnMissingPR == model.CompletionActionContinue {
+		return &SuccessfulRunDecision{
+			Disposition:     DispositionContinuation,
+			Reason:          &reason,
+			ExpectedOutcome: contract.Mode,
+			FinalBranch:     branch,
+		}
+	}
+	return &SuccessfulRunDecision{
+		Disposition:     DispositionAwaitingIntervention,
+		Reason:          &reason,
+		ExpectedOutcome: contract.Mode,
+		FinalBranch:     branch,
 	}
 }
 
@@ -593,6 +856,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	workspacePath := entry.WorkspacePath
 	retryAttempt := entry.RetryAttempt
 	stallCount := entry.StallCount
+	dispatch := model.CloneDispatchContext(entry.Dispatch)
 	issueState := ""
 	if entry.Issue != nil {
 		issueState = entry.Issue.State
@@ -613,7 +877,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 			nextAttempt = 1
 		}
 		errorText := result.Err.Error()
-		o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false, stallCount)
+		o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false, stallCount, dispatch)
 		o.refreshSnapshotLocked()
 		o.publishSnapshotLocked()
 		o.mu.Unlock()
@@ -635,41 +899,51 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 			return
 		}
 	}
-
-	if result.HasNewOpenPR && cfg.OrchestratorAutoCloseOnPR {
-		pr, lookupErr := o.lookupPullRequestByHeadBranch(ctx, workspacePath, result.FinalBranch)
-		if lookupErr != nil {
-			o.logger.Warn("post-run PR status lookup failed", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch, "error", lookupErr.Error())
-			errorText := lookupErr.Error()
-			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, nil, &errorText)
-			return
+	decision, decisionErr := o.classifySuccessfulRun(ctx, workspacePath, result.FinalBranch, dispatch, cfg.OrchestratorAutoCloseOnPR, issueState)
+	if decisionErr != nil {
+		o.logger.Warn("post-run completion classification failed", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch, "error", decisionErr.Error())
+		errorText := decisionErr.Error()
+		o.mu.Lock()
+		o.scheduleRetryLocked(result.IssueID, identifier, retryAttempt+1, &errorText, false, stallCount, dispatch)
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.mu.Unlock()
+		return
+	}
+	switch decision.Disposition {
+	case DispositionTryCompleteMergedPR:
+		o.tryCompleteMergedPullRequest(ctx, result.IssueID, identifier, decision.FinalBranch, retryAttempt, stallCount)
+		return
+	case DispositionAwaitingMerge:
+		o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, decision.FinalBranch, retryAttempt, stallCount, pullRequestInfoFromContext(decision.PR), nil)
+		return
+	case DispositionAwaitingIntervention:
+		reason := ""
+		if decision.Reason != nil {
+			reason = string(*decision.Reason)
 		}
-		if pr == nil {
-			errorText := "pull request lookup returned no match"
-			o.logger.Warn("post-run PR lookup returned no match", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch)
-			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, nil, &errorText)
-			return
+		o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, decision.FinalBranch, retryAttempt, stallCount, decision.ExpectedOutcome, reason, issueState, pullRequestInfoFromContext(decision.PR))
+		return
+	case DispositionContinuation:
+		reason := model.ContinuationReasonUnfinishedIssue
+		if decision.Reason != nil {
+			reason = *decision.Reason
 		}
-		switch pr.State {
-		case PullRequestStateMerged:
-			o.tryCompleteMergedPullRequest(ctx, result.IssueID, identifier, result.FinalBranch, retryAttempt, stallCount)
-			return
-		case PullRequestStateOpen:
-			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr, nil)
-			return
-		case PullRequestStateClosed:
-			o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr)
-			return
-		default:
-			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
-			o.logger.Warn("post-run PR state is unsupported", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch, "state", pr.State)
-			o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, result.FinalBranch, retryAttempt, stallCount, pr, &errorText)
-			return
-		}
+		retryDispatch := continuationDispatchContext(dispatch, normalizeCompletionContract(model.CompletionContract{
+			Mode:        decision.ExpectedOutcome,
+			OnMissingPR: dispatchCompletionAction(dispatch, "missing"),
+			OnClosedPR:  dispatchCompletionAction(dispatch, "closed"),
+		}), reason, decision.FinalBranch, pullRequestInfoFromContext(decision.PR), issueState)
+		o.mu.Lock()
+		o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount, retryDispatch)
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.mu.Unlock()
+		return
 	}
 
 	o.mu.Lock()
-	o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount)
+	o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount, continuationDispatchContext(dispatch, normalizeCompletionContract(o.currentWorkflow().Completion), model.ContinuationReasonUnfinishedIssue, result.FinalBranch, nil, issueState))
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	o.mu.Unlock()
@@ -863,7 +1137,11 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				continue
 			}
 			delete(o.state.AwaitingMerge, issueID)
-			o.scheduleRetryLocked(issueID, current.Identifier, 1, nil, true, current.StallCount)
+			o.scheduleRetryLocked(issueID, current.Identifier, 1, nil, true, current.StallCount, continuationDispatchContext(nil, model.CompletionContract{
+				Mode:        model.CompletionModePullRequest,
+				OnMissingPR: model.CompletionActionIntervention,
+				OnClosedPR:  model.CompletionActionIntervention,
+			}, model.ContinuationReasonMissingPR, current.Branch, nil, current.State))
 			o.refreshSnapshotLocked()
 			o.publishSnapshotLocked()
 			o.mu.Unlock()
@@ -889,7 +1167,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 		case PullRequestStateMerged:
 			o.tryCompleteMergedPullRequest(ctx, issueID, entry.Identifier, entry.Branch, entry.RetryAttempt, entry.StallCount)
 		case PullRequestStateClosed:
-			o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, pr)
+			o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonClosedUnmergedPR), entry.State, pr)
 		default:
 			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
 			o.logger.Warn("awaiting-merge PR state is unsupported", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "state", pr.State)
@@ -975,7 +1253,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	if err != nil {
 		errorText := "retry poll failed"
 		o.mu.Lock()
-		o.scheduleRetryLocked(issueID, retryEntry.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount)
+		o.scheduleRetryLocked(issueID, retryEntry.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount, retryEntry.Dispatch)
 		o.refreshSnapshotLocked()
 		o.mu.Unlock()
 		return
@@ -1010,7 +1288,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	if !o.hasAvailableSlots(*issue, cfg) {
 		errorText := "no available orchestrator slots"
 		o.mu.Lock()
-		o.scheduleRetryLocked(issueID, issue.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount)
+		o.scheduleRetryLocked(issueID, issue.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount, retryEntry.Dispatch)
 		o.refreshSnapshotLocked()
 		o.mu.Unlock()
 		return
@@ -1102,11 +1380,11 @@ func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID strin
 			stallCount++
 		}
 		errorPtr := optionalError(errText)
-		o.scheduleRetryLocked(issueID, entry.Identifier, nextAttempt, errorPtr, false, stallCount)
+		o.scheduleRetryLocked(issueID, entry.Identifier, nextAttempt, errorPtr, false, stallCount, entry.Dispatch)
 	}
 }
 
-func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, attempt int, errText *string, continuation bool, stallCount int) {
+func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, attempt int, errText *string, continuation bool, stallCount int, dispatch *model.DispatchContext) {
 	if existing := o.state.RetryAttempts[issueID]; existing != nil && existing.TimerHandle != nil {
 		existing.TimerHandle.Stop()
 	}
@@ -1125,6 +1403,11 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 		}
 	})
 
+	retryDispatch := model.CloneDispatchContext(dispatch)
+	if retryDispatch != nil {
+		retryAttempt := attempt
+		retryDispatch.RetryAttempt = &retryAttempt
+	}
 	o.state.Claimed[issueID] = struct{}{}
 	o.state.RetryAttempts[issueID] = &model.RetryEntry{
 		IssueID:       issueID,
@@ -1135,6 +1418,7 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 		DueAt:         dueAt,
 		TimerHandle:   timer,
 		Error:         errText,
+		Dispatch:      retryDispatch,
 	}
 }
 
@@ -1193,6 +1477,14 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			CurrentRetryAttempt: entry.RetryAttempt,
 			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
 		}
+		if entry.Dispatch != nil {
+			row.DispatchKind = string(entry.Dispatch.Kind)
+			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
+			if entry.Dispatch.Reason != nil {
+				reason := string(*entry.Dispatch.Reason)
+				row.ContinuationReason = &reason
+			}
+		}
 		if entry.Session.LastCodexEvent != nil {
 			row.LastEvent = *entry.Session.LastCodexEvent
 		}
@@ -1226,15 +1518,19 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	awaitingIntervention := make([]AwaitingInterventionSnapshot, 0, len(o.state.AwaitingIntervention))
 	for issueID, entry := range o.state.AwaitingIntervention {
 		awaitingIntervention = append(awaitingIntervention, AwaitingInterventionSnapshot{
-			IssueID:         issueID,
-			IssueIdentifier: entry.Identifier,
-			WorkspacePath:   entry.WorkspacePath,
-			Branch:          entry.Branch,
-			PRNumber:        entry.PRNumber,
-			PRURL:           entry.PRURL,
-			PRState:         entry.PRState,
-			ObservedAt:      entry.ObservedAt,
-			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
+			IssueID:             issueID,
+			IssueIdentifier:     entry.Identifier,
+			WorkspacePath:       entry.WorkspacePath,
+			Branch:              entry.Branch,
+			PRNumber:            entry.PRNumber,
+			PRURL:               entry.PRURL,
+			PRState:             entry.PRState,
+			Reason:              entry.Reason,
+			ExpectedOutcome:     entry.ExpectedOutcome,
+			PreviousBranch:      entry.PreviousBranch,
+			LastKnownIssueState: entry.LastKnownIssueState,
+			ObservedAt:          entry.ObservedAt,
+			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
 		})
 	}
 	sort.SliceStable(awaitingIntervention, func(i int, j int) bool {
@@ -1246,14 +1542,23 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 
 	retrying := make([]RetrySnapshot, 0, len(o.state.RetryAttempts))
 	for issueID, entry := range o.state.RetryAttempts {
-		retrying = append(retrying, RetrySnapshot{
+		row := RetrySnapshot{
 			IssueID:         issueID,
 			IssueIdentifier: entry.Identifier,
 			WorkspacePath:   entry.WorkspacePath,
 			Attempt:         entry.Attempt,
 			DueAt:           entry.DueAt,
 			Error:           entry.Error,
-		})
+		}
+		if entry.Dispatch != nil {
+			row.DispatchKind = string(entry.Dispatch.Kind)
+			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
+			if entry.Dispatch.Reason != nil {
+				reason := string(*entry.Dispatch.Reason)
+				row.ContinuationReason = &reason
+			}
+		}
+		retrying = append(retrying, row)
 	}
 
 	alerts := make([]AlertSnapshot, 0, len(o.systemAlerts)+len(o.state.RetryAttempts))
@@ -1505,14 +1810,18 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	o.mu.Unlock()
 }
 
-func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, pr *PullRequestInfo) {
+func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, expectedOutcome model.CompletionMode, reason string, issueState string, pr *PullRequestInfo) {
 	entry := &model.AwaitingInterventionEntry{
-		Identifier:    identifier,
-		WorkspacePath: workspacePath,
-		Branch:        branch,
-		RetryAttempt:  retryAttempt,
-		StallCount:    stallCount,
-		ObservedAt:    o.now().UTC(),
+		Identifier:          identifier,
+		WorkspacePath:       workspacePath,
+		Branch:              branch,
+		RetryAttempt:        retryAttempt,
+		StallCount:          stallCount,
+		ObservedAt:          o.now().UTC(),
+		Reason:              reason,
+		ExpectedOutcome:     string(expectedOutcome),
+		PreviousBranch:      branch,
+		LastKnownIssueState: issueState,
 	}
 	if pr != nil {
 		entry.PRNumber = pr.Number
@@ -1520,7 +1829,7 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 		entry.PRState = string(pr.State)
 	}
 
-	o.logger.Warn("issue awaiting manual intervention after PR closed", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "pr_state", entry.PRState)
+	o.logger.Warn("issue awaiting manual intervention", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "pr_state", entry.PRState, "reason", reason)
 
 	o.mu.Lock()
 	delete(o.state.AwaitingMerge, issueID)
@@ -1561,7 +1870,7 @@ func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID
 	o.mu.Lock()
 	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
-	o.scheduleRetryLocked(issueID, identifier, nextAttempt, optionalError(errorText), false, stallCount)
+	o.scheduleRetryLocked(issueID, identifier, nextAttempt, optionalError(errorText), false, stallCount, nil)
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	o.mu.Unlock()
@@ -1593,99 +1902,6 @@ func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID stri
 	o.mu.Unlock()
 }
 
-func (o *Orchestrator) capturePRContext(ctx context.Context, workspacePath string) (string, map[string]struct{}, bool) {
-	if o.gitBranchFn == nil || o.openPRHeadsFn == nil {
-		return "", nil, false
-	}
-
-	preBranch, err := o.gitBranchFn(ctx, workspacePath)
-	if err != nil {
-		o.logger.Warn("pre-run branch detection failed", "workspace_path", workspacePath, "error", err.Error())
-		return "", nil, false
-	}
-	preOpenPRHeads, err := o.openPRHeadsFn(ctx, workspacePath)
-	if err != nil {
-		o.logger.Warn("pre-run open PR detection failed", "workspace_path", workspacePath, "error", err.Error())
-		return "", nil, false
-	}
-	return preBranch, preOpenPRHeads, true
-}
-
-func (o *Orchestrator) detectNewOpenPR(ctx context.Context, workspacePath string, preBranch string, preOpenPRHeads map[string]struct{}) (bool, string) {
-	if o.gitBranchFn == nil || o.openPRHeadsFn == nil {
-		return false, ""
-	}
-
-	postBranch, err := o.gitBranchFn(ctx, workspacePath)
-	if err != nil {
-		o.logger.Warn("post-run branch detection failed", "workspace_path", workspacePath, "error", err.Error())
-		return false, ""
-	}
-	postOpenPRHeads, err := o.openPRHeadsFn(ctx, workspacePath)
-	if err != nil {
-		o.logger.Warn("post-run open PR detection failed", "workspace_path", workspacePath, "error", err.Error())
-		return false, postBranch
-	}
-	if strings.TrimSpace(postBranch) == "" || postBranch == preBranch {
-		return false, postBranch
-	}
-	if _, existed := preOpenPRHeads[postBranch]; existed {
-		return false, postBranch
-	}
-	if _, open := postOpenPRHeads[postBranch]; !open {
-		return false, postBranch
-	}
-	return true, postBranch
-}
-
-type ghPRLookup struct{}
-
-func (ghPRLookup) FindByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error) {
-	stdout, stderr, err := runBashOutput(ctx, workspacePath, fmt.Sprintf("gh pr list --state all --head %s --json number,url,state,mergedAt,headRefName", bashSingleQuote(headBranch)))
-	if err != nil {
-		return nil, fmt.Errorf("gh pr list: %w: %s", err, strings.TrimSpace(stderr))
-	}
-
-	var payload []struct {
-		Number      int     `json:"number"`
-		URL         string  `json:"url"`
-		State       string  `json:"state"`
-		MergedAt    *string `json:"mergedAt"`
-		HeadRefName string  `json:"headRefName"`
-	}
-	if strings.TrimSpace(stdout) == "" {
-		return nil, nil
-	}
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		return nil, fmt.Errorf("decode gh pr list output: %w", err)
-	}
-
-	branch := strings.TrimSpace(headBranch)
-	var selected *PullRequestInfo
-	for _, item := range payload {
-		if strings.TrimSpace(item.HeadRefName) != branch {
-			continue
-		}
-		state := PullRequestStateClosed
-		switch {
-		case item.MergedAt != nil && strings.TrimSpace(*item.MergedAt) != "":
-			state = PullRequestStateMerged
-		case strings.EqualFold(item.State, "open"):
-			state = PullRequestStateOpen
-		}
-		candidate := &PullRequestInfo{
-			Number:     item.Number,
-			URL:        strings.TrimSpace(item.URL),
-			HeadBranch: branch,
-			State:      state,
-		}
-		if selected == nil || candidate.Number > selected.Number {
-			selected = candidate
-		}
-	}
-	return selected, nil
-}
-
 func defaultGitBranch(ctx context.Context, workspacePath string) (string, error) {
 	stdout, stderr, err := runBashOutput(ctx, workspacePath, "git branch --show-current")
 	if err != nil {
@@ -1694,35 +1910,15 @@ func defaultGitBranch(ctx context.Context, workspacePath string) (string, error)
 	return strings.TrimSpace(stdout), nil
 }
 
-func defaultOpenPRHeads(ctx context.Context, workspacePath string) (map[string]struct{}, error) {
-	stdout, stderr, err := runBashOutput(ctx, workspacePath, "gh pr list --state open --json headRefName")
-	if err != nil {
-		return nil, fmt.Errorf("gh pr list: %w: %s", err, strings.TrimSpace(stderr))
-	}
-
-	var payload []struct {
-		HeadRefName string `json:"headRefName"`
-	}
-	if strings.TrimSpace(stdout) == "" {
-		return map[string]struct{}{}, nil
-	}
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		return nil, fmt.Errorf("decode gh pr list output: %w", err)
-	}
-
-	result := make(map[string]struct{}, len(payload))
-	for _, item := range payload {
-		branch := strings.TrimSpace(item.HeadRefName)
-		if branch == "" {
-			continue
-		}
-		result[branch] = struct{}{}
-	}
-	return result, nil
+func runBashOutput(ctx context.Context, workspacePath string, script string) (string, string, error) {
+	return runBashOutputWithTimeout(ctx, workspacePath, script, 10*time.Second)
 }
 
-func runBashOutput(ctx context.Context, workspacePath string, script string) (string, string, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+func runBashOutputWithTimeout(ctx context.Context, workspacePath string, script string, timeout time.Duration) (string, string, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd, err := shell.BashCommand(probeCtx, workspacePath, script)

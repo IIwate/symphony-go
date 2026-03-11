@@ -92,17 +92,17 @@ func runCLI(args []string, stderr io.Writer) int {
 }
 
 func execute(args []string, stderr io.Writer) error {
-	if hasLegacyWorkflowArg(args) {
-		return fmt.Errorf("workflow path argument is no longer supported; use --config-dir")
-	}
-
 	rootCmd := newRootCommand(stderr)
 	if args == nil {
 		rootCmd.SetArgs([]string{})
 	} else {
 		rootCmd.SetArgs(args)
 	}
-	return rootCmd.Execute()
+	err := rootCmd.Execute()
+	if err != nil && hasLegacyWorkflowArg(args) && strings.Contains(err.Error(), "unknown command") {
+		return fmt.Errorf("workflow path argument is no longer supported; use --config-dir")
+	}
+	return err
 }
 
 func newRootCommand(stderr io.Writer) *cobra.Command {
@@ -138,31 +138,18 @@ func newRootCommand(stderr io.Writer) *cobra.Command {
 }
 
 func hasLegacyWorkflowArg(args []string) bool {
-	for index := 0; index < len(args); index++ {
-		arg := strings.TrimSpace(args[index])
-		if arg == "" {
+	for _, raw := range args {
+		arg := strings.TrimSpace(raw)
+		if arg == "" || strings.HasPrefix(arg, "-") {
 			continue
 		}
-		if strings.HasPrefix(arg, "--config-dir=") ||
-			strings.HasPrefix(arg, "--profile=") ||
-			strings.HasPrefix(arg, "--log-level=") ||
-			strings.HasPrefix(arg, "--log-file=") ||
-			strings.HasPrefix(arg, "--port=") ||
-			strings.HasPrefix(arg, "--dry-run=") ||
-			strings.HasPrefix(arg, "--non-interactive=") {
-			continue
+		if strings.ContainsAny(arg, `/\`) {
+			return true
 		}
-		switch arg {
-		case "--config-dir", "--profile", "--log-level", "--log-file", "--port":
-			index++
-			continue
-		case "--dry-run", "--non-interactive":
-			continue
+		lower := strings.ToLower(arg)
+		if strings.HasSuffix(lower, ".md") || strings.HasSuffix(lower, ".markdown") {
+			return true
 		}
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		return arg != "setup" && arg != "config"
 	}
 	return false
 }

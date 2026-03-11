@@ -188,6 +188,7 @@ func collectHookEnvRefs(cfg *model.ServiceConfig) []requiredEnvRef {
 	}{
 		{name: "after_create", script: cfg.HookAfterCreate},
 		{name: "before_run", script: cfg.HookBeforeRun},
+		{name: "before_run_continuation", script: cfg.HookBeforeRunContinuation},
 		{name: "after_run", script: cfg.HookAfterRun},
 		{name: "before_remove", script: cfg.HookBeforeRemove},
 	} {

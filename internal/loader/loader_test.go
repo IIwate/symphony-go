@@ -151,6 +151,8 @@ func TestResolveActiveWorkflowMappingTable(t *testing.T) {
 		ProjectYAML: `runtime:
   polling:
     interval_ms: 15000
+  hooks:
+    timeout_ms: 12345
   workspace:
     root: ~/workspaces
   agent:
@@ -169,7 +171,12 @@ selection:
 		FlowYAML: `prompt: prompts/implement.md.liquid
 hooks:
   before_run: hooks/before_run.sh
+  before_run_continuation: hooks/before_run.sh
   after_run: null
+completion:
+  mode: pull_request
+  on_missing_pr: intervention
+  on_closed_pr: continue
 `,
 		Hooks: map[string]string{
 			"before_run.sh": "echo before-run\n",
@@ -197,9 +204,63 @@ hooks:
 	if got := getMapValue(workflowDef.Config, "hooks")["before_run"]; got != "echo before-run" {
 		t.Fatalf("hooks.before_run = %v, want echo before-run", got)
 	}
+	if got := getMapValue(workflowDef.Config, "hooks")["before_run_continuation"]; got != "echo before-run" {
+		t.Fatalf("hooks.before_run_continuation = %v, want echo before-run", got)
+	}
+	if got := getMapValue(workflowDef.Config, "hooks")["timeout_ms"]; got != 12345 {
+		t.Fatalf("hooks.timeout_ms = %v, want 12345", got)
+	}
 	value, ok := getMapValue(workflowDef.Config, "hooks")["after_run"]
 	if !ok || value != nil {
 		t.Fatalf("hooks.after_run = %v, want explicit nil", value)
+	}
+	if workflowDef.Completion.Mode != model.CompletionModePullRequest {
+		t.Fatalf("completion mode = %q, want pull_request", workflowDef.Completion.Mode)
+	}
+	if workflowDef.Completion.OnMissingPR != model.CompletionActionIntervention {
+		t.Fatalf("completion on_missing_pr = %q, want intervention", workflowDef.Completion.OnMissingPR)
+	}
+	if workflowDef.Completion.OnClosedPR != model.CompletionActionContinue {
+		t.Fatalf("completion on_closed_pr = %q, want continue", workflowDef.Completion.OnClosedPR)
+	}
+}
+
+func TestResolveActiveWorkflowCompletionDefaultsToNone(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	workflowDef, err := ResolveActiveWorkflow(def)
+	if err != nil {
+		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
+	}
+	if workflowDef.Completion.Mode != model.CompletionModeNone {
+		t.Fatalf("completion mode = %q, want none", workflowDef.Completion.Mode)
+	}
+	if workflowDef.Completion.OnMissingPR != model.CompletionActionContinue {
+		t.Fatalf("completion on_missing_pr = %q, want continue", workflowDef.Completion.OnMissingPR)
+	}
+	if workflowDef.Completion.OnClosedPR != model.CompletionActionContinue {
+		t.Fatalf("completion on_closed_pr = %q, want continue", workflowDef.Completion.OnClosedPR)
+	}
+}
+
+func TestResolveActiveWorkflowRejectsInvalidCompletionValues(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		FlowYAML: `prompt: prompts/implement.md.liquid
+completion:
+  mode: unsupported
+`,
+	})
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if _, err := ResolveActiveWorkflow(def); err == nil {
+		t.Fatal("ResolveActiveWorkflow() error = nil, want invalid completion error")
 	}
 }
 

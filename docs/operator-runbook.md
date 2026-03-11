@@ -302,14 +302,15 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 常见原因：
 
 - 关联 PR 仍为 open，系统正在等待 merge，而不是继续重跑 agent
-- `gh` CLI 不可用、未认证，或当前工作区无法按 head branch 查询 PR
+- GitHub API 查询失败，且 fallback 到 `gh api` 也失败
 - PR 状态查询失败，`/api/v1/state` 中出现 `merge_status_unknown` 告警
 - PR 已 closed 但未 merged，issue 被转入 `awaiting_intervention`，不会自动 retry / re-dispatch
 
 处理：
 
-- 先看 `/api/v1/state` 的 `awaiting_merge` / `awaiting_intervention` 列表，确认 `branch`、`pr_state`、`last_error`
-- 在对应工作区内手动执行 `gh pr list --state all --head <branch> --json number,url,state,mergedAt,headRefName`
+- 先看 `/api/v1/state` 的 `awaiting_merge` / `awaiting_intervention` 列表，确认 `branch`、`pr_state`、`reason`、`expected_outcome`、`last_error`
+- 当前实现默认按 worker 成功退出后的 `FinalBranch` 使用 GitHub API 查询 PR；若命中 auth 类状态（401/403/404），才 fallback 到 `gh api`
+- 手动排查时可在对应工作区内执行 `gh pr view <number>` 或 `gh pr list --state all --head <branch> --json number,url,state,mergedAt,headRefName`
 - 若 PR 已 merged 但 issue 未收口，检查 tracker 状态流转权限和日志中的 `post-merge transition` 错误
 - 若 PR 已 closed 但未 merged，按人工决策处理：手动收口 issue，或先把 issue 调整到非 active state 释放 claim，再恢复到 active state 重新参与调度
 

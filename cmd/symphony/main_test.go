@@ -66,6 +66,22 @@ func TestRunCLIRejectsLegacyWorkflowArgument(t *testing.T) {
 	}
 }
 
+func TestRunCLIHelpCommand(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	var stderr bytes.Buffer
+	if exitCode := runCLI([]string{"help"}, &stderr); exitCode != 0 {
+		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "no longer supported") {
+		t.Fatalf("stderr = %q, want Cobra help output instead of legacy workflow rejection", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Available Commands:") {
+		t.Fatalf("stderr = %q, want Cobra help output", stderr.String())
+	}
+}
+
 func TestRunCLIFailsWhenDefaultAutomationMissing(t *testing.T) {
 	restore := stubDependencies(t)
 	defer restore()

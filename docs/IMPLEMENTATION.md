@@ -103,13 +103,13 @@ cmd/symphony → orchestrator → tracker (interface)
 | 实体 | 用途 | 关键字段 |
 |---|---|---|
 | `Issue` | tracker issue 映射 | ID, Identifier, Title, State, Priority, Labels, BlockedBy |
-| `WorkflowDefinition` | 工作流定义 | Config (map), PromptTemplate (string) |
+| `WorkflowDefinition` | 工作流定义 | Config, PromptTemplate, Source, Completion |
 | `ServiceConfig` | 类型化运行配置 | tracker/polling/workspace/hooks/agent/codex/server 各项 |
-| `Workspace` | per-issue 工作区 | Path, WorkspaceKey, CreatedNow |
+| `Workspace` | per-issue 工作区 | Path, WorkspaceKey, Identifier, BranchNamespace, GitAuthor*, Dispatch |
 | `RunAttempt` | 运行尝试记录 | IssueID, Attempt, Status(RunPhase), Error |
 | `LiveSession` | 活跃 agent 会话 | SessionID, ThreadID, TurnID, TokenUsage |
-| `RetryEntry` | 重试队列条目 | Attempt, DueAt, TimerHandle |
-| `OrchestratorState` | 全局运行时状态 | Running, Claimed, RetryAttempts, Completed, CodexTotals |
+| `RetryEntry` | 重试队列条目 | Attempt, DueAt, TimerHandle, StallCount, Dispatch |
+| `OrchestratorState` | 全局运行时状态 | Running, AwaitingMerge, AwaitingIntervention, Claimed, RetryAttempts, Completed |
 
 ### 状态枚举
 
@@ -143,8 +143,8 @@ cmd/symphony → orchestrator → tracker (interface)
 ```
 Worker goroutine 启动后:
   1. 创建/复用工作区 → 执行 after_create 钩子
-  2. 渲染 Liquid 模板生成 prompt
-  3. 执行 before_run 钩子
+  2. 渲染 Liquid 模板生成 prompt（首轮 prompt 绑定 `issue` / `attempt` / `source` / `run`）
+  3. fresh run 执行 before_run；continuation/intervention retry 优先执行 before_run_continuation
   4. 启动 Codex app-server 子进程
   5. 握手: initialize → initialized → thread/start → turn/start
   6. 流式读取 turn 事件（JSON lines from stdout）
@@ -152,7 +152,7 @@ Worker goroutine 启动后:
      - 仍活跃且 turn < max_turns → continuation turn（同线程）
      - 否则 → 退出
   8. 执行 after_run 钩子
-  9. 上报退出结果 → orchestrator 决定 retry 或 release
+  9. 上报退出结果 → orchestrator 基于 completion contract、FinalBranch 和 PR 状态决定 AwaitingMerge / AwaitingIntervention / retry / release
 ```
 
 > Windows 实现备注：hooks 与 Codex app-server 都通过统一 shell 解析层启动。Windows 主机上会优先探测 Git for Windows 的 `bash.exe`，再回退到 PATH 中的 `bash`。这样做是为了规避常见的 `C:/Windows/System32/bash.exe`（WSL 启动器）抢占命令解析顺序后导致的 `execvpe(/bin/bash) failed`，不是多余兼容代码。
@@ -160,11 +160,17 @@ Worker goroutine 启动后:
 ### 3. 重试与退避
 
 ```
-正常退出 → continuation retry (1s, attempt=1)
+正常退出 → 不再默认总是 continuation retry；若 flow 未要求 PR 收口或 completion action 允许 continue，才会进入 continuation retry (1s, attempt=1)
 失败退出 → 指数退避: min(10000 * 2^(attempt-1), max_backoff) * jitter(0.5~1.0)
 退避上限: 300000ms (5分钟)
 Retry 到期后重新检查 issue 活跃性 → 合格则调度，否则释放
 ```
+
+补充：
+
+- `completion.mode = pull_request` 时，worker 成功退出后会统一按 `FinalBranch` 查询 PR 状态
+- 默认先走 GitHub API；若命中 auth 类状态（401/403/404），再 fallback 到 `gh api`
+- `missing_pr` / `pr_closed_unmerged` 不再视为普通 continuation，而是进入 `AwaitingIntervention`
 
 ### 4. 对账（每 tick）
 

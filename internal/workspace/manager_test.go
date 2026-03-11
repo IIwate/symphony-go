@@ -118,6 +118,119 @@ func TestPrepareForRunTimeout(t *testing.T) {
 	}
 }
 
+func TestPrepareForRunUsesContinuationHook(t *testing.T) {
+	runner := &fakeRunner{}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().HookBeforeRun = stringPtr("fresh")
+	manager.currentConfig().HookBeforeRunContinuation = stringPtr("continue")
+
+	workspace, err := manager.CreateForIssue(context.Background(), "ABC-3")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	workspace.CreatedNow = false
+	workspace.Dispatch = &model.DispatchContext{
+		Kind:            model.DispatchKindContinuation,
+		ExpectedOutcome: model.CompletionModePullRequest,
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("fresh"); got != 0 {
+		t.Fatalf("fresh before_run call count = %d, want 0", got)
+	}
+	if got := runner.callCount("continue"); got != 1 {
+		t.Fatalf("continuation hook call count = %d, want 1", got)
+	}
+}
+
+func TestPrepareForRunContinuationWithoutHookSkipsFreshHook(t *testing.T) {
+	runner := &fakeRunner{}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().HookBeforeRun = stringPtr("fresh")
+
+	workspace, err := manager.CreateForIssue(context.Background(), "ABC-3")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	workspace.CreatedNow = false
+	workspace.Dispatch = &model.DispatchContext{
+		Kind:            model.DispatchKindContinuation,
+		ExpectedOutcome: model.CompletionModePullRequest,
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("fresh"); got != 0 {
+		t.Fatalf("fresh before_run call count = %d, want 0", got)
+	}
+}
+
+func TestPrepareForRunContinuationNewWorkspaceFallsBackToFreshHook(t *testing.T) {
+	runner := &fakeRunner{}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().HookBeforeRun = stringPtr("fresh")
+
+	workspace, err := manager.CreateForIssue(context.Background(), "ABC-3")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	workspace.Dispatch = &model.DispatchContext{
+		Kind:            model.DispatchKindContinuation,
+		ExpectedOutcome: model.CompletionModePullRequest,
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("fresh"); got != 1 {
+		t.Fatalf("fresh before_run call count = %d, want 1", got)
+	}
+}
+
+func TestPrepareForRunPassesDispatchEnvToHook(t *testing.T) {
+	runner := &fakeRunner{}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().HookBeforeRunContinuation = stringPtr("continue")
+	reason := model.ContinuationReasonMissingPR
+	branch := "runner/demo-1"
+
+	workspace, err := manager.CreateForIssue(context.Background(), "ABC-3")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	workspace.CreatedNow = false
+	workspace.Dispatch = &model.DispatchContext{
+		Kind:            model.DispatchKindContinuation,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		Reason:          &reason,
+		PreviousBranch:  &branch,
+		RetryAttempt:    intPtr(2),
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	env := runner.lastEnv("continue")
+	if env["SYMPHONY_DISPATCH_KIND"] != "continuation" {
+		t.Fatalf("dispatch env = %+v", env)
+	}
+	if env["SYMPHONY_EXPECTED_OUTCOME"] != "pull_request" {
+		t.Fatalf("dispatch env = %+v", env)
+	}
+	if env["SYMPHONY_CONTINUATION_REASON"] != "missing_pr" {
+		t.Fatalf("dispatch env = %+v", env)
+	}
+	if env["SYMPHONY_PREVIOUS_BRANCH"] != "runner/demo-1" {
+		t.Fatalf("dispatch env = %+v", env)
+	}
+	if env["SYMPHONY_RETRY_ATTEMPT"] != "2" {
+		t.Fatalf("dispatch env = %+v", env)
+	}
+}
+
 func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
@@ -130,7 +243,7 @@ func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 	manager.currentConfig().WorkspaceBranchNamespace = "testuser"
 	manager.currentConfig().WorkspaceGitAuthorName = "commit-bot"
 	manager.currentConfig().WorkspaceGitAuthorEmail = "commit-bot@symphony.invalid"
-	runner.stdoutByScript["git switch -c testuser/linear-demo-scope-demo-37"] = ""
+	runner.stdoutByScript["git switch -c "+bashSingleQuote("testuser/linear-demo-scope-demo-37")] = ""
 
 	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
 	if err != nil {
@@ -143,7 +256,7 @@ func TestPrepareForRunCreatesExpectedBranch(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c testuser/linear-demo-scope-demo-37"); got != 1 {
+	if got := runner.callCount("git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37")); got != 1 {
 		t.Fatalf("branch create call count = %d, want 1", got)
 	}
 	if workspace.BranchNamespace != "testuser" {
@@ -163,7 +276,8 @@ func TestPrepareForRunReusesUniqueRemoteBranchWhenNoBindingExists(t *testing.T) 
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "abc\trefs/heads/testuser/linear-demo-scope-demo-37\n",
-			"git switch -c testuser/linear-demo-scope-demo-37 --track origin/testuser/linear-demo-scope-demo-37": "",
+			"git fetch origin " + bashSingleQuote("+refs/heads/testuser/linear-demo-scope-demo-37:refs/remotes/origin/testuser/linear-demo-scope-demo-37"): "",
+			"git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/testuser/linear-demo-scope-demo-37"): "",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -180,7 +294,10 @@ func TestPrepareForRunReusesUniqueRemoteBranchWhenNoBindingExists(t *testing.T) 
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c testuser/linear-demo-scope-demo-37 --track origin/testuser/linear-demo-scope-demo-37"); got != 1 {
+	if got := runner.callCount("git fetch origin " + bashSingleQuote("+refs/heads/testuser/linear-demo-scope-demo-37:refs/remotes/origin/testuser/linear-demo-scope-demo-37")); got != 1 {
+		t.Fatalf("remote branch fetch call count = %d, want 1", got)
+	}
+	if got := runner.callCount("git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/testuser/linear-demo-scope-demo-37")); got != 1 {
 		t.Fatalf("remote branch reuse call count = %d, want 1", got)
 	}
 	if workspace.BranchNamespace != "testuser" {
@@ -191,10 +308,10 @@ func TestPrepareForRunReusesUniqueRemoteBranchWhenNoBindingExists(t *testing.T) 
 func TestPrepareForRunUsesGitHubIssueNumberShortName(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git branch --show-current":                               "main\n",
-			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
-			"git ls-remote --heads origin":                            "",
-			"git switch -c testuser/github-linear-test-123":           "",
+			"git branch --show-current":                                           "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'":             "main\n",
+			"git ls-remote --heads origin":                                        "",
+			"git switch -c " + bashSingleQuote("testuser/github-linear-test-123"): "",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -213,7 +330,7 @@ func TestPrepareForRunUsesGitHubIssueNumberShortName(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c testuser/github-linear-test-123"); got != 1 {
+	if got := runner.callCount("git switch -c " + bashSingleQuote("testuser/github-linear-test-123")); got != 1 {
 		t.Fatalf("branch create call count = %d, want 1", got)
 	}
 }
@@ -224,7 +341,8 @@ func TestPrepareForRunUsesBoundRemoteBranch(t *testing.T) {
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "abc\trefs/heads/legacy/linear-demo-scope-demo-37\n",
-			"git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37": "",
+			"git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
+			"git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -244,7 +362,10 @@ func TestPrepareForRunUsesBoundRemoteBranch(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37"); got != 1 {
+	if got := runner.callCount("git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37")); got != 1 {
+		t.Fatalf("remote tracking fetch call count = %d, want 1", got)
+	}
+	if got := runner.callCount("git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/legacy/linear-demo-scope-demo-37")); got != 1 {
 		t.Fatalf("remote tracking switch call count = %d, want 1", got)
 	}
 }
@@ -252,10 +373,10 @@ func TestPrepareForRunUsesBoundRemoteBranch(t *testing.T) {
 func TestPrepareForRunRecreatesBoundBranchWhenMissingLocallyAndRemotely(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git branch --show-current":                               "main\n",
-			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
-			"git ls-remote --heads origin":                            "",
-			"git switch -c legacy/linear-demo-scope-demo-37":          "",
+			"git branch --show-current":                                            "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'":              "main\n",
+			"git ls-remote --heads origin":                                         "",
+			"git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37"): "",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -275,7 +396,7 @@ func TestPrepareForRunRecreatesBoundBranchWhenMissingLocallyAndRemotely(t *testi
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c legacy/linear-demo-scope-demo-37"); got != 1 {
+	if got := runner.callCount("git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37")); got != 1 {
 		t.Fatalf("recreate bound branch call count = %d, want 1", got)
 	}
 }
@@ -286,7 +407,8 @@ func TestPrepareForRunDiscoversUniqueLegacyBranchWithoutBinding(t *testing.T) {
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "abc\trefs/heads/legacy/linear-demo-scope-demo-37\n",
-			"git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37": "",
+			"git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
+			"git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -303,7 +425,10 @@ func TestPrepareForRunDiscoversUniqueLegacyBranchWithoutBinding(t *testing.T) {
 	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
 		t.Fatalf("PrepareForRun() error = %v", err)
 	}
-	if got := runner.callCount("git switch -c legacy/linear-demo-scope-demo-37 --track origin/legacy/linear-demo-scope-demo-37"); got != 1 {
+	if got := runner.callCount("git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37")); got != 1 {
+		t.Fatalf("legacy remote fetch call count = %d, want 1", got)
+	}
+	if got := runner.callCount("git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/legacy/linear-demo-scope-demo-37")); got != 1 {
 		t.Fatalf("legacy remote switch call count = %d, want 1", got)
 	}
 	binding, ok, err := manager.loadBranchBinding(workspace.WorkspaceKey)
@@ -344,6 +469,38 @@ func TestPrepareForRunFailsOnMultipleLegacyBranchCandidates(t *testing.T) {
 	}
 }
 
+func TestPrepareForRunQuotesBranchSwitchCommand(t *testing.T) {
+	branchName := "legacy/linear-demo-scope-demo-37&whoami"
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                               "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
+			"git ls-remote --heads origin":                            "",
+			"git switch -c " + bashSingleQuote(branchName):            "",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "newns"
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO-37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	if err := manager.saveBranchBinding(workspace.WorkspaceKey, workspace.Identifier, branchName); err != nil {
+		t.Fatalf("saveBranchBinding() error = %v", err)
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("git switch -c " + bashSingleQuote(branchName)); got != 1 {
+		t.Fatalf("quoted branch recreate call count = %d, want 1", got)
+	}
+}
+
 func TestPrepareForRunUsesStableRunnerAliasFallback(t *testing.T) {
 	originalGenerateRunnerAlias := generateRunnerAlias
 	generateRunnerAlias = func() (string, error) { return "runner-abc123", nil }
@@ -351,11 +508,11 @@ func TestPrepareForRunUsesStableRunnerAliasFallback(t *testing.T) {
 
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git branch --show-current":                               "main\n",
-			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
-			"git ls-remote --heads origin":                            "",
-			"git switch -c runner-abc123/linear-demo-scope-demo-37":   "",
-			"git switch -c runner-abc123/linear-demo-scope-demo-38":   "",
+			"git branch --show-current":                                                   "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'":                     "main\n",
+			"git ls-remote --heads origin":                                                "",
+			"git switch -c " + bashSingleQuote("runner-abc123/linear-demo-scope-demo-37"): "",
+			"git switch -c " + bashSingleQuote("runner-abc123/linear-demo-scope-demo-38"): "",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -397,12 +554,12 @@ func TestPrepareForRunUsesStableRunnerAliasFallback(t *testing.T) {
 func TestPrepareForRunUsesRepoLocalGitIdentity(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git branch --show-current":                               "main\n",
-			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
-			"git ls-remote --heads origin":                            "",
-			"git switch -c testuser/linear-demo-scope-demo-37":        "",
-			"git config --local --get user.name 2>/dev/null || true":  "repo-user\n",
-			"git config --local --get user.email 2>/dev/null || true": "repo-user@example.com\n",
+			"git branch --show-current":                                              "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'":                "main\n",
+			"git ls-remote --heads origin":                                           "",
+			"git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37"): "",
+			"git config --local --get user.name 2>/dev/null || true":                 "repo-user\n",
+			"git config --local --get user.email 2>/dev/null || true":                "repo-user@example.com\n",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -429,10 +586,10 @@ func TestPrepareForRunUsesRepoLocalGitIdentity(t *testing.T) {
 func TestPrepareForRunIgnoresHalfConfiguredIdentityAndFallsBack(t *testing.T) {
 	runner := &fakeRunner{
 		stdoutByScript: map[string]string{
-			"git branch --show-current":                               "main\n",
-			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
-			"git ls-remote --heads origin":                            "",
-			"git switch -c testuser/linear-demo-scope-demo-37":        "",
+			"git branch --show-current":                                              "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'":                "main\n",
+			"git ls-remote --heads origin":                                           "",
+			"git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37"): "",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -527,10 +684,21 @@ type fakeRunner struct {
 	errorsByScript map[string]error
 	stdoutByScript map[string]string
 	stderrByScript map[string]string
+	envByScript    map[string]map[string]string
 }
 
-func (f *fakeRunner) Run(ctx context.Context, _ string, script string) (string, string, error) {
+func (f *fakeRunner) Run(ctx context.Context, _ string, script string, env map[string]string) (string, string, error) {
 	f.calledScripts = append(f.calledScripts, script)
+	if len(env) > 0 {
+		if f.envByScript == nil {
+			f.envByScript = map[string]map[string]string{}
+		}
+		copied := make(map[string]string, len(env))
+		for key, value := range env {
+			copied[key] = value
+		}
+		f.envByScript[script] = copied
+	}
 	if script == f.blockScript {
 		<-ctx.Done()
 		return "", "", ctx.Err()
@@ -560,6 +728,17 @@ func coalesceString(value string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func (f *fakeRunner) lastEnv(script string) map[string]string {
+	if f.envByScript == nil {
+		return nil
+	}
+	return f.envByScript[script]
+}
+
+func intPtr(value int) *int {
+	return &value
 }
 
 func stringPtr(value string) *string {

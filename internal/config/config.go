@@ -72,6 +72,9 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	if value, ok := getOptionalString(hooks, "before_run"); ok {
 		cfg.HookBeforeRun = stringPointer(value)
 	}
+	if value, ok := getOptionalString(hooks, "before_run_continuation"); ok {
+		cfg.HookBeforeRunContinuation = stringPointer(value)
+	}
 	if value, ok := getOptionalString(hooks, "after_run"); ok {
 		cfg.HookAfterRun = stringPointer(value)
 	}
@@ -414,6 +417,9 @@ func requiredHookScripts(cfg *model.ServiceConfig) map[string]string {
 	}
 	if cfg.HookBeforeRun != nil {
 		scripts["before_run"] = *cfg.HookBeforeRun
+	}
+	if cfg.HookBeforeRunContinuation != nil {
+		scripts["before_run_continuation"] = *cfg.HookBeforeRunContinuation
 	}
 	if cfg.HookAfterRun != nil {
 		scripts["after_run"] = *cfg.HookAfterRun

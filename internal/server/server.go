@@ -194,6 +194,9 @@ type runningResponse struct {
 	IssueID             string         `json:"issue_id"`
 	IssueIdentifier     string         `json:"issue_identifier"`
 	State               string         `json:"state"`
+	DispatchKind        string         `json:"dispatch_kind,omitempty"`
+	ExpectedOutcome     string         `json:"expected_outcome,omitempty"`
+	ContinuationReason  *string        `json:"continuation_reason"`
 	SessionID           string         `json:"session_id"`
 	TurnCount           int            `json:"turn_count"`
 	LastEvent           string         `json:"last_event"`
@@ -205,11 +208,14 @@ type runningResponse struct {
 }
 
 type retryResponse struct {
-	IssueID         string  `json:"issue_id"`
-	IssueIdentifier string  `json:"issue_identifier"`
-	Attempt         int     `json:"attempt"`
-	DueAt           string  `json:"due_at"`
-	Error           *string `json:"error"`
+	IssueID            string  `json:"issue_id"`
+	IssueIdentifier    string  `json:"issue_identifier"`
+	DispatchKind       string  `json:"dispatch_kind,omitempty"`
+	ExpectedOutcome    string  `json:"expected_outcome,omitempty"`
+	ContinuationReason *string `json:"continuation_reason"`
+	Attempt            int     `json:"attempt"`
+	DueAt              string  `json:"due_at"`
+	Error              *string `json:"error"`
 }
 
 type awaitingMergeResponse struct {
@@ -226,14 +232,18 @@ type awaitingMergeResponse struct {
 }
 
 type awaitingInterventionResponse struct {
-	IssueID         string `json:"issue_id"`
-	IssueIdentifier string `json:"issue_identifier"`
-	WorkspacePath   string `json:"workspace_path"`
-	Branch          string `json:"branch"`
-	PRNumber        int    `json:"pr_number"`
-	PRURL           string `json:"pr_url"`
-	PRState         string `json:"pr_state"`
-	ObservedAt      string `json:"observed_at"`
+	IssueID             string `json:"issue_id"`
+	IssueIdentifier     string `json:"issue_identifier"`
+	WorkspacePath       string `json:"workspace_path"`
+	Branch              string `json:"branch"`
+	PRNumber            int    `json:"pr_number"`
+	PRURL               string `json:"pr_url"`
+	PRState             string `json:"pr_state"`
+	Reason              string `json:"reason,omitempty"`
+	ExpectedOutcome     string `json:"expected_outcome,omitempty"`
+	PreviousBranch      string `json:"previous_branch,omitempty"`
+	LastKnownIssueState string `json:"last_known_issue_state,omitempty"`
+	ObservedAt          string `json:"observed_at"`
 }
 
 type alertResponse struct {
@@ -286,6 +296,9 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 			IssueID:             item.IssueID,
 			IssueIdentifier:     item.IssueIdentifier,
 			State:               item.State,
+			DispatchKind:        item.DispatchKind,
+			ExpectedOutcome:     item.ExpectedOutcome,
+			ContinuationReason:  item.ContinuationReason,
 			SessionID:           item.SessionID,
 			TurnCount:           item.TurnCount,
 			LastEvent:           item.LastEvent,
@@ -320,25 +333,32 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 	awaitingIntervention := make([]awaitingInterventionResponse, 0, len(snapshot.AwaitingIntervention))
 	for _, item := range snapshot.AwaitingIntervention {
 		awaitingIntervention = append(awaitingIntervention, awaitingInterventionResponse{
-			IssueID:         item.IssueID,
-			IssueIdentifier: item.IssueIdentifier,
-			WorkspacePath:   item.WorkspacePath,
-			Branch:          item.Branch,
-			PRNumber:        item.PRNumber,
-			PRURL:           item.PRURL,
-			PRState:         item.PRState,
-			ObservedAt:      item.ObservedAt.UTC().Format(time.RFC3339),
+			IssueID:             item.IssueID,
+			IssueIdentifier:     item.IssueIdentifier,
+			WorkspacePath:       item.WorkspacePath,
+			Branch:              item.Branch,
+			PRNumber:            item.PRNumber,
+			PRURL:               item.PRURL,
+			PRState:             item.PRState,
+			Reason:              item.Reason,
+			ExpectedOutcome:     item.ExpectedOutcome,
+			PreviousBranch:      item.PreviousBranch,
+			LastKnownIssueState: item.LastKnownIssueState,
+			ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
 		})
 	}
 
 	retrying := make([]retryResponse, 0, len(snapshot.Retrying))
 	for _, item := range snapshot.Retrying {
 		retrying = append(retrying, retryResponse{
-			IssueID:         item.IssueID,
-			IssueIdentifier: item.IssueIdentifier,
-			Attempt:         item.Attempt,
-			DueAt:           item.DueAt.UTC().Format(time.RFC3339),
-			Error:           item.Error,
+			IssueID:            item.IssueID,
+			IssueIdentifier:    item.IssueIdentifier,
+			DispatchKind:       item.DispatchKind,
+			ExpectedOutcome:    item.ExpectedOutcome,
+			ContinuationReason: item.ContinuationReason,
+			Attempt:            item.Attempt,
+			DueAt:              item.DueAt.UTC().Format(time.RFC3339),
+			Error:              item.Error,
 		})
 	}
 
@@ -393,6 +413,9 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 				IssueID:             item.IssueID,
 				IssueIdentifier:     item.IssueIdentifier,
 				State:               item.State,
+				DispatchKind:        item.DispatchKind,
+				ExpectedOutcome:     item.ExpectedOutcome,
+				ContinuationReason:  item.ContinuationReason,
 				SessionID:           item.SessionID,
 				TurnCount:           item.TurnCount,
 				LastEvent:           item.LastEvent,
@@ -444,14 +467,18 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 	for _, item := range snapshot.AwaitingIntervention {
 		if item.IssueIdentifier == identifier {
 			copyItem := awaitingInterventionResponse{
-				IssueID:         item.IssueID,
-				IssueIdentifier: item.IssueIdentifier,
-				WorkspacePath:   item.WorkspacePath,
-				Branch:          item.Branch,
-				PRNumber:        item.PRNumber,
-				PRURL:           item.PRURL,
-				PRState:         item.PRState,
-				ObservedAt:      item.ObservedAt.UTC().Format(time.RFC3339),
+				IssueID:             item.IssueID,
+				IssueIdentifier:     item.IssueIdentifier,
+				WorkspacePath:       item.WorkspacePath,
+				Branch:              item.Branch,
+				PRNumber:            item.PRNumber,
+				PRURL:               item.PRURL,
+				PRState:             item.PRState,
+				Reason:              item.Reason,
+				ExpectedOutcome:     item.ExpectedOutcome,
+				PreviousBranch:      item.PreviousBranch,
+				LastKnownIssueState: item.LastKnownIssueState,
+				ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
 			}
 			return issueResponse{
 				GeneratedAt:          snapshot.GeneratedAt.UTC().Format(time.RFC3339),
@@ -466,11 +493,14 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 	for _, item := range snapshot.Retrying {
 		if item.IssueIdentifier == identifier {
 			copyItem := retryResponse{
-				IssueID:         item.IssueID,
-				IssueIdentifier: item.IssueIdentifier,
-				Attempt:         item.Attempt,
-				DueAt:           item.DueAt.UTC().Format(time.RFC3339),
-				Error:           item.Error,
+				IssueID:            item.IssueID,
+				IssueIdentifier:    item.IssueIdentifier,
+				DispatchKind:       item.DispatchKind,
+				ExpectedOutcome:    item.ExpectedOutcome,
+				ContinuationReason: item.ContinuationReason,
+				Attempt:            item.Attempt,
+				DueAt:              item.DueAt.UTC().Format(time.RFC3339),
+				Error:              item.Error,
 			}
 			return issueResponse{
 				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),

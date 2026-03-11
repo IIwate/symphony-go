@@ -38,11 +38,97 @@ type BlockerRef struct {
 	State      *string
 }
 
+type CompletionMode string
+
+const (
+	CompletionModeNone        CompletionMode = "none"
+	CompletionModePullRequest CompletionMode = "pull_request"
+)
+
+type CompletionAction string
+
+const (
+	CompletionActionContinue     CompletionAction = "continue"
+	CompletionActionIntervention CompletionAction = "intervention"
+)
+
+type CompletionContract struct {
+	Mode        CompletionMode
+	OnMissingPR CompletionAction
+	OnClosedPR  CompletionAction
+}
+
+type DispatchKind string
+
+const (
+	DispatchKindFresh             DispatchKind = "fresh"
+	DispatchKindContinuation      DispatchKind = "continuation"
+	DispatchKindInterventionRetry DispatchKind = "intervention_retry"
+)
+
+type ContinuationReason string
+
+const (
+	ContinuationReasonUnfinishedIssue      ContinuationReason = "unfinished_issue"
+	ContinuationReasonMissingPR            ContinuationReason = "missing_pr"
+	ContinuationReasonClosedUnmergedPR     ContinuationReason = "pr_closed_unmerged"
+	ContinuationReasonMergedPRAutoCloseOff ContinuationReason = "merged_pr_auto_close_disabled"
+)
+
+type PRContext struct {
+	Number     int
+	URL        string
+	State      string
+	Merged     bool
+	HeadBranch string
+}
+
+type DispatchContext struct {
+	Kind               DispatchKind
+	RetryAttempt       *int
+	ExpectedOutcome    CompletionMode
+	OnMissingPR        CompletionAction
+	OnClosedPR         CompletionAction
+	Reason             *ContinuationReason
+	PreviousBranch     *string
+	PreviousPR         *PRContext
+	PreviousIssueState *string
+}
+
+func CloneDispatchContext(dispatch *DispatchContext) *DispatchContext {
+	if dispatch == nil {
+		return nil
+	}
+	copyValue := *dispatch
+	if dispatch.PreviousPR != nil {
+		prCopy := *dispatch.PreviousPR
+		copyValue.PreviousPR = &prCopy
+	}
+	if dispatch.RetryAttempt != nil {
+		retryAttempt := *dispatch.RetryAttempt
+		copyValue.RetryAttempt = &retryAttempt
+	}
+	if dispatch.Reason != nil {
+		reason := *dispatch.Reason
+		copyValue.Reason = &reason
+	}
+	if dispatch.PreviousBranch != nil {
+		branch := *dispatch.PreviousBranch
+		copyValue.PreviousBranch = &branch
+	}
+	if dispatch.PreviousIssueState != nil {
+		state := *dispatch.PreviousIssueState
+		copyValue.PreviousIssueState = &state
+	}
+	return &copyValue
+}
+
 type WorkflowDefinition struct {
 	RootDir        string
 	Config         map[string]any
 	PromptTemplate string
 	Source         map[string]any
+	Completion     CompletionContract
 }
 
 type AutomationDefinition struct {
@@ -93,6 +179,7 @@ type ServiceConfig struct {
 	WorkspaceGitAuthorEmail          string
 	HookAfterCreate                  *string
 	HookBeforeRun                    *string
+	HookBeforeRunContinuation        *string
 	HookAfterRun                     *string
 	HookBeforeRemove                 *string
 	HookTimeoutMS                    int
@@ -119,6 +206,7 @@ type Workspace struct {
 	BranchNamespace string
 	GitAuthorName   string
 	GitAuthorEmail  string
+	Dispatch        *DispatchContext
 }
 
 type RunAttempt struct {
@@ -157,6 +245,7 @@ type RetryEntry struct {
 	DueAt         time.Time
 	TimerHandle   *time.Timer
 	Error         *string
+	Dispatch      *DispatchContext
 }
 
 type AwaitingMergeEntry struct {
@@ -174,15 +263,19 @@ type AwaitingMergeEntry struct {
 }
 
 type AwaitingInterventionEntry struct {
-	Identifier    string
-	WorkspacePath string
-	Branch        string
-	PRNumber      int
-	PRURL         string
-	PRState       string
-	RetryAttempt  int
-	StallCount    int
-	ObservedAt    time.Time
+	Identifier          string
+	WorkspacePath       string
+	Branch              string
+	PRNumber            int
+	PRURL               string
+	PRState             string
+	RetryAttempt        int
+	StallCount          int
+	ObservedAt          time.Time
+	Reason              string
+	ExpectedOutcome     string
+	PreviousBranch      string
+	LastKnownIssueState string
 }
 
 type OrchestratorState struct {
@@ -207,6 +300,7 @@ type RunningEntry struct {
 	StallCount    int
 	StartedAt     time.Time
 	WorkerCancel  context.CancelFunc
+	Dispatch      *DispatchContext
 }
 
 type TokenTotals struct {
