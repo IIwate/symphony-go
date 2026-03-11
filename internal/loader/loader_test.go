@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/secret"
 )
 
 func TestLoadProjectOnly(t *testing.T) {
@@ -259,6 +260,45 @@ func TestLoadMissingProjectYaml(t *testing.T) {
 	root := t.TempDir()
 	if _, err := Load(root, ""); !errors.Is(err, model.ErrMissingWorkflowFile) {
 		t.Fatalf("Load() error = %v, want ErrMissingWorkflowFile", err)
+	}
+}
+
+func TestResolveActiveWorkflowUsesDefaultResolver(t *testing.T) {
+	originalResolver := secret.DefaultResolver
+	secret.DefaultResolver = func(key string) (string, bool) {
+		switch key {
+		case "LINEAR_PROJECT_SLUG":
+			return "resolver-project", true
+		case "LINEAR_BRANCH_SCOPE":
+			return "Resolver Scope", true
+		default:
+			return "", false
+		}
+	}
+	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
+
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	writeLoaderFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
+api_key: $LINEAR_API_KEY
+project_slug: $LINEAR_PROJECT_SLUG
+branch_scope: $LINEAR_BRANCH_SCOPE
+active_states: ["Todo", "In Progress"]
+terminal_states: ["Closed", "Done"]
+`)
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	workflowDef, err := ResolveActiveWorkflow(def)
+	if err != nil {
+		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
+	}
+	if got := getMapValue(workflowDef.Config, "tracker")["project_slug"]; got != "resolver-project" {
+		t.Fatalf("tracker.project_slug = %v, want resolver-project", got)
+	}
+	if got := getMapValue(workflowDef.Config, "workspace")["linear_branch_scope"]; got != "Resolver Scope" {
+		t.Fatalf("workspace.linear_branch_scope = %v, want Resolver Scope", got)
 	}
 }
 

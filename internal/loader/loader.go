@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/secret"
 )
 
 const defaultDispatchFlow = "implement"
@@ -575,7 +576,7 @@ func resolveEnvString(value string) string {
 		return value
 	}
 
-	resolved, ok := os.LookupEnv(matches[1])
+	resolved, ok := secret.DefaultResolver(matches[1])
 	if !ok {
 		return ""
 	}

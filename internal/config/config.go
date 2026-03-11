@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/secret"
 )
 
 var (
@@ -367,7 +368,7 @@ func resolveEnvString(value string) string {
 		return value
 	}
 
-	resolved, ok := os.LookupEnv(matches[1])
+	resolved, ok := secret.DefaultResolver(matches[1])
 	if !ok {
 		return ""
 	}
@@ -383,7 +384,7 @@ func validateRequiredHookEnvs(cfg *model.ServiceConfig) error {
 				continue
 			}
 			envName := match[1]
-			value, ok := os.LookupEnv(envName)
+			value, ok := secret.DefaultResolver(envName)
 			if ok && strings.TrimSpace(value) != "" {
 				continue
 			}

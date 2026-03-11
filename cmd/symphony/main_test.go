@@ -19,6 +19,7 @@ import (
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
 	"symphony-go/internal/orchestrator"
+	"symphony-go/internal/secret"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workspace"
 )
@@ -85,6 +86,94 @@ func TestRunCLIFailsWhenDefaultAutomationMissing(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "missing_workflow_file") {
 		t.Fatalf("stderr = %q, want missing_workflow_file", stderr.String())
+	}
+}
+
+func TestRunCLIConfigDoctorReady(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+
+	var stderr bytes.Buffer
+	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stderr); exitCode != 0 {
+		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "配置已完整") {
+		t.Fatalf("stderr = %q, want ready message", stderr.String())
+	}
+}
+
+func TestRunCLIConfigDoctorReportsMissingSecret(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	if err := os.Unsetenv("LINEAR_API_KEY"); err != nil {
+		t.Fatalf("Unsetenv() error = %v", err)
+	}
+
+	var stderr bytes.Buffer
+	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stderr); exitCode == 0 {
+		t.Fatalf("runCLI() exitCode = %d, want non-zero", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "missing required secrets") || !strings.Contains(stderr.String(), "LINEAR_API_KEY") {
+		t.Fatalf("stderr = %q, want missing secret diagnosis", stderr.String())
+	}
+}
+
+func TestConfigSetWritesEnvLocalFromStdin(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	stdinIsTerminal = func() bool { return false }
+
+	var stderr bytes.Buffer
+	cmd := newRootCommand(&stderr)
+	cmd.SetIn(strings.NewReader("secret-key\n"))
+	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !strings.Contains(string(content), "LINEAR_API_KEY=secret-key") {
+		t.Fatalf("env.local = %q, want written key", string(content))
+	}
+}
+
+func TestSetupRunsWizardWhenSecretsMissing(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	if err := os.Unsetenv("LINEAR_API_KEY"); err != nil {
+		t.Fatalf("Unsetenv() error = %v", err)
+	}
+
+	wizardCalled := false
+	runWizardFunc = func(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *secret.Store) error {
+		wizardCalled = true
+		if err := envfile.Upsert(envLocalPath, "LINEAR_API_KEY", "wizard-secret"); err != nil {
+			return err
+		}
+		return store.Set("LINEAR_API_KEY", "wizard-secret")
+	}
+	stdinIsTerminal = func() bool { return true }
+	stdoutIsTerminal = func() bool { return true }
+
+	var stderr bytes.Buffer
+	if exitCode := runCLI([]string{"setup", "--config-dir", configDir}, &stderr); exitCode != 0 {
+		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if !wizardCalled {
+		t.Fatal("wizard was not called")
+	}
+	if !strings.Contains(stderr.String(), "配置已完成") {
+		t.Fatalf("stderr = %q, want setup completion message", stderr.String())
 	}
 }
 
@@ -401,6 +490,10 @@ func stubDependencies(t *testing.T) func() {
 	origOrchestrator := newOrchestratorFactory
 	origHTTPServer := newHTTPServerFactory
 	origNotify := notifySignalContext
+	origStdinIsTerminal := stdinIsTerminal
+	origStdoutIsTerminal := stdoutIsTerminal
+	origReadPassword := readPasswordInput
+	origRunWizard := runWizardFunc
 
 	loadEnvFile = envfile.Load
 	loadAutomationDefinition = loader.Load
@@ -427,6 +520,10 @@ func stubDependencies(t *testing.T) func() {
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
 		return context.WithCancel(parent)
 	}
+	stdinIsTerminal = func() bool { return false }
+	stdoutIsTerminal = func() bool { return false }
+	readPasswordInput = func() ([]byte, error) { return []byte(""), nil }
+	runWizardFunc = runWizard
 
 	return func() {
 		loadEnvFile = origLoadEnv
@@ -440,6 +537,10 @@ func stubDependencies(t *testing.T) func() {
 		newOrchestratorFactory = origOrchestrator
 		newHTTPServerFactory = origHTTPServer
 		notifySignalContext = origNotify
+		stdinIsTerminal = origStdinIsTerminal
+		stdoutIsTerminal = origStdoutIsTerminal
+		readPasswordInput = origReadPassword
+		runWizardFunc = origRunWizard
 	}
 }
 

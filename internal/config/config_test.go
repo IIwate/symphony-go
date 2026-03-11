@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/secret"
 )
 
 func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
@@ -221,5 +222,54 @@ func TestNewFromWorkflowFallsBackToDefaultHookTimeoutForNonPositiveValues(t *tes
 				t.Fatal("TrackerLinearChildrenBlockParent = false, want default true")
 			}
 		})
+	}
+}
+
+func TestNewFromWorkflowUsesDefaultResolver(t *testing.T) {
+	originalResolver := secret.DefaultResolver
+	secret.DefaultResolver = func(key string) (string, bool) {
+		if key == "LINEAR_API_KEY" {
+			return "resolver-secret", true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
+
+	cfg, err := NewFromWorkflow(&model.WorkflowDefinition{
+		Config: map[string]any{
+			"tracker": map[string]any{
+				"kind":     "linear",
+				"api_key":  "$LINEAR_API_KEY",
+				"endpoint": "https://api.linear.app/graphql",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewFromWorkflow() error = %v", err)
+	}
+	if cfg.TrackerAPIKey != "resolver-secret" {
+		t.Fatalf("TrackerAPIKey = %q, want resolver-secret", cfg.TrackerAPIKey)
+	}
+}
+
+func TestValidateForDispatchUsesDefaultResolverForHookEnv(t *testing.T) {
+	originalResolver := secret.DefaultResolver
+	secret.DefaultResolver = func(key string) (string, bool) {
+		if key == "SYMPHONY_GIT_REPO" {
+			return "https://example.com/repo.git", true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
+
+	cfg := defaultServiceConfig()
+	cfg.TrackerKind = "linear"
+	cfg.TrackerAPIKey = "secret"
+	cfg.TrackerProjectSlug = "demo"
+	cfg.WorkspaceLinearBranchScope = "demo-scope"
+	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO:?SYMPHONY_GIT_REPO is required}"`)
+
+	if err := ValidateForDispatch(cfg); err != nil {
+		t.Fatalf("ValidateForDispatch() error = %v, want nil", err)
 	}
 }
