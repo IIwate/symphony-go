@@ -331,6 +331,50 @@ func TestWatchReloadsOnPromptChange(t *testing.T) {
 	}
 }
 
+func TestWatchReloadsOnNewPromptFileChanges(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 2)
+	if err := Watch(ctx, root, "", func(def *model.AutomationDefinition) {
+		updates <- def
+	}); err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	promptPath := filepath.Join(root, "prompts", "review-pr.md.liquid")
+	writeLoaderFile(t, promptPath, "review {{ issue.title }}\n")
+	awaitWatchUpdate(t, updates)
+
+	writeLoaderFile(t, promptPath, "review updated {{ issue.title }}\n")
+	awaitWatchUpdate(t, updates)
+}
+
+func TestWatchReloadsWhenPoliciesDirectoryCreatedLater(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 1)
+	if err := Watch(ctx, root, "", func(def *model.AutomationDefinition) {
+		updates <- def
+	}); err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	policyDir := filepath.Join(root, "policies")
+	if err := os.MkdirAll(policyDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(policyDir, "pr-gate.yaml"), "mode: strict\n")
+
+	awaitWatchUpdate(t, updates)
+}
+
 func TestWatchSkipsInvalidReload(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -350,6 +394,40 @@ func TestWatchSkipsInvalidReload(t *testing.T) {
 	case definition := <-updates:
 		t.Fatalf("unexpected update received: %+v", definition)
 	case <-time.After(750 * time.Millisecond):
+	}
+}
+
+func TestWatchIgnoresEnvLocalChange(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 1)
+	if err := Watch(ctx, root, "", func(def *model.AutomationDefinition) {
+		updates <- def
+	}); err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(root, "local", "env.local"), "LINEAR_API_KEY=changed\n")
+
+	select {
+	case definition := <-updates:
+		t.Fatalf("unexpected update received for env.local change: %+v", definition)
+	case <-time.After(750 * time.Millisecond):
+	}
+}
+
+func awaitWatchUpdate(t *testing.T, updates <-chan *model.AutomationDefinition) *model.AutomationDefinition {
+	t.Helper()
+
+	select {
+	case updated := <-updates:
+		return updated
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch callback not triggered")
+		return nil
 	}
 }
 

@@ -183,7 +183,7 @@ import "symphony-go/internal/secret"
 
 ```go
 // Upsert 将 key=value 写入 env 文件。已存在则更新值，否则追加。
-// 保留注释和空行。原子替换（write-to-temp + rename），不支持并发写者。
+// 保留注释和空行。原子替换（同目录临时文件 + 平台原子替换），不支持并发写者。
 func Upsert(path string, key string, value string) error
 
 // UpsertMultiple 批量更新。同样原子替换，不支持并发写者。
@@ -198,9 +198,10 @@ func UpsertMultiple(path string, pairs map[string]string) error
 4. 未匹配的 key 追加到末尾
 5. 值含空格、`#` 或引号时使用双引号包裹
 6. 原子写入：
-   - 先写 `path + ".tmp"`
-   - 再 `os.Remove(path)`
-   - 最后 `os.Rename(tmp, path)`
+   - 先写 `path + ".tmp"`，并确保内容已 flush 到磁盘
+   - 再使用平台原子替换覆盖正式文件，不先删除旧文件
+   - Unix-like 平台使用 `rename` 覆盖，并尽量 `fsync` 父目录
+   - Windows 使用系统级 replace / `MoveFileEx(..., REPLACE_EXISTING | WRITE_THROUGH)`
 
 ### 2.3 语义限制
 

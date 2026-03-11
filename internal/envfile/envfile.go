@@ -11,6 +11,8 @@ import (
 	"strings"
 )
 
+var replaceFileFunc = replaceFileAtomically
+
 func Load(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -56,7 +58,7 @@ func Load(path string) error {
 }
 
 // Upsert 将 key=value 写入 env 文件。已存在则更新值，否则追加。
-// 保留注释和空行。原子替换（write-to-temp + rename），不支持并发写者。
+// 保留注释和空行。原子替换（同目录临时文件 + 平台原子替换），不支持并发写者。
 func Upsert(path string, key string, value string) error {
 	return UpsertMultiple(path, map[string]string{key: value})
 }
@@ -82,6 +84,9 @@ func UpsertMultiple(path string, pairs map[string]string) error {
 
 	keys := make([]string, 0, len(pairs))
 	for key := range pairs {
+		if strings.ContainsAny(pairs[key], "\r\n") {
+			return fmt.Errorf("value for %s must be single-line", key)
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
@@ -121,14 +126,10 @@ func UpsertMultiple(path string, pairs map[string]string) error {
 	if len(output) > 0 {
 		body += "\n"
 	}
-	if err := os.WriteFile(tmpPath, []byte(body), 0o600); err != nil {
+	if err := writeTempFile(tmpPath, []byte(body), 0o600); err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := replaceFileFunc(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
@@ -191,4 +192,31 @@ func formatValue(value string) string {
 func quoteValue(value string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 	return `"` + replacer.Replace(value) + `"`
+}
+
+func writeTempFile(path string, body []byte, perm os.FileMode) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		file.Close()
+	}()
+
+	if _, err := file.Write(body); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }

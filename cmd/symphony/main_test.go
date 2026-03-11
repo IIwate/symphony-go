@@ -142,6 +142,108 @@ func TestConfigSetWritesEnvLocalFromStdin(t *testing.T) {
 	if !strings.Contains(string(content), "LINEAR_API_KEY=secret-key") {
 		t.Fatalf("env.local = %q, want written key", string(content))
 	}
+	if !strings.Contains(stderr.String(), "当前运行实例不会自动更新") {
+		t.Fatalf("stderr = %q, want runtime update warning", stderr.String())
+	}
+}
+
+func TestConfigSetReadsOnlyFirstStdinLine(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	stdinIsTerminal = func() bool { return false }
+	stdoutIsTerminal = func() bool { return false }
+
+	var stderr bytes.Buffer
+	cmd := newRootCommand(&stderr)
+	cmd.SetIn(strings.NewReader("secret-key\nignored-line\n"))
+	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(content) != "LINEAR_API_KEY=secret-key\n" {
+		t.Fatalf("env.local = %q, want only first stdin line", string(content))
+	}
+}
+
+func TestConfigSetUsesInteractivePromptForSensitiveKey(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	stdinIsTerminal = func() bool { return true }
+	stdoutIsTerminal = func() bool { return true }
+
+	var (
+		gotTitle       string
+		gotDescription string
+		gotSensitive   bool
+	)
+	promptSingleValueFunc = func(title string, description string, sensitive bool) (string, error) {
+		gotTitle = title
+		gotDescription = description
+		gotSensitive = sensitive
+		return "interactive-secret", nil
+	}
+
+	var stderr bytes.Buffer
+	cmd := newRootCommand(&stderr)
+	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if gotTitle != "LINEAR_API_KEY" {
+		t.Fatalf("title = %q, want LINEAR_API_KEY", gotTitle)
+	}
+	if gotDescription == "" {
+		t.Fatal("description = empty, want interactive prompt description")
+	}
+	if !gotSensitive {
+		t.Fatal("sensitive = false, want true")
+	}
+}
+
+func TestConfigSetUsesInteractivePromptForNonSensitiveKey(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	writeFile(t, filepath.Join(configDir, "sources", "linear-main.yaml"), `kind: linear
+api_key: $LINEAR_API_KEY
+project_slug: $LINEAR_PROJECT_SLUG
+branch_scope: demo-scope
+active_states: ["Todo", "In Progress"]
+terminal_states: ["Closed", "Done"]
+`)
+	stdinIsTerminal = func() bool { return true }
+	stdoutIsTerminal = func() bool { return true }
+
+	gotSensitive := true
+	promptSingleValueFunc = func(title string, description string, sensitive bool) (string, error) {
+		gotSensitive = sensitive
+		return "demo-project", nil
+	}
+
+	var stderr bytes.Buffer
+	cmd := newRootCommand(&stderr)
+	cmd.SetArgs([]string{"config", "set", "LINEAR_PROJECT_SLUG", "--config-dir", configDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if gotSensitive {
+		t.Fatal("sensitive = true, want false")
+	}
 }
 
 func TestSetupRunsWizardWhenSecretsMissing(t *testing.T) {
@@ -492,7 +594,7 @@ func stubDependencies(t *testing.T) func() {
 	origNotify := notifySignalContext
 	origStdinIsTerminal := stdinIsTerminal
 	origStdoutIsTerminal := stdoutIsTerminal
-	origReadPassword := readPasswordInput
+	origPromptSingleValue := promptSingleValueFunc
 	origRunWizard := runWizardFunc
 
 	loadEnvFile = envfile.Load
@@ -522,7 +624,7 @@ func stubDependencies(t *testing.T) func() {
 	}
 	stdinIsTerminal = func() bool { return false }
 	stdoutIsTerminal = func() bool { return false }
-	readPasswordInput = func() ([]byte, error) { return []byte(""), nil }
+	promptSingleValueFunc = promptSingleValue
 	runWizardFunc = runWizard
 
 	return func() {
@@ -539,7 +641,7 @@ func stubDependencies(t *testing.T) func() {
 		notifySignalContext = origNotify
 		stdinIsTerminal = origStdinIsTerminal
 		stdoutIsTerminal = origStdoutIsTerminal
-		readPasswordInput = origReadPassword
+		promptSingleValueFunc = origPromptSingleValue
 		runWizardFunc = origRunWizard
 	}
 }

@@ -1,6 +1,7 @@
 package envfile
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,5 +177,44 @@ func TestUpsertQuotesAndLoadParsesEscapedValues(t *testing.T) {
 	}
 	if got := os.Getenv("TOKEN"); got != value {
 		t.Fatalf("TOKEN = %q, want %q", got, value)
+	}
+}
+
+func TestUpsertRejectsMultilineValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "env.local")
+	if err := Upsert(path, "TOKEN", "line-one\nline-two"); err == nil {
+		t.Fatal("Upsert() error = nil, want multiline value rejection")
+	}
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("Stat() error = %v, want file not created", err)
+	}
+}
+
+func TestUpsertPreservesOriginalFileWhenReplaceFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "env.local")
+	if err := os.WriteFile(path, []byte("TOKEN=original\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	originalReplace := replaceFileFunc
+	replaceFileFunc = func(tmpPath string, targetPath string) error {
+		return errors.New("replace failed")
+	}
+	t.Cleanup(func() { replaceFileFunc = originalReplace })
+
+	if err := Upsert(path, "TOKEN", "updated"); err == nil {
+		t.Fatal("Upsert() error = nil, want replace failure")
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(content) != "TOKEN=original\n" {
+		t.Fatalf("file content = %q, want original content preserved", string(content))
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("Stat(tmp) error = %v, want temp file removed", err)
 	}
 }

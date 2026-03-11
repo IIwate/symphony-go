@@ -89,39 +89,21 @@ func runSetCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "已写入 %s 到 %s，将在下次启动生效\n", key, path)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "已写入 %s 到 %s，将在下次启动生效；当前运行实例不会自动更新\n", key, path)
 	return nil
 }
 
 func readConfigValue(cmd *cobra.Command, key string, sensitive bool) (string, error) {
-	if !stdinIsTerminal() {
-		data, err := io.ReadAll(cmd.InOrStdin())
-		if err != nil {
+	if !isInteractive() {
+		reader := bufio.NewReader(cmd.InOrStdin())
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
 			return "", err
 		}
-		return strings.TrimSpace(string(data)), nil
+		return strings.TrimSpace(line), nil
 	}
 
-	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "请输入 %s: ", key); err != nil {
-		return "", err
-	}
-	if sensitive {
-		value, err := readPasswordInput()
-		if _, printErr := fmt.Fprintln(cmd.OutOrStdout()); printErr != nil && err == nil {
-			err = printErr
-		}
-		if err != nil {
-			return "", err
-		}
-		return strings.TrimSpace(string(value)), nil
-	}
-
-	reader := bufio.NewReader(cmd.InOrStdin())
-	line, err := reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", err
-	}
-	return strings.TrimSpace(line), nil
+	return promptSingleValueFunc(key, "将写入 env.local，并在下次启动生效", sensitive)
 }
 
 func containsEnvKey(values []string, target string) bool {

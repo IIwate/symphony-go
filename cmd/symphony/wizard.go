@@ -14,11 +14,10 @@ import (
 )
 
 var (
-	stdinIsTerminal     = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
-	stdoutIsTerminal    = func() bool { return term.IsTerminal(int(os.Stdout.Fd())) }
-	stdinFileDescriptor = func() int { return int(os.Stdin.Fd()) }
-	readPasswordInput   = func() ([]byte, error) { return term.ReadPassword(stdinFileDescriptor()) }
-	runWizardFunc       = runWizard
+	stdinIsTerminal       = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
+	stdoutIsTerminal      = func() bool { return term.IsTerminal(int(os.Stdout.Fd())) }
+	promptSingleValueFunc = promptSingleValue
+	runWizardFunc         = runWizard
 )
 
 type wizardField struct {
@@ -28,6 +27,27 @@ type wizardField struct {
 
 func isInteractive() bool {
 	return stdinIsTerminal() && stdoutIsTerminal()
+}
+
+func newPromptInput(title string, description string, value *string, sensitive bool) *huh.Input {
+	input := huh.NewInput().
+		Title(title).
+		Value(value)
+	if strings.TrimSpace(description) != "" {
+		input = input.Description(description)
+	}
+	if sensitive {
+		input = input.EchoMode(huh.EchoModePassword)
+	}
+	return input
+}
+
+func promptSingleValue(title string, description string, sensitive bool) (string, error) {
+	var value string
+	if err := huh.NewForm(huh.NewGroup(newPromptInput(title, description, &value, sensitive))).Run(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(value), nil
 }
 
 func runWizard(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *secret.Store) error {
@@ -42,15 +62,8 @@ func runWizard(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *se
 	groups := make([]*huh.Group, 0, len(diagnosis.MissingSecrets))
 	for _, missing := range diagnosis.MissingSecrets {
 		field := &wizardField{secret: missing}
-		input := huh.NewInput().
-			Title(missing.EnvVar).
-			Description(missing.Source).
-			Value(&field.value)
-		if missing.IsSensitive {
-			input = input.EchoMode(huh.EchoModePassword)
-		}
 		fields = append(fields, field)
-		groups = append(groups, huh.NewGroup(input))
+		groups = append(groups, huh.NewGroup(newPromptInput(missing.EnvVar, missing.Source, &field.value, missing.IsSensitive)))
 	}
 
 	_, _ = fmt.Fprintln(os.Stderr, "检测到以下密钥缺失，开始交互式配置")

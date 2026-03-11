@@ -3,6 +3,7 @@ package loader
 import (
 	"context"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -30,15 +31,10 @@ func WatchWithErrors(ctx context.Context, dir string, profile string, onChange f
 		return err
 	}
 
-	for _, watchDir := range watchDirectories(initialDef.RootDir) {
-		info, statErr := os.Stat(watchDir)
-		if statErr != nil || !info.IsDir() {
-			continue
-		}
-		if err := watcher.Add(watchDir); err != nil {
-			watcher.Close()
-			return err
-		}
+	watchedDirs := map[string]struct{}{}
+	if err := addWatchDirectories(watcher, watchedDirs, initialDef.RootDir); err != nil {
+		watcher.Close()
+		return err
 	}
 
 	go func() {
@@ -46,7 +42,7 @@ func WatchWithErrors(ctx context.Context, dir string, profile string, onChange f
 
 		var timer *time.Timer
 		var timerC <-chan time.Time
-		watchedPaths := buildWatchedPaths(initialDef)
+		activeProfile := strings.TrimSpace(initialDef.Profile)
 
 		resetTimer := func() {
 			if timer == nil {
@@ -78,7 +74,17 @@ func WatchWithErrors(ctx context.Context, dir string, profile string, onChange f
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
 					continue
 				}
-				if !matchesWatchedPathSet(watchedPaths, event.Name) {
+				if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+					delete(watchedDirs, cleanComparablePath(event.Name))
+				}
+				if event.Op&fsnotify.Create != 0 {
+					if err := addWatchDirectory(watcher, watchedDirs, initialDef.RootDir, event.Name); err != nil {
+						if onError != nil {
+							onError(err)
+						}
+					}
+				}
+				if !matchesWatchedPath(initialDef.RootDir, activeProfile, event.Name) {
 					continue
 				}
 				resetTimer()
@@ -90,6 +96,11 @@ func WatchWithErrors(ctx context.Context, dir string, profile string, onChange f
 						onError(loadErr)
 					}
 					continue
+				}
+				if err := addWatchDirectories(watcher, watchedDirs, definition.RootDir); err != nil {
+					if onError != nil {
+						onError(err)
+					}
 				}
 				if onChange != nil {
 					onChange(definition)
@@ -121,51 +132,104 @@ func watchDirectories(rootDir string) []string {
 	}
 }
 
-func buildWatchedPaths(def *model.AutomationDefinition) map[string]struct{} {
-	paths := map[string]struct{}{
-		cleanComparablePath(filepath.Join(def.RootDir, "project.yaml")):            {},
-		cleanComparablePath(filepath.Join(def.RootDir, "local", "overrides.yaml")): {},
-	}
-	if strings.TrimSpace(def.Profile) != "" {
-		paths[cleanComparablePath(filepath.Join(def.RootDir, "profiles", def.Profile+".yaml"))] = struct{}{}
-	}
-
-	for name := range def.Sources {
-		paths[cleanComparablePath(filepath.Join(def.RootDir, "sources", name+".yaml"))] = struct{}{}
-	}
-	for name := range def.Flows {
-		paths[cleanComparablePath(filepath.Join(def.RootDir, "flows", name+".yaml"))] = struct{}{}
-	}
-	for name := range def.Policies {
-		paths[cleanComparablePath(filepath.Join(def.RootDir, "policies", name+".yaml"))] = struct{}{}
-	}
-
-	promptDir := filepath.Join(def.RootDir, "prompts")
-	hookDir := filepath.Join(def.RootDir, "hooks")
-	if entries, err := os.ReadDir(promptDir); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md.liquid") {
-				continue
-			}
-			paths[cleanComparablePath(filepath.Join(promptDir, entry.Name()))] = struct{}{}
+func addWatchDirectories(watcher *fsnotify.Watcher, watchedDirs map[string]struct{}, rootDir string) error {
+	for _, watchDir := range watchDirectories(rootDir) {
+		if err := addWatchDirectory(watcher, watchedDirs, rootDir, watchDir); err != nil {
+			return err
 		}
 	}
-	if entries, err := os.ReadDir(hookDir); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() || filepath.Ext(entry.Name()) != ".sh" {
-				continue
-			}
-			paths[cleanComparablePath(filepath.Join(hookDir, entry.Name()))] = struct{}{}
-		}
-	}
-
-	return paths
+	return nil
 }
 
-func matchesWatchedPathSet(paths map[string]struct{}, eventPath string) bool {
-	comparable := cleanComparablePath(eventPath)
-	_, ok := paths[comparable]
-	return ok
+func addWatchDirectory(watcher *fsnotify.Watcher, watchedDirs map[string]struct{}, rootDir string, dir string) error {
+	if !isWatchDirectory(rootDir, dir) {
+		return nil
+	}
+
+	comparable := cleanComparablePath(dir)
+	if _, exists := watchedDirs[comparable]; exists {
+		return nil
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	if err := watcher.Add(dir); err != nil {
+		return err
+	}
+	watchedDirs[comparable] = struct{}{}
+	return nil
+}
+
+func matchesWatchedPath(rootDir string, activeProfile string, eventPath string) bool {
+	relativePath, ok := relativeWatchPath(rootDir, eventPath)
+	if !ok {
+		return false
+	}
+
+	switch relativePath {
+	case "project.yaml", "local/overrides.yaml":
+		return true
+	case "local/env.local", "local/session-state.json":
+		return false
+	}
+
+	switch {
+	case strings.HasPrefix(relativePath, "profiles/"):
+		return activeProfile != "" && relativePath == path.Join("profiles", activeProfile+".yaml")
+	case strings.HasPrefix(relativePath, "sources/"):
+		return matchesDirectoryFile(relativePath, "sources", ".yaml")
+	case strings.HasPrefix(relativePath, "flows/"):
+		return matchesDirectoryFile(relativePath, "flows", ".yaml")
+	case strings.HasPrefix(relativePath, "prompts/"):
+		return matchesDirectoryFile(relativePath, "prompts", ".md.liquid")
+	case strings.HasPrefix(relativePath, "policies/"):
+		return matchesDirectoryFile(relativePath, "policies", ".yaml")
+	case strings.HasPrefix(relativePath, "hooks/"):
+		return matchesDirectoryFile(relativePath, "hooks", ".sh")
+	default:
+		return false
+	}
+}
+
+func isWatchDirectory(rootDir string, eventPath string) bool {
+	relativePath, ok := relativeWatchPath(rootDir, eventPath)
+	if !ok {
+		return false
+	}
+
+	switch relativePath {
+	case ".", "profiles", "sources", "flows", "prompts", "policies", "hooks", "local":
+		return true
+	default:
+		return false
+	}
+}
+
+func relativeWatchPath(rootDir string, eventPath string) (string, bool) {
+	absEventPath, err := filepath.Abs(eventPath)
+	if err != nil {
+		return "", false
+	}
+	relativePath, err := filepath.Rel(rootDir, absEventPath)
+	if err != nil {
+		return "", false
+	}
+	if relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return filepath.ToSlash(filepath.Clean(relativePath)), true
+}
+
+func matchesDirectoryFile(relativePath string, directory string, suffix string) bool {
+	return path.Dir(relativePath) == directory && strings.HasSuffix(path.Base(relativePath), suffix)
 }
 
 func cleanComparablePath(path string) string {

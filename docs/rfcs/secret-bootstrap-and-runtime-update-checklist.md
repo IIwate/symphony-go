@@ -74,7 +74,9 @@
 - [ ] 未匹配 key 时追加到末尾
 - [ ] 值中包含空格、`#`、引号时正确加双引号
 - [ ] 使用 `path.tmp` 临时文件写入
-- [ ] Windows 下按 `Remove + Rename` 处理替换
+- [ ] 临时文件写入后显式 flush / close
+- [ ] 使用平台原子替换覆盖正式文件，不先删除旧文件
+- [ ] Windows 下使用系统级 replace / `MoveFileEx(..., REPLACE_EXISTING | WRITE_THROUGH)`
 - [ ] 文档/注释中明确“不支持并发写者”
 
 ### 2.3 测试
