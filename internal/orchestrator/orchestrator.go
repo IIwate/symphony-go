@@ -43,7 +43,6 @@ type Snapshot struct {
 	Service              ServiceSnapshot
 	Counts               SnapshotCounts
 	Running              []RunningSnapshot
-	RecoveredPending     []RecoveredPendingSnapshot
 	AwaitingMerge        []AwaitingMergeSnapshot
 	AwaitingIntervention []AwaitingInterventionSnapshot
 	Retrying             []RetrySnapshot
@@ -59,7 +58,6 @@ type ServiceSnapshot struct {
 
 type SnapshotCounts struct {
 	Running              int
-	RecoveredPending     int
 	AwaitingMerge        int
 	AwaitingIntervention int
 	Retrying             int
@@ -96,20 +94,6 @@ type RetrySnapshot struct {
 	Attempt            int
 	DueAt              time.Time
 	Error              *string
-}
-
-type RecoveredPendingSnapshot struct {
-	IssueID             string
-	IssueIdentifier     string
-	WorkspacePath       string
-	State               string
-	DispatchKind        string
-	ExpectedOutcome     string
-	ContinuationReason  *string
-	CurrentRetryAttempt int
-	AttemptCount        int
-	RecoverySource      string
-	ObservedAt          time.Time
 }
 
 type AwaitingMergeSnapshot struct {
@@ -194,12 +178,40 @@ type PullRequestLookup interface {
 }
 
 type RuntimeIdentity struct {
-	ConfigRoot  string
-	Profile     string
-	SourceName  string
-	FlowName    string
-	TrackerKind string
-	TrackerRepo string
+	ConfigRoot               string
+	Profile                  string
+	SourceName               string
+	SourceKind               string
+	FlowName                 string
+	TrackerKind              string
+	TrackerRepo              string
+	TrackerProjectSlug       string
+	WorkspaceRoot            string
+	SessionStatePath         string
+	SessionFlushIntervalMS   int
+	SessionFsyncOnCritical   bool
+}
+
+type RefreshRequestResult struct {
+	Accepted    bool
+	Coalesced   bool
+	RequestedAt time.Time
+	Operations  []string
+}
+
+type runtimeExtensionEventKind string
+
+const (
+	runtimeExtensionEventNotificationEnqueue runtimeExtensionEventKind = "notification_enqueue"
+	runtimeExtensionEventNotificationDeliver runtimeExtensionEventKind = "notification_delivery"
+	runtimeExtensionEventPersistenceSuccess  runtimeExtensionEventKind = "persistence_success"
+	runtimeExtensionEventPersistenceFailure  runtimeExtensionEventKind = "persistence_failure"
+)
+
+type runtimeExtensionEvent struct {
+	Kind    runtimeExtensionEventKind
+	Channel string
+	Err     error
 }
 
 type Orchestrator struct {
@@ -223,6 +235,7 @@ type Orchestrator struct {
 	configReloadCh chan struct{}
 	refreshCh      chan struct{}
 	retryFireCh    chan string
+	extensionCh    chan runtimeExtensionEvent
 	shutdownCh     chan struct{}
 	doneCh         chan struct{}
 
@@ -239,6 +252,7 @@ type Orchestrator struct {
 	nextSubscriberID int
 	systemAlerts     map[string]AlertSnapshot
 	pendingCleanup   map[string]string
+	recoveredPending map[string]*recoveredPendingEntry
 	completedOrder   []string
 	maxCompleted     int
 	startedAt        time.Time
@@ -272,23 +286,23 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		configReloadCh:    make(chan struct{}, 8),
 		refreshCh:         make(chan struct{}, 8),
 		retryFireCh:       make(chan string, 128),
+		extensionCh:       make(chan runtimeExtensionEvent, 256),
 		shutdownCh:        make(chan struct{}),
 		doneCh:            make(chan struct{}),
 		state: model.OrchestratorState{
 			Running:              map[string]*model.RunningEntry{},
-			RecoveredPending:     map[string]*model.RecoveredPendingEntry{},
 			AwaitingMerge:        map[string]*model.AwaitingMergeEntry{},
 			AwaitingIntervention: map[string]*model.AwaitingInterventionEntry{},
-			Claimed:              map[string]*model.ClaimedEntry{},
 			RetryAttempts:        map[string]*model.RetryEntry{},
 			Completed:            map[string]struct{}{},
 		},
-		subscribers:    map[int]chan Snapshot{},
-		systemAlerts:   map[string]AlertSnapshot{},
-		pendingCleanup: map[string]string{},
-		maxCompleted:   defaultMaxCompletedEntries,
-		startedAt:      time.Now().UTC(),
-		serviceVersion: BuildVersion,
+		subscribers:      map[int]chan Snapshot{},
+		systemAlerts:     map[string]AlertSnapshot{},
+		pendingCleanup:   map[string]string{},
+		recoveredPending: map[string]*recoveredPendingEntry{},
+		maxCompleted:     defaultMaxCompletedEntries,
+		startedAt:        time.Now().UTC(),
+		serviceVersion:   BuildVersion,
 	}
 	o.prLookup = newGitHubPRLookup()
 	o.applyCurrentConfigLocked()
@@ -338,6 +352,8 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 				o.tick(ctx)
 			case issueID := <-o.retryFireCh:
 				o.handleRetryTimer(ctx, issueID)
+			case event := <-o.extensionCh:
+				o.handleRuntimeExtensionEvent(event)
 			case <-o.configReloadCh:
 				o.mu.Lock()
 				o.applyCurrentConfigLocked()
@@ -364,10 +380,39 @@ func (o *Orchestrator) Wait() {
 	<-o.doneCh
 }
 
-func (o *Orchestrator) RequestRefresh() {
+func (o *Orchestrator) RequestRefresh() RefreshRequestResult {
+	result := RefreshRequestResult{
+		Accepted:    true,
+		RequestedAt: o.now().UTC(),
+		Operations:  []string{"poll", "reconcile"},
+	}
 	select {
 	case o.refreshCh <- struct{}{}:
+		return result
 	default:
+		result.Coalesced = true
+		return result
+	}
+}
+
+func (o *Orchestrator) postRuntimeExtensionEvent(event runtimeExtensionEvent) {
+	select {
+	case o.extensionCh <- event:
+	default:
+		o.logger.Warn("runtime extension event dropped", "kind", event.Kind, "channel", event.Channel, "error", errorString(event.Err))
+	}
+}
+
+func (o *Orchestrator) handleRuntimeExtensionEvent(event runtimeExtensionEvent) {
+	switch event.Kind {
+	case runtimeExtensionEventNotificationEnqueue:
+		o.handleNotificationEnqueueResult(event.Channel, event.Err)
+	case runtimeExtensionEventNotificationDeliver:
+		o.handleNotificationDeliveryResult(event.Channel, event.Err)
+	case runtimeExtensionEventPersistenceSuccess:
+		o.handleSessionPersistenceWriteSuccess()
+	case runtimeExtensionEventPersistenceFailure:
+		o.handleSessionPersistenceWriteFailure(event.Err)
 	}
 }
 
@@ -439,7 +484,7 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		o.logger.Warn("dispatch preflight failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertLocked(AlertSnapshot{
+		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "dispatch_preflight_failed",
 			Level:   "warn",
 			Message: err.Error(),
@@ -449,14 +494,14 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 		return
 	}
 	o.mu.Lock()
-	o.clearSystemAlertLocked("dispatch_preflight_failed")
+	o.clearSystemAlertAndNotifyLocked("dispatch_preflight_failed")
 	o.mu.Unlock()
 
 	candidates, err := o.tracker.FetchCandidateIssues(ctx)
 	if err != nil {
 		o.logger.Warn("fetch candidate issues failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertLocked(AlertSnapshot{
+		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "tracker_unreachable",
 			Level:   "warn",
 			Message: err.Error(),
@@ -467,7 +512,7 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	}
 	o.mu.Lock()
 	if !stateRefreshAttempted || stateRefreshSucceeded {
-		o.clearSystemAlertLocked("tracker_unreachable")
+		o.clearSystemAlertAndNotifyLocked("tracker_unreachable")
 	}
 	o.mu.Unlock()
 	sort.SliceStable(candidates, func(i int, j int) bool {
@@ -551,7 +596,6 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		"attempt", attemptCountFromRetry(normalizedAttempt),
 		"run_phase", model.PhasePreparingWorkspace.String(),
 	)
-	o.setClaimedLocked(issue.ID, o.claimedEntry(&issue, issue.Identifier, "", normalizedAttempt, stallCount, dispatch))
 	o.emitNotificationLocked(o.newIssueDispatchedEvent(issue, normalizedAttempt, dispatch))
 	o.commitStateLocked(true)
 	o.mu.Unlock()
@@ -579,7 +623,6 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		if entry := o.state.Running[issue.ID]; entry != nil {
 			entry.WorkspacePath = workspaceRef.Path
 			entry.Dispatch = model.CloneDispatchContext(dispatch)
-			o.setClaimedLocked(issue.ID, o.claimedEntry(entry.Issue, entry.Identifier, workspaceRef.Path, entry.RetryAttempt, entry.StallCount, entry.Dispatch))
 			o.commitStateLocked(false)
 		}
 		o.mu.Unlock()
@@ -927,7 +970,6 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	if entry.Issue != nil {
 		issueState = entry.Issue.State
 	}
-	o.setClaimedLocked(result.IssueID, o.claimedEntry(entry.Issue, identifier, workspacePath, retryAttempt, stallCount, dispatch))
 	o.logger.Info(
 		"worker finished",
 		"issue_id", result.IssueID,
@@ -1079,7 +1121,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	if err != nil {
 		o.logger.Warn("reconcile state refresh failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertLocked(AlertSnapshot{
+		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "tracker_unreachable",
 			Level:   "warn",
 			Message: err.Error(),
@@ -1096,7 +1138,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.clearSystemAlertLocked("tracker_unreachable")
+	o.clearSystemAlertAndNotifyLocked("tracker_unreachable")
 	for issueID, entry := range o.state.Running {
 		issue, ok := byID[issueID]
 		if !ok {
@@ -1159,7 +1201,6 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				current := o.state.AwaitingMerge[issueID]
 				if current != nil {
 					delete(o.state.AwaitingMerge, issueID)
-					delete(o.state.Claimed, issueID)
 					o.commitStateLocked(true)
 				}
 				o.mu.Unlock()
@@ -1291,14 +1332,13 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 		case o.isTerminalState(issue.State, cfg):
 			o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
 		case !o.isActiveState(issue.State, cfg):
-			o.mu.Lock()
-			current := o.state.AwaitingIntervention[issueID]
-			if current != nil {
-				delete(o.state.AwaitingIntervention, issueID)
-				delete(o.state.Claimed, issueID)
-				o.commitStateLocked(true)
-			}
-			o.mu.Unlock()
+		o.mu.Lock()
+		current := o.state.AwaitingIntervention[issueID]
+		if current != nil {
+			delete(o.state.AwaitingIntervention, issueID)
+			o.commitStateLocked(true)
+		}
+		o.mu.Unlock()
 		}
 	}
 }
@@ -1334,7 +1374,6 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	}
 	if issue == nil {
 		o.mu.Lock()
-		delete(o.state.Claimed, issueID)
 		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
@@ -1343,7 +1382,6 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	cfg := o.currentConfig()
 	if !o.isDispatchEligible(*issue, cfg, true) {
 		o.mu.Lock()
-		delete(o.state.Claimed, issueID)
 		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
@@ -1367,7 +1405,7 @@ func (o *Orchestrator) startupCleanup(ctx context.Context) {
 	if err != nil {
 		o.logger.Warn("startup cleanup fetch failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertLocked(AlertSnapshot{
+		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "tracker_terminal_fetch_failed",
 			Level:   "warn",
 			Message: err.Error(),
@@ -1377,7 +1415,7 @@ func (o *Orchestrator) startupCleanup(ctx context.Context) {
 		return
 	}
 	o.mu.Lock()
-	o.clearSystemAlertLocked("tracker_terminal_fetch_failed")
+	o.clearSystemAlertAndNotifyLocked("tracker_terminal_fetch_failed")
 	o.mu.Unlock()
 	for _, issue := range issues {
 		if err := o.workspace.CleanupWorkspace(ctx, issue.Identifier); err != nil {
@@ -1428,10 +1466,7 @@ func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID strin
 	delete(o.state.Running, issueID)
 
 	if cleanup {
-		delete(o.state.Claimed, issueID)
 		o.pendingCleanup[issueID] = entry.Identifier
-	} else if !scheduleRetry {
-		delete(o.state.Claimed, issueID)
 	}
 
 	if scheduleRetry {
@@ -1472,19 +1507,6 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 		retryAttempt := attempt
 		retryDispatch.RetryAttempt = &retryAttempt
 	}
-	state := ""
-	if existing := o.state.Claimed[issueID]; existing != nil {
-		state = existing.State
-	}
-	o.setClaimedLocked(issueID, &model.ClaimedEntry{
-		Identifier:    identifier,
-		WorkspacePath: workspacePathForIdentifier(o.currentConfig().WorkspaceRoot, identifier),
-		State:         state,
-		RetryAttempt:  attempt,
-		StallCount:    stallCount,
-		ClaimedAt:     o.now().UTC(),
-		Dispatch:      model.CloneDispatchContext(retryDispatch),
-	})
 	o.state.RetryAttempts[issueID] = &model.RetryEntry{
 		IssueID:       issueID,
 		Identifier:    identifier,
@@ -1567,35 +1589,6 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		row.LastEventAt = entry.Session.LastCodexTimestamp
 		running = append(running, row)
 	}
-
-	recoveredPending := make([]RecoveredPendingSnapshot, 0, len(o.state.RecoveredPending))
-	for issueID, entry := range o.state.RecoveredPending {
-		row := RecoveredPendingSnapshot{
-			IssueID:             issueID,
-			IssueIdentifier:     entry.Identifier,
-			WorkspacePath:       entry.WorkspacePath,
-			State:               entry.State,
-			CurrentRetryAttempt: entry.RetryAttempt,
-			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
-			RecoverySource:      entry.RecoverySource,
-			ObservedAt:          entry.ObservedAt,
-		}
-		if entry.Dispatch != nil {
-			row.DispatchKind = string(entry.Dispatch.Kind)
-			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
-			if entry.Dispatch.Reason != nil {
-				reason := string(*entry.Dispatch.Reason)
-				row.ContinuationReason = &reason
-			}
-		}
-		recoveredPending = append(recoveredPending, row)
-	}
-	sort.SliceStable(recoveredPending, func(i int, j int) bool {
-		if recoveredPending[i].IssueIdentifier != recoveredPending[j].IssueIdentifier {
-			return recoveredPending[i].IssueIdentifier < recoveredPending[j].IssueIdentifier
-		}
-		return recoveredPending[i].IssueID < recoveredPending[j].IssueID
-	})
 
 	awaitingMerge := make([]AwaitingMergeSnapshot, 0, len(o.state.AwaitingMerge))
 	for issueID, entry := range o.state.AwaitingMerge {
@@ -1730,13 +1723,11 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		},
 		Counts: SnapshotCounts{
 			Running:              len(running),
-			RecoveredPending:     len(recoveredPending),
 			AwaitingMerge:        len(awaitingMerge),
 			AwaitingIntervention: len(awaitingIntervention),
 			Retrying:             len(retrying),
 		},
 		Running:              running,
-		RecoveredPending:     recoveredPending,
 		AwaitingMerge:        awaitingMerge,
 		AwaitingIntervention: awaitingIntervention,
 		Retrying:             retrying,
@@ -1802,9 +1793,6 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 	if _, ok := o.state.Running[issue.ID]; ok {
 		return false
 	}
-	if _, ok := o.state.RecoveredPending[issue.ID]; ok {
-		return false
-	}
 	if _, ok := o.state.AwaitingMerge[issue.ID]; ok {
 		return false
 	}
@@ -1814,11 +1802,7 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 	if _, ok := o.state.RetryAttempts[issue.ID]; ok {
 		return false
 	}
-	if !ignoreClaim {
-		if _, ok := o.state.Claimed[issue.ID]; ok {
-			return false
-		}
-	}
+	_ = ignoreClaim
 
 	if model.NormalizeState(issue.State) == "todo" {
 		for _, blocker := range issue.BlockedBy {
@@ -1919,15 +1903,6 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	}
 
 	o.mu.Lock()
-	o.setClaimedLocked(issueID, &model.ClaimedEntry{
-		Identifier:    identifier,
-		WorkspacePath: workspacePath,
-		State:         issueState,
-		RetryAttempt:  retryAttempt,
-		StallCount:    stallCount,
-		ClaimedAt:     o.now().UTC(),
-		Dispatch:      nil,
-	})
 	o.state.AwaitingMerge[issueID] = entry
 	o.commitStateLocked(true)
 	o.mu.Unlock()
@@ -1959,15 +1934,6 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 
 	o.mu.Lock()
 	delete(o.state.AwaitingMerge, issueID)
-	o.setClaimedLocked(issueID, &model.ClaimedEntry{
-		Identifier:    identifier,
-		WorkspacePath: workspacePath,
-		State:         issueState,
-		RetryAttempt:  retryAttempt,
-		StallCount:    stallCount,
-		ClaimedAt:     o.now().UTC(),
-		Dispatch:      nil,
-	})
 	o.state.AwaitingIntervention[issueID] = entry
 	o.emitNotificationLocked(o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, pr))
 	o.commitStateLocked(true)
@@ -2020,15 +1986,6 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 		current.PRHeadOwner = pr.HeadOwner
 	}
 	delete(o.state.AwaitingIntervention, issueID)
-	o.setClaimedLocked(issueID, &model.ClaimedEntry{
-		Identifier:    identifier,
-		WorkspacePath: workspacePath,
-		State:         issueState,
-		RetryAttempt:  retryAttempt,
-		StallCount:    stallCount,
-		ClaimedAt:     o.now().UTC(),
-		Dispatch:      nil,
-	})
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 	return false
@@ -2058,13 +2015,13 @@ func isRetryablePostMergeError(err error) bool {
 }
 
 func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo) bool {
-	transitioner, ok := o.tracker.(tracker.IssueTransitioner)
+	completer, ok := o.tracker.(tracker.IssueCompleter)
 	if !ok {
-		o.logger.Warn("tracker does not support issue transition", "issue_id", issueID, "issue_identifier", identifier, "branch", branch)
+		o.logger.Warn("tracker does not support issue completion", "issue_id", issueID, "issue_identifier", identifier, "branch", branch)
 		o.moveToAwaitingIntervention(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, model.CompletionModePullRequest, "post_merge_transition_unsupported", issueState, pr)
 		return false
 	}
-	if err := transitioner.TransitionIssue(ctx, issueID, "Done"); err != nil {
+	if err := completer.CompleteIssue(ctx, issueID); err != nil {
 		errorText := fmt.Sprintf("post-merge transition failed: %s", err.Error())
 		o.logger.Warn("post-merge transition failed", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "error", err.Error())
 		return o.handleFailedPostMergeTransition(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, pr, errorText, isRetryablePostMergeError(err))
@@ -2127,7 +2084,6 @@ func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID stri
 	o.mu.Lock()
 	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
-	delete(o.state.Claimed, issueID)
 	o.emitNotificationLocked(o.newIssueCompletedEvent(issueID, identifier))
 	o.commitStateLocked(true)
 	o.mu.Unlock()
@@ -2236,26 +2192,41 @@ func (o *Orchestrator) setSystemAlertLocked(alert AlertSnapshot) bool {
 		}
 	}
 	o.systemAlerts[alert.Code] = alert
-	if shouldSuppressAlertNotification(alert.Code) {
-		return true
+	return true
+}
+
+func (o *Orchestrator) setSystemAlertAndNotifyLocked(alert AlertSnapshot) bool {
+	if !o.setSystemAlertLocked(alert) {
+		return false
 	}
 	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlert, alert))
 	return true
 }
 
 func (o *Orchestrator) clearSystemAlertLocked(code string) bool {
+	_, cleared := o.clearSystemAlertStateLocked(code)
+	return cleared
+}
+
+func (o *Orchestrator) clearSystemAlertStateLocked(code string) (*AlertSnapshot, bool) {
 	if strings.TrimSpace(code) == "" {
-		return false
+		return nil, false
 	}
 	existing, ok := o.systemAlerts[code]
 	if !ok {
-		return false
+		return nil, false
 	}
 	delete(o.systemAlerts, code)
-	if shouldSuppressAlertNotification(code) {
-		return true
+	copyAlert := existing
+	return &copyAlert, true
+}
+
+func (o *Orchestrator) clearSystemAlertAndNotifyLocked(code string) bool {
+	alert, cleared := o.clearSystemAlertStateLocked(code)
+	if !cleared || alert == nil {
+		return false
 	}
-	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlertCleared, existing))
+	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlertCleared, *alert))
 	return true
 }
 

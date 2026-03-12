@@ -78,7 +78,6 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
             [
                 "  session_persistence:",
                 "    enabled: true",
-                "    backend: file",
                 f"    path: {session_state_path}",
                 "    flush_interval_ms: 200",
                 "    fsync_on_critical: true",
@@ -306,6 +305,18 @@ def start_symphony(binary_path: Path, config_dir: Path, *, echo: bool = True, en
 
 def fetch_json(url: str) -> dict[str, Any]:
     with request.urlopen(url, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def post_json(url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = json.dumps(payload or {}).encode("utf-8")
+    req = request.Request(
+        url,
+        data=raw,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 

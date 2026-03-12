@@ -31,7 +31,7 @@ type orchestratorService interface {
 	Wait()
 	RunOnce(context.Context, bool)
 	NotifyWorkflowReload(*model.WorkflowDefinition)
-	RequestRefresh()
+	RequestRefresh() orchestrator.RefreshRequestResult
 }
 
 type httpServer interface {
@@ -183,21 +183,7 @@ func (s *runtimeState) CurrentIdentity() orchestrator.RuntimeIdentity {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	identity := orchestrator.RuntimeIdentity{
-		ConfigRoot: s.configDir,
-		Profile:    strings.TrimSpace(s.profile),
-	}
-	if s.repoDef != nil {
-		identity.FlowName = strings.TrimSpace(s.repoDef.Selection.DispatchFlow)
-		if len(s.repoDef.Selection.EnabledSources) == 1 {
-			identity.SourceName = strings.TrimSpace(s.repoDef.Selection.EnabledSources[0])
-		}
-	}
-	if s.config != nil {
-		identity.TrackerKind = strings.TrimSpace(s.config.TrackerKind)
-		identity.TrackerRepo = strings.TrimSpace(s.config.TrackerRepo)
-	}
-	return identity
+	return runtimeIdentityForConfig(s.configDir, s.profile, s.repoDef, s.config)
 }
 
 func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.WorkflowDefinition, error) {
@@ -223,21 +209,29 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 		if strings.TrimSpace(currentRepoDef.Profile) != strings.TrimSpace(repoDef.Profile) {
 			return nil, fmt.Errorf("profile selection changed: restart required")
 		}
-		if selectedSourceKind(currentRepoDef) != selectedSourceKind(repoDef) {
-			return nil, fmt.Errorf("source.kind changed: restart required")
-		}
-		if !enabledSourcesEqual(currentRepoDef, repoDef) {
-			return nil, fmt.Errorf("selection.enabled_sources changed: restart required")
-		}
 	}
 	if currentCfg != nil {
-		if currentCfg.WorkspaceRoot != newCfg.WorkspaceRoot {
-			return nil, fmt.Errorf("runtime.workspace.root changed: restart required")
-		}
 		if !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort) {
 			return nil, fmt.Errorf("runtime.server.port changed: restart required")
 		}
-		if !reflect.DeepEqual(currentCfg.SessionPersistence, newCfg.SessionPersistence) {
+	}
+	if currentCfg != nil && currentRepoDef != nil && sessionPersistenceCompatibilityRequired(currentCfg, newCfg) {
+		switch {
+		case selectedSourceKind(currentRepoDef) != selectedSourceKind(repoDef):
+			return nil, fmt.Errorf("source.kind changed: restart required")
+		case !enabledSourcesEqual(currentRepoDef, repoDef):
+			return nil, fmt.Errorf("selection.enabled_sources changed: restart required")
+		case strings.TrimSpace(currentRepoDef.Selection.DispatchFlow) != strings.TrimSpace(repoDef.Selection.DispatchFlow):
+			return nil, fmt.Errorf("selection.dispatch_flow changed: restart required")
+		case currentCfg.WorkspaceRoot != newCfg.WorkspaceRoot:
+			return nil, fmt.Errorf("runtime.workspace.root changed: restart required")
+		case currentCfg.TrackerKind != newCfg.TrackerKind:
+			return nil, fmt.Errorf("runtime.tracker.kind changed: restart required")
+		case currentCfg.TrackerRepo != newCfg.TrackerRepo:
+			return nil, fmt.Errorf("runtime.tracker.repo changed: restart required")
+		case currentCfg.TrackerProjectSlug != newCfg.TrackerProjectSlug:
+			return nil, fmt.Errorf("runtime.tracker.project changed: restart required")
+		case !reflect.DeepEqual(currentCfg.SessionPersistence, newCfg.SessionPersistence):
 			return nil, fmt.Errorf("runtime.session_persistence changed: restart required")
 		}
 	}
@@ -296,6 +290,32 @@ func enabledSourcesEqual(left *model.AutomationDefinition, right *model.Automati
 		}
 	}
 	return true
+}
+
+func sessionPersistenceCompatibilityRequired(currentCfg *model.ServiceConfig, newCfg *model.ServiceConfig) bool {
+	return (currentCfg != nil && currentCfg.SessionPersistence.Enabled) || (newCfg != nil && newCfg.SessionPersistence.Enabled)
+}
+
+func runtimeIdentityForConfig(configDir string, profile string, repoDef *model.AutomationDefinition, cfg *model.ServiceConfig) orchestrator.RuntimeIdentity {
+	identity := orchestrator.RuntimeIdentity{
+		ConfigRoot: configDir,
+		Profile:    strings.TrimSpace(profile),
+	}
+	if repoDef != nil {
+		identity.SourceName = strings.Join(nilSafeSources(repoDef), ",")
+		identity.SourceKind = selectedSourceKind(repoDef)
+		identity.FlowName = strings.TrimSpace(repoDef.Selection.DispatchFlow)
+	}
+	if cfg != nil {
+		identity.TrackerKind = strings.TrimSpace(cfg.TrackerKind)
+		identity.TrackerRepo = strings.TrimSpace(cfg.TrackerRepo)
+		identity.TrackerProjectSlug = strings.TrimSpace(cfg.TrackerProjectSlug)
+		identity.WorkspaceRoot = strings.TrimSpace(cfg.WorkspaceRoot)
+		identity.SessionStatePath = strings.TrimSpace(cfg.SessionPersistence.Path)
+		identity.SessionFlushIntervalMS = cfg.SessionPersistence.FlushIntervalMS
+		identity.SessionFsyncOnCritical = cfg.SessionPersistence.FsyncOnCritical
+	}
+	return identity
 }
 
 func nilSafeSources(def *model.AutomationDefinition) []string {

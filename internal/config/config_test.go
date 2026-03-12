@@ -316,9 +316,6 @@ func TestNewFromWorkflowParsesSessionPersistenceAndNotifications(t *testing.T) {
 	if !cfg.SessionPersistence.Enabled {
 		t.Fatal("SessionPersistence.Enabled = false, want true")
 	}
-	if cfg.SessionPersistence.Backend != "file" {
-		t.Fatalf("SessionPersistence.Backend = %q, want file", cfg.SessionPersistence.Backend)
-	}
 	if cfg.SessionPersistence.Path != filepath.Join(homeDir, "session-state.json") {
 		t.Fatalf("SessionPersistence.Path = %q, want %q", cfg.SessionPersistence.Path, filepath.Join(homeDir, "session-state.json"))
 	}
@@ -360,10 +357,10 @@ func TestValidateForDispatchRejectsInvalidRuntimeExtensions(t *testing.T) {
 		mutate func(*model.ServiceConfig)
 	}{
 		{
-			name: "invalid session persistence backend",
+			name: "missing session persistence path",
 			mutate: func(cfg *model.ServiceConfig) {
 				cfg.SessionPersistence.Enabled = true
-				cfg.SessionPersistence.Backend = "memory"
+				cfg.SessionPersistence.Path = ""
 			},
 		},
 		{

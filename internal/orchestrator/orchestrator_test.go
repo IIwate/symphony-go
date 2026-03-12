@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -159,9 +160,6 @@ func TestReconcileRunningStopsTerminalAndInactiveIssues(t *testing.T) {
 			cancelled["2"]++
 		},
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-	o.state.Claimed["2"] = &model.ClaimedEntry{}
-
 	o.reconcileRunning(context.Background())
 
 	if len(o.state.Running) != 0 {
@@ -204,8 +202,6 @@ func TestReconcileRunningSchedulesRetryForStalledSession(t *testing.T) {
 		StartedAt:    now.Add(-2 * time.Second),
 		WorkerCancel: func() { cancelCount++ },
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileRunning(context.Background())
 
 	if cancelCount != 1 {
@@ -256,8 +252,6 @@ func TestReconcileRunningFirstStallAfterContinuationDoesNotTriggerRepeatedStall(
 		StartedAt:    now.Add(-2 * time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileRunning(context.Background())
 
 	retry := o.state.RetryAttempts["1"]
@@ -303,8 +297,6 @@ func TestHandleRetryTimerRequeuesWhenNoSlotsAvailable(t *testing.T) {
 		Attempt:       1,
 		DueAt:         now,
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.handleRetryTimer(context.Background(), "1")
 
 	retry := o.state.RetryAttempts["1"]
@@ -437,8 +429,6 @@ func TestRunOnceKeepsTrackerAlertWhenReconcileFails(t *testing.T) {
 		StartedAt:    now.Add(-time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.RunOnce(context.Background(), false)
 	snapshot := o.Snapshot()
 	if !hasAlertCode(snapshot.Alerts, "tracker_unreachable") {
@@ -479,8 +469,6 @@ func TestHandleWorkerExitPerformsDeferredCleanupAfterTerminalReconcile(t *testin
 		StartedAt:     now.Add(-time.Second),
 		WorkerCancel:  func() { cancelCount++ },
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.mu.Lock()
 	o.terminateRunningLocked(context.Background(), "1", true, false, "")
 	o.mu.Unlock()
@@ -537,8 +525,6 @@ func TestRunOncePreflightFailureStillReconcilesRunningIssues(t *testing.T) {
 		StartedAt:    now.Add(-10 * time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.RunOnce(context.Background(), true)
 
 	if tracker.stateFetchCalls != 1 {
@@ -665,8 +651,6 @@ func TestHandleWorkerExitAlreadyTerminal(t *testing.T) {
 		StartedAt:    now.Add(-time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.handleWorkerExit(WorkerResult{IssueID: "1", Identifier: "ABC-1", StartedAt: now, Phase: model.PhaseSucceeded})
 
 	if len(o.state.RetryAttempts) != 0 {
@@ -674,9 +658,6 @@ func TestHandleWorkerExitAlreadyTerminal(t *testing.T) {
 	}
 	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
 		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
-	}
-	if _, ok := o.state.Claimed["1"]; ok {
-		t.Fatal("claimed entry still exists")
 	}
 }
 
@@ -715,8 +696,6 @@ func TestHandleWorkerExitHasNewOpenPRMergedTransitionsToDone(t *testing.T) {
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.handleWorkerExit(WorkerResult{
 		IssueID:      "1",
 		Identifier:   "ABC-1",
@@ -726,8 +705,8 @@ func TestHandleWorkerExitHasNewOpenPRMergedTransitionsToDone(t *testing.T) {
 		FinalBranch:  branch,
 	})
 
-	if tracker.transitionCalls != 1 || tracker.transitionTarget != "Done" {
-		t.Fatalf("transition calls = %d target = %q", tracker.transitionCalls, tracker.transitionTarget)
+	if tracker.transitionCalls != 1 || tracker.transitionIssueID != "1" {
+		t.Fatalf("transition calls = %d issue = %q", tracker.transitionCalls, tracker.transitionIssueID)
 	}
 	if len(o.state.RetryAttempts) != 0 {
 		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
@@ -767,8 +746,6 @@ func TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge(t *testing.T) {
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.handleWorkerExit(WorkerResult{
 		IssueID:      "1",
 		Identifier:   "ABC-1",
@@ -826,8 +803,6 @@ func TestHandleWorkerExitClosedPRMovesToAwaitingIntervention(t *testing.T) {
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.handleWorkerExit(WorkerResult{
 		IssueID:      "1",
 		Identifier:   "ABC-1",
@@ -852,9 +827,6 @@ func TestHandleWorkerExitClosedPRMovesToAwaitingIntervention(t *testing.T) {
 	}
 	if len(o.state.RetryAttempts) != 0 {
 		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
-	}
-	if _, ok := o.state.Claimed["1"]; !ok {
-		t.Fatal("claimed entry should be retained while awaiting intervention")
 	}
 	if len(workspace.cleaned) != 0 {
 		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
@@ -962,8 +934,6 @@ func TestHandleWorkerExitMissingPRMovesToAwaitingInterventionForPullRequestMode(
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.handleWorkerExit(WorkerResult{
 		IssueID:     "1",
 		Identifier:  "ABC-1",
@@ -1041,9 +1011,6 @@ func TestHandleWorkerExitMergedPRTransitionFailureMovesToAwaitingIntervention(t 
 	}
 	if awaiting.PRState != string(PullRequestStateMerged) {
 		t.Fatalf("awaiting intervention entry = %+v, want merged PR state", awaiting)
-	}
-	if _, ok := o.state.Claimed["1"]; !ok {
-		t.Fatal("claimed entry should be retained while awaiting intervention")
 	}
 }
 
@@ -1244,18 +1211,13 @@ func TestReconcileAwaitingMergeMergedClosesIssue(t *testing.T) {
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileAwaitingMerge(context.Background())
 
-	if tracker.transitionCalls != 1 || tracker.transitionTarget != "Done" {
-		t.Fatalf("transition calls = %d target = %q", tracker.transitionCalls, tracker.transitionTarget)
+	if tracker.transitionCalls != 1 || tracker.transitionIssueID != "1" {
+		t.Fatalf("transition calls = %d issue = %q", tracker.transitionCalls, tracker.transitionIssueID)
 	}
 	if _, ok := o.state.AwaitingMerge["1"]; ok {
 		t.Fatal("awaiting merge entry still exists")
-	}
-	if _, ok := o.state.Claimed["1"]; ok {
-		t.Fatal("claimed entry still exists")
 	}
 	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
 		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
@@ -1290,8 +1252,6 @@ func TestReconcileAwaitingMergeTerminalIssueCleansUpAndReleasesClaim(t *testing.
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileAwaitingMerge(context.Background())
 
 	if tracker.stateFetchCalls == 0 {
@@ -1299,9 +1259,6 @@ func TestReconcileAwaitingMergeTerminalIssueCleansUpAndReleasesClaim(t *testing.
 	}
 	if _, ok := o.state.AwaitingMerge["1"]; ok {
 		t.Fatal("awaiting merge entry still exists")
-	}
-	if _, ok := o.state.Claimed["1"]; ok {
-		t.Fatal("claimed entry still exists")
 	}
 	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
 		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
@@ -1339,8 +1296,6 @@ func TestReconcileAwaitingMergeNonActiveIssueReleasesClaimWithoutCleanup(t *test
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileAwaitingMerge(context.Background())
 
 	if tracker.stateFetchCalls == 0 {
@@ -1348,9 +1303,6 @@ func TestReconcileAwaitingMergeNonActiveIssueReleasesClaimWithoutCleanup(t *test
 	}
 	if _, ok := o.state.AwaitingMerge["1"]; ok {
 		t.Fatal("awaiting merge entry still exists")
-	}
-	if _, ok := o.state.Claimed["1"]; ok {
-		t.Fatal("claimed entry still exists")
 	}
 	if len(workspace.cleaned) != 0 {
 		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
@@ -1383,8 +1335,6 @@ func TestReconcileAwaitingMergeClosedMovesToAwaitingIntervention(t *testing.T) {
 		StallCount:    2,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileAwaitingMerge(context.Background())
 
 	if _, ok := o.state.AwaitingMerge["1"]; ok {
@@ -1399,9 +1349,6 @@ func TestReconcileAwaitingMergeClosedMovesToAwaitingIntervention(t *testing.T) {
 	}
 	if len(o.state.RetryAttempts) != 0 {
 		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
-	}
-	if _, ok := o.state.Claimed["1"]; !ok {
-		t.Fatal("claimed entry should be retained while awaiting intervention")
 	}
 }
 
@@ -1427,8 +1374,6 @@ func TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert(t *testing.T) 
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileAwaitingMerge(context.Background())
 
 	awaiting := o.state.AwaitingMerge["1"]
@@ -1468,8 +1413,6 @@ func TestReconcileAwaitingMergeLookupFailureDuringContextCancelIsIgnored(t *test
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	o.reconcileAwaitingMerge(ctx)
@@ -1505,8 +1448,6 @@ func TestReconcileAwaitingMergeMissingPRMovesToAwaitingIntervention(t *testing.T
 		StallCount:    2,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileAwaitingMerge(context.Background())
 
 	if _, ok := o.state.AwaitingMerge["1"]; ok {
@@ -1604,8 +1545,6 @@ func TestReconcileAwaitingInterventionReleasesInactiveIssue(t *testing.T) {
 		RetryAttempt:  1,
 		ObservedAt:    now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = &model.ClaimedEntry{}
-
 	o.reconcileAwaitingIntervention(context.Background())
 
 	if tracker.stateFetchCalls == 0 {
@@ -1613,9 +1552,6 @@ func TestReconcileAwaitingInterventionReleasesInactiveIssue(t *testing.T) {
 	}
 	if _, ok := o.state.AwaitingIntervention["1"]; ok {
 		t.Fatal("awaiting intervention entry still exists")
-	}
-	if _, ok := o.state.Claimed["1"]; ok {
-		t.Fatal("claimed entry still exists")
 	}
 	if len(workspace.cleaned) != 0 {
 		t.Fatalf("cleanup calls = %+v, want none", workspace.cleaned)
@@ -1697,26 +1633,26 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 				Dispatch:      &model.DispatchContext{Kind: model.DispatchKindFresh},
 			},
 		},
-		RecoveredPending: []durableRecoveredPendingEntry{
+		Interrupted: []durableInterruptedEntry{
 			{
-				IssueID:        "1",
-				Identifier:     "ISSUE-1",
-				State:          "In Progress",
-				WorkspacePath:  "/tmp/ISSUE-1",
-				RetryAttempt:   1,
-				StallCount:     2,
-				ObservedAt:     savedAt,
-				RecoverySource: "running",
+				IssueID:       "1",
+				Identifier:    "ISSUE-1",
+				State:         "In Progress",
+				WorkspacePath: "/tmp/ISSUE-1",
+				RetryAttempt:  1,
+				StallCount:    2,
+				ObservedAt:    savedAt,
+				Source:        "running",
 			},
 			{
-				IssueID:        "5",
-				Identifier:     "ISSUE-5",
-				State:          "In Progress",
-				WorkspacePath:  "/tmp/ISSUE-5",
-				RetryAttempt:   4,
-				StallCount:     1,
-				ObservedAt:     savedAt,
-				RecoverySource: "claimed",
+				IssueID:       "5",
+				Identifier:    "ISSUE-5",
+				State:         "In Progress",
+				WorkspacePath: "/tmp/ISSUE-5",
+				RetryAttempt:  4,
+				StallCount:    1,
+				ObservedAt:    savedAt,
+				Source:        "interrupted",
 			},
 		},
 		AwaitingMerge: []durableAwaitingMergeEntry{
@@ -1773,17 +1709,17 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 	if len(o.state.Running) != 0 {
 		t.Fatalf("running size = %d, want 0", len(o.state.Running))
 	}
-	if len(o.state.RecoveredPending) != 2 {
-		t.Fatalf("recovered pending size = %d, want 2", len(o.state.RecoveredPending))
+	if len(o.recoveredPending) != 2 {
+		t.Fatalf("recovered pending size = %d, want 2", len(o.recoveredPending))
 	}
 	if o.state.RetryAttempts["2"].TimerHandle == nil {
 		t.Fatal("restored retry timer = nil, want timer")
 	}
-	if got := o.state.RecoveredPending["1"].RecoverySource; got != "running" {
+	if got := o.recoveredPending["1"].Source; got != "running" {
 		t.Fatalf("recovered pending source = %q, want running", got)
 	}
-	if got := o.state.RecoveredPending["5"].RecoverySource; got != "claimed" {
-		t.Fatalf("recovered pending source = %q, want claimed", got)
+	if got := o.recoveredPending["5"].Source; got != "interrupted" {
+		t.Fatalf("recovered pending source = %q, want interrupted", got)
 	}
 	if len(o.state.AwaitingMerge) != 1 {
 		t.Fatalf("awaiting merge size = %d, want 1", len(o.state.AwaitingMerge))
@@ -1831,7 +1767,7 @@ func TestSystemAlertNotificationsEmitWebhookEvents(t *testing.T) {
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 	o.mu.Lock()
-	o.setSystemAlertLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 	waitForCondition(t, time.Second, func() bool {
@@ -1841,7 +1777,7 @@ func TestSystemAlertNotificationsEmitWebhookEvents(t *testing.T) {
 	})
 
 	o.mu.Lock()
-	o.clearSystemAlertLocked("tracker_unreachable")
+	o.clearSystemAlertAndNotifyLocked("tracker_unreachable")
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 	waitForCondition(t, time.Second, func() bool {
@@ -1906,8 +1842,8 @@ func TestMoveToAwaitingInterventionEmitsNotification(t *testing.T) {
 	if payload[0].Type != string(model.NotificationEventIssueInterventionRequired) {
 		t.Fatalf("payload[0].Type = %q, want %q", payload[0].Type, model.NotificationEventIssueInterventionRequired)
 	}
-	if got := payload[0].Reason; got != "missing_pr" {
-		t.Fatalf("payload[0].Reason = %q, want missing_pr", got)
+	if got := detailValue(payload[0].Details, "reason"); got != "missing_pr" {
+		t.Fatalf("payload[0].details.reason = %q, want missing_pr", got)
 	}
 }
 
@@ -1936,20 +1872,32 @@ func TestNotificationDeliveryFailureCreatesInternalAlert(t *testing.T) {
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 	o.mu.Lock()
-	o.setSystemAlertLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 
 	waitForCondition(t, time.Second, func() bool {
-		snapshot := o.Snapshot()
-		return hasAlertCode(snapshot.Alerts, "notification_delivery_failed_ops")
+		mu.Lock()
+		defer mu.Unlock()
+		return requestsHit == 1
+	})
+	waitForCondition(t, time.Second, func() bool {
+		return len(o.extensionCh) > 0
+	})
+	for len(o.extensionCh) > 0 {
+		o.handleRuntimeExtensionEvent(<-o.extensionCh)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		return hasAlertCode(o.Snapshot().Alerts, "notification_delivery_failed_ops")
 	})
 
-	time.Sleep(50 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
 	if requestsHit != 1 {
 		t.Fatalf("request count = %d, want 1", requestsHit)
+	}
+	if !hasAlertCode(o.Snapshot().Alerts, "notification_delivery_failed_ops") {
+		t.Fatalf("snapshot alerts = %+v, want notification_delivery_failed_ops", o.Snapshot().Alerts)
 	}
 }
 
@@ -2007,7 +1955,7 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 
 	o.mu.Lock()
-	o.setSystemAlertLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 
@@ -2038,7 +1986,7 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 	}
 
 	o.mu.Lock()
-	o.setSystemAlertLocked(AlertSnapshot{Code: "dispatch_preflight_failed", Level: "warn", Message: "preflight down"})
+	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "dispatch_preflight_failed", Level: "warn", Message: "preflight down"})
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 
@@ -2068,11 +2016,11 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 	if len(newPayload) != 1 {
 		t.Fatalf("new notifier deliveries = %d, want 1", len(newPayload))
 	}
-	if oldPayload[0].AlertCode != "tracker_unreachable" {
-		t.Fatalf("old payload alert_code = %q, want tracker_unreachable", oldPayload[0].AlertCode)
+	if got := detailValue(oldPayload[0].Details, "alert_code"); got != "tracker_unreachable" {
+		t.Fatalf("old payload details.alert_code = %q, want tracker_unreachable", got)
 	}
-	if newPayload[0].AlertCode != "dispatch_preflight_failed" {
-		t.Fatalf("new payload alert_code = %q, want dispatch_preflight_failed", newPayload[0].AlertCode)
+	if got := detailValue(newPayload[0].Details, "alert_code"); got != "dispatch_preflight_failed" {
+		t.Fatalf("new payload details.alert_code = %q, want dispatch_preflight_failed", got)
 	}
 }
 
@@ -2080,8 +2028,16 @@ func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 	customNotifier := &asyncNotifier{
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		queue:         make(chan model.RuntimeEvent, 1),
-		enqueueResult: o.handleNotificationEnqueueResult,
+		emitters: []*notificationEmitter{
+			{
+				channel: notificationChannel{
+					name:         "ops",
+					subscribeAll: true,
+				},
+				queue: make(chan model.RuntimeEvent, 1),
+			},
+		},
+		enqueueResult: o.reportNotificationEnqueueResult,
 	}
 	o.notifier = customNotifier
 	t.Cleanup(func() {
@@ -2092,9 +2048,14 @@ func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 	o.emitNotificationLocked(o.newIssueCompletedEvent("2", "ISSUE-2"))
 
 	waitForCondition(t, time.Second, func() bool {
-		snapshot := o.Snapshot()
-		return hasAlertCode(snapshot.Alerts, notificationQueueOverflowCode)
+		return len(o.extensionCh) > 0
 	})
+	for len(o.extensionCh) > 0 {
+		o.handleRuntimeExtensionEvent(<-o.extensionCh)
+	}
+	if !hasAlertCode(o.Snapshot().Alerts, notificationQueueOverflowCode("ops")) {
+		t.Fatalf("snapshot alerts = %+v, want %q", o.Snapshot().Alerts, notificationQueueOverflowCode("ops"))
+	}
 }
 
 func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient tracker.Client, workspaceManager *fakeWorkspaceManager, runner *fakeRunner, now time.Time) *Orchestrator {
@@ -2189,15 +2150,15 @@ func (f *fakeTracker) FetchIssueStatesByIDs(_ context.Context, ids []string) ([]
 	return result, nil
 }
 
-func (f *fakeTracker) TransitionIssue(_ context.Context, issueID string, targetState string) error {
+func (f *fakeTracker) CompleteIssue(_ context.Context, issueID string) error {
 	f.transitionCalls++
 	f.transitionIssueID = issueID
-	f.transitionTarget = targetState
+	f.transitionTarget = "completed"
 	if f.transitionErr != nil {
 		return f.transitionErr
 	}
 	if f.onTransition != nil {
-		f.onTransition(issueID, targetState)
+		f.onTransition(issueID, "completed")
 	}
 	return nil
 }
@@ -2304,6 +2265,17 @@ func hasAlertCode(alerts []AlertSnapshot, code string) bool {
 	return false
 }
 
+func detailValue(details map[string]any, key string) string {
+	if details == nil {
+		return ""
+	}
+	value, ok := details[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return fmt.Sprint(value)
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, check func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -2330,7 +2302,6 @@ func testServiceConfig() *model.ServiceConfig {
 		CodexStallTimeoutMS:        300000,
 		WorkspaceLinearBranchScope: "demo-scope",
 		SessionPersistence: model.SessionPersistenceConfig{
-			Backend:         "file",
 			Path:            filepath.Join(os.TempDir(), "session-state.json"),
 			FlushIntervalMS: 1,
 			FsyncOnCritical: true,

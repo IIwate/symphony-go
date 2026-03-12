@@ -136,9 +136,6 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	if enabled, ok := getBool(sessionPersistence, "enabled"); ok {
 		cfg.SessionPersistence.Enabled = enabled
 	}
-	if backend := strings.TrimSpace(getString(sessionPersistence, "backend", "")); backend != "" {
-		cfg.SessionPersistence.Backend = model.NormalizeState(backend)
-	}
 	if path := expandHomePath(strings.TrimSpace(getString(sessionPersistence, "path", ""))); path != "" {
 		cfg.SessionPersistence.Path = path
 	}
@@ -159,7 +156,6 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 				Kind:    model.NotificationChannelKind(model.NormalizeState(getString(channel, "kind", ""))),
 				URL:     strings.TrimSpace(getString(channel, "url", "")),
 				Headers: getStringMap(getMap(channel, "headers")),
-				Events:  allNotificationEventTypes(),
 			}
 			if eventNames, ok := getStringSlice(channel, "events"); ok && len(eventNames) > 0 {
 				parsed.Events = make([]model.NotificationEventType, 0, len(eventNames))
@@ -241,8 +237,7 @@ func defaultServiceConfig() *model.ServiceConfig {
 		CodexReadTimeoutMS:               5000,
 		CodexStallTimeoutMS:              300000,
 		SessionPersistence: model.SessionPersistenceConfig{
-			Backend:         "file",
-			Path:            filepath.Join("automation", "local", "session-state.json"),
+			Path:            filepath.Join(".", "local", "session-state.json"),
 			FlushIntervalMS: 1000,
 			FsyncOnCritical: true,
 		},
@@ -510,9 +505,6 @@ func validateSessionPersistenceConfig(cfg model.SessionPersistenceConfig) error 
 	if !cfg.Enabled {
 		return nil
 	}
-	if model.NormalizeState(cfg.Backend) != "file" {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.session_persistence.backend %q is unsupported", cfg.Backend), nil)
-	}
 	if strings.TrimSpace(cfg.Path) == "" {
 		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.session_persistence.path is required", nil)
 	}
@@ -556,6 +548,9 @@ func validateNotificationsConfig(cfg model.NotificationsConfig) error {
 		if strings.TrimSpace(channel.URL) == "" {
 			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].url is required", index), nil)
 		}
+		if len(channel.Events) == 0 {
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].events is required", index), nil)
+		}
 
 		for key, value := range channel.Headers {
 			if strings.TrimSpace(key) == "" {
@@ -588,7 +583,8 @@ func allNotificationEventTypes() []model.NotificationEventType {
 }
 
 func notificationEventSet() map[model.NotificationEventType]struct{} {
-	result := make(map[model.NotificationEventType]struct{}, 6)
+	result := make(map[model.NotificationEventType]struct{}, 7)
+	result[model.NotificationEventAll] = struct{}{}
 	for _, eventType := range allNotificationEventTypes() {
 		result[eventType] = struct{}{}
 	}

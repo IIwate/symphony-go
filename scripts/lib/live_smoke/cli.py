@@ -22,6 +22,7 @@ from live_smoke.symphony import (
     allocate_port,
     fetch_issue_state,
     fetch_json,
+    post_json,
     start_symphony,
     symphony_binary_name,
     symphony_command,
@@ -563,23 +564,36 @@ def _run_runtime_extensions_smoke(
         base_url = f"http://127.0.0.1:{port}"
         process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
         resources.processes.append(process)
-        _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="runtime_extensions startup")
+        state_payload = _wait_for(
+            lambda: fetch_json(f"{base_url}/api/v1/state"),
+            process,
+            timeout_seconds=30,
+            description="runtime_extensions startup",
+        )
+        _assert_public_state_surface(state_payload)
+        _assert_refresh_contract(base_url)
 
         persistence_issue = linear.create_issue(f"{LIVE_SMOKE_PREFIX} runtime_extensions persistence {int(time.time())}", context)
         resources.issue_ids.append(str(persistence_issue["id"]))
         persistence_identifier = str(persistence_issue["identifier"])
-        _wait_for(
+        persistence_payload = _wait_for(
             lambda: _await_issue_status(base_url, persistence_identifier, "awaiting_intervention"),
             process,
             timeout_seconds=120,
             description="runtime_extensions awaiting_intervention",
         )
-        _wait_for(
+        _assert_issue_surface(persistence_payload)
+        webhook_events = _wait_for(
             lambda: recorder.find(path="/webhook", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=30,
             description="runtime_extensions webhook intervention notification",
             interval_seconds=0.5,
+        )
+        _assert_notification_details(
+            webhook_events[0],
+            reason="missing_pr",
+            expected_outcome="pull_request",
         )
         _wait_for(
             lambda: recorder.find(path="/slack", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
@@ -596,6 +610,14 @@ def _run_runtime_extensions_smoke(
             interval_seconds=0.2,
         )
         persisted = _load_session_state(session_state_path)
+        _assert_session_identity(
+            persisted,
+            flow_name="implement",
+            tracker_project_slug=project_slug,
+            workspace_root=str((resources.temp_dir.parent / f"workspaces-{branch_namespace}-feature").resolve()).replace("\\", "/"),
+        )
+        if "recovered_pending" in persisted:
+            raise RuntimeError("session-state.json still exposes legacy recovered_pending key")
         awaiting_intervention = _session_state_entries(persisted, "awaiting_intervention")
         if not any(item.get("Identifier") == persistence_identifier for item in awaiting_intervention):
             raise RuntimeError("session-state.json missing awaiting_intervention entry after intervention path")
@@ -603,15 +625,34 @@ def _run_runtime_extensions_smoke(
         notification_count_before_restart = recorder.count()
         process.stop()
         resources.processes.remove(process)
+        original_state = session_state_path.read_text(encoding="utf-8")
+        tampered_state = json.loads(original_state)
+        identity = tampered_state.get("identity")
+        if not isinstance(identity, dict):
+            raise RuntimeError("session-state.json missing identity object")
+        identity["FlowName"] = "tampered-flow"
+        session_state_path.write_text(json.dumps(tampered_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        incompatible_process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
+        incompatible_tail = _wait_for_process_exit(incompatible_process, timeout_seconds=20)
+        if "delete the file and restart" not in incompatible_tail or "identity does not match current runtime" not in incompatible_tail:
+            raise RuntimeError(f"incompatible session state did not fail fast as expected:\n{incompatible_tail}")
+        session_state_path.write_text(original_state, encoding="utf-8")
         process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
         resources.processes.append(process)
-        _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="runtime_extensions restart")
-        _wait_for(
+        restarted_state = _wait_for(
+            lambda: fetch_json(f"{base_url}/api/v1/state"),
+            process,
+            timeout_seconds=30,
+            description="runtime_extensions restart",
+        )
+        _assert_public_state_surface(restarted_state)
+        restored_payload = _wait_for(
             lambda: _await_issue_status(base_url, persistence_identifier, "awaiting_intervention"),
             process,
             timeout_seconds=60,
             description="runtime_extensions restored awaiting_intervention",
         )
+        _assert_issue_surface(restored_payload)
         time.sleep(5)
         notification_count_after_restart = recorder.count()
         if notification_count_after_restart != notification_count_before_restart:
@@ -632,24 +673,32 @@ def _run_runtime_extensions_smoke(
             work_root=resources.temp_dir / "runtime-extensions-pr",
         )
         resources.pull_request_numbers.append(pr.number)
-        _wait_for(
+        merge_waiting_payload = _wait_for(
             lambda: _await_issue_status(base_url, merge_identifier, "awaiting_merge"),
             process,
             timeout_seconds=120,
             description="runtime_extensions awaiting_merge",
         )
+        _assert_issue_surface(merge_waiting_payload)
 
         process.stop()
         resources.processes.remove(process)
         process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
         resources.processes.append(process)
-        _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="runtime_extensions second restart")
+        second_state = _wait_for(
+            lambda: fetch_json(f"{base_url}/api/v1/state"),
+            process,
+            timeout_seconds=30,
+            description="runtime_extensions second restart",
+        )
+        _assert_public_state_surface(second_state)
         merge_payload = _wait_for(
             lambda: _await_issue_status(base_url, merge_identifier, "awaiting_merge"),
             process,
             timeout_seconds=60,
             description="runtime_extensions restored awaiting_merge",
         )
+        _assert_issue_surface(merge_payload)
         if int(merge_payload["awaiting_merge"]["pr_number"]) != pr.number:
             raise RuntimeError(
                 f"restored awaiting_merge pr_number mismatch: {merge_payload['awaiting_merge']['pr_number']} != {pr.number}"
@@ -695,6 +744,8 @@ def _run_runtime_extensions_smoke(
         return (
             f"{persistence_identifier} restored awaiting_intervention, "
             f"{merge_identifier} restored awaiting_merge and completed, "
+            f"refresh=accepted/coalesced schema ok, "
+            f"identity_mismatch=fail_fast, "
             f"notifications={recorder.count()} no-replay={notification_count_before_restart == notification_count_after_restart}"
         )
     finally:
@@ -781,6 +832,78 @@ def _session_state_entries(payload: dict[str, object], key: str) -> list[dict[st
     if not isinstance(values, list):
         return []
     return [item for item in values if isinstance(item, dict)]
+
+
+def _assert_public_state_surface(payload: dict[str, object]) -> None:
+    if "recovered_pending" in payload:
+        raise RuntimeError("/api/v1/state still exposes recovered_pending")
+    counts = payload.get("counts")
+    if isinstance(counts, dict) and "recovered_pending" in counts:
+        raise RuntimeError("/api/v1/state counts still expose recovered_pending")
+
+
+def _assert_issue_surface(payload: dict[str, object]) -> None:
+    if "recovered_pending" in payload:
+        raise RuntimeError("issue detail still exposes recovered_pending")
+
+
+def _assert_refresh_contract(base_url: str) -> None:
+    payload = post_json(f"{base_url}/api/v1/refresh")
+    if payload.get("accepted") is not True:
+        raise RuntimeError(f"refresh accepted mismatch: {payload}")
+    if not isinstance(payload.get("coalesced"), bool):
+        raise RuntimeError(f"refresh coalesced is not bool: {payload}")
+    if payload.get("operations") != ["poll", "reconcile"]:
+        raise RuntimeError(f"refresh operations mismatch: {payload}")
+    if not str(payload.get("requested_at", "")).strip():
+        raise RuntimeError(f"refresh requested_at missing: {payload}")
+
+
+def _assert_notification_details(event: dict[str, object], **expected_details: str) -> None:
+    body = event.get("body")
+    if not isinstance(body, dict):
+        raise RuntimeError(f"notification body is not json object: {event}")
+    details = body.get("details")
+    if not isinstance(details, dict):
+        raise RuntimeError(f"notification details missing: {body}")
+    for key, expected in expected_details.items():
+        if str(details.get(key, "")).strip() != expected:
+            raise RuntimeError(f"notification details[{key!r}] mismatch: {details.get(key)!r} != {expected!r}")
+
+
+def _assert_session_identity(
+    payload: dict[str, object],
+    *,
+    flow_name: str,
+    tracker_project_slug: str,
+    workspace_root: str,
+) -> None:
+    identity = payload.get("identity")
+    if not isinstance(identity, dict):
+        raise RuntimeError("session-state.json missing identity object")
+    required = {
+        "FlowName": flow_name,
+        "TrackerProjectSlug": tracker_project_slug,
+    }
+    for key, expected in required.items():
+        if str(identity.get(key, "")).strip() != expected:
+            raise RuntimeError(f"session identity {key} mismatch: {identity.get(key)!r} != {expected!r}")
+    workspace = str(identity.get("WorkspaceRoot", "")).replace("\\", "/").lower()
+    if workspace != workspace_root.replace("\\", "/").lower():
+        raise RuntimeError(f"session identity WorkspaceRoot mismatch: {identity.get('WorkspaceRoot')!r} != {workspace_root!r}")
+    if not str(identity.get("SessionStatePath", "")).strip():
+        raise RuntimeError("session identity SessionStatePath missing")
+
+
+def _wait_for_process_exit(process: object, *, timeout_seconds: float) -> str:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if hasattr(process, "is_running") and not process.is_running():
+            return process.tail()
+        time.sleep(0.5)
+    if hasattr(process, "stop"):
+        process.stop()
+    raise RuntimeError("expected process to exit but it stayed alive")
 
 
 def _start_notification_server(port: int, recorder: NotificationRecorder) -> ThreadingHTTPServer:

@@ -14,7 +14,7 @@
 
 - 重启后可恢复 retry 队列、暂停态、系统告警和累计用量
 - 不要求恢复旧 agent 子进程本身，但要求把中断中的运行收敛为可继续处理的状态
-- 持久化失败或文件损坏时，服务可降级为“无恢复启动”
+- 状态文件缺失时可按空状态启动；身份或版本不兼容时明确 fail-fast
 
 ## 2. 非目标
 
@@ -28,7 +28,7 @@
 
 - durable state 只能来自 orchestrator 真实状态变更点，不能依赖 `SubscribeSnapshots` 或事件订阅推断
 - 恢复的是“元数据”，不是“旧进程”
-- 状态文件损坏、版本不兼容或恢复失败时，启动降级为空状态而不是整体失败
+- 状态文件损坏、版本不兼容、identity 不匹配或恢复失败时，启动失败并要求显式清理
 - 首版只支持文件后端，并使用原子写入
 - `runtime.session_persistence` 整个配置树首版视为 `restart-required`
 
@@ -40,8 +40,7 @@
 runtime:
   session_persistence:
     enabled: true
-    backend: file
-    path: ./automation/local/session-state.json
+    path: ./local/session-state.json
     flush_interval_ms: 1000
     fsync_on_critical: true
 ```
@@ -49,8 +48,7 @@ runtime:
 | 字段 | 默认值 | 约束 |
 |---|---|---|
 | `enabled` | `false` | 是否启用持久化 |
-| `backend` | `file` | 首版仅允许 `file` |
-| `path` | `./automation/local/session-state.json` | `enabled=true` 时必填 |
+| `path` | `./local/session-state.json` | `enabled=true` 时必填；相对路径始终相对于 automation root |
 | `flush_interval_ms` | `1000` | 必须 `> 0` |
 | `fsync_on_critical` | `true` | 关键状态变化是否强制刷盘 |
 
@@ -59,10 +57,10 @@ runtime:
 持久化根结构至少包含：
 
 - `Version`
+- `Identity`
 - `SavedAt`
 - `Retrying`
-- `Claimed`
-- `Running`
+- `Interrupted`
 - `AwaitingMerge`
 - `AwaitingIntervention`
 - `Alerts`
@@ -70,7 +68,7 @@ runtime:
 
 约束：
 
-- `Running` / `Claimed` 只保存恢复必需元数据
+- `Interrupted` 只保存中断前运行态的恢复必需元数据
 - `AwaitingMerge` / `AwaitingIntervention` 保存继续 reconcile 所需字段
 - 不持久化 channel、timer handle、PID、回调、文件描述符等进程内对象
 
@@ -88,7 +86,7 @@ runtime:
 | 状态 | 恢复语义 |
 |---|---|
 | `Retrying` | 恢复条目并重建 timer |
-| `Claimed` / `Running` | 视为“中断前运行中”，启动后重新 reconcile，不直接恢复旧进程 |
+| `Interrupted` | 视为“中断前运行中”，启动后重新 reconcile，不直接恢复旧进程 |
 | `AwaitingMerge` | 恢复为暂停态，启动后优先执行 PR reconcile |
 | `AwaitingIntervention` | 恢复为暂停态，不自动 dispatch |
 | `Alerts` | 直接恢复 |
@@ -97,13 +95,13 @@ runtime:
 ### 5.3 失败处理
 
 - 状态文件缺失：按空状态启动
-- 状态文件损坏或版本不兼容：记录告警/日志并按空状态启动
+- 状态文件损坏、版本不兼容、identity 不匹配：启动失败并要求清理状态文件
 - 持久化临时失败：不拖垮主流程，只影响恢复能力
 
 ## 6. 兼容性与回滚
 
 - 未启用 `session_persistence` 时，当前行为保持不变
-- 启用后默认状态文件位于 `automation/local/session-state.json`
+- 启用后默认状态文件位于 `local/session-state.json`
 - `session_persistence` 任一字段变化首版统一要求重启
 - 回滚方式：
   - 将 `session_persistence.enabled` 设为 `false`
@@ -114,5 +112,5 @@ runtime:
 
 - 重启后 `Retrying`、`AwaitingMerge`、`AwaitingIntervention`、`Alerts`、`TokenTotal` 可恢复
 - `Running` 不会伪装成旧进程继续执行，而是重新进入 reconcile 路径
-- 文件损坏时服务仍可启动，只是丢失恢复能力
+- 文件损坏或 identity 不匹配时服务 fail-fast，并给出清理指引
 - 未启用持久化时行为与当前版本一致

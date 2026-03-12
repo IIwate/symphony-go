@@ -604,24 +604,23 @@ reported back to it and converted into explicit state transitions.
 ### 7.1 Issue Orchestration States
 
 This is not the same as tracker states (`Todo`, `In Progress`, etc.). This is the service's internal
-claim state.
+runtime scheduling state.
 
 1. `Unclaimed`
    - Issue is not running and has no retry scheduled.
 
-2. `Claimed`
-   - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
-
-3. `Running`
+2. `Running`
    - Worker task exists and the issue is tracked in `running` map.
 
-4. `RetryQueued`
+3. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
 
+4. `AwaitingMerge` / `AwaitingIntervention`
+   - Issue is paused on an explicit resumable state while waiting for external merge/intervention.
+
 5. `Released`
-   - Claim removed because issue is terminal, non-active, missing, or retry path completed without
-     re-dispatch.
+   - Issue is removed from runtime maps because it is terminal, non-active, missing, or retry path
+     completed without re-dispatch.
 
 Important nuance:
 
@@ -1522,7 +1521,7 @@ Minimum endpoints:
 
     ```json
     {
-      "queued": true,
+      "accepted": true,
       "coalesced": false,
       "requested_at": "2026-02-24T20:15:30Z",
       "operations": ["poll", "reconcile"]

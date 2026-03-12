@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	durableStateVersion             = 2
+	durableStateVersion             = 3
 	sessionPersistenceWriteFailCode = "session_persistence_write_failed"
 	stateStoreDrainTimeout          = 5 * time.Second
 	initialStateStoreRetryDelay     = time.Second
@@ -35,7 +35,7 @@ type durableRuntimeState struct {
 	Identity             RuntimeIdentity                    `json:"identity"`
 	SavedAt              time.Time                          `json:"saved_at"`
 	Retrying             []durableRetryEntry                `json:"retrying"`
-	RecoveredPending     []durableRecoveredPendingEntry     `json:"recovered_pending"`
+	Interrupted          []durableInterruptedEntry          `json:"interrupted"`
 	AwaitingMerge        []durableAwaitingMergeEntry        `json:"awaiting_merge"`
 	AwaitingIntervention []durableAwaitingInterventionEntry `json:"awaiting_intervention"`
 	Alerts               []AlertSnapshot                    `json:"alerts"`
@@ -53,7 +53,19 @@ type durableRetryEntry struct {
 	Dispatch      *model.DispatchContext `json:"dispatch,omitempty"`
 }
 
-type durableRecoveredPendingEntry struct {
+type recoveredPendingEntry struct {
+	IssueID       string
+	Identifier    string
+	WorkspacePath string
+	State         string
+	RetryAttempt  int
+	StallCount    int
+	ObservedAt    time.Time
+	Dispatch      *model.DispatchContext
+	Source        string
+}
+
+type durableInterruptedEntry struct {
 	IssueID        string                 `json:"issue_id"`
 	Identifier     string                 `json:"identifier"`
 	WorkspacePath  string                 `json:"workspace_path"`
@@ -62,7 +74,7 @@ type durableRecoveredPendingEntry struct {
 	StallCount     int                    `json:"stall_count"`
 	ObservedAt     time.Time              `json:"observed_at"`
 	Dispatch       *model.DispatchContext `json:"dispatch,omitempty"`
-	RecoverySource string                 `json:"recovery_source"`
+	Source         string                 `json:"source,omitempty"`
 }
 
 type durableAwaitingMergeEntry struct {
@@ -411,7 +423,7 @@ func (o *Orchestrator) ensureRuntimeExtensions() error {
 	var restoredState *durableRuntimeState
 	var err error
 	if cfg.SessionPersistence.Enabled {
-		store = newFileStateStore(cfg.SessionPersistence, identity, o.logger, o.handleSessionPersistenceWriteSuccess, o.handleSessionPersistenceWriteFailure)
+		store = newFileStateStore(cfg.SessionPersistence, identity, o.logger, o.reportSessionPersistenceWriteSuccess, o.reportSessionPersistenceWriteFailure)
 		restoredState, err = store.Load()
 		if err != nil {
 			o.mu.Lock()
@@ -454,9 +466,14 @@ func (o *Orchestrator) currentRuntimeIdentity() RuntimeIdentity {
 	if o.runtimeIdentityFn == nil {
 		cfg := o.currentConfig()
 		return normalizeRuntimeIdentity(RuntimeIdentity{
-			ConfigRoot:  cfg.AutomationRootDir,
-			TrackerKind: cfg.TrackerKind,
-			TrackerRepo: cfg.TrackerRepo,
+			ConfigRoot:             cfg.AutomationRootDir,
+			TrackerKind:            cfg.TrackerKind,
+			TrackerRepo:            cfg.TrackerRepo,
+			TrackerProjectSlug:     cfg.TrackerProjectSlug,
+			WorkspaceRoot:          cfg.WorkspaceRoot,
+			SessionStatePath:       cfg.SessionPersistence.Path,
+			SessionFlushIntervalMS: cfg.SessionPersistence.FlushIntervalMS,
+			SessionFsyncOnCritical: cfg.SessionPersistence.FsyncOnCritical,
 		})
 	}
 	return normalizeRuntimeIdentity(o.runtimeIdentityFn())
@@ -466,9 +483,13 @@ func normalizeRuntimeIdentity(identity RuntimeIdentity) RuntimeIdentity {
 	identity.ConfigRoot = normalizeRuntimePath(identity.ConfigRoot)
 	identity.Profile = strings.TrimSpace(identity.Profile)
 	identity.SourceName = strings.TrimSpace(identity.SourceName)
+	identity.SourceKind = model.NormalizeState(identity.SourceKind)
 	identity.FlowName = strings.TrimSpace(identity.FlowName)
 	identity.TrackerKind = model.NormalizeState(identity.TrackerKind)
 	identity.TrackerRepo = strings.TrimSpace(identity.TrackerRepo)
+	identity.TrackerProjectSlug = strings.TrimSpace(identity.TrackerProjectSlug)
+	identity.WorkspaceRoot = normalizeRuntimePath(identity.WorkspaceRoot)
+	identity.SessionStatePath = normalizeRuntimePath(resolveStateStorePath(identity.SessionStatePath, identity.ConfigRoot))
 	return identity
 }
 
@@ -543,12 +564,12 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 		return state.Retrying[i].IssueID < state.Retrying[j].IssueID
 	})
 
-	recovered := make(map[string]durableRecoveredPendingEntry, len(o.state.RecoveredPending)+len(o.state.Running)+len(o.state.Claimed))
-	for issueID, entry := range o.state.RecoveredPending {
+	interrupted := make(map[string]durableInterruptedEntry, len(o.recoveredPending)+len(o.state.Running))
+	for issueID, entry := range o.recoveredPending {
 		if entry == nil {
 			continue
 		}
-		recovered[issueID] = durableRecoveredPendingEntry{
+		interrupted[issueID] = durableInterruptedEntry{
 			IssueID:        issueID,
 			Identifier:     entry.Identifier,
 			WorkspacePath:  entry.WorkspacePath,
@@ -557,14 +578,14 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 			StallCount:     entry.StallCount,
 			ObservedAt:     entry.ObservedAt,
 			Dispatch:       model.CloneDispatchContext(entry.Dispatch),
-			RecoverySource: entry.RecoverySource,
+			Source:         entry.Source,
 		}
 	}
 	for issueID, entry := range o.state.Running {
 		if entry == nil {
 			continue
 		}
-		item := durableRecoveredPendingEntry{
+		item := durableInterruptedEntry{
 			IssueID:        issueID,
 			Identifier:     entry.Identifier,
 			WorkspacePath:  entry.WorkspacePath,
@@ -572,49 +593,21 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 			StallCount:     entry.StallCount,
 			ObservedAt:     entry.StartedAt,
 			Dispatch:       model.CloneDispatchContext(entry.Dispatch),
-			RecoverySource: "running",
+			Source:         "running",
 		}
 		if entry.Issue != nil {
 			item.State = entry.Issue.State
 		}
-		recovered[issueID] = item
+		interrupted[issueID] = item
 	}
-	for issueID, entry := range o.state.Claimed {
-		if entry == nil {
-			continue
-		}
-		if _, exists := o.state.RetryAttempts[issueID]; exists {
-			continue
-		}
-		if _, exists := o.state.AwaitingMerge[issueID]; exists {
-			continue
-		}
-		if _, exists := o.state.AwaitingIntervention[issueID]; exists {
-			continue
-		}
-		if _, exists := recovered[issueID]; exists {
-			continue
-		}
-		recovered[issueID] = durableRecoveredPendingEntry{
-			IssueID:        issueID,
-			Identifier:     entry.Identifier,
-			WorkspacePath:  entry.WorkspacePath,
-			State:          entry.State,
-			RetryAttempt:   entry.RetryAttempt,
-			StallCount:     entry.StallCount,
-			ObservedAt:     entry.ClaimedAt,
-			Dispatch:       model.CloneDispatchContext(entry.Dispatch),
-			RecoverySource: "claimed",
-		}
+	for _, item := range interrupted {
+		state.Interrupted = append(state.Interrupted, item)
 	}
-	for _, item := range recovered {
-		state.RecoveredPending = append(state.RecoveredPending, item)
-	}
-	sort.SliceStable(state.RecoveredPending, func(i int, j int) bool {
-		if state.RecoveredPending[i].Identifier != state.RecoveredPending[j].Identifier {
-			return state.RecoveredPending[i].Identifier < state.RecoveredPending[j].Identifier
+	sort.SliceStable(state.Interrupted, func(i int, j int) bool {
+		if state.Interrupted[i].Identifier != state.Interrupted[j].Identifier {
+			return state.Interrupted[i].Identifier < state.Interrupted[j].Identifier
 		}
-		return state.RecoveredPending[i].IssueID < state.RecoveredPending[j].IssueID
+		return state.Interrupted[i].IssueID < state.Interrupted[j].IssueID
 	})
 
 	for issueID, entry := range o.state.AwaitingMerge {
@@ -688,60 +681,37 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 		}
 		retryEntry.TimerHandle = o.newRetryTimer(item.IssueID, item.DueAt)
 		o.state.RetryAttempts[item.IssueID] = retryEntry
-		o.setClaimedLocked(item.IssueID, &model.ClaimedEntry{
-			Identifier:    item.Identifier,
-			WorkspacePath: item.WorkspacePath,
-			RetryAttempt:  item.Attempt,
-			StallCount:    item.StallCount,
-			ClaimedAt:     state.SavedAt,
-			Dispatch:      model.CloneDispatchContext(item.Dispatch),
-		})
 	}
 
-	for _, item := range state.RecoveredPending {
-		o.state.RecoveredPending[item.IssueID] = &model.RecoveredPendingEntry{
-			Identifier:     item.Identifier,
-			WorkspacePath:  item.WorkspacePath,
-			State:          item.State,
-			RetryAttempt:   item.RetryAttempt,
-			StallCount:     item.StallCount,
-			ObservedAt:     item.ObservedAt,
-			Dispatch:       model.CloneDispatchContext(item.Dispatch),
-			RecoverySource: item.RecoverySource,
+	for _, item := range state.Interrupted {
+		o.recoveredPending[item.IssueID] = &recoveredPendingEntry{
+			IssueID:       item.IssueID,
+			Identifier:    item.Identifier,
+			WorkspacePath: item.WorkspacePath,
+			State:         item.State,
+			RetryAttempt:  item.RetryAttempt,
+			StallCount:    item.StallCount,
+			ObservedAt:    item.ObservedAt,
+			Dispatch:      model.CloneDispatchContext(item.Dispatch),
+			Source:        item.Source,
 		}
 	}
 
 	for _, item := range state.AwaitingMerge {
 		entry := cloneAwaitingMergeEntry(&item.AwaitingMergeEntry)
 		o.state.AwaitingMerge[item.IssueID] = entry
-		o.setClaimedLocked(item.IssueID, &model.ClaimedEntry{
-			Identifier:    entry.Identifier,
-			WorkspacePath: entry.WorkspacePath,
-			State:         entry.State,
-			RetryAttempt:  entry.RetryAttempt,
-			StallCount:    entry.StallCount,
-			ClaimedAt:     entry.AwaitingSince,
-		})
 	}
 
 	for _, item := range state.AwaitingIntervention {
 		entry := cloneAwaitingInterventionEntry(&item.AwaitingInterventionEntry)
 		o.state.AwaitingIntervention[item.IssueID] = entry
-		o.setClaimedLocked(item.IssueID, &model.ClaimedEntry{
-			Identifier:    entry.Identifier,
-			WorkspacePath: entry.WorkspacePath,
-			State:         entry.LastKnownIssueState,
-			RetryAttempt:  entry.RetryAttempt,
-			StallCount:    entry.StallCount,
-			ClaimedAt:     entry.ObservedAt,
-		})
 	}
 }
 
 func (o *Orchestrator) reconcileRecoveredPending(ctx context.Context) {
 	o.mu.RLock()
-	pending := make(map[string]model.RecoveredPendingEntry, len(o.state.RecoveredPending))
-	for issueID, entry := range o.state.RecoveredPending {
+	pending := make(map[string]recoveredPendingEntry, len(o.recoveredPending))
+	for issueID, entry := range o.recoveredPending {
 		if entry == nil {
 			continue
 		}
@@ -765,7 +735,7 @@ func (o *Orchestrator) reconcileRecoveredPending(ctx context.Context) {
 		}
 		o.logger.Warn("recovered-pending state refresh failed", "error", err.Error())
 		o.mu.Lock()
-		if o.setSystemAlertLocked(AlertSnapshot{
+		if o.setSystemAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "tracker_unreachable",
 			Level:   "warn",
 			Message: err.Error(),
@@ -782,9 +752,9 @@ func (o *Orchestrator) reconcileRecoveredPending(ctx context.Context) {
 	}
 
 	o.mu.Lock()
-	changed := o.clearSystemAlertLocked("tracker_unreachable")
+	changed := o.clearSystemAlertAndNotifyLocked("tracker_unreachable")
 	for issueID, entry := range pending {
-		current := o.state.RecoveredPending[issueID]
+		current := o.recoveredPending[issueID]
 		if current == nil {
 			continue
 		}
@@ -796,20 +766,10 @@ func (o *Orchestrator) reconcileRecoveredPending(ctx context.Context) {
 
 		switch {
 		case o.isTerminalState(issue.State, cfg), !o.isActiveState(issue.State, cfg):
-			delete(o.state.RecoveredPending, issueID)
-			delete(o.state.Claimed, issueID)
+			delete(o.recoveredPending, issueID)
 			changed = true
 		default:
-			o.setClaimedLocked(issueID, &model.ClaimedEntry{
-				Identifier:    entry.Identifier,
-				WorkspacePath: entry.WorkspacePath,
-				State:         issue.State,
-				RetryAttempt:  entry.RetryAttempt,
-				StallCount:    entry.StallCount,
-				ClaimedAt:     entry.ObservedAt,
-				Dispatch:      model.CloneDispatchContext(entry.Dispatch),
-			})
-			delete(o.state.RecoveredPending, issueID)
+			delete(o.recoveredPending, issueID)
 			o.scheduleRetryLocked(issueID, entry.Identifier, entry.RetryAttempt, nil, true, entry.StallCount, entry.Dispatch)
 			changed = true
 		}
@@ -833,10 +793,21 @@ func (o *Orchestrator) newRetryTimer(issueID string, dueAt time.Time) *time.Time
 	})
 }
 
+func (o *Orchestrator) reportSessionPersistenceWriteSuccess() {
+	o.postRuntimeExtensionEvent(runtimeExtensionEvent{Kind: runtimeExtensionEventPersistenceSuccess})
+}
+
+func (o *Orchestrator) reportSessionPersistenceWriteFailure(err error) {
+	o.postRuntimeExtensionEvent(runtimeExtensionEvent{
+		Kind: runtimeExtensionEventPersistenceFailure,
+		Err:  err,
+	})
+}
+
 func (o *Orchestrator) handleSessionPersistenceWriteSuccess() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.clearSystemAlertLocked(sessionPersistenceWriteFailCode) {
+	if o.clearSystemAlertAndNotifyLocked(sessionPersistenceWriteFailCode) {
 		o.commitStateLocked(false)
 	}
 }
@@ -845,7 +816,7 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.logger.Warn("session persistence write failed", "error", err.Error())
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if !o.setSystemAlertLocked(AlertSnapshot{
+	if !o.setSystemAlertAndNotifyLocked(AlertSnapshot{
 		Code:    sessionPersistenceWriteFailCode,
 		Level:   "warn",
 		Message: err.Error(),
@@ -855,55 +826,20 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.commitStateLocked(false)
 }
 
-func (o *Orchestrator) setClaimedLocked(issueID string, entry *model.ClaimedEntry) {
-	if strings.TrimSpace(issueID) == "" {
-		return
-	}
-	o.state.Claimed[issueID] = cloneClaimedEntry(entry)
-}
-
-func (o *Orchestrator) claimedEntry(issue *model.Issue, identifier string, workspacePath string, retryAttempt int, stallCount int, dispatch *model.DispatchContext) *model.ClaimedEntry {
-	state := ""
-	if issue != nil {
-		state = issue.State
-		if strings.TrimSpace(identifier) == "" {
-			identifier = issue.Identifier
-		}
-	}
-	return &model.ClaimedEntry{
-		Identifier:    identifier,
-		WorkspacePath: workspacePath,
-		State:         state,
-		RetryAttempt:  retryAttempt,
-		StallCount:    stallCount,
-		ClaimedAt:     o.now().UTC(),
-		Dispatch:      model.CloneDispatchContext(dispatch),
-	}
-}
-
 func cloneDurableRuntimeState(state durableRuntimeState) durableRuntimeState {
 	copyState := state
 	copyState.Alerts = append([]AlertSnapshot(nil), state.Alerts...)
 	copyState.Retrying = append([]durableRetryEntry(nil), state.Retrying...)
-	copyState.RecoveredPending = append([]durableRecoveredPendingEntry(nil), state.RecoveredPending...)
+	copyState.Interrupted = append([]durableInterruptedEntry(nil), state.Interrupted...)
 	copyState.AwaitingMerge = append([]durableAwaitingMergeEntry(nil), state.AwaitingMerge...)
 	copyState.AwaitingIntervention = append([]durableAwaitingInterventionEntry(nil), state.AwaitingIntervention...)
 	for index := range copyState.Retrying {
 		copyState.Retrying[index].Dispatch = model.CloneDispatchContext(copyState.Retrying[index].Dispatch)
 	}
-	for index := range copyState.RecoveredPending {
-		copyState.RecoveredPending[index].Dispatch = model.CloneDispatchContext(copyState.RecoveredPending[index].Dispatch)
+	for index := range copyState.Interrupted {
+		copyState.Interrupted[index].Dispatch = model.CloneDispatchContext(copyState.Interrupted[index].Dispatch)
 	}
 	return copyState
-}
-
-func cloneClaimedEntry(entry *model.ClaimedEntry) *model.ClaimedEntry {
-	if entry == nil {
-		return nil
-	}
-	copyEntry := *entry
-	copyEntry.Dispatch = model.CloneDispatchContext(entry.Dispatch)
-	return &copyEntry
 }
 
 func cloneAwaitingMergeEntry(entry *model.AwaitingMergeEntry) *model.AwaitingMergeEntry {

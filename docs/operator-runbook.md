@@ -159,8 +159,8 @@ curl http://127.0.0.1:8080/api/v1/state
 ### 建议操作方式
 
 - 先修改一小处可验证字段，再观察日志是否出现 reload 成功
-- 对高风险字段（tracker、workspace.root、hooks、codex、orchestrator.auto_close_on_pr、session_persistence）变更，先用 `--dry-run` 验证再上服务；`notifications` 支持热更新，但建议先小流量验证
-- 若启用 `runtime.session_persistence`，默认状态文件位于 `automation/local/session-state.json`，该文件默认被 Git 忽略，不参与热重载；若文件格式或运行实例身份不兼容，启动会明确失败并要求删除旧文件
+- 对高风险字段（tracker、workspace.root、selection.dispatch_flow、hooks、codex、orchestrator.auto_close_on_pr、session_persistence）变更，先用 `--dry-run` 验证再上服务；`notifications` 支持热更新，但建议先小流量验证
+- 若启用 `runtime.session_persistence`，默认状态文件位于 `local/session-state.json`，该文件默认被 Git 忽略，不参与热重载；若文件格式、identity 或运行实例版本不兼容，启动会明确失败并要求删除旧文件
 - 若启用 `runtime.notifications`，通知仅针对进程存活期间的新事件发送；reload 只影响后续事件，不会补发旧通知
 
 ## 6. Smoke Test 操作指南
@@ -193,6 +193,13 @@ curl http://127.0.0.1:8080/api/v1/state
 ```powershell
 curl -X POST http://127.0.0.1:8080/api/v1/refresh
 ```
+
+期望响应至少包含：
+
+- `accepted`
+- `coalesced`
+- `requested_at`
+- `operations`
 
 ### 6.4 仓库内 Live Smoke 脚本
 
@@ -235,8 +242,9 @@ py -3 scripts/live_smoke.py --phase all
 - `--phase heavy`
   - 创建隔离测试 issue
   - 验证 `missing_pr -> awaiting_intervention`
+  - 验证 `session_persistence.identity` 落盘，并在 identity 不匹配时 fail-fast
   - 验证 `session_persistence` 可恢复 `awaiting_intervention` / `awaiting_merge`
-  - 验证 `notifications` 的 webhook / slack 通道实际投递，且重启后不补发旧通知
+  - 验证 `notifications` 的 webhook / slack 通道实际投递、Webhook payload 使用 `details`、且重启后不补发旧通知
   - 创建测试分支和 PR
   - 验证 `awaiting_merge -> merged -> issue Done`
 - `--phase all`

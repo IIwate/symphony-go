@@ -109,11 +109,11 @@ cmd/symphony → orchestrator → tracker (interface)
 | `RunAttempt` | 运行尝试记录 | IssueID, Attempt, Status(RunPhase), Error |
 | `LiveSession` | 活跃 agent 会话 | SessionID, ThreadID, TurnID, TokenUsage |
 | `RetryEntry` | 重试队列条目 | Attempt, DueAt, TimerHandle, StallCount, Dispatch |
-| `OrchestratorState` | 全局运行时状态 | Running, AwaitingMerge, AwaitingIntervention, Claimed, RetryAttempts, Completed |
+| `OrchestratorState` | 全局运行时状态 | Running, AwaitingMerge, AwaitingIntervention, RetryAttempts, Completed |
 
 ### 状态枚举
 
-- **OrchState**: Unclaimed → Claimed → Running → RetryQueued → Released
+- **运行时主状态**: Running / RetryQueued / AwaitingMerge / AwaitingIntervention（`Claimed` 不再作为长期并行账本）
 - **RunPhase**: PreparingWorkspace → BuildingPrompt → LaunchingAgent → ... → Succeeded/Failed/TimedOut/Stalled
 
 补充约定：

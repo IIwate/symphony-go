@@ -116,8 +116,8 @@ type Client interface {
 	FetchIssueStatesByIDs(ctx context.Context, ids []string) ([]model.Issue, error)
 }
 
-type IssueTransitioner interface {
-	TransitionIssue(ctx context.Context, issueID string, targetState string) error
+type IssueCompleter interface {
+	CompleteIssue(ctx context.Context, issueID string) error
 }
 
 type LinearClient struct {
@@ -198,7 +198,7 @@ func (c *LinearClient) FetchIssueStatesByIDs(ctx context.Context, ids []string) 
 	})
 }
 
-func (c *LinearClient) TransitionIssue(ctx context.Context, issueID string, targetState string) error {
+func (c *LinearClient) CompleteIssue(ctx context.Context, issueID string) error {
 	rawPayload, err := c.executeGraphQL(ctx, issueTeamStatesQuery, map[string]any{
 		"id": issueID,
 	})
@@ -215,12 +215,11 @@ func (c *LinearClient) TransitionIssue(ctx context.Context, issueID string, targ
 	}
 
 	stateID := ""
-	normalizedTarget := model.NormalizeState(targetState)
 	for _, state := range statePayload.Issue.Team.States.Nodes {
 		if strings.TrimSpace(state.ID) == "" {
 			continue
 		}
-		if model.NormalizeState(state.Name) == normalizedTarget {
+		if model.NormalizeState(state.Type) == "completed" {
 			stateID = state.ID
 			break
 		}
@@ -230,14 +229,14 @@ func (c *LinearClient) TransitionIssue(ctx context.Context, issueID string, targ
 			if strings.TrimSpace(state.ID) == "" {
 				continue
 			}
-			if model.NormalizeState(state.Type) == "completed" {
+			if model.NormalizeState(state.Name) == "done" {
 				stateID = state.ID
 				break
 			}
 		}
 	}
 	if stateID == "" {
-		return model.NewTrackerError(model.ErrLinearStateNotFound, fmt.Sprintf("no Linear workflow state found for target %q", targetState), nil)
+		return model.NewTrackerError(model.ErrLinearStateNotFound, "no Linear completed workflow state found", nil)
 	}
 
 	rawPayload, err = c.executeGraphQL(ctx, issueUpdateStateMutation, map[string]any{

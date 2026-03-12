@@ -16,7 +16,7 @@ import (
 
 type RuntimeSource interface {
 	Snapshot() orchestrator.Snapshot
-	RequestRefresh()
+	RequestRefresh() orchestrator.RefreshRequestResult
 	SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func())
 }
 
@@ -96,12 +96,12 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 			writeMethodNotAllowed(w, logger)
 			return
 		}
-		runtime.RequestRefresh()
+		result := runtime.RequestRefresh()
 		writeJSON(w, http.StatusAccepted, map[string]any{
-			"queued":       true,
-			"coalesced":    false,
-			"requested_at": time.Now().UTC().Format(time.RFC3339),
-			"operations":   []string{"poll", "reconcile"},
+			"accepted":     result.Accepted,
+			"coalesced":    result.Coalesced,
+			"requested_at": result.RequestedAt.UTC().Format(time.RFC3339),
+			"operations":   result.Operations,
 		}, logger)
 	})
 	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +169,6 @@ type stateResponse struct {
 	Service              serviceResponse                `json:"service"`
 	Counts               stateCounts                    `json:"counts"`
 	Running              []runningResponse              `json:"running"`
-	RecoveredPending     []recoveredPendingResponse     `json:"recovered_pending"`
 	AwaitingMerge        []awaitingMergeResponse        `json:"awaiting_merge"`
 	AwaitingIntervention []awaitingInterventionResponse `json:"awaiting_intervention"`
 	Retrying             []retryResponse                `json:"retrying"`
@@ -186,7 +185,6 @@ type serviceResponse struct {
 
 type stateCounts struct {
 	Running              int `json:"running"`
-	RecoveredPending     int `json:"recovered_pending"`
 	AwaitingMerge        int `json:"awaiting_merge"`
 	AwaitingIntervention int `json:"awaiting_intervention"`
 	Retrying             int `json:"retrying"`
@@ -218,20 +216,6 @@ type retryResponse struct {
 	Attempt            int     `json:"attempt"`
 	DueAt              string  `json:"due_at"`
 	Error              *string `json:"error"`
-}
-
-type recoveredPendingResponse struct {
-	IssueID             string  `json:"issue_id"`
-	IssueIdentifier     string  `json:"issue_identifier"`
-	WorkspacePath       string  `json:"workspace_path"`
-	State               string  `json:"state"`
-	DispatchKind        string  `json:"dispatch_kind,omitempty"`
-	ExpectedOutcome     string  `json:"expected_outcome,omitempty"`
-	ContinuationReason  *string `json:"continuation_reason"`
-	CurrentRetryAttempt int     `json:"current_retry_attempt"`
-	AttemptCount        int     `json:"attempt_count"`
-	RecoverySource      string  `json:"recovery_source"`
-	ObservedAt          string  `json:"observed_at"`
 }
 
 type awaitingMergeResponse struct {
@@ -285,7 +269,6 @@ type issueResponse struct {
 	LastError            *string                       `json:"last_error"`
 	AttemptCount         int                           `json:"attempt_count"`
 	Running              *runningResponse              `json:"running"`
-	RecoveredPending     *recoveredPendingResponse     `json:"recovered_pending"`
 	AwaitingMerge        *awaitingMergeResponse        `json:"awaiting_merge"`
 	AwaitingIntervention *awaitingInterventionResponse `json:"awaiting_intervention"`
 	Retry                *retryResponse                `json:"retry"`
@@ -328,23 +311,6 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 				OutputTokens: item.OutputTokens,
 				TotalTokens:  item.TotalTokens,
 			},
-		})
-	}
-
-	recoveredPending := make([]recoveredPendingResponse, 0, len(snapshot.RecoveredPending))
-	for _, item := range snapshot.RecoveredPending {
-		recoveredPending = append(recoveredPending, recoveredPendingResponse{
-			IssueID:             item.IssueID,
-			IssueIdentifier:     item.IssueIdentifier,
-			WorkspacePath:       item.WorkspacePath,
-			State:               item.State,
-			DispatchKind:        item.DispatchKind,
-			ExpectedOutcome:     item.ExpectedOutcome,
-			ContinuationReason:  item.ContinuationReason,
-			CurrentRetryAttempt: item.CurrentRetryAttempt,
-			AttemptCount:        item.AttemptCount,
-			RecoverySource:      item.RecoverySource,
-			ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
 		})
 	}
 
@@ -416,13 +382,11 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		},
 		Counts: stateCounts{
 			Running:              snapshot.Counts.Running,
-			RecoveredPending:     snapshot.Counts.RecoveredPending,
 			AwaitingMerge:        snapshot.Counts.AwaitingMerge,
 			AwaitingIntervention: snapshot.Counts.AwaitingIntervention,
 			Retrying:             snapshot.Counts.Retrying,
 		},
 		Running:              running,
-		RecoveredPending:     recoveredPending,
 		AwaitingMerge:        awaitingMerge,
 		AwaitingIntervention: awaitingIntervention,
 		Retrying:             retrying,
@@ -472,31 +436,6 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 				WorkspacePath: item.WorkspacePath,
 				AttemptCount:  item.AttemptCount,
 				Running:       &copyItem,
-			}, true
-		}
-	}
-	for _, item := range snapshot.RecoveredPending {
-		if item.IssueIdentifier == identifier {
-			copyItem := recoveredPendingResponse{
-				IssueID:             item.IssueID,
-				IssueIdentifier:     item.IssueIdentifier,
-				WorkspacePath:       item.WorkspacePath,
-				State:               item.State,
-				DispatchKind:        item.DispatchKind,
-				ExpectedOutcome:     item.ExpectedOutcome,
-				ContinuationReason:  item.ContinuationReason,
-				CurrentRetryAttempt: item.CurrentRetryAttempt,
-				AttemptCount:        item.AttemptCount,
-				RecoverySource:      item.RecoverySource,
-				ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
-			}
-			return issueResponse{
-				GeneratedAt:      snapshot.GeneratedAt.UTC().Format(time.RFC3339),
-				Identifier:       identifier,
-				Status:           "recovered_pending",
-				WorkspacePath:    item.WorkspacePath,
-				AttemptCount:     item.AttemptCount,
-				RecoveredPending: &copyItem,
 			}, true
 		}
 	}

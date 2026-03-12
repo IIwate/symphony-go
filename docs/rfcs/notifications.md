@@ -31,7 +31,7 @@
 - 首版只通知一等业务事件，不通知派生 issue 告警
 - 配置错误在 `ValidateForDispatch` 阶段 fail-fast，而不是运行时静默跳过
 - 发送失败按通道 best-effort 处理，不影响主状态机
-- `notifications` 整个配置树首版视为 `restart-required`
+- `notifications` 允许热更新，但只影响后续事件
 
 ## 4. 契约变化
 
@@ -52,9 +52,10 @@
 
 统一字段：
 
+- `EventID`
 - `Type`
 - `Level`
-- `Timestamp`
+- `OccurredAt`
 - `IssueID`
 - `Identifier`
 - `Message`
@@ -91,7 +92,7 @@ runtime:
 | `channels[].kind` | — | 仅允许 `webhook` / `slack` |
 | `channels[].url` | — | 必填，支持整值 `$ENV_VAR` |
 | `channels[].headers` | `{}` | 仅 webhook 使用 |
-| `channels[].events` | 全部事件 | 事件白名单 |
+| `channels[].events` | — | 必填；显式声明事件白名单，若要订阅全部使用 `all` |
 | `defaults.timeout_ms` | `5000` | 必须 `> 0` |
 | `defaults.retry_count` | `2` | 必须 `>= 0` |
 | `defaults.retry_delay_ms` | `1000` | 必须 `>= 0` |
@@ -100,8 +101,10 @@ runtime:
 
 - orchestrator 在精确业务节点发射事件
 - notifier 消费事件并向匹配通道发送
+- 每个 channel 有独立 worker/队列，慢通道或坏通道不会串行拖住其他通道
 - 发送失败按每通道重试策略处理
 - 单个通道失败不影响其他通道，也不影响 orchestrator
+- 后台通道只上报发送结果，真正的 alert / snapshot 变更仍回到 orchestrator 主循环处理
 - reload 成功后，仅影响后续事件的发送配置
 
 ## 6. 兼容性与回滚

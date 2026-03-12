@@ -302,7 +302,7 @@ func TestFetchCandidateIssuesMapsMalformedPayload(t *testing.T) {
 	}
 }
 
-func TestTransitionIssueSuccess(t *testing.T) {
+func TestCompleteIssueSuccess(t *testing.T) {
 	var sawStateQuery bool
 	var sawMutation bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -331,15 +331,15 @@ func TestTransitionIssueSuccess(t *testing.T) {
 	defer server.Close()
 
 	client := newTestLinearClient(t, server.URL)
-	if err := client.TransitionIssue(context.Background(), "1", "Done"); err != nil {
-		t.Fatalf("TransitionIssue() error = %v", err)
+	if err := client.CompleteIssue(context.Background(), "1"); err != nil {
+		t.Fatalf("CompleteIssue() error = %v", err)
 	}
 	if !sawStateQuery || !sawMutation {
 		t.Fatalf("stateQuery=%v mutation=%v, want both true", sawStateQuery, sawMutation)
 	}
 }
 
-func TestTransitionIssueCompletedFallback(t *testing.T) {
+func TestCompleteIssueCompletedFallback(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := decodeRequestBody(t, r.Body)
 		w.Header().Set("Content-Type", "application/json")
@@ -358,12 +358,12 @@ func TestTransitionIssueCompletedFallback(t *testing.T) {
 	defer server.Close()
 
 	client := newTestLinearClient(t, server.URL)
-	if err := client.TransitionIssue(context.Background(), "1", "Done"); err != nil {
-		t.Fatalf("TransitionIssue() error = %v", err)
+	if err := client.CompleteIssue(context.Background(), "1"); err != nil {
+		t.Fatalf("CompleteIssue() error = %v", err)
 	}
 }
 
-func TestTransitionIssueStateNotFound(t *testing.T) {
+func TestCompleteIssueStateNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := decodeRequestBody(t, r.Body)
 		w.Header().Set("Content-Type", "application/json")
@@ -375,13 +375,13 @@ func TestTransitionIssueStateNotFound(t *testing.T) {
 	defer server.Close()
 
 	client := newTestLinearClient(t, server.URL)
-	err := client.TransitionIssue(context.Background(), "1", "Done")
+	err := client.CompleteIssue(context.Background(), "1")
 	if !errors.Is(err, model.ErrLinearStateNotFound) {
-		t.Fatalf("TransitionIssue() error = %v, want ErrLinearStateNotFound", err)
+		t.Fatalf("CompleteIssue() error = %v, want ErrLinearStateNotFound", err)
 	}
 }
 
-func TestTransitionIssueMutationFailed(t *testing.T) {
+func TestCompleteIssueMutationFailed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := decodeRequestBody(t, r.Body)
 		w.Header().Set("Content-Type", "application/json")
@@ -397,9 +397,9 @@ func TestTransitionIssueMutationFailed(t *testing.T) {
 	defer server.Close()
 
 	client := newTestLinearClient(t, server.URL)
-	err := client.TransitionIssue(context.Background(), "1", "Done")
+	err := client.CompleteIssue(context.Background(), "1")
 	if !errors.Is(err, model.ErrLinearTransitionFailed) {
-		t.Fatalf("TransitionIssue() error = %v, want ErrLinearTransitionFailed", err)
+		t.Fatalf("CompleteIssue() error = %v, want ErrLinearTransitionFailed", err)
 	}
 }
 

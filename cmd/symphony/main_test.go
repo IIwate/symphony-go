@@ -66,7 +66,6 @@ func TestRunCLIDryRunSkipsRuntimeDependencies(t *testing.T) {
     command: codex app-server
   session_persistence:
     enabled: true
-    backend: file
     path: ./local/session-state.json
     flush_interval_ms: 1000
     fsync_on_critical: true
@@ -540,7 +539,6 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
     command: codex app-server
   session_persistence:
     enabled: true
-    backend: file
     path: %s
     flush_interval_ms: 1000
     fsync_on_critical: true
@@ -650,7 +648,6 @@ func TestExecuteFailsWhenSessionStateIdentityMismatch(t *testing.T) {
     command: codex app-server
   session_persistence:
     enabled: true
-    backend: file
     path: ./local/session-state.json
     flush_interval_ms: 1000
     fsync_on_critical: true
@@ -663,7 +660,7 @@ defaults:
 `, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
 	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	writeFile(t, statePath, `{
-  "version": 2,
+  "version": 3,
   "identity": {
     "ConfigRoot": "C:/different/root",
     "Profile": "",
@@ -1101,7 +1098,9 @@ func (f *fakeOrchestrator) NotifyWorkflowReload(def *model.WorkflowDefinition) {
 	}
 }
 
-func (f *fakeOrchestrator) RequestRefresh()                 {}
+func (f *fakeOrchestrator) RequestRefresh() orchestrator.RefreshRequestResult {
+	return orchestrator.RefreshRequestResult{Accepted: true}
+}
 func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot { return f.snapshot }
 func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func()) {
 	ch := make(chan orchestrator.Snapshot, max(1, buffer))

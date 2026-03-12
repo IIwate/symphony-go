@@ -308,7 +308,6 @@ type OrchestratorState struct {
     Running             map[string]*RunningEntry
     AwaitingMerge       map[string]*AwaitingMergeEntry
     AwaitingIntervention map[string]*AwaitingInterventionEntry
-    Claimed             map[string]struct{}
     RetryAttempts       map[string]*RetryEntry
     Completed           map[string]struct{}
     CodexTotals         TokenTotals
@@ -628,21 +627,25 @@ type Orchestrator struct {
 
 #### 5.4.2 状态机（SPEC §7.1）
 
-Issue 编排状态（非 tracker 状态）：
+Issue 编排状态（非 tracker 状态，公开/持久层不再暴露独立 `Claimed`）：
 
 ```
-Unclaimed ──(dispatch)──→ Claimed ──→ Running
-                              │              │
-                              │         (exit normal)
-                              │              ↓
-                              ├──→ RetryQueued ──(timer)──→ 重新检查
-                              │
-                              └──(terminal/inactive)──→ Released
+Unclaimed ──(dispatch)──→ Running
+   │                          │
+   │                     (exit/reconcile)
+   │                          ↓
+   ├──────────────→ RetryQueued ──(timer)──→ 重新检查
+   │
+   ├──────────────→ AwaitingMerge
+   │
+   ├──────────────→ AwaitingIntervention
+   │
+   └──────────────→ Released
 ```
 
 - `Running`：worker goroutine 存在，issue 在 `running` map 中
 - `RetryQueued`：worker 不运行，retry timer 存在于 `retry_attempts` map 中
-- `Released`：claim 移除（issue 终态/非活跃/缺失/重试路径完成）
+- `Released`：issue 终态/非活跃/缺失/重试路径完成后，不再出现在运行时状态映射中
 
 **重要细节**：
 - Worker 正常退出**不**意味着 issue 永远完成
@@ -1026,7 +1029,7 @@ type TokenUsage struct {
 - 未知 issue → `404` + `{"error":{"code":"issue_not_found","message":"..."}}`
 
 **`POST /api/v1/refresh` 响应**（SPEC §13.7.2）：
-- `202 Accepted` + `{"queued":true,"coalesced":false,"requested_at":"...","operations":["poll","reconcile"]}`
+- `202 Accepted` + `{"accepted":true,"coalesced":false,"requested_at":"...","operations":["poll","reconcile"]}`
 - 可合并重复请求
 
 **`GET /api/v1/events` SSE 端点**（竞品 contrabass 同款功能）：

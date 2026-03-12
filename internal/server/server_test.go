@@ -351,10 +351,15 @@ func (f *fakeRuntime) Snapshot() orchestrator.Snapshot {
 	return f.snapshot
 }
 
-func (f *fakeRuntime) RequestRefresh() {
+func (f *fakeRuntime) RequestRefresh() orchestrator.RefreshRequestResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refreshCount++
+	return orchestrator.RefreshRequestResult{
+		Accepted:    true,
+		RequestedAt: time.Date(2026, 3, 7, 12, 1, 0, 0, time.UTC),
+		Operations:  []string{"poll", "reconcile"},
+	}
 }
 
 func (f *fakeRuntime) SubscribeSnapshots(_ int) (<-chan orchestrator.Snapshot, func()) {
