@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -50,12 +51,15 @@ func promptSingleValue(title string, description string, sensitive bool) (string
 	return strings.TrimSpace(value), nil
 }
 
-func runWizard(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *secret.Store) error {
+func runWizard(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *secret.Store, stderr io.Writer) error {
 	if diagnosis == nil || len(diagnosis.MissingSecrets) == 0 {
 		return nil
 	}
 	if store == nil {
 		store = secret.New()
+	}
+	if stderr == nil {
+		stderr = os.Stderr
 	}
 
 	fields := make([]*wizardField, 0, len(diagnosis.MissingSecrets))
@@ -66,7 +70,7 @@ func runWizard(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *se
 		groups = append(groups, huh.NewGroup(newPromptInput(missing.EnvVar, missing.Source, &field.value, missing.IsSensitive)))
 	}
 
-	_, _ = fmt.Fprintln(os.Stderr, "检测到以下密钥缺失，开始交互式配置")
+	_, _ = fmt.Fprintln(stderr, "检测到以下密钥缺失，开始交互式配置")
 	if err := huh.NewForm(groups...).Run(); err != nil {
 		return err
 	}

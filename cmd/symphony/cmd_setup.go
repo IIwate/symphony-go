@@ -44,7 +44,7 @@ func runSetupCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	store := secret.New()
-	if err := runWizardFunc(diagnosis, envLocalPath(opts.configDir), store); err != nil {
+	if err := runWizardFunc(diagnosis, envLocalPath(opts.configDir), store, cmd.ErrOrStderr()); err != nil {
 		return err
 	}
 	_, _, cfg, err = loadCommandConfig(opts.configDir, opts.profile)

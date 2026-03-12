@@ -330,8 +330,10 @@ func sourceBindings(source map[string]any) liquid.Bindings {
 		"active_states":   nil,
 		"terminal_states": nil,
 	}
-	for key, value := range source {
-		bindings[key] = value
+	for _, key := range []string{"kind", "project_slug", "owner", "repo", "branch_scope", "active_states", "terminal_states"} {
+		if value, ok := source[key]; ok {
+			bindings[key] = value
+		}
 	}
 	return bindings
 }

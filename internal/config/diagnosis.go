@@ -61,7 +61,7 @@ func ExtractRequiredEnvVars(def *model.AutomationDefinition, cfg *model.ServiceC
 
 func DiagnoseConfig(cfg *model.ServiceConfig, def *model.AutomationDefinition) *ConfigDiagnosis {
 	diagnosis := &ConfigDiagnosis{}
-	refs, sourceFields, collectionErrs := collectRequiredEnvRefs(def, cfg)
+	refs, fieldRefs, collectionErrs := collectRequiredEnvRefs(def, cfg)
 	diagnosis.OtherErrors = append(diagnosis.OtherErrors, collectionErrs...)
 
 	missingEnvVars := map[string]bool{}
@@ -82,7 +82,7 @@ func DiagnoseConfig(cfg *model.ServiceConfig, def *model.AutomationDefinition) *
 		})
 	}
 
-	diagnosis.OtherErrors = append(diagnosis.OtherErrors, diagnoseStructuralErrors(cfg, sourceFields, missingEnvVars)...)
+	diagnosis.OtherErrors = append(diagnosis.OtherErrors, diagnoseStructuralErrors(cfg, fieldRefs, missingEnvVars)...)
 	return diagnosis
 }
 
@@ -93,18 +93,21 @@ type requiredEnvRef struct {
 
 func collectRequiredEnvRefs(def *model.AutomationDefinition, cfg *model.ServiceConfig) ([]requiredEnvRef, map[string]string, []error) {
 	refs := make([]requiredEnvRef, 0)
-	sourceFields := map[string]string{}
+	fieldRefs := map[string]string{}
 	errorsList := make([]error, 0)
 
+	if def != nil {
+		collectRuntimeEnvRefs(def.Runtime, "runtime", "", &refs, fieldRefs)
+	}
 	sourceName, sourceRaw, err := activeSourceRaw(def)
 	if err != nil {
 		errorsList = append(errorsList, err)
 	} else {
-		collectSourceEnvRefs(sourceRaw, "source."+sourceName, "", &refs, sourceFields)
+		collectSourceEnvRefs(sourceRaw, "source."+sourceName, "", &refs, fieldRefs)
 	}
 
 	refs = append(refs, collectHookEnvRefs(cfg)...)
-	return uniqueRequiredEnvRefs(refs), sourceFields, errorsList
+	return uniqueRequiredEnvRefs(refs), fieldRefs, errorsList
 }
 
 func activeSourceRaw(def *model.AutomationDefinition) (string, map[string]any, error) {
@@ -131,7 +134,7 @@ func activeSourceRaw(def *model.AutomationDefinition) (string, map[string]any, e
 	return sourceName, sourceDef.Raw, nil
 }
 
-func collectSourceEnvRefs(value any, sourceBase string, path string, refs *[]requiredEnvRef, sourceFields map[string]string) {
+func collectSourceEnvRefs(value any, sourceBase string, path string, refs *[]requiredEnvRef, fieldRefs map[string]string) {
 	switch typed := value.(type) {
 	case string:
 		matches := envValuePattern.FindStringSubmatch(strings.TrimSpace(typed))
@@ -139,15 +142,7 @@ func collectSourceEnvRefs(value any, sourceBase string, path string, refs *[]req
 			return
 		}
 
-		*refs = append(*refs, requiredEnvRef{
-			EnvVar: matches[1],
-			Source: joinDiagnosisPath(sourceBase, path),
-		})
-		if path != "" && !strings.Contains(path, ".") && !strings.Contains(path, "[") {
-			if _, exists := sourceFields[path]; !exists {
-				sourceFields[path] = matches[1]
-			}
-		}
+		recordEnvRef(refs, fieldRefs, sourceBase, path, matches[1])
 	case map[string]any:
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
@@ -155,7 +150,7 @@ func collectSourceEnvRefs(value any, sourceBase string, path string, refs *[]req
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
-			collectSourceEnvRefs(typed[key], sourceBase, joinNestedPath(path, key), refs, sourceFields)
+			collectSourceEnvRefs(typed[key], sourceBase, joinNestedPath(path, key), refs, fieldRefs)
 		}
 	case map[any]any:
 		keys := make([]string, 0, len(typed))
@@ -167,12 +162,79 @@ func collectSourceEnvRefs(value any, sourceBase string, path string, refs *[]req
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
-			collectSourceEnvRefs(values[key], sourceBase, joinNestedPath(path, key), refs, sourceFields)
+			collectSourceEnvRefs(values[key], sourceBase, joinNestedPath(path, key), refs, fieldRefs)
 		}
 	case []any:
 		for index, nested := range typed {
-			collectSourceEnvRefs(nested, sourceBase, joinSlicePath(path, index), refs, sourceFields)
+			collectSourceEnvRefs(nested, sourceBase, joinSlicePath(path, index), refs, fieldRefs)
 		}
+	}
+}
+
+func collectRuntimeEnvRefs(value any, sourceBase string, path string, refs *[]requiredEnvRef, fieldRefs map[string]string) {
+	switch typed := value.(type) {
+	case string:
+		matches := envValuePattern.FindStringSubmatch(strings.TrimSpace(typed))
+		if len(matches) != 2 {
+			return
+		}
+
+		recordEnvRef(refs, fieldRefs, sourceBase, path, matches[1])
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			collectRuntimeEnvRefs(typed[key], sourceBase, joinNestedPath(path, key), refs, fieldRefs)
+		}
+	case map[any]any:
+		keys := make([]string, 0, len(typed))
+		values := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			stringKey := fmt.Sprint(key)
+			keys = append(keys, stringKey)
+			values[stringKey] = nested
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			collectRuntimeEnvRefs(values[key], sourceBase, joinNestedPath(path, key), refs, fieldRefs)
+		}
+	case []any:
+		for index, nested := range typed {
+			collectRuntimeEnvRefs(nested, sourceBase, joinSlicePath(path, index), refs, fieldRefs)
+		}
+	}
+}
+
+func recordEnvRef(refs *[]requiredEnvRef, fieldRefs map[string]string, sourceBase string, path string, envVar string) {
+	joinedPath := joinDiagnosisPath(sourceBase, path)
+	*refs = append(*refs, requiredEnvRef{
+		EnvVar: envVar,
+		Source: joinedPath,
+	})
+	if path == "" {
+		return
+	}
+	if _, exists := fieldRefs[joinedPath]; !exists {
+		fieldRefs[joinedPath] = envVar
+	}
+	if logicalKey := logicalFieldRefKey(sourceBase, path); logicalKey != "" {
+		if _, exists := fieldRefs[logicalKey]; !exists {
+			fieldRefs[logicalKey] = envVar
+		}
+	}
+}
+
+func logicalFieldRefKey(sourceBase string, path string) string {
+	switch {
+	case sourceBase == "runtime":
+		return joinDiagnosisPath(sourceBase, path)
+	case strings.HasPrefix(sourceBase, "source.") && path != "" && !strings.Contains(path, ".") && !strings.Contains(path, "["):
+		return "source." + path
+	default:
+		return ""
 	}
 }
 
@@ -224,7 +286,7 @@ func uniqueRequiredEnvRefs(refs []requiredEnvRef) []requiredEnvRef {
 	return result
 }
 
-func diagnoseStructuralErrors(cfg *model.ServiceConfig, sourceFields map[string]string, missingEnvVars map[string]bool) []error {
+func diagnoseStructuralErrors(cfg *model.ServiceConfig, fieldRefs map[string]string, missingEnvVars map[string]bool) []error {
 	if cfg == nil {
 		return []error{model.NewWorkflowError(model.ErrWorkflowParseError, "service config is nil", nil)}
 	}
@@ -238,16 +300,16 @@ func diagnoseStructuralErrors(cfg *model.ServiceConfig, sourceFields map[string]
 		errorsList = append(errorsList, model.NewTrackerError(model.ErrUnsupportedTrackerKind, fmt.Sprintf("unsupported tracker.kind %q", cfg.TrackerKind), nil))
 		return errorsList
 	}
-	if strings.TrimSpace(cfg.TrackerAPIKey) == "" && !fieldMissingBecauseSecret(sourceFields, "api_key", missingEnvVars) {
+	if strings.TrimSpace(cfg.TrackerAPIKey) == "" && !fieldMissingBecauseSecret(fieldRefs, "source.api_key", missingEnvVars) {
 		errorsList = append(errorsList, model.NewTrackerError(model.ErrMissingTrackerAPIKey, "tracker.api_key is required", nil))
 	}
-	if strings.TrimSpace(cfg.TrackerProjectSlug) == "" && !fieldMissingBecauseSecret(sourceFields, "project_slug", missingEnvVars) {
+	if strings.TrimSpace(cfg.TrackerProjectSlug) == "" && !fieldMissingBecauseSecret(fieldRefs, "source.project_slug", missingEnvVars) {
 		errorsList = append(errorsList, model.NewTrackerError(model.ErrMissingTrackerProjectSlug, "tracker.project_slug is required", nil))
 	}
-	if strings.TrimSpace(cfg.WorkspaceLinearBranchScope) == "" && !fieldMissingBecauseSecret(sourceFields, "branch_scope", missingEnvVars) {
+	if strings.TrimSpace(cfg.WorkspaceLinearBranchScope) == "" && !fieldMissingBecauseSecret(fieldRefs, "source.branch_scope", missingEnvVars) {
 		errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, "source.branch_scope is required for linear tracker", nil))
 	}
-	if strings.TrimSpace(cfg.CodexCommand) == "" {
+	if strings.TrimSpace(cfg.CodexCommand) == "" && !fieldMissingBecauseSecret(fieldRefs, "runtime.codex.command", missingEnvVars) {
 		errorsList = append(errorsList, model.NewWorkflowError(model.ErrInvalidCodexCommand, "codex.command is required", nil))
 	}
 	return errorsList

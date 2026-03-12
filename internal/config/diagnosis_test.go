@@ -1,7 +1,6 @@
 package config
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
@@ -11,6 +10,16 @@ import (
 
 func TestExtractRequiredEnvVarsStableOrder(t *testing.T) {
 	def := &model.AutomationDefinition{
+		Runtime: map[string]any{
+			"codex": map[string]any{
+				"command": "$CODEX_COMMAND",
+			},
+			"workspace": map[string]any{
+				"git": map[string]any{
+					"author_email": "$BOT_EMAIL",
+				},
+			},
+		},
 		Selection: model.AutomationSelection{EnabledSources: []string{"linear-main"}},
 		Sources: map[string]*model.SourceDefinition{
 			"linear-main": {
@@ -30,6 +39,8 @@ func TestExtractRequiredEnvVarsStableOrder(t *testing.T) {
 
 	got := ExtractRequiredEnvVars(def, cfg)
 	want := []string{
+		"CODEX_COMMAND",
+		"BOT_EMAIL",
 		"LINEAR_API_KEY",
 		"LINEAR_BRANCH_SCOPE",
 		"LINEAR_LABEL",
@@ -50,6 +61,11 @@ func TestDiagnoseConfigSeparatesMissingSecretsAndOtherErrors(t *testing.T) {
 	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
 
 	def := &model.AutomationDefinition{
+		Runtime: map[string]any{
+			"codex": map[string]any{
+				"command": "$CODEX_COMMAND",
+			},
+		},
 		Selection: model.AutomationSelection{EnabledSources: []string{"linear-main"}},
 		Sources: map[string]*model.SourceDefinition{
 			"linear-main": {
@@ -73,14 +89,11 @@ func TestDiagnoseConfigSeparatesMissingSecretsAndOtherErrors(t *testing.T) {
 	if !diagnosis.HasMissingSecrets() {
 		t.Fatal("HasMissingSecrets() = false, want true")
 	}
-	if len(diagnosis.MissingSecrets) != 3 {
-		t.Fatalf("MissingSecrets size = %d, want 3", len(diagnosis.MissingSecrets))
+	if len(diagnosis.MissingSecrets) != 4 {
+		t.Fatalf("MissingSecrets size = %d, want 4", len(diagnosis.MissingSecrets))
 	}
-	if len(diagnosis.OtherErrors) != 1 {
-		t.Fatalf("OtherErrors size = %d, want 1", len(diagnosis.OtherErrors))
-	}
-	if !errors.Is(diagnosis.OtherErrors[0], model.ErrInvalidCodexCommand) {
-		t.Fatalf("OtherErrors[0] = %v, want ErrInvalidCodexCommand", diagnosis.OtherErrors[0])
+	if len(diagnosis.OtherErrors) != 0 {
+		t.Fatalf("OtherErrors = %v, want none", diagnosis.OtherErrors)
 	}
 }
 

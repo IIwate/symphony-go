@@ -50,8 +50,8 @@ terminal_states: ["Closed", "Done"]
 		_ = os.Unsetenv("LINEAR_API_KEY")
 	}()
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"--dry-run", "--config-dir", configDir}, &stderr); exitCode != 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"--dry-run", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
 	if !bytes.Contains(stderr.Bytes(), []byte("dry-run 校验通过")) {

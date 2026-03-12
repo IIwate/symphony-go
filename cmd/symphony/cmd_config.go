@@ -75,7 +75,8 @@ func runSetCmd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("config key %s is not allowed; expected one of: %s", key, strings.Join(allowed, ", "))
 	}
 
-	value, err := readConfigValue(cmd, key, isSensitiveKey(key))
+	allowPrompt := !opts.nonInteractive && isInteractive()
+	value, err := readConfigValue(cmd, key, isSensitiveKey(key), allowPrompt)
 	if err != nil {
 		return err
 	}
@@ -93,8 +94,8 @@ func runSetCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func readConfigValue(cmd *cobra.Command, key string, sensitive bool) (string, error) {
-	if !isInteractive() {
+func readConfigValue(cmd *cobra.Command, key string, sensitive bool, allowPrompt bool) (string, error) {
+	if !allowPrompt {
 		reader := bufio.NewReader(cmd.InOrStdin())
 		line, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {

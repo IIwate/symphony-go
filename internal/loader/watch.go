@@ -102,6 +102,7 @@ func WatchWithErrors(ctx context.Context, dir string, profile string, onChange f
 						onError(err)
 					}
 				}
+				activeProfile = strings.TrimSpace(definition.Profile)
 				if onChange != nil {
 					onChange(definition)
 				}

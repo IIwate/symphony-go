@@ -41,8 +41,8 @@ func TestRunCLIUsesDefaultAutomationDir(t *testing.T) {
 	restore := stubDependencies(t)
 	defer restore()
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"--dry-run"}, &stderr); exitCode != 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"--dry-run"}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "dry-run 仍会访问 tracker 并执行 startupCleanup") {
@@ -57,8 +57,8 @@ func TestRunCLIRejectsLegacyWorkflowArgument(t *testing.T) {
 	restore := stubDependencies(t)
 	defer restore()
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"./WORKFLOW.md"}, &stderr); exitCode == 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"./WORKFLOW.md"}, &stdout, &stderr); exitCode == 0 {
 		t.Fatalf("runCLI() exitCode = %d, want non-zero", exitCode)
 	}
 	if !strings.Contains(stderr.String(), "no longer supported") {
@@ -70,15 +70,15 @@ func TestRunCLIHelpCommand(t *testing.T) {
 	restore := stubDependencies(t)
 	defer restore()
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"help"}, &stderr); exitCode != 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"help"}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
 	if strings.Contains(stderr.String(), "no longer supported") {
 		t.Fatalf("stderr = %q, want Cobra help output instead of legacy workflow rejection", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "Available Commands:") {
-		t.Fatalf("stderr = %q, want Cobra help output", stderr.String())
+	if !strings.Contains(stdout.String(), "Available Commands:") {
+		t.Fatalf("stdout = %q, want Cobra help output", stdout.String())
 	}
 }
 
@@ -96,8 +96,8 @@ func TestRunCLIFailsWhenDefaultAutomationMissing(t *testing.T) {
 		t.Fatalf("Chdir() error = %v", err)
 	}
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI(nil, &stderr); exitCode == 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI(nil, &stdout, &stderr); exitCode == 0 {
 		t.Fatalf("runCLI() exitCode = %d, want non-zero", exitCode)
 	}
 	if !strings.Contains(stderr.String(), "missing_workflow_file") {
@@ -110,12 +110,12 @@ func TestRunCLIConfigDoctorReady(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stderr); exitCode != 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "配置已完整") {
-		t.Fatalf("stderr = %q, want ready message", stderr.String())
+	if !strings.Contains(stdout.String(), "配置已完整") {
+		t.Fatalf("stdout = %q, want ready message", stdout.String())
 	}
 }
 
@@ -126,8 +126,8 @@ func TestRunCLIConfigDoctorReportsMissingSecret(t *testing.T) {
 		t.Fatalf("Unsetenv() error = %v", err)
 	}
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stderr); exitCode == 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stdout, &stderr); exitCode == 0 {
 		t.Fatalf("runCLI() exitCode = %d, want non-zero", exitCode)
 	}
 	if !strings.Contains(stderr.String(), "missing required secrets") || !strings.Contains(stderr.String(), "LINEAR_API_KEY") {
@@ -143,8 +143,8 @@ func TestConfigSetWritesEnvLocalFromStdin(t *testing.T) {
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
 	stdinIsTerminal = func() bool { return false }
 
-	var stderr bytes.Buffer
-	cmd := newRootCommand(&stderr)
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(&stdout, &stderr)
 	cmd.SetIn(strings.NewReader("secret-key\n"))
 	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
 	if err := cmd.Execute(); err != nil {
@@ -158,8 +158,8 @@ func TestConfigSetWritesEnvLocalFromStdin(t *testing.T) {
 	if !strings.Contains(string(content), "LINEAR_API_KEY=secret-key") {
 		t.Fatalf("env.local = %q, want written key", string(content))
 	}
-	if !strings.Contains(stderr.String(), "当前运行实例不会自动更新") {
-		t.Fatalf("stderr = %q, want runtime update warning", stderr.String())
+	if !strings.Contains(stdout.String(), "当前运行实例不会自动更新") {
+		t.Fatalf("stdout = %q, want runtime update warning", stdout.String())
 	}
 }
 
@@ -172,8 +172,8 @@ func TestConfigSetReadsOnlyFirstStdinLine(t *testing.T) {
 	stdinIsTerminal = func() bool { return false }
 	stdoutIsTerminal = func() bool { return false }
 
-	var stderr bytes.Buffer
-	cmd := newRootCommand(&stderr)
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(&stdout, &stderr)
 	cmd.SetIn(strings.NewReader("secret-key\nignored-line\n"))
 	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
 	if err := cmd.Execute(); err != nil {
@@ -186,6 +186,43 @@ func TestConfigSetReadsOnlyFirstStdinLine(t *testing.T) {
 	}
 	if string(content) != "LINEAR_API_KEY=secret-key\n" {
 		t.Fatalf("env.local = %q, want only first stdin line", string(content))
+	}
+}
+
+func TestConfigSetAllowsRuntimeEnvReference(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	writeFile(t, filepath.Join(configDir, "project.yaml"), `runtime:
+  codex:
+    command: $CODEX_COMMAND
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`)
+	stdinIsTerminal = func() bool { return false }
+	stdoutIsTerminal = func() bool { return false }
+
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(&stdout, &stderr)
+	cmd.SetIn(strings.NewReader("codex --profile test\n"))
+	cmd.SetArgs([]string{"config", "set", "CODEX_COMMAND", "--config-dir", configDir, "--non-interactive"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(content) != "CODEX_COMMAND=\"codex --profile test\"\n" {
+		t.Fatalf("env.local = %q, want runtime env key written", string(content))
 	}
 }
 
@@ -210,8 +247,8 @@ func TestConfigSetUsesInteractivePromptForSensitiveKey(t *testing.T) {
 		return "interactive-secret", nil
 	}
 
-	var stderr bytes.Buffer
-	cmd := newRootCommand(&stderr)
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(&stdout, &stderr)
 	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -250,8 +287,8 @@ terminal_states: ["Closed", "Done"]
 		return "demo-project", nil
 	}
 
-	var stderr bytes.Buffer
-	cmd := newRootCommand(&stderr)
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(&stdout, &stderr)
 	cmd.SetArgs([]string{"config", "set", "LINEAR_PROJECT_SLUG", "--config-dir", configDir})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -259,6 +296,77 @@ terminal_states: ["Closed", "Done"]
 
 	if gotSensitive {
 		t.Fatal("sensitive = true, want false")
+	}
+}
+
+func TestConfigSetNonInteractiveReadsFromStdinEvenWhenTerminal(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	stdinIsTerminal = func() bool { return true }
+	stdoutIsTerminal = func() bool { return true }
+
+	promptCalled := false
+	promptSingleValueFunc = func(title string, description string, sensitive bool) (string, error) {
+		promptCalled = true
+		return "should-not-be-used", nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(&stdout, &stderr)
+	cmd.SetIn(strings.NewReader("stdin-secret\n"))
+	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir, "--non-interactive"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if promptCalled {
+		t.Fatal("promptSingleValueFunc was called, want stdin path")
+	}
+
+	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(content) != "LINEAR_API_KEY=stdin-secret\n" {
+		t.Fatalf("env.local = %q, want non-interactive stdin value", string(content))
+	}
+}
+
+func TestConfigSetAllowsRuntimeEnvKey(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	writeFile(t, filepath.Join(configDir, "project.yaml"), `runtime:
+  codex:
+    command: $CODEX_COMMAND
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`)
+	stdinIsTerminal = func() bool { return false }
+	stdoutIsTerminal = func() bool { return false }
+
+	var stdout, stderr bytes.Buffer
+	cmd := newRootCommand(&stdout, &stderr)
+	cmd.SetIn(strings.NewReader("codex app-server --profile strict\n"))
+	cmd.SetArgs([]string{"config", "set", "CODEX_COMMAND", "--config-dir", configDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !strings.Contains(string(content), `CODEX_COMMAND="codex app-server --profile strict"`) {
+		t.Fatalf("env.local = %q, want CODEX_COMMAND entry", string(content))
 	}
 }
 
@@ -273,8 +381,9 @@ func TestSetupRunsWizardWhenSecretsMissing(t *testing.T) {
 	}
 
 	wizardCalled := false
-	runWizardFunc = func(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *secret.Store) error {
+	runWizardFunc = func(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *secret.Store, stderr io.Writer) error {
 		wizardCalled = true
+		_, _ = fmt.Fprintln(stderr, "检测到以下密钥缺失，开始交互式配置")
 		if err := envfile.Upsert(envLocalPath, "LINEAR_API_KEY", "wizard-secret"); err != nil {
 			return err
 		}
@@ -283,15 +392,18 @@ func TestSetupRunsWizardWhenSecretsMissing(t *testing.T) {
 	stdinIsTerminal = func() bool { return true }
 	stdoutIsTerminal = func() bool { return true }
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"setup", "--config-dir", configDir}, &stderr); exitCode != 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"setup", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
 	if !wizardCalled {
 		t.Fatal("wizard was not called")
 	}
-	if !strings.Contains(stderr.String(), "配置已完成") {
-		t.Fatalf("stderr = %q, want setup completion message", stderr.String())
+	if !strings.Contains(stdout.String(), "配置已完成") {
+		t.Fatalf("stdout = %q, want setup completion message", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "检测到以下密钥缺失") {
+		t.Fatalf("stderr = %q, want wizard stderr notice", stderr.String())
 	}
 }
 
@@ -360,8 +472,8 @@ func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 		return ctx, func() {}
 	}
 
-	var stderr bytes.Buffer
-	if err := execute([]string{"--config-dir", configDir}, &stderr); err != nil {
+	var stdout, stderr bytes.Buffer
+	if err := execute([]string{"--config-dir", configDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("execute() error = %v", err)
 	}
 	if !watchCalled {
@@ -420,7 +532,7 @@ func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- execute([]string{"--config-dir", configDir, "--port", "8080"}, io.Discard)
+		errCh <- execute([]string{"--config-dir", configDir, "--port", "8080"}, io.Discard, io.Discard)
 	}()
 
 	select {
@@ -486,7 +598,7 @@ func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- execute([]string{"--config-dir", configDir, "--port", "8081"}, io.Discard)
+		errCh <- execute([]string{"--config-dir", configDir, "--port", "8081"}, io.Discard, io.Discard)
 	}()
 
 	select {
@@ -567,7 +679,7 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- execute([]string{"--config-dir", configDir, "--port", "9090"}, io.Discard)
+		errCh <- execute([]string{"--config-dir", configDir, "--port", "9090"}, io.Discard, io.Discard)
 	}()
 
 	select {

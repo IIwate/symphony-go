@@ -298,7 +298,7 @@ func (r *AppServerRunner) waitForResponse(ctx context.Context, timeoutMS int, ex
 				}
 				return message, nil
 			}
-			if eventErr, terminal := r.handleStreamMessage(writer, message, params, pid, "", "", ""); eventErr != nil {
+			if eventErr, terminal := r.handleStreamMessage(ctx, writer, message, params, pid, "", "", ""); eventErr != nil {
 				return nil, eventErr
 			} else if terminal {
 				return nil, model.NewAgentError(model.ErrResponseError, "turn terminated before response completed", nil)
@@ -345,7 +345,7 @@ func (r *AppServerRunner) waitForTurnEnd(ctx context.Context, timeoutMS int, wri
 				r.emit(params, AgentEvent{Event: "malformed", Timestamp: r.now().UTC(), CodexAppServerPID: pid, SessionID: stringPtr(sessionID), ThreadID: stringPtr(threadID), TurnID: stringPtr(turnID), Message: line, Payload: err.Error()})
 				continue
 			}
-			if eventErr, terminal := r.handleStreamMessage(writer, message, params, pid, threadID, turnID, sessionID); eventErr != nil {
+			if eventErr, terminal := r.handleStreamMessage(ctx, writer, message, params, pid, threadID, turnID, sessionID); eventErr != nil {
 				return eventErr
 			} else if terminal {
 				return nil
@@ -354,7 +354,7 @@ func (r *AppServerRunner) waitForTurnEnd(ctx context.Context, timeoutMS int, wri
 	}
 }
 
-func (r *AppServerRunner) handleStreamMessage(writer io.Writer, message map[string]any, params RunParams, pid *string, threadID string, turnID string, sessionID string) (error, bool) {
+func (r *AppServerRunner) handleStreamMessage(ctx context.Context, writer io.Writer, message map[string]any, params RunParams, pid *string, threadID string, turnID string, sessionID string) (error, bool) {
 	timestamp := r.now().UTC()
 	method, _ := message["method"].(string)
 	lowerMethod := strings.ToLower(method)
@@ -373,7 +373,7 @@ func (r *AppServerRunner) handleStreamMessage(writer io.Writer, message map[stri
 		return nil, false
 	}
 	if strings.Contains(lowerMethod, "tool/call") && message["id"] != nil {
-		toolResult, eventName := r.handleToolCall(message)
+		toolResult, eventName := r.handleToolCall(ctx, message)
 		if err := writeJSONLine(writer, map[string]any{"id": message["id"], "result": toolResult}); err != nil && r.logger != nil {
 			r.logger.Warn("failed to write tool response", "method", method, "request_id", fmt.Sprint(message["id"]), "event", eventName, "error", err.Error())
 		}
@@ -479,7 +479,7 @@ func (r *AppServerRunner) dynamicTools(cfg *model.ServiceConfig) []any {
 	}
 }
 
-func (r *AppServerRunner) handleToolCall(message map[string]any) (map[string]any, string) {
+func (r *AppServerRunner) handleToolCall(ctx context.Context, message map[string]any) (map[string]any, string) {
 	toolName, arguments, ok := extractToolCall(message)
 	if !ok {
 		result := map[string]any{"success": false, "error": "unsupported_tool_call"}
@@ -489,11 +489,11 @@ func (r *AppServerRunner) handleToolCall(message map[string]any) (map[string]any
 		result := map[string]any{"success": false, "error": "unsupported_tool_call"}
 		return dynamicToolResponse(result), "unsupported_tool_call"
 	}
-	result := r.executeLinearGraphQL(arguments)
+	result := r.executeLinearGraphQL(ctx, arguments)
 	return dynamicToolResponse(result), "notification"
 }
 
-func (r *AppServerRunner) executeLinearGraphQL(arguments any) map[string]any {
+func (r *AppServerRunner) executeLinearGraphQL(ctx context.Context, arguments any) map[string]any {
 	query, variables, err := parseLinearGraphQLInput(arguments)
 	if err != nil {
 		return map[string]any{"success": false, "error": "invalid_arguments", "message": err.Error()}
@@ -507,7 +507,10 @@ func (r *AppServerRunner) executeLinearGraphQL(arguments any) map[string]any {
 	if err != nil {
 		return map[string]any{"success": false, "error": "invalid_arguments", "message": err.Error()}
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, cfg.TrackerEndpoint, bytes.NewReader(body))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.TrackerEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return map[string]any{"success": false, "error": "transport_failure", "message": err.Error()}
 	}

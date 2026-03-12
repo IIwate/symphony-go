@@ -387,19 +387,30 @@ func (m *LocalManager) resolveWorkBranch(workspace *model.Workspace, namespace s
 	if binding, ok, err := m.loadBranchBinding(workspace.WorkspaceKey); err != nil {
 		return "", "", model.NewWorkspaceError(model.ErrWorkspacePathConflict, fmt.Sprintf("read branch binding for %q", workspace.WorkspaceKey), err)
 	} else if ok {
-		boundBranch := strings.TrimSpace(binding.Branch)
-		switch {
-		case boundBranch == "":
-			m.logger.Warn("branch binding is empty; falling back to discovery", "workspace_key", workspace.WorkspaceKey)
-		case currentBranch == boundBranch:
-			return boundBranch, "current", nil
-		case hasBranch(localBranches, boundBranch):
-			return boundBranch, "local", nil
-		case hasBranch(remoteBranches, boundBranch):
-			return boundBranch, "remote", nil
-		default:
-			m.logger.Warn("bound branch is missing locally and remotely; recreating locally", "workspace_key", workspace.WorkspaceKey, "branch", boundBranch)
-			return boundBranch, "recreate", nil
+		bindingIdentifier := strings.TrimSpace(binding.Identifier)
+		workspaceIdentifier := strings.TrimSpace(workspace.Identifier)
+		if bindingIdentifier != "" && workspaceIdentifier != "" && bindingIdentifier != workspaceIdentifier {
+			m.logger.Warn(
+				"branch binding identifier mismatch; falling back to discovery",
+				"workspace_key", workspace.WorkspaceKey,
+				"binding_identifier", bindingIdentifier,
+				"workspace_identifier", workspaceIdentifier,
+			)
+		} else {
+			boundBranch := strings.TrimSpace(binding.Branch)
+			switch {
+			case boundBranch == "":
+				m.logger.Warn("branch binding is empty; falling back to discovery", "workspace_key", workspace.WorkspaceKey)
+			case currentBranch == boundBranch:
+				return boundBranch, "current", nil
+			case hasBranch(localBranches, boundBranch):
+				return boundBranch, "local", nil
+			case hasBranch(remoteBranches, boundBranch):
+				return boundBranch, "remote", nil
+			default:
+				m.logger.Warn("bound branch is missing locally and remotely; recreating locally", "workspace_key", workspace.WorkspaceKey, "branch", boundBranch)
+				return boundBranch, "recreate", nil
+			}
 		}
 	}
 

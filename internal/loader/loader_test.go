@@ -300,6 +300,23 @@ terminal_states: ["Closed", "Done"]
 	}
 }
 
+func TestResolveActiveWorkflowSourceBindingsExcludeSensitiveFields(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	workflowDef, err := ResolveActiveWorkflow(def)
+	if err != nil {
+		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
+	}
+	if _, exists := workflowDef.Source["api_key"]; exists {
+		t.Fatalf("workflowDef.Source = %+v, want api_key to stay hidden", workflowDef.Source)
+	}
+}
+
 func TestResolveActiveWorkflowHookPathEscape(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		FlowYAML: `prompt: prompts/implement.md.liquid
@@ -314,6 +331,92 @@ hooks:
 	}
 	if _, err := ResolveActiveWorkflow(def); err == nil {
 		t.Fatal("ResolveActiveWorkflow() error = nil, want path escape error")
+	}
+}
+
+func TestResolveActiveWorkflowHookPathEscapeViaSymlink(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		FlowYAML: `prompt: prompts/implement.md.liquid
+hooks:
+  before_run: hooks/link.sh
+`,
+	})
+	outsidePath := filepath.Join(t.TempDir(), "outside.sh")
+	writeLoaderFile(t, outsidePath, "echo outside\n")
+	linkPath := filepath.Join(root, "hooks", "link.sh")
+	if err := os.Remove(linkPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Remove(%q) error = %v", linkPath, err)
+	}
+	if err := os.Symlink(outsidePath, linkPath); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if _, err := ResolveActiveWorkflow(def); err == nil {
+		t.Fatal("ResolveActiveWorkflow() error = nil, want symlink path escape error")
+	}
+}
+
+func TestResolveActiveWorkflowTreatsSingleLineHookWithSlashAsInlineScript(t *testing.T) {
+	script := "git remote set-url origin https://example.test/repo.git"
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		FlowYAML: "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: " + script + "\n",
+	})
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	workflowDef, err := ResolveActiveWorkflow(def)
+	if err != nil {
+		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
+	}
+	if got := getMapValue(workflowDef.Config, "hooks")["before_run"]; got != script {
+		t.Fatalf("hooks.before_run = %v, want inline script", got)
+	}
+}
+
+func TestResolveActiveWorkflowRejectsHookSymlinkEscape(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		FlowYAML: `prompt: prompts/implement.md.liquid
+hooks:
+  before_run: hooks/before_run.sh
+`,
+	})
+	outsidePath := filepath.Join(t.TempDir(), "outside.sh")
+	writeLoaderFile(t, outsidePath, "echo outside\n")
+	linkPath := filepath.Join(root, "hooks", "before_run.sh")
+	if err := os.Symlink(outsidePath, linkPath); err != nil {
+		t.Skipf("Symlink() unsupported on this host: %v", err)
+	}
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if _, err := ResolveActiveWorkflow(def); err == nil {
+		t.Fatal("ResolveActiveWorkflow() error = nil, want symlink escape error")
+	}
+}
+
+func TestResolveActiveWorkflowTreatsInlineHookWithSlashAsScript(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		FlowYAML: "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: \"git remote set-url origin https://example.test/repo.git\"\n",
+	})
+
+	def, err := Load(root, "")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	workflowDef, err := ResolveActiveWorkflow(def)
+	if err != nil {
+		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
+	}
+	if got := getMapValue(workflowDef.Config, "hooks")["before_run"]; got != "git remote set-url origin https://example.test/repo.git" {
+		t.Fatalf("hooks.before_run = %v, want inline hook script", got)
 	}
 }
 
@@ -477,6 +580,101 @@ func TestWatchIgnoresEnvLocalChange(t *testing.T) {
 	case definition := <-updates:
 		t.Fatalf("unexpected update received for env.local change: %+v", definition)
 	case <-time.After(750 * time.Millisecond):
+	}
+}
+
+func TestWatchReloadsActiveDefaultProfileFile(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		ProfileName: "dev",
+		ProfileYAML: "runtime:\n  polling:\n    interval_ms: 10000\n",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 2)
+	if err := Watch(ctx, root, "", func(def *model.AutomationDefinition) {
+		updates <- def
+	}); err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
+  codex:
+    command: codex app-server
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: dev
+`)
+
+	updated := awaitWatchUpdate(t, updates)
+	if updated.Profile != "dev" {
+		t.Fatalf("Profile = %q, want dev", updated.Profile)
+	}
+
+	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "runtime:\n  polling:\n    interval_ms: 15000\n")
+	updated = awaitWatchUpdate(t, updates)
+	if updated.Profile != "dev" {
+		t.Fatalf("Profile = %q after profile update, want dev", updated.Profile)
+	}
+	if got := getMapValue(updated.Runtime, "polling")["interval_ms"]; got != 15000 {
+		t.Fatalf("runtime.polling.interval_ms = %v, want 15000", got)
+	}
+}
+
+func TestWatchTracksActiveProfileAfterDefaultProfileSwitch(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		ProjectYAML: `runtime:
+  codex:
+    command: codex app-server
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: dev
+`,
+		ProfileName: "dev",
+		ProfileYAML: "runtime:\n  agent:\n    max_turns: 3\n",
+	})
+	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "runtime:\n  agent:\n    max_turns: 7\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 2)
+	if err := Watch(ctx, root, "", func(def *model.AutomationDefinition) {
+		updates <- def
+	}); err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
+  codex:
+    command: codex app-server
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: prod
+`)
+	updated := awaitWatchUpdate(t, updates)
+	if updated.Profile != "prod" {
+		t.Fatalf("updated profile = %q, want prod", updated.Profile)
+	}
+
+	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "runtime:\n  agent:\n    max_turns: 9\n")
+	updated = awaitWatchUpdate(t, updates)
+	if updated.Profile != "prod" {
+		t.Fatalf("updated profile = %q, want prod", updated.Profile)
+	}
+	if got := getMapValue(updated.Runtime, "agent")["max_turns"]; got != 9 {
+		t.Fatalf("runtime.agent.max_turns = %v, want 9", got)
 	}
 }
 

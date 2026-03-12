@@ -276,7 +276,7 @@ func TestPrepareForRunReusesUniqueRemoteBranchWhenNoBindingExists(t *testing.T) 
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "abc\trefs/heads/testuser/linear-demo-scope-demo-37\n",
-			"git fetch origin " + bashSingleQuote("+refs/heads/testuser/linear-demo-scope-demo-37:refs/remotes/origin/testuser/linear-demo-scope-demo-37"): "",
+			"git fetch origin " + bashSingleQuote("+refs/heads/testuser/linear-demo-scope-demo-37:refs/remotes/origin/testuser/linear-demo-scope-demo-37"):             "",
 			"git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/testuser/linear-demo-scope-demo-37"): "",
 		},
 	}
@@ -341,7 +341,7 @@ func TestPrepareForRunUsesBoundRemoteBranch(t *testing.T) {
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "abc\trefs/heads/legacy/linear-demo-scope-demo-37\n",
-			"git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
+			"git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37"):             "",
 			"git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
 		},
 	}
@@ -407,7 +407,7 @@ func TestPrepareForRunDiscoversUniqueLegacyBranchWithoutBinding(t *testing.T) {
 			"git branch --show-current":                               "main\n",
 			"git for-each-ref refs/heads --format='%(refname:short)'": "main\n",
 			"git ls-remote --heads origin":                            "abc\trefs/heads/legacy/linear-demo-scope-demo-37\n",
-			"git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
+			"git fetch origin " + bashSingleQuote("+refs/heads/legacy/linear-demo-scope-demo-37:refs/remotes/origin/legacy/linear-demo-scope-demo-37"):             "",
 			"git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37") + " " + bashSingleQuote("refs/remotes/origin/legacy/linear-demo-scope-demo-37"): "",
 		},
 	}
@@ -437,6 +437,53 @@ func TestPrepareForRunDiscoversUniqueLegacyBranchWithoutBinding(t *testing.T) {
 	}
 	if !ok || binding.Branch != "legacy/linear-demo-scope-demo-37" {
 		t.Fatalf("binding = %+v, ok = %t, want legacy branch binding", binding, ok)
+	}
+}
+
+func TestPrepareForRunIgnoresBindingFromDifferentIdentifier(t *testing.T) {
+	runner := &fakeRunner{
+		stdoutByScript: map[string]string{
+			"git branch --show-current":                                           "main\n",
+			"git for-each-ref refs/heads --format='%(refname:short)'":             "main\n",
+			"git ls-remote --heads origin":                                        "",
+			"git switch -c " + bashSingleQuote("newns/linear-demo-scope-demo-37"): "",
+		},
+	}
+	manager := newTestManager(t, runner)
+	manager.currentConfig().WorkspaceBranchNamespace = "newns"
+
+	legacyWorkspace, err := manager.CreateForIssue(context.Background(), "DEMO/37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() legacy error = %v", err)
+	}
+	if err := manager.saveBranchBinding(legacyWorkspace.WorkspaceKey, legacyWorkspace.Identifier, "legacy/linear-demo-scope-demo-37"); err != nil {
+		t.Fatalf("saveBranchBinding() error = %v", err)
+	}
+
+	workspace, err := manager.CreateForIssue(context.Background(), "DEMO:37")
+	if err != nil {
+		t.Fatalf("CreateForIssue() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace.Path, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+	if got := runner.callCount("git switch -c " + bashSingleQuote("newns/linear-demo-scope-demo-37")); got != 1 {
+		t.Fatalf("new branch create call count = %d, want 1", got)
+	}
+	if got := runner.callCount("git switch -c " + bashSingleQuote("legacy/linear-demo-scope-demo-37")); got != 0 {
+		t.Fatalf("legacy branch recreate call count = %d, want 0", got)
+	}
+
+	binding, ok, err := manager.loadBranchBinding(workspace.WorkspaceKey)
+	if err != nil {
+		t.Fatalf("loadBranchBinding() error = %v", err)
+	}
+	if !ok || binding.Identifier != "DEMO:37" || binding.Branch != "newns/linear-demo-scope-demo-37" {
+		t.Fatalf("binding = %+v, ok = %t, want DEMO:37 -> newns/linear-demo-scope-demo-37", binding, ok)
 	}
 }
 

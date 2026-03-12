@@ -126,6 +126,17 @@ func TestRenderPromptSourceVariable(t *testing.T) {
 	}
 }
 
+func TestRenderPromptRejectsSensitiveSourceField(t *testing.T) {
+	_, err := RenderPrompt("{{ source.api_key }}", &model.Issue{Title: "Test"}, nil, map[string]any{
+		"kind":         "linear",
+		"project_slug": "demo",
+		"api_key":      "secret-key",
+	}, nil)
+	if err == nil {
+		t.Fatal("RenderPrompt() error = nil, want hidden sensitive source field")
+	}
+}
+
 func TestRenderPromptRunVariable(t *testing.T) {
 	reason := model.ContinuationReasonMissingPR
 	branch := "runner/demo-1"

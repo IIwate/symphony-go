@@ -50,7 +50,7 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		diagnosis := config.DiagnoseConfig(cfg, repoDef)
 		if diagnosis.HasMissingSecrets() && len(diagnosis.OtherErrors) == 0 && isInteractive() && !opts.nonInteractive {
-			if err := runWizardFunc(diagnosis, envLocalPath(opts.configDir), store); err != nil {
+			if err := runWizardFunc(diagnosis, envLocalPath(opts.configDir), store, cmd.ErrOrStderr()); err != nil {
 				return err
 			}
 			repoDef, definition, cfg, err = loadCommandConfig(opts.configDir, opts.profile)

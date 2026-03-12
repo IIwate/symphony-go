@@ -28,6 +28,7 @@
 ### 2.2 必要凭证
 
 - 当前版本仅支持 `tracker.kind=linear`：注入 `LINEAR_API_KEY`
+- 若使用仓库内 `scripts/live_smoke.py` 做真实链路验证，还需要提供 `LINEAR_PROJECT_SLUG`
 - Cycle 5 草案目录模式下，推荐把本地 secrets 放在 `automation/local/env.local`
 - `GITHUB_TOKEN` / GitHub source 属于 Cycle 5 之后的扩展，不适用于当前已发布实现
 - 不要把 token 明文写入日志、命令历史或共享文档
@@ -190,6 +191,58 @@ curl http://127.0.0.1:8080/api/v1/state
 ```powershell
 curl -X POST http://127.0.0.1:8080/api/v1/refresh
 ```
+
+### 6.4 仓库内 Live Smoke 脚本
+
+仓库提供了一个面向真实环境的验证脚本：
+
+- 入口：`scripts/live_smoke.py`
+- 目标：把 dry-run、`config doctor/set`、inline hook、symlink 逃逸、`missing_pr`、`awaiting_merge -> merged -> Done` 这些链路做成可重复执行的 smoke
+- 默认会在 `.codex-tmp/live-smoke/` 下生成临时配置、工作区和临时 binary；脚本结束后默认自动清理
+- 若需要保留现场排障，传 `--keep-artifacts`
+- 若需要清理历史已终态 smoke issue，显式传 `--purge-history`
+
+前置条件：
+
+- 已安装 `go`、`git`、`gh`、`py`
+- `gh auth status` 已通过
+- 已设置 `LINEAR_API_KEY`
+- 已设置 `LINEAR_PROJECT_SLUG`
+- 默认测试仓库为 `IIwate/linear-test`
+
+推荐命令：
+
+```powershell
+# 轻量 smoke：不创建真实 issue / PR
+$env:LINEAR_API_KEY="..."
+$env:LINEAR_PROJECT_SLUG="..."
+py -3 scripts/live_smoke.py --phase light
+
+# 完整 smoke：包含真实 issue / PR / merge 路径
+$env:LINEAR_API_KEY="..."
+$env:LINEAR_PROJECT_SLUG="..."
+py -3 scripts/live_smoke.py --phase all
+```
+
+脚本阶段说明：
+
+- `--phase light`
+  - `config doctor` / `config set --non-interactive`
+  - 单行 hook 含 `/` 的解析
+  - symlink 逃逸拦截
+- `--phase heavy`
+  - 创建隔离测试 issue
+  - 验证 `missing_pr -> awaiting_intervention`
+  - 创建测试分支和 PR
+  - 验证 `awaiting_merge -> merged -> issue Done`
+- `--phase all`
+  - 同时执行 light + heavy
+
+补充说明：
+
+- heavy 阶段默认使用显式 branch namespace `live-smoke`，便于识别和清理测试分支
+- summary 末尾会明确打印 `artifacts cleaned from ...` 或 `artifacts kept at ...`
+- `--purge-history` 会归档旧的 terminal smoke issue；默认关闭，以保留审计痕迹
 
 ## 7. 日志使用说明
 
@@ -366,10 +419,11 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 1. 本地 `go test ./...`
 2. 目标环境 `--dry-run`
-3. 启动服务并完成最小 smoke test
-4. 若启用 HTTP，验证 `/api/v1/state`、`/api/v1/events`、`/api/v1/refresh`
-5. 若启用 `linear_graphql`，验证一次成功调用与一次错误调用
-6. 完成 `docs/release-checklist.md` 勾选
+3. 运行 `py -3 scripts/live_smoke.py --phase light`
+4. 若需要做完整真实链路验证，运行 `py -3 scripts/live_smoke.py --phase heavy`
+5. 若启用 HTTP，验证 `/api/v1/state`、`/api/v1/events`、`/api/v1/refresh`
+6. 若启用 `linear_graphql`，验证一次成功调用与一次错误调用
+7. 完成 `docs/release-checklist.md` 勾选
 
 ## 11. 相关文档
 
@@ -377,6 +431,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - `docs/cycles/cycle-04-extension-release.md`
 - `docs/rfcs/github-issues-tracker.md`（Cycle 5 草案）
 - `docs/examples/automation-github-issues.md`（Cycle 5 目录模式示例）
+- `scripts/live_smoke.py`
 - `IMPLEMENTATION.md`
 - `REQUIREMENTS.md`
 - `SPEC.md`

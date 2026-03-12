@@ -383,7 +383,7 @@ func resolveHookValue(rootDir string, value any) (any, error) {
 	if strings.Contains(text, "\n") {
 		return text, nil
 	}
-	if strings.ContainsAny(text, `/\`) {
+	if isHookFileReference(text) {
 		resolvedPath, err := resolveAutomationPath(rootDir, text)
 		if err != nil {
 			return nil, err
@@ -395,6 +395,21 @@ func resolveHookValue(rootDir string, value any) (any, error) {
 		return strings.TrimSpace(string(content)), nil
 	}
 	return text, nil
+}
+
+func isHookFileReference(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.Contains(trimmed, "\n") {
+		return false
+	}
+	if strings.Contains(trimmed, "://") || strings.ContainsAny(trimmed, " \t\r") {
+		return false
+	}
+	normalized := strings.ReplaceAll(trimmed, "\\", "/")
+	if !strings.Contains(normalized, "/") {
+		return false
+	}
+	return strings.EqualFold(path.Ext(normalized), ".sh")
 }
 
 func readPromptTemplate(rootDir string, reference string) (string, error) {
@@ -414,6 +429,10 @@ func resolveAutomationPath(rootDir string, reference string) (string, error) {
 	if trimmed == "" {
 		return "", model.NewWorkflowError(model.ErrWorkflowParseError, "path reference is empty", nil)
 	}
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("resolve automation root %q", rootDir), err)
+	}
 	normalized := strings.ReplaceAll(trimmed, "\\", "/")
 	if path.IsAbs(normalized) || filepath.IsAbs(trimmed) {
 		return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("absolute path %q is not allowed", trimmed), nil)
@@ -423,13 +442,27 @@ func resolveAutomationPath(rootDir string, reference string) (string, error) {
 		return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("path %q escapes automation directory", trimmed), nil)
 	}
 
-	resolved := filepath.Join(rootDir, filepath.FromSlash(cleaned))
+	resolved := filepath.Join(absRoot, filepath.FromSlash(cleaned))
 	absResolved, err := filepath.Abs(resolved)
 	if err != nil {
 		return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("resolve path %q", trimmed), err)
 	}
-	if !pathWithinRoot(rootDir, absResolved) {
+	if !pathWithinRoot(absRoot, absResolved) {
 		return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("path %q escapes automation directory", trimmed), nil)
+	}
+	resolvedReal, err := filepath.EvalSymlinks(absResolved)
+	switch {
+	case err == nil:
+		rootReal, rootErr := filepath.EvalSymlinks(absRoot)
+		if rootErr == nil {
+			if !pathWithinRoot(rootReal, resolvedReal) {
+				return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("path %q escapes automation directory", trimmed), nil)
+			}
+		} else if !errors.Is(rootErr, os.ErrNotExist) {
+			return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("resolve automation root %q", absRoot), rootErr)
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return "", model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("resolve path %q", trimmed), err)
 	}
 	return absResolved, nil
 }

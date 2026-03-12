@@ -912,7 +912,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	}
 	switch decision.Disposition {
 	case DispositionTryCompleteMergedPR:
-		o.tryCompleteMergedPullRequest(ctx, result.IssueID, identifier, decision.FinalBranch, retryAttempt, stallCount)
+		o.tryCompleteMergedPullRequest(ctx, result.IssueID, identifier, workspacePath, decision.FinalBranch, retryAttempt, stallCount, issueState, pullRequestInfoFromContext(decision.PR))
 		return
 	case DispositionAwaitingMerge:
 		o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, decision.FinalBranch, retryAttempt, stallCount, pullRequestInfoFromContext(decision.PR), nil)
@@ -1078,6 +1078,9 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 	refreshed, err := o.tracker.FetchIssueStatesByIDs(ctx, ids)
 	byID := make(map[string]model.Issue, len(refreshed))
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		o.logger.Warn("awaiting-merge state refresh failed", "error", err.Error())
 	} else {
 		for _, issue := range refreshed {
@@ -1116,6 +1119,9 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 
 		pr, err := o.lookupPullRequestByHeadBranch(ctx, entry.WorkspacePath, entry.Branch)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			o.logger.Warn("awaiting-merge PR lookup failed", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "error", err.Error())
 			errorText := err.Error()
 			o.mu.Lock()
@@ -1130,21 +1136,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 		}
 		if pr == nil {
 			o.logger.Warn("awaiting-merge PR lookup returned no match", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch)
-			o.mu.Lock()
-			current := o.state.AwaitingMerge[issueID]
-			if current == nil {
-				o.mu.Unlock()
-				continue
-			}
-			delete(o.state.AwaitingMerge, issueID)
-			o.scheduleRetryLocked(issueID, current.Identifier, 1, nil, true, current.StallCount, continuationDispatchContext(nil, model.CompletionContract{
-				Mode:        model.CompletionModePullRequest,
-				OnMissingPR: model.CompletionActionIntervention,
-				OnClosedPR:  model.CompletionActionIntervention,
-			}, model.ContinuationReasonMissingPR, current.Branch, nil, current.State))
-			o.refreshSnapshotLocked()
-			o.publishSnapshotLocked()
-			o.mu.Unlock()
+			o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonMissingPR), entry.State, nil)
 			continue
 		}
 
@@ -1165,7 +1157,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 			}
 			o.mu.Unlock()
 		case PullRequestStateMerged:
-			o.tryCompleteMergedPullRequest(ctx, issueID, entry.Identifier, entry.Branch, entry.RetryAttempt, entry.StallCount)
+			o.tryCompleteMergedPullRequest(ctx, issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, entry.State, pr)
 		case PullRequestStateClosed:
 			o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonClosedUnmergedPR), entry.State, pr)
 		default:
@@ -1840,12 +1832,14 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	o.mu.Unlock()
 }
 
-func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, branch string, retryAttempt int, stallCount int) bool {
+func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo) bool {
 	transitioner, ok := o.tracker.(tracker.IssueTransitioner)
 	errorText := ""
 	if !ok {
 		errorText = "tracker does not support issue transition"
 		o.logger.Warn("tracker does not support issue transition", "issue_id", issueID, "issue_identifier", identifier, "branch", branch)
+		o.moveToAwaitingIntervention(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, model.CompletionModePullRequest, "post_merge_transition_unsupported", issueState, pr)
+		return false
 	} else if err := transitioner.TransitionIssue(ctx, issueID, "Done"); err != nil {
 		errorText = fmt.Sprintf("post-merge transition failed: %s", err.Error())
 		o.logger.Warn("post-merge transition failed", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "error", err.Error())
@@ -1863,14 +1857,30 @@ func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID
 		}
 	}
 
-	nextAttempt := retryAttempt + 1
-	if nextAttempt <= 0 {
-		nextAttempt = 1
-	}
 	o.mu.Lock()
-	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
-	o.scheduleRetryLocked(issueID, identifier, nextAttempt, optionalError(errorText), false, stallCount, nil)
+	entry := o.state.AwaitingMerge[issueID]
+	awaitingSince := o.now().UTC()
+	if entry == nil {
+		entry = &model.AwaitingMergeEntry{}
+		o.state.AwaitingMerge[issueID] = entry
+	} else if !entry.AwaitingSince.IsZero() {
+		awaitingSince = entry.AwaitingSince
+	}
+	entry.Identifier = identifier
+	entry.State = issueState
+	entry.WorkspacePath = workspacePath
+	entry.Branch = branch
+	entry.RetryAttempt = retryAttempt
+	entry.StallCount = stallCount
+	entry.AwaitingSince = awaitingSince
+	entry.LastError = optionalError(errorText)
+	if pr != nil {
+		entry.PRNumber = pr.Number
+		entry.PRURL = pr.URL
+		entry.PRState = string(pr.State)
+	}
+	o.state.Claimed[issueID] = struct{}{}
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	o.mu.Unlock()

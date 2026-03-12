@@ -263,10 +263,10 @@ func TestHandleStreamMessageLogsWriteFailures(t *testing.T) {
 	runner.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	writer := &failingWriteCloser{writeErr: errors.New("broken pipe")}
 
-	if err, done := runner.handleStreamMessage(writer, map[string]any{"id": "approval-1", "method": "approval/request"}, RunParams{}, nil, "", "", ""); err != nil || done {
+	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "approval-1", "method": "approval/request"}, RunParams{}, nil, "", "", ""); err != nil || done {
 		t.Fatalf("approval handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
 	}
-	if err, done := runner.handleStreamMessage(writer, map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "unknown_tool"}}, RunParams{}, nil, "", "", ""); err != nil || done {
+	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "unknown_tool"}}, RunParams{}, nil, "", "", ""); err != nil || done {
 		t.Fatalf("tool handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
 	}
 
@@ -816,6 +816,42 @@ func TestRunnerLinearGraphQLToolTransportFailure(t *testing.T) {
 	}
 	if !containsToolError(factory.process.stdinRecorder.lines(), "tool-1", "transport_failure") {
 		t.Fatalf("tool transport_failure response missing: %v", factory.process.stdinRecorder.lines())
+	}
+}
+
+func TestExecuteLinearGraphQLUsesRequestContext(t *testing.T) {
+	runner := newTestRunnerWithConfig(&fakeProcessFactory{process: newFakeProcess(nil, nil, false)}, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        "http://linear.invalid",
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	}).(*AppServerRunner)
+
+	transportCalled := false
+	runner.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			transportCalled = true
+			if err := req.Context().Err(); err == nil {
+				t.Fatal("request context was not cancelled")
+			}
+			return nil, req.Context().Err()
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := runner.executeLinearGraphQL(ctx, map[string]any{"query": "query Viewer { viewer { id } }"})
+	if !transportCalled {
+		t.Fatal("transport was not called")
+	}
+	if result["success"] != false || result["error"] != "transport_failure" {
+		t.Fatalf("executeLinearGraphQL() = %+v, want transport_failure", result)
 	}
 }
 

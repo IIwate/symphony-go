@@ -75,15 +75,18 @@ var (
 )
 
 func main() {
-	os.Exit(runCLI(os.Args[1:], os.Stderr))
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func runCLI(args []string, stderr io.Writer) int {
+func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
+	if stdout == nil {
+		stdout = os.Stdout
+	}
 	if stderr == nil {
 		stderr = os.Stderr
 	}
 
-	if err := execute(args, stderr); err != nil {
+	if err := execute(args, stdout, stderr); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -91,8 +94,8 @@ func runCLI(args []string, stderr io.Writer) int {
 	return 0
 }
 
-func execute(args []string, stderr io.Writer) error {
-	rootCmd := newRootCommand(stderr)
+func execute(args []string, stdout io.Writer, stderr io.Writer) error {
+	rootCmd := newRootCommand(stdout, stderr)
 	if args == nil {
 		rootCmd.SetArgs([]string{})
 	} else {
@@ -105,7 +108,13 @@ func execute(args []string, stderr io.Writer) error {
 	return err
 }
 
-func newRootCommand(stderr io.Writer) *cobra.Command {
+func newRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
 	rootCmd := &cobra.Command{
 		Use:   "symphony",
 		Short: "Symphony automation runner",
@@ -120,7 +129,7 @@ func newRootCommand(stderr io.Writer) *cobra.Command {
 		SilenceErrors: true,
 	}
 	rootCmd.SetIn(os.Stdin)
-	rootCmd.SetOut(stderr)
+	rootCmd.SetOut(stdout)
 	rootCmd.SetErr(stderr)
 
 	rootCmd.PersistentFlags().String("config-dir", "automation", "path to automation config directory")
