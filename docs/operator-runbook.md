@@ -49,7 +49,6 @@
 - 状态标签默认使用 `state_label_prefix=symphony:`，例如 `symphony:todo`、`symphony:in-progress`、`symphony:cancelled`
 - 同一 issue 若存在多个 `symphony:*` 状态标签，系统应记录告警并跳过该 issue；先人工清理标签冲突
 - GitHub `/issues` 接口返回的 PR 条目会被过滤，不会参与调度
-- 参考示例：`docs/examples/automation-github-issues.md`（目录模式示例文档）
 
 ## 3. 启动命令
 
@@ -394,7 +393,6 @@ py -3 scripts/live_smoke.py --phase all
 - 检查 token 是否具备仓库 `Issues: Read` 权限
 - 提高 `polling.interval_ms`，避免高频轮询
 - 观察日志中的 rate limit 告警与 GitHub 返回头
-- 用示例文档 `docs/examples/automation-github-issues.md` 对照 `automation/sources/*.yaml`、`automation/project.yaml` 与 `automation/local/env.local`
 
 ## 9. 关闭与回滚
 
@@ -428,9 +426,8 @@ py -3 scripts/live_smoke.py --phase all
 ## 11. 相关文档
 
 - `docs/release-checklist.md`
-- `docs/cycles/cycle-04-extension-release.md`
+- `docs/cycles/archive/cycle-04-extension-release.md`
 - `docs/rfcs/github-issues-tracker.md`（Cycle 5 草案）
-- `docs/examples/automation-github-issues.md`（Cycle 5 目录模式示例）
 - `scripts/live_smoke.py`
 - `IMPLEMENTATION.md`
 - `REQUIREMENTS.md`

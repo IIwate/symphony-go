@@ -14,17 +14,22 @@
 2. **先稳定契约，后外部依赖，再进入调度核心与可观测能力**
 3. **每个周期都必须可独立验收，并给下一周期提供明确输入**
 
-## 周期划分
+## 当前周期文档
 
-> 周期长度不强绑定自然周，按团队容量执行；下表强调的是“可独立交付的边界”，不是固定日历时长。
+> 周期长度不强绑定自然周，按团队容量执行；这里保留仍作为活跃规划入口的周期文档。
 
 | 周期 | 名称 | 目标模块 | 目标结果 | 对应文档 |
 |---|---|---|---|---|
-| Cycle 1 | 基础框架 | `internal/model`、`internal/workflow`、`internal/config`、`cmd/symphony` | 形成可编译、可加载配置、可执行 preflight 的最小骨架 | `docs/cycles/cycle-01-foundation.md` |
-| Cycle 2 | 基础设施层 | `internal/workspace`、`internal/tracker`、`internal/logging` | 打通工作区、Tracker、日志三类基础设施 | `docs/cycles/cycle-02-infrastructure.md` |
-| Cycle 3 | 核心引擎 | `internal/agent`、`internal/orchestrator`、`cmd/symphony` 集成 | 形成可运行的 headless orchestration 主流程 | `docs/cycles/cycle-03-core-engine.md` |
-| Cycle 4 | 扩展与发布 | `internal/server`、`internal/agent` 扩展、集成验证 | 交付可观测面、可选工具扩展与发布前验证包 | `docs/cycles/cycle-04-extension-release.md` |
 | Cycle 5 | 发布后扩展 | 多 tracker、多 runner、分发与通知能力 | 管理首版之后的 P2 演进，不阻塞首发 | `docs/cycles/cycle-05-post-mvp.md` |
+
+## 已归档周期
+
+以下周期文档主要用于保留历史实施边界与阶段性输入输出，已不再作为当前规范源：
+
+- `docs/cycles/archive/cycle-01-foundation.md`
+- `docs/cycles/archive/cycle-02-infrastructure.md`
+- `docs/cycles/archive/cycle-03-core-engine.md`
+- `docs/cycles/archive/cycle-04-extension-release.md`
 
 ## 跨周期约束
 
@@ -65,6 +70,6 @@ Cycle 5
 
 ## 建议执行方式
 
-- Cycle 1~4 作为首版主线；Cycle 5 作为首版发布后的 backlog 管理。
+- Cycle 5 作为当前 backlog 管理入口；Cycle 1~4 已归档，仅作历史参考。
 - 每个周期开始前先 review 上一周期文档，避免把“未决问题”隐性带入下一周期。
 - 周期中途如果需求变更，优先更新本目录文档，再安排实现任务，保证设计与实现一致。

@@ -1,6 +1,6 @@
 # Checklist: 本地 Secret 启动向导与运行中补 Key
 
-> 对应 RFC: [secret-bootstrap-and-runtime-update.md](/H:/code/temp/symphony-go/docs/rfcs/secret-bootstrap-and-runtime-update.md)
+> 对应 RFC: [secret-bootstrap-and-runtime-update.md](/H:/code/temp/symphony-go/docs/rfcs/archive/secret-bootstrap-and-runtime-update.md)
 > 用途: 将 RFC 拆解为可执行实施清单
 
 ---

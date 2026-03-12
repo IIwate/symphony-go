@@ -1,9 +1,9 @@
 # RFC: 本地 Secret 启动向导与运行中补 Key
 
 > **状态**: 草案
-> **对应**: `docs/rfcs/config-layering.md` 执行过程中发现的问题修复 / Cycle 5 扩展池
+> **对应**: `docs/rfcs/archive/config-layering.md` 执行过程中发现的问题修复 / Cycle 5 扩展池
 > **前置**: `automation/` 目录模式已经落地
-> **来源**: 本 RFC 不替代 `docs/rfcs/config-layering.md`，而是在推进其落地过程中暴露出的配置体验、secret 生命周期和 CLI 入口问题的修复方案
+> **来源**: 本 RFC 不替代 `docs/rfcs/archive/config-layering.md`，而是在推进其落地过程中暴露出的配置体验、secret 生命周期和 CLI 入口问题的修复方案
 
 ---
 
