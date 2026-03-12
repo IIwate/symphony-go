@@ -245,8 +245,9 @@
 
 - `[核心规范]` invalid reload 不会导致服务崩溃，而是继续沿用最后一次有效配置。
 - `[核心规范]` reload 影响未来 dispatch、retry 调度、reconcile、hook 执行与 agent 启动。
-- `[实现现状]` `runtime.session_persistence` 与 `runtime.notifications` 首版属于 `restart-required`，变更后会被 reload gate 拒绝。
+- `[实现现状]` `runtime.session_persistence` 仍属于 `restart-required`；`runtime.notifications` 支持热更新，切换后仅影响后续事件。
 - `[实现现状]` `automation/local/session-state.json` 只承载本地 runtime state，不保存 secret，也不会参与 watcher reload。
+- `[实现现状]` 若 `automation/local/session-state.json` 与当前运行实例身份或版本不兼容，启动会明确失败并要求先删除旧文件。
 - `[实现决策]` 当前 HTTP server 已经启动后不会因为 `server.port` 变化而热重绑；该类 listener 资源仍需重启进程。
 
 ---
@@ -379,7 +380,7 @@ CLI 当前支持：
 10. 执行 `config.ValidateForDispatch`。
 11. 构造 `runtimeState`，把 repository definition、workflow definition 与 config 封装成可热更新状态。
 12. 创建 tracker、workspace manager、agent runner、orchestrator。
-13. 如果是 `--dry-run`，执行一次 `orch.RunOnce(context.Background(), false)` 后退出。
+13. 如果是 `--dry-run`，只执行无副作用的加载与校验后退出。
 14. 如果是正常运行：
     - 建立信号上下文（`os.Interrupt`、`SIGTERM`）。
     - 注册 `automation/` watcher。

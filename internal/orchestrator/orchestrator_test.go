@@ -1682,10 +1682,11 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 	savedAt := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
 	dueAt := time.Now().Add(2 * time.Minute).UTC()
 
-	err := writePersistedSessionState(statePath, persistedSessionState{
-		Version: sessionStateVersion,
-		SavedAt: savedAt,
-		Retrying: []persistedRetryEntry{
+	err := writeDurableRuntimeState(statePath, durableRuntimeState{
+		Version:  durableStateVersion,
+		Identity: RuntimeIdentity{TrackerKind: "linear"},
+		SavedAt:  savedAt,
+		Retrying: []durableRetryEntry{
 			{
 				IssueID:       "2",
 				Identifier:    "ISSUE-2",
@@ -1696,47 +1697,29 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 				Dispatch:      &model.DispatchContext{Kind: model.DispatchKindFresh},
 			},
 		},
-		Claimed: []persistedClaimedEntry{
+		RecoveredPending: []durableRecoveredPendingEntry{
 			{
-				IssueID: "1",
-				ClaimedEntry: model.ClaimedEntry{
-					Identifier:    "ISSUE-1",
-					WorkspacePath: "/tmp/ISSUE-1",
-					State:         "In Progress",
-					RetryAttempt:  1,
-					StallCount:    2,
-					ClaimedAt:     savedAt,
-				},
+				IssueID:        "1",
+				Identifier:     "ISSUE-1",
+				State:          "In Progress",
+				WorkspacePath:  "/tmp/ISSUE-1",
+				RetryAttempt:   1,
+				StallCount:     2,
+				ObservedAt:     savedAt,
+				RecoverySource: "running",
 			},
 			{
-				IssueID: "5",
-				ClaimedEntry: model.ClaimedEntry{
-					Identifier:    "ISSUE-5",
-					WorkspacePath: "/tmp/ISSUE-5",
-					State:         "In Progress",
-					RetryAttempt:  4,
-					StallCount:    1,
-					ClaimedAt:     savedAt,
-				},
+				IssueID:        "5",
+				Identifier:     "ISSUE-5",
+				State:          "In Progress",
+				WorkspacePath:  "/tmp/ISSUE-5",
+				RetryAttempt:   4,
+				StallCount:     1,
+				ObservedAt:     savedAt,
+				RecoverySource: "claimed",
 			},
 		},
-		Running: []persistedRunningEntry{
-			{
-				IssueID:       "1",
-				Identifier:    "ISSUE-1",
-				State:         "In Progress",
-				WorkspacePath: "/tmp/ISSUE-1",
-				Session: model.LiveSession{
-					SessionID:        "thread-turn",
-					LastCodexMessage: "still running",
-					TurnCount:        2,
-				},
-				RetryAttempt: 1,
-				StallCount:   2,
-				StartedAt:    savedAt,
-			},
-		},
-		AwaitingMerge: []persistedAwaitingMergeEntry{
+		AwaitingMerge: []durableAwaitingMergeEntry{
 			{
 				IssueID: "3",
 				AwaitingMergeEntry: model.AwaitingMergeEntry{
@@ -1749,7 +1732,7 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 				},
 			},
 		},
-		AwaitingIntervention: []persistedAwaitingInterventionEntry{
+		AwaitingIntervention: []durableAwaitingInterventionEntry{
 			{
 				IssueID: "4",
 				AwaitingInterventionEntry: model.AwaitingInterventionEntry{
@@ -1779,25 +1762,28 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, savedAt.Add(time.Minute))
 	t.Cleanup(func() {
-		if o.persistence != nil {
-			o.persistence.Close()
+		if o.stateStore != nil {
+			o.closeStateStore(o.stateStore)
 		}
 	})
+	if err := o.ensureRuntimeExtensions(); err != nil {
+		t.Fatalf("ensureRuntimeExtensions() error = %v", err)
+	}
 
-	if len(o.state.Running) != 1 {
-		t.Fatalf("running size = %d, want 1", len(o.state.Running))
+	if len(o.state.Running) != 0 {
+		t.Fatalf("running size = %d, want 0", len(o.state.Running))
 	}
-	if got := o.state.Running["1"].Session.SessionID; got != "thread-turn" {
-		t.Fatalf("running session = %q, want thread-turn", got)
-	}
-	if len(o.state.RetryAttempts) != 2 {
-		t.Fatalf("retry size = %d, want 2", len(o.state.RetryAttempts))
+	if len(o.state.RecoveredPending) != 2 {
+		t.Fatalf("recovered pending size = %d, want 2", len(o.state.RecoveredPending))
 	}
 	if o.state.RetryAttempts["2"].TimerHandle == nil {
 		t.Fatal("restored retry timer = nil, want timer")
 	}
-	if _, ok := o.state.RetryAttempts["5"]; !ok {
-		t.Fatal("claimed-only entry was not converted into retry state")
+	if got := o.state.RecoveredPending["1"].RecoverySource; got != "running" {
+		t.Fatalf("recovered pending source = %q, want running", got)
+	}
+	if got := o.state.RecoveredPending["5"].RecoverySource; got != "claimed" {
+		t.Fatalf("recovered pending source = %q, want claimed", got)
 	}
 	if len(o.state.AwaitingMerge) != 1 {
 		t.Fatalf("awaiting merge size = %d, want 1", len(o.state.AwaitingMerge))
@@ -1920,8 +1906,8 @@ func TestMoveToAwaitingInterventionEmitsNotification(t *testing.T) {
 	if payload[0].Type != string(model.NotificationEventIssueInterventionRequired) {
 		t.Fatalf("payload[0].Type = %q, want %q", payload[0].Type, model.NotificationEventIssueInterventionRequired)
 	}
-	if got := payload[0].Details["reason"]; got != "missing_pr" {
-		t.Fatalf("payload[0].Details[reason] = %v, want missing_pr", got)
+	if got := payload[0].Reason; got != "missing_pr" {
+		t.Fatalf("payload[0].Reason = %q, want missing_pr", got)
 	}
 }
 
@@ -1967,17 +1953,172 @@ func TestNotificationDeliveryFailureCreatesInternalAlert(t *testing.T) {
 	}
 }
 
+func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
+	var (
+		oldMu      sync.Mutex
+		oldPayload []webhookPayload
+		newMu      sync.Mutex
+		newPayload []webhookPayload
+	)
+	oldStarted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	oldServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var item webhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			t.Fatalf("Decode() old error = %v", err)
+		}
+		oldMu.Lock()
+		oldPayload = append(oldPayload, item)
+		oldMu.Unlock()
+		select {
+		case <-oldStarted:
+		default:
+			close(oldStarted)
+		}
+		<-releaseOld
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer oldServer.Close()
+
+	newServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var item webhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			t.Fatalf("Decode() new error = %v", err)
+		}
+		newMu.Lock()
+		newPayload = append(newPayload, item)
+		newMu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer newServer.Close()
+
+	cfg := testServiceConfig()
+	cfg.Notifications.Channels = []model.NotificationChannelConfig{
+		{
+			Name:   "ops",
+			Kind:   model.NotificationChannelKindWebhook,
+			URL:    oldServer.URL,
+			Events: []model.NotificationEventType{model.NotificationEventSystemAlert},
+		},
+	}
+
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
+
+	o.mu.Lock()
+	o.setSystemAlertLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.commitStateLocked(true)
+	o.mu.Unlock()
+
+	waitForCondition(t, time.Second, func() bool {
+		select {
+		case <-oldStarted:
+			return true
+		default:
+			return false
+		}
+	})
+
+	cfg.Notifications.Channels[0].URL = newServer.URL
+	o.mu.Lock()
+	oldNotifier := o.reloadNotifierLocked()
+	o.mu.Unlock()
+
+	drained := make(chan struct{})
+	go func() {
+		o.closeNotifier(oldNotifier)
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		t.Fatal("old notifier drained before in-flight delivery was released")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	o.mu.Lock()
+	o.setSystemAlertLocked(AlertSnapshot{Code: "dispatch_preflight_failed", Level: "warn", Message: "preflight down"})
+	o.commitStateLocked(true)
+	o.mu.Unlock()
+
+	waitForCondition(t, time.Second, func() bool {
+		newMu.Lock()
+		defer newMu.Unlock()
+		return len(newPayload) == 1
+	})
+
+	close(releaseOld)
+	waitForCondition(t, time.Second, func() bool {
+		select {
+		case <-drained:
+			return true
+		default:
+			return false
+		}
+	})
+
+	oldMu.Lock()
+	defer oldMu.Unlock()
+	newMu.Lock()
+	defer newMu.Unlock()
+	if len(oldPayload) != 1 {
+		t.Fatalf("old notifier deliveries = %d, want 1", len(oldPayload))
+	}
+	if len(newPayload) != 1 {
+		t.Fatalf("new notifier deliveries = %d, want 1", len(newPayload))
+	}
+	if oldPayload[0].AlertCode != "tracker_unreachable" {
+		t.Fatalf("old payload alert_code = %q, want tracker_unreachable", oldPayload[0].AlertCode)
+	}
+	if newPayload[0].AlertCode != "dispatch_preflight_failed" {
+		t.Fatalf("new payload alert_code = %q, want dispatch_preflight_failed", newPayload[0].AlertCode)
+	}
+}
+
+func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
+	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
+	customNotifier := &asyncNotifier{
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		queue:         make(chan model.RuntimeEvent, 1),
+		enqueueResult: o.handleNotificationEnqueueResult,
+	}
+	o.notifier = customNotifier
+	t.Cleanup(func() {
+		o.closeNotifier(customNotifier)
+	})
+
+	o.emitNotificationLocked(o.newIssueCompletedEvent("1", "ISSUE-1"))
+	o.emitNotificationLocked(o.newIssueCompletedEvent("2", "ISSUE-2"))
+
+	waitForCondition(t, time.Second, func() bool {
+		snapshot := o.Snapshot()
+		return hasAlertCode(snapshot.Alerts, notificationQueueOverflowCode)
+	})
+}
+
 func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient tracker.Client, workspaceManager *fakeWorkspaceManager, runner *fakeRunner, now time.Time) *Orchestrator {
 	o := NewOrchestrator(trackerClient, workspaceManager, runner, func() *model.ServiceConfig {
 		return cfg
 	}, func() *model.WorkflowDefinition {
 		return &model.WorkflowDefinition{PromptTemplate: "Issue {{ issue.identifier }}"}
+	}, func() RuntimeIdentity {
+		return RuntimeIdentity{
+			ConfigRoot:  cfg.AutomationRootDir,
+			TrackerKind: cfg.TrackerKind,
+			TrackerRepo: cfg.TrackerRepo,
+		}
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	o.now = func() time.Time { return now }
 	o.startedAt = now
 	o.serviceVersion = "test"
 	o.gitBranchFn = func(context.Context, string) (string, error) { return "test/branch", nil }
 	o.prLookup = &fakePRLookup{byBranch: map[string]*PullRequestInfo{}}
+	if len(cfg.Notifications.Channels) > 0 {
+		if err := o.ensureRuntimeExtensions(); err != nil {
+			panic(err)
+		}
+	}
 	return o
 }
 

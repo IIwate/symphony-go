@@ -78,7 +78,19 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 	defer closer.Close()
 	logger.Info("automation loaded", slog.String("config_dir", repoDef.RootDir))
 
-	state := &runtimeState{repoDef: repoDef, definition: definition, config: cfg, portOverride: portOverride, configDir: repoDef.RootDir}
+	if dryRun {
+		logger.Info("dry-run 校验通过")
+		return nil
+	}
+
+	state := &runtimeState{
+		repoDef:      repoDef,
+		definition:   definition,
+		config:       cfg,
+		portOverride: portOverride,
+		configDir:    repoDef.RootDir,
+		profile:      repoDef.Profile,
+	}
 	orchestrator.BuildVersion = buildVersion
 	trackerClient, err := newTrackerFactory(state.CurrentConfig)
 	if err != nil {
@@ -89,14 +101,7 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	runner := newAgentRunnerFactory(state.CurrentConfig, logger)
-	orch := newOrchestratorFactory(trackerClient, workspaceManager, runner, state.CurrentConfig, state.CurrentWorkflow, logger)
-
-	if dryRun {
-		logger.Warn("dry-run 仍会访问 tracker 并执行 startupCleanup，可能产生副作用", slog.String("config_dir", repoDef.RootDir))
-		orch.RunOnce(context.Background(), false)
-		logger.Info("dry-run 校验通过")
-		return nil
-	}
+	orch := newOrchestratorFactory(trackerClient, workspaceManager, runner, state.CurrentConfig, state.CurrentWorkflow, state.CurrentIdentity, logger)
 
 	ctx, cancel := notifySignalContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

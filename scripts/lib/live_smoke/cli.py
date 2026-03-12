@@ -596,7 +596,7 @@ def _run_runtime_extensions_smoke(
             interval_seconds=0.2,
         )
         persisted = _load_session_state(session_state_path)
-        awaiting_intervention = persisted.get("AwaitingIntervention") or []
+        awaiting_intervention = _session_state_entries(persisted, "awaiting_intervention")
         if not any(item.get("Identifier") == persistence_identifier for item in awaiting_intervention):
             raise RuntimeError("session-state.json missing awaiting_intervention entry after intervention path")
 
@@ -655,7 +655,7 @@ def _run_runtime_extensions_smoke(
                 f"restored awaiting_merge pr_number mismatch: {merge_payload['awaiting_merge']['pr_number']} != {pr.number}"
             )
         persisted = _load_session_state(session_state_path)
-        awaiting_merge = persisted.get("AwaitingMerge") or []
+        awaiting_merge = _session_state_entries(persisted, "awaiting_merge")
         if not any(item.get("Identifier") == merge_identifier for item in awaiting_merge):
             raise RuntimeError("session-state.json missing awaiting_merge entry after restart")
 
@@ -771,6 +771,16 @@ def _await_linear_done(linear: LinearClient, issue_id: str) -> dict[str, object]
 
 def _load_session_state(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _session_state_entries(payload: dict[str, object], key: str) -> list[dict[str, object]]:
+    values = payload.get(key)
+    if values is None:
+        legacy_key = "".join(part.capitalize() for part in key.split("_"))
+        values = payload.get(legacy_key)
+    if not isinstance(values, list):
+        return []
+    return [item for item in values if isinstance(item, dict)]
 
 
 def _start_notification_server(port: int, recorder: NotificationRecorder) -> ThreadingHTTPServer:

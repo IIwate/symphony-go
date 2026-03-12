@@ -139,8 +139,8 @@ curl http://127.0.0.1:8080/api/v1/state
 - 变更后会尝试 reload
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
-- `orchestrator.auto_close_on_pr` 也支持热更新；默认值为 `true`
-- `runtime.session_persistence` 与 `runtime.notifications` 首版均属于 `restart-required`
+- `orchestrator.auto_close_on_pr` 与 `runtime.notifications` 也支持热更新；默认值分别为 `true` 和“关闭”
+- `runtime.session_persistence` 仍属于 `restart-required`
 
 - `automation/project.yaml`
 - 当前激活的 `automation/profiles/*.yaml`
@@ -159,16 +159,16 @@ curl http://127.0.0.1:8080/api/v1/state
 ### 建议操作方式
 
 - 先修改一小处可验证字段，再观察日志是否出现 reload 成功
-- 对高风险字段（tracker、workspace.root、hooks、codex、orchestrator.auto_close_on_pr、session_persistence、notifications）变更，先用 `--dry-run` 验证再上服务
-- 若启用 `runtime.session_persistence`，默认状态文件位于 `automation/local/session-state.json`，该文件默认被 Git 忽略，不参与热重载
-- 若启用 `runtime.notifications`，通知仅针对重启后的新事件发送；不会补发进程重启前已发生的旧通知
+- 对高风险字段（tracker、workspace.root、hooks、codex、orchestrator.auto_close_on_pr、session_persistence）变更，先用 `--dry-run` 验证再上服务；`notifications` 支持热更新，但建议先小流量验证
+- 若启用 `runtime.session_persistence`，默认状态文件位于 `automation/local/session-state.json`，该文件默认被 Git 忽略，不参与热重载；若文件格式或运行实例身份不兼容，启动会明确失败并要求删除旧文件
+- 若启用 `runtime.notifications`，通知仅针对进程存活期间的新事件发送；reload 只影响后续事件，不会补发旧通知
 
 ## 6. Smoke Test 操作指南
 
 ### 6.1 配置烟测
 
 - 当前版本仅支持 `tracker.kind=linear`：设置 `LINEAR_API_KEY`
-- 若 `--dry-run` 成功，表示当前 workflow/config 基本可用；但它仍会访问 tracker，并可能执行启动清理副作用
+- 若 `--dry-run` 成功，表示当前 workflow/config 基本可用；当前实现只做无副作用加载与校验，不会访问 tracker、恢复 session state、发送通知或执行启动清理
 - 执行 `go run ./cmd/symphony --dry-run`
 - 期望结果：退出码为 0，日志出现“dry-run 校验通过”
 - 若你在对照 Cycle 5 草案目录模式排查，请先确认 `automation/project.yaml`、active source 和 `automation/local/env.local` 的内容一致

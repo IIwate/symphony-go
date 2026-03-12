@@ -45,11 +45,93 @@ func TestRunCLIUsesDefaultAutomationDir(t *testing.T) {
 	if exitCode := runCLI([]string{"--dry-run"}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "dry-run 仍会访问 tracker 并执行 startupCleanup") {
-		t.Fatalf("stderr = %q, want dry-run side-effect warning", stderr.String())
-	}
 	if !strings.Contains(stderr.String(), "dry-run 校验通过") {
 		t.Fatalf("stderr = %q, want dry-run success message", stderr.String())
+	}
+}
+
+func TestRunCLIDryRunSkipsRuntimeDependencies(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	statePath := filepath.Join(configDir, "local", "session-state.json")
+	writeFile(t, statePath, "not-json\n")
+	projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+  codex:
+    command: codex app-server
+  session_persistence:
+    enabled: true
+    backend: file
+    path: ./local/session-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, filepath.ToSlash(filepath.Join(filepath.Dir(configDir), "workspaces")))
+	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
+
+	trackerCalls := 0
+	workspaceCalls := 0
+	runnerCalls := 0
+	orchestratorCalls := 0
+	serverCalls := 0
+	watchCalls := 0
+
+	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
+		trackerCalls++
+		return &fakeTrackerClient{}, nil
+	}
+	newWorkspaceFactory = func(func() *model.ServiceConfig, *slog.Logger) (workspace.Manager, error) {
+		workspaceCalls++
+		return &fakeWorkspaceManager{}, nil
+	}
+	newAgentRunnerFactory = func(func() *model.ServiceConfig, *slog.Logger) agent.Runner {
+		runnerCalls++
+		return fakeAgentRunner{}
+	}
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
+		orchestratorCalls++
+		return &fakeOrchestrator{}
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+		serverCalls++
+		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
+	}
+	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
+		watchCalls++
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"--dry-run", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if trackerCalls != 0 || workspaceCalls != 0 || runnerCalls != 0 || orchestratorCalls != 0 || serverCalls != 0 || watchCalls != 0 {
+		t.Fatalf(
+			"dry-run initialized runtime deps: tracker=%d workspace=%d runner=%d orchestrator=%d server=%d watch=%d",
+			trackerCalls,
+			workspaceCalls,
+			runnerCalls,
+			orchestratorCalls,
+			serverCalls,
+			watchCalls,
+		)
+	}
+	content, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", statePath, err)
+	}
+	if string(content) != "not-json\n" {
+		t.Fatalf("session state content changed during dry-run: %q", string(content))
 	}
 }
 
@@ -501,25 +583,27 @@ defaults:
 		definition: definition,
 		config:     cfg,
 		configDir:  repoDef.RootDir,
+		profile:    repoDef.Profile,
 	}
 
 	tests := []struct {
 		name        string
 		sessionPath string
 		url         string
-		want        string
+		wantErr     string
+		wantURL     string
 	}{
 		{
 			name:        "session persistence",
 			sessionPath: "./automation/local/other-session-state.json",
 			url:         "https://hooks.example.com/a",
-			want:        "runtime.session_persistence changed: restart required",
+			wantErr:     "runtime.session_persistence changed: restart required",
 		},
 		{
 			name:        "notifications",
 			sessionPath: "./automation/local/session-state.json",
 			url:         "https://hooks.example.com/b",
-			want:        "runtime.notifications changed: restart required",
+			wantURL:     "https://hooks.example.com/b",
 		},
 	}
 
@@ -531,10 +615,96 @@ defaults:
 				t.Fatalf("loader.Load() reload error = %v", err)
 			}
 			_, err = state.ApplyReload(reloaded)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("ApplyReload() error = %v, want %q", err, tc.want)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ApplyReload() error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ApplyReload() error = %v", err)
+			}
+			if got := state.CurrentConfig().Notifications.Channels[0].URL; got != tc.wantURL {
+				t.Fatalf("Notifications.Channels[0].URL = %q, want %q", got, tc.wantURL)
 			}
 		})
+	}
+}
+
+func TestExecuteFailsWhenSessionStateIdentityMismatch(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	restore := stubDependencies(t)
+	defer restore()
+
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	statePath := filepath.Join(configDir, "local", "session-state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(statePath), err)
+	}
+	projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+  codex:
+    command: codex app-server
+  session_persistence:
+    enabled: true
+    backend: file
+    path: ./local/session-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
+	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
+	writeFile(t, statePath, `{
+  "version": 2,
+  "identity": {
+    "ConfigRoot": "C:/different/root",
+    "Profile": "",
+    "SourceName": "linear-main",
+    "FlowName": "implement",
+    "TrackerKind": "linear",
+    "TrackerRepo": ""
+  },
+  "saved_at": "2026-03-12T00:00:00Z"
+}
+`)
+
+	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
+		return &fakeTrackerClient{}, nil
+	}
+	newWorkspaceFactory = func(func() *model.ServiceConfig, *slog.Logger) (workspace.Manager, error) {
+		return &fakeWorkspaceManager{}, nil
+	}
+	newAgentRunnerFactory = func(func() *model.ServiceConfig, *slog.Logger) agent.Runner {
+		return fakeAgentRunner{}
+	}
+	newOrchestratorFactory = func(tc tracker.Client, wm workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, identityFn func() orchestrator.RuntimeIdentity, logger *slog.Logger) orchestratorService {
+		return orchestrator.NewOrchestrator(tc, wm, runner, configFn, workflowFn, identityFn, logger)
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
+	}
+	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+		return context.WithCancel(parent)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := execute([]string{"--config-dir", configDir}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("execute() error = nil, want session state identity mismatch failure")
+	}
+	if !strings.Contains(err.Error(), "delete the file and restart") {
+		t.Fatalf("execute() error = %v, want delete/restart guidance", err)
+	}
+	if !strings.Contains(err.Error(), "identity does not match current runtime") {
+		t.Fatalf("execute() error = %v, want identity mismatch detail", err)
 	}
 }
 
@@ -548,7 +718,7 @@ func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{notifyReload: func(_ *model.WorkflowDefinition) { reloadCount++ }}
 	}
 	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
@@ -596,7 +766,7 @@ func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
 	waitReturned := make(chan struct{})
 	shutdownCalled := make(chan struct{})
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{
 			start: func(context.Context) error {
 				close(started)
@@ -667,7 +837,7 @@ func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
 	releaseWait := make(chan struct{})
 	shutdownCalled := make(chan struct{})
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{
 			start: func(context.Context) error {
 				close(started)
@@ -747,7 +917,7 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 	shutdownCount := 0
 	gotPort := -1
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{
 			start: func(context.Context) error {
 				close(started)
@@ -842,7 +1012,7 @@ func stubDependencies(t *testing.T) func() {
 	newAgentRunnerFactory = func(func() *model.ServiceConfig, *slog.Logger) agent.Runner {
 		return fakeAgentRunner{}
 	}
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{}
 	}
 	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {

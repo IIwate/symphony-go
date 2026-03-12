@@ -43,6 +43,7 @@ type Snapshot struct {
 	Service              ServiceSnapshot
 	Counts               SnapshotCounts
 	Running              []RunningSnapshot
+	RecoveredPending     []RecoveredPendingSnapshot
 	AwaitingMerge        []AwaitingMergeSnapshot
 	AwaitingIntervention []AwaitingInterventionSnapshot
 	Retrying             []RetrySnapshot
@@ -58,6 +59,7 @@ type ServiceSnapshot struct {
 
 type SnapshotCounts struct {
 	Running              int
+	RecoveredPending     int
 	AwaitingMerge        int
 	AwaitingIntervention int
 	Retrying             int
@@ -94,6 +96,20 @@ type RetrySnapshot struct {
 	Attempt            int
 	DueAt              time.Time
 	Error              *string
+}
+
+type RecoveredPendingSnapshot struct {
+	IssueID             string
+	IssueIdentifier     string
+	WorkspacePath       string
+	State               string
+	DispatchKind        string
+	ExpectedOutcome     string
+	ContinuationReason  *string
+	CurrentRetryAttempt int
+	AttemptCount        int
+	RecoverySource      string
+	ObservedAt          time.Time
 }
 
 type AwaitingMergeSnapshot struct {
@@ -177,19 +193,29 @@ type PullRequestLookup interface {
 	Refresh(ctx context.Context, workspacePath string, pr *PullRequestInfo) (*PullRequestInfo, error)
 }
 
+type RuntimeIdentity struct {
+	ConfigRoot  string
+	Profile     string
+	SourceName  string
+	FlowName    string
+	TrackerKind string
+	TrackerRepo string
+}
+
 type Orchestrator struct {
-	tracker     tracker.Client
-	workspace   workspace.Manager
-	runner      agent.Runner
-	configFn    func() *model.ServiceConfig
-	workflowFn  func() *model.WorkflowDefinition
-	logger      *slog.Logger
-	now         func() time.Time
-	randFloat   func() float64
-	gitBranchFn func(context.Context, string) (string, error)
-	prLookup    PullRequestLookup
-	persistence *sessionStateWriter
-	notifier    *asyncNotifier
+	tracker           tracker.Client
+	workspace         workspace.Manager
+	runner            agent.Runner
+	configFn          func() *model.ServiceConfig
+	workflowFn        func() *model.WorkflowDefinition
+	runtimeIdentityFn func() RuntimeIdentity
+	logger            *slog.Logger
+	now               func() time.Time
+	randFloat         func() float64
+	gitBranchFn       func(context.Context, string) (string, error)
+	prLookup          PullRequestLookup
+	stateStore        stateStore
+	notifier          notifier
 
 	tickTimer      *time.Timer
 	workerResultCh chan WorkerResult
@@ -217,36 +243,40 @@ type Orchestrator struct {
 	maxCompleted     int
 	startedAt        time.Time
 	serviceVersion   string
+	extensionsReady  bool
+	eventSeq         uint64
 }
 
 var BuildVersion = "dev"
 
 const defaultMaxCompletedEntries = 4096
 
-func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, logger *slog.Logger) *Orchestrator {
+func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, runtimeIdentityFn func() RuntimeIdentity, logger *slog.Logger) *Orchestrator {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
 	o := &Orchestrator{
-		tracker:        trackerClient,
-		workspace:      workspaceManager,
-		runner:         runner,
-		configFn:       configFn,
-		workflowFn:     workflowFn,
-		logger:         logger,
-		now:            time.Now,
-		randFloat:      func() float64 { return 0.5 },
-		gitBranchFn:    defaultGitBranch,
-		workerResultCh: make(chan WorkerResult, 128),
-		codexUpdateCh:  make(chan CodexUpdate, 1024),
-		configReloadCh: make(chan struct{}, 8),
-		refreshCh:      make(chan struct{}, 8),
-		retryFireCh:    make(chan string, 128),
-		shutdownCh:     make(chan struct{}),
-		doneCh:         make(chan struct{}),
+		tracker:           trackerClient,
+		workspace:         workspaceManager,
+		runner:            runner,
+		configFn:          configFn,
+		workflowFn:        workflowFn,
+		runtimeIdentityFn: runtimeIdentityFn,
+		logger:            logger,
+		now:               time.Now,
+		randFloat:         func() float64 { return 0.5 },
+		gitBranchFn:       defaultGitBranch,
+		workerResultCh:    make(chan WorkerResult, 128),
+		codexUpdateCh:     make(chan CodexUpdate, 1024),
+		configReloadCh:    make(chan struct{}, 8),
+		refreshCh:         make(chan struct{}, 8),
+		retryFireCh:       make(chan string, 128),
+		shutdownCh:        make(chan struct{}),
+		doneCh:            make(chan struct{}),
 		state: model.OrchestratorState{
 			Running:              map[string]*model.RunningEntry{},
+			RecoveredPending:     map[string]*model.RecoveredPendingEntry{},
 			AwaitingMerge:        map[string]*model.AwaitingMergeEntry{},
 			AwaitingIntervention: map[string]*model.AwaitingInterventionEntry{},
 			Claimed:              map[string]*model.ClaimedEntry{},
@@ -261,13 +291,16 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		serviceVersion: BuildVersion,
 	}
 	o.prLookup = newGitHubPRLookup()
-	o.initRuntimeExtensions()
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
 	return o
 }
 
 func (o *Orchestrator) Start(ctx context.Context) error {
+	if err := o.ensureRuntimeExtensions(); err != nil {
+		return err
+	}
+
 	o.mu.Lock()
 	if o.started {
 		o.mu.Unlock()
@@ -308,9 +341,11 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 			case <-o.configReloadCh:
 				o.mu.Lock()
 				o.applyCurrentConfigLocked()
+				oldNotifier := o.reloadNotifierLocked()
 				o.refreshSnapshotLocked()
 				o.publishSnapshotLocked()
 				o.mu.Unlock()
+				o.closeNotifier(oldNotifier)
 			}
 		}
 	}()
@@ -382,6 +417,10 @@ func (o *Orchestrator) SubscribeSnapshots(buffer int) (<-chan Snapshot, func()) 
 }
 
 func (o *Orchestrator) RunOnce(ctx context.Context, allowDispatch bool) {
+	if err := o.ensureRuntimeExtensions(); err != nil {
+		o.logger.Error("runtime extensions initialization failed", "error", err.Error())
+		return
+	}
 	o.startupCleanup(ctx)
 	o.tickWithMode(ctx, allowDispatch)
 }
@@ -392,6 +431,7 @@ func (o *Orchestrator) tick(ctx context.Context) {
 
 func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	stateRefreshAttempted, stateRefreshSucceeded := o.reconcileRunning(ctx)
+	o.reconcileRecoveredPending(ctx)
 	o.reconcileAwaitingMerge(ctx)
 	o.reconcileAwaitingIntervention(ctx)
 
@@ -1372,12 +1412,8 @@ func (o *Orchestrator) gracefulShutdown() {
 	case <-done:
 	case <-time.After(2 * time.Second):
 	}
-	if o.persistence != nil {
-		o.persistence.Close()
-	}
-	if o.notifier != nil {
-		o.notifier.Close()
-	}
+	o.closeStateStore(o.stateStore)
+	o.closeNotifier(o.notifier)
 }
 
 func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID string, cleanup bool, scheduleRetry bool, errText string) {
@@ -1532,6 +1568,35 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		running = append(running, row)
 	}
 
+	recoveredPending := make([]RecoveredPendingSnapshot, 0, len(o.state.RecoveredPending))
+	for issueID, entry := range o.state.RecoveredPending {
+		row := RecoveredPendingSnapshot{
+			IssueID:             issueID,
+			IssueIdentifier:     entry.Identifier,
+			WorkspacePath:       entry.WorkspacePath,
+			State:               entry.State,
+			CurrentRetryAttempt: entry.RetryAttempt,
+			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
+			RecoverySource:      entry.RecoverySource,
+			ObservedAt:          entry.ObservedAt,
+		}
+		if entry.Dispatch != nil {
+			row.DispatchKind = string(entry.Dispatch.Kind)
+			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
+			if entry.Dispatch.Reason != nil {
+				reason := string(*entry.Dispatch.Reason)
+				row.ContinuationReason = &reason
+			}
+		}
+		recoveredPending = append(recoveredPending, row)
+	}
+	sort.SliceStable(recoveredPending, func(i int, j int) bool {
+		if recoveredPending[i].IssueIdentifier != recoveredPending[j].IssueIdentifier {
+			return recoveredPending[i].IssueIdentifier < recoveredPending[j].IssueIdentifier
+		}
+		return recoveredPending[i].IssueID < recoveredPending[j].IssueID
+	})
+
 	awaitingMerge := make([]AwaitingMergeSnapshot, 0, len(o.state.AwaitingMerge))
 	for issueID, entry := range o.state.AwaitingMerge {
 		awaitingMerge = append(awaitingMerge, AwaitingMergeSnapshot{
@@ -1665,11 +1730,13 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		},
 		Counts: SnapshotCounts{
 			Running:              len(running),
+			RecoveredPending:     len(recoveredPending),
 			AwaitingMerge:        len(awaitingMerge),
 			AwaitingIntervention: len(awaitingIntervention),
 			Retrying:             len(retrying),
 		},
 		Running:              running,
+		RecoveredPending:     recoveredPending,
 		AwaitingMerge:        awaitingMerge,
 		AwaitingIntervention: awaitingIntervention,
 		Retrying:             retrying,
@@ -1735,10 +1802,16 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 	if _, ok := o.state.Running[issue.ID]; ok {
 		return false
 	}
+	if _, ok := o.state.RecoveredPending[issue.ID]; ok {
+		return false
+	}
 	if _, ok := o.state.AwaitingMerge[issue.ID]; ok {
 		return false
 	}
 	if _, ok := o.state.AwaitingIntervention[issue.ID]; ok {
+		return false
+	}
+	if _, ok := o.state.RetryAttempts[issue.ID]; ok {
 		return false
 	}
 	if !ignoreClaim {
@@ -2150,38 +2223,40 @@ func isStallErrorText(errText string) bool {
 	return strings.Contains(strings.ToLower(errText), "stalled session")
 }
 
-func (o *Orchestrator) setSystemAlertLocked(alert AlertSnapshot) {
+func (o *Orchestrator) setSystemAlertLocked(alert AlertSnapshot) bool {
 	if strings.TrimSpace(alert.Code) == "" {
-		return
+		return false
 	}
 	if existing, ok := o.systemAlerts[alert.Code]; ok {
 		if existing.Level == alert.Level &&
 			existing.Message == alert.Message &&
 			existing.IssueID == alert.IssueID &&
 			existing.IssueIdentifier == alert.IssueIdentifier {
-			return
+			return false
 		}
 	}
 	o.systemAlerts[alert.Code] = alert
 	if shouldSuppressAlertNotification(alert.Code) {
-		return
+		return true
 	}
 	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlert, alert))
+	return true
 }
 
-func (o *Orchestrator) clearSystemAlertLocked(code string) {
+func (o *Orchestrator) clearSystemAlertLocked(code string) bool {
 	if strings.TrimSpace(code) == "" {
-		return
+		return false
 	}
 	existing, ok := o.systemAlerts[code]
 	if !ok {
-		return
+		return false
 	}
 	delete(o.systemAlerts, code)
 	if shouldSuppressAlertNotification(code) {
-		return
+		return true
 	}
 	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlertCleared, existing))
+	return true
 }
 
 func attemptCountFromRetry(retryAttempt int) int {

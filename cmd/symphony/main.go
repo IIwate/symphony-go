@@ -46,6 +46,7 @@ type runtimeState struct {
 	config       *model.ServiceConfig
 	portOverride *int
 	configDir    string
+	profile      string
 }
 
 var (
@@ -66,8 +67,8 @@ var (
 	newAgentRunnerFactory = func(configFn func() *model.ServiceConfig, logger *slog.Logger) agent.Runner {
 		return agent.NewRunner(configFn, logger, nil)
 	}
-	newOrchestratorFactory = func(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, logger *slog.Logger) orchestratorService {
-		return orchestrator.NewOrchestrator(trackerClient, workspaceManager, runner, configFn, workflowFn, logger)
+	newOrchestratorFactory = func(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, identityFn func() orchestrator.RuntimeIdentity, logger *slog.Logger) orchestratorService {
+		return orchestrator.NewOrchestrator(trackerClient, workspaceManager, runner, configFn, workflowFn, identityFn, logger)
 	}
 	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
 		return server.Start(runtime, logger, port)
@@ -178,6 +179,27 @@ func (s *runtimeState) CurrentWorkflow() *model.WorkflowDefinition {
 	return s.definition
 }
 
+func (s *runtimeState) CurrentIdentity() orchestrator.RuntimeIdentity {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	identity := orchestrator.RuntimeIdentity{
+		ConfigRoot: s.configDir,
+		Profile:    strings.TrimSpace(s.profile),
+	}
+	if s.repoDef != nil {
+		identity.FlowName = strings.TrimSpace(s.repoDef.Selection.DispatchFlow)
+		if len(s.repoDef.Selection.EnabledSources) == 1 {
+			identity.SourceName = strings.TrimSpace(s.repoDef.Selection.EnabledSources[0])
+		}
+	}
+	if s.config != nil {
+		identity.TrackerKind = strings.TrimSpace(s.config.TrackerKind)
+		identity.TrackerRepo = strings.TrimSpace(s.config.TrackerRepo)
+	}
+	return identity
+}
+
 func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.WorkflowDefinition, error) {
 	newDefinition, err := resolveActiveWorkflow(repoDef)
 	if err != nil {
@@ -218,9 +240,6 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 		if !reflect.DeepEqual(currentCfg.SessionPersistence, newCfg.SessionPersistence) {
 			return nil, fmt.Errorf("runtime.session_persistence changed: restart required")
 		}
-		if !reflect.DeepEqual(currentCfg.Notifications, newCfg.Notifications) {
-			return nil, fmt.Errorf("runtime.notifications changed: restart required")
-		}
 	}
 	if err := config.ValidateForDispatch(newCfg); err != nil {
 		return nil, err
@@ -231,6 +250,7 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 	s.definition = newDefinition
 	s.config = newCfg
 	s.configDir = repoDef.RootDir
+	s.profile = repoDef.Profile
 	s.mu.Unlock()
 
 	return newDefinition, nil
