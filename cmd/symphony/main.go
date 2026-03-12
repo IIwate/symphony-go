@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -213,6 +214,12 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 		}
 		if !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort) {
 			return nil, fmt.Errorf("runtime.server.port changed: restart required")
+		}
+		if !reflect.DeepEqual(currentCfg.SessionPersistence, newCfg.SessionPersistence) {
+			return nil, fmt.Errorf("runtime.session_persistence changed: restart required")
+		}
+		if !reflect.DeepEqual(currentCfg.Notifications, newCfg.Notifications) {
+			return nil, fmt.Errorf("runtime.notifications changed: restart required")
 		}
 	}
 	if err := config.ValidateForDispatch(newCfg); err != nil {

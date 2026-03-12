@@ -140,6 +140,7 @@ curl http://127.0.0.1:8080/api/v1/state
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
 - `orchestrator.auto_close_on_pr` 也支持热更新；默认值为 `true`
+- `runtime.session_persistence` 与 `runtime.notifications` 首版均属于 `restart-required`
 
 - `automation/project.yaml`
 - 当前激活的 `automation/profiles/*.yaml`
@@ -158,7 +159,9 @@ curl http://127.0.0.1:8080/api/v1/state
 ### 建议操作方式
 
 - 先修改一小处可验证字段，再观察日志是否出现 reload 成功
-- 对高风险字段（tracker、workspace.root、hooks、codex、orchestrator.auto_close_on_pr）变更，先用 `--dry-run` 验证再上服务
+- 对高风险字段（tracker、workspace.root、hooks、codex、orchestrator.auto_close_on_pr、session_persistence、notifications）变更，先用 `--dry-run` 验证再上服务
+- 若启用 `runtime.session_persistence`，默认状态文件位于 `automation/local/session-state.json`，该文件默认被 Git 忽略，不参与热重载
+- 若启用 `runtime.notifications`，通知仅针对重启后的新事件发送；不会补发进程重启前已发生的旧通知
 
 ## 6. Smoke Test 操作指南
 
@@ -232,6 +235,8 @@ py -3 scripts/live_smoke.py --phase all
 - `--phase heavy`
   - 创建隔离测试 issue
   - 验证 `missing_pr -> awaiting_intervention`
+  - 验证 `session_persistence` 可恢复 `awaiting_intervention` / `awaiting_merge`
+  - 验证 `notifications` 的 webhook / slack 通道实际投递，且重启后不补发旧通知
   - 创建测试分支和 PR
   - 验证 `awaiting_merge -> merged -> issue Done`
 - `--phase all`

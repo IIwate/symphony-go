@@ -132,6 +132,55 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 		cfg.ServerPort = &port
 	}
 
+	sessionPersistence := getMap(configMap, "session_persistence")
+	if enabled, ok := getBool(sessionPersistence, "enabled"); ok {
+		cfg.SessionPersistence.Enabled = enabled
+	}
+	if backend := strings.TrimSpace(getString(sessionPersistence, "backend", "")); backend != "" {
+		cfg.SessionPersistence.Backend = model.NormalizeState(backend)
+	}
+	if path := expandHomePath(strings.TrimSpace(getString(sessionPersistence, "path", ""))); path != "" {
+		cfg.SessionPersistence.Path = path
+	}
+	if flushInterval, ok := getInt(sessionPersistence, "flush_interval_ms"); ok {
+		cfg.SessionPersistence.FlushIntervalMS = flushInterval
+	}
+	if fsyncOnCritical, ok := getBool(sessionPersistence, "fsync_on_critical"); ok {
+		cfg.SessionPersistence.FsyncOnCritical = fsyncOnCritical
+	}
+
+	notifications := getMap(configMap, "notifications")
+	channelMaps := getMapSlice(notifications, "channels")
+	if len(channelMaps) > 0 {
+		cfg.Notifications.Channels = make([]model.NotificationChannelConfig, 0, len(channelMaps))
+		for _, channel := range channelMaps {
+			parsed := model.NotificationChannelConfig{
+				Name:    strings.TrimSpace(getString(channel, "name", "")),
+				Kind:    model.NotificationChannelKind(model.NormalizeState(getString(channel, "kind", ""))),
+				URL:     strings.TrimSpace(getString(channel, "url", "")),
+				Headers: getStringMap(getMap(channel, "headers")),
+				Events:  allNotificationEventTypes(),
+			}
+			if eventNames, ok := getStringSlice(channel, "events"); ok && len(eventNames) > 0 {
+				parsed.Events = make([]model.NotificationEventType, 0, len(eventNames))
+				for _, eventName := range eventNames {
+					parsed.Events = append(parsed.Events, model.NotificationEventType(strings.ToLower(strings.TrimSpace(eventName))))
+				}
+			}
+			cfg.Notifications.Channels = append(cfg.Notifications.Channels, parsed)
+		}
+	}
+	notificationDefaults := getMap(notifications, "defaults")
+	if timeoutMS, ok := getInt(notificationDefaults, "timeout_ms"); ok {
+		cfg.Notifications.Defaults.TimeoutMS = timeoutMS
+	}
+	if retryCount, ok := getInt(notificationDefaults, "retry_count"); ok {
+		cfg.Notifications.Defaults.RetryCount = retryCount
+	}
+	if retryDelayMS, ok := getInt(notificationDefaults, "retry_delay_ms"); ok {
+		cfg.Notifications.Defaults.RetryDelayMS = retryDelayMS
+	}
+
 	return cfg, nil
 }
 
@@ -156,6 +205,12 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 	}
 	if strings.TrimSpace(cfg.CodexCommand) == "" {
 		return model.NewWorkflowError(model.ErrInvalidCodexCommand, "codex.command is required", nil)
+	}
+	if err := validateSessionPersistenceConfig(cfg.SessionPersistence); err != nil {
+		return err
+	}
+	if err := validateNotificationsConfig(cfg.Notifications); err != nil {
+		return err
 	}
 	if err := validateRequiredHookEnvs(cfg); err != nil {
 		return err
@@ -185,6 +240,19 @@ func defaultServiceConfig() *model.ServiceConfig {
 		CodexTurnTimeoutMS:               3600000,
 		CodexReadTimeoutMS:               5000,
 		CodexStallTimeoutMS:              300000,
+		SessionPersistence: model.SessionPersistenceConfig{
+			Backend:         "file",
+			Path:            filepath.Join("automation", "local", "session-state.json"),
+			FlushIntervalMS: 1000,
+			FsyncOnCritical: true,
+		},
+		Notifications: model.NotificationsConfig{
+			Defaults: model.NotificationDefaultsConfig{
+				TimeoutMS:    5000,
+				RetryCount:   2,
+				RetryDelayMS: 1000,
+			},
+		},
 	}
 }
 
@@ -270,6 +338,60 @@ func getStringSlice(source map[string]any, key string) ([]string, bool) {
 	default:
 		return nil, false
 	}
+}
+
+func getMapSlice(source map[string]any, key string) []map[string]any {
+	if source == nil {
+		return nil
+	}
+	raw, ok := source[key]
+	if !ok || raw == nil {
+		return nil
+	}
+
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		typed, ok := item.(map[string]any)
+		if ok {
+			result = append(result, typed)
+			continue
+		}
+		nested, ok := item.(map[any]any)
+		if !ok {
+			continue
+		}
+		converted := make(map[string]any, len(nested))
+		for nestedKey, nestedValue := range nested {
+			converted[fmt.Sprint(nestedKey)] = nestedValue
+		}
+		result = append(result, converted)
+	}
+	return result
+}
+
+func getStringMap(source map[string]any) map[string]string {
+	if len(source) == 0 {
+		return map[string]string{}
+	}
+	result := make(map[string]string, len(source))
+	for key, raw := range source {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		switch typed := raw.(type) {
+		case string:
+			result[trimmedKey] = strings.TrimSpace(resolveEnvString(typed))
+		default:
+			result[trimmedKey] = strings.TrimSpace(stringifyValue(raw))
+		}
+	}
+	return result
 }
 
 func getInt(source map[string]any, key string) (int, bool) {
@@ -382,6 +504,95 @@ func resolveEnvString(value string) string {
 	}
 
 	return strings.TrimSpace(resolved)
+}
+
+func validateSessionPersistenceConfig(cfg model.SessionPersistenceConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if model.NormalizeState(cfg.Backend) != "file" {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.session_persistence.backend %q is unsupported", cfg.Backend), nil)
+	}
+	if strings.TrimSpace(cfg.Path) == "" {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.session_persistence.path is required", nil)
+	}
+	if cfg.FlushIntervalMS <= 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.session_persistence.flush_interval_ms must be > 0", nil)
+	}
+	return nil
+}
+
+func validateNotificationsConfig(cfg model.NotificationsConfig) error {
+	if len(cfg.Channels) == 0 && cfg.Defaults.TimeoutMS == 0 && cfg.Defaults.RetryCount == 0 && cfg.Defaults.RetryDelayMS == 0 {
+		return nil
+	}
+	if cfg.Defaults.TimeoutMS <= 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.timeout_ms must be > 0", nil)
+	}
+	if cfg.Defaults.RetryCount < 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.retry_count must be >= 0", nil)
+	}
+	if cfg.Defaults.RetryDelayMS < 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.retry_delay_ms must be >= 0", nil)
+	}
+
+	seenNames := make(map[string]struct{}, len(cfg.Channels))
+	allowedEvents := notificationEventSet()
+	for index, channel := range cfg.Channels {
+		if strings.TrimSpace(channel.Name) == "" {
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].name is required", index), nil)
+		}
+		if _, exists := seenNames[channel.Name]; exists {
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].name %q is duplicated", index, channel.Name), nil)
+		}
+		seenNames[channel.Name] = struct{}{}
+
+		switch channel.Kind {
+		case model.NotificationChannelKindWebhook, model.NotificationChannelKindSlack:
+		default:
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].kind %q is unsupported", index, channel.Kind), nil)
+		}
+
+		if strings.TrimSpace(channel.URL) == "" {
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].url is required", index), nil)
+		}
+
+		for key, value := range channel.Headers {
+			if strings.TrimSpace(key) == "" {
+				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].headers contains an empty key", index), nil)
+			}
+			if strings.TrimSpace(value) == "" {
+				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].headers.%s is required", index, key), nil)
+			}
+		}
+
+		for _, eventType := range channel.Events {
+			if _, ok := allowedEvents[eventType]; !ok {
+				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].events contains unsupported event %q", index, eventType), nil)
+			}
+		}
+	}
+
+	return nil
+}
+
+func allNotificationEventTypes() []model.NotificationEventType {
+	return []model.NotificationEventType{
+		model.NotificationEventIssueDispatched,
+		model.NotificationEventIssueCompleted,
+		model.NotificationEventIssueFailed,
+		model.NotificationEventIssueInterventionRequired,
+		model.NotificationEventSystemAlert,
+		model.NotificationEventSystemAlertCleared,
+	}
+}
+
+func notificationEventSet() map[model.NotificationEventType]struct{} {
+	result := make(map[model.NotificationEventType]struct{}, 6)
+	for _, eventType := range allNotificationEventTypes() {
+		result[eventType] = struct{}{}
+	}
+	return result
 }
 
 func validateRequiredHookEnvs(cfg *model.ServiceConfig) error {

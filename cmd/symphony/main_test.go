@@ -443,6 +443,101 @@ func TestRuntimeStateApplyReloadKeepsPortOverride(t *testing.T) {
 	}
 }
 
+func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, "automation")
+	workspaceRoot := filepath.ToSlash(filepath.Join(tmpDir, "workspaces"))
+	writeAutomationConfig(t, configDir, automationFixtureOptions{WorkspaceRoot: workspaceRoot})
+
+	writeProject := func(sessionPath string, notificationURL string) {
+		projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+  codex:
+    command: codex app-server
+  session_persistence:
+    enabled: true
+    backend: file
+    path: %s
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+  notifications:
+    channels:
+      - name: ops
+        kind: webhook
+        url: %s
+        events: [system_alert]
+    defaults:
+      timeout_ms: 5000
+      retry_count: 2
+      retry_delay_ms: 1000
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, workspaceRoot, sessionPath, notificationURL)
+		writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
+	}
+
+	writeProject("./automation/local/session-state.json", "https://hooks.example.com/a")
+
+	repoDef, err := loader.Load(configDir, "")
+	if err != nil {
+		t.Fatalf("loader.Load() error = %v", err)
+	}
+	definition, err := loader.ResolveActiveWorkflow(repoDef)
+	if err != nil {
+		t.Fatalf("loader.ResolveActiveWorkflow() error = %v", err)
+	}
+	cfg, err := config.NewFromWorkflow(definition)
+	if err != nil {
+		t.Fatalf("config.NewFromWorkflow() error = %v", err)
+	}
+	state := &runtimeState{
+		repoDef:    repoDef,
+		definition: definition,
+		config:     cfg,
+		configDir:  repoDef.RootDir,
+	}
+
+	tests := []struct {
+		name        string
+		sessionPath string
+		url         string
+		want        string
+	}{
+		{
+			name:        "session persistence",
+			sessionPath: "./automation/local/other-session-state.json",
+			url:         "https://hooks.example.com/a",
+			want:        "runtime.session_persistence changed: restart required",
+		},
+		{
+			name:        "notifications",
+			sessionPath: "./automation/local/session-state.json",
+			url:         "https://hooks.example.com/b",
+			want:        "runtime.notifications changed: restart required",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			writeProject(tc.sessionPath, tc.url)
+			reloaded, err := loader.Load(configDir, "")
+			if err != nil {
+				t.Fatalf("loader.Load() reload error = %v", err)
+			}
+			_, err = state.ApplyReload(reloaded)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ApplyReload() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "secret-key")
 	var reloadCount int

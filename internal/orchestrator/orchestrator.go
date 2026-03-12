@@ -188,6 +188,8 @@ type Orchestrator struct {
 	randFloat   func() float64
 	gitBranchFn func(context.Context, string) (string, error)
 	prLookup    PullRequestLookup
+	persistence *sessionStateWriter
+	notifier    *asyncNotifier
 
 	tickTimer      *time.Timer
 	workerResultCh chan WorkerResult
@@ -247,7 +249,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 			Running:              map[string]*model.RunningEntry{},
 			AwaitingMerge:        map[string]*model.AwaitingMergeEntry{},
 			AwaitingIntervention: map[string]*model.AwaitingInterventionEntry{},
-			Claimed:              map[string]struct{}{},
+			Claimed:              map[string]*model.ClaimedEntry{},
 			RetryAttempts:        map[string]*model.RetryEntry{},
 			Completed:            map[string]struct{}{},
 		},
@@ -259,6 +261,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		serviceVersion: BuildVersion,
 	}
 	o.prLookup = newGitHubPRLookup()
+	o.initRuntimeExtensions()
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
 	return o
@@ -401,8 +404,7 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 			Level:   "warn",
 			Message: err.Error(),
 		})
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -419,8 +421,7 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 			Level:   "warn",
 			Message: err.Error(),
 		})
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -472,7 +473,6 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 	completion := normalizeCompletionContract(o.currentWorkflow().Completion)
 
 	o.mu.Lock()
-	o.state.Claimed[issue.ID] = struct{}{}
 	stallCount := 0
 	var dispatch *model.DispatchContext
 	if existing := o.state.RetryAttempts[issue.ID]; existing != nil {
@@ -511,8 +511,9 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		"attempt", attemptCountFromRetry(normalizedAttempt),
 		"run_phase", model.PhasePreparingWorkspace.String(),
 	)
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.setClaimedLocked(issue.ID, o.claimedEntry(&issue, issue.Identifier, "", normalizedAttempt, stallCount, dispatch))
+	o.emitNotificationLocked(o.newIssueDispatchedEvent(issue, normalizedAttempt, dispatch))
+	o.commitStateLocked(true)
 	o.mu.Unlock()
 
 	o.workerWG.Add(1)
@@ -538,8 +539,8 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		if entry := o.state.Running[issue.ID]; entry != nil {
 			entry.WorkspacePath = workspaceRef.Path
 			entry.Dispatch = model.CloneDispatchContext(dispatch)
-			o.refreshSnapshotLocked()
-			o.publishSnapshotLocked()
+			o.setClaimedLocked(issue.ID, o.claimedEntry(entry.Issue, entry.Identifier, workspaceRef.Path, entry.RetryAttempt, entry.StallCount, entry.Dispatch))
+			o.commitStateLocked(false)
 		}
 		o.mu.Unlock()
 		if preparer, ok := o.workspace.(interface {
@@ -886,6 +887,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	if entry.Issue != nil {
 		issueState = entry.Issue.State
 	}
+	o.setClaimedLocked(result.IssueID, o.claimedEntry(entry.Issue, identifier, workspacePath, retryAttempt, stallCount, dispatch))
 	o.logger.Info(
 		"worker finished",
 		"issue_id", result.IssueID,
@@ -903,15 +905,14 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		}
 		errorText := result.Err.Error()
 		o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false, stallCount, dispatch)
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.emitNotificationLocked(o.newIssueFailedEvent(result.IssueID, identifier, workspacePath, result.Phase, retryAttempt, result.Err, dispatch))
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
 
 	o.rememberCompletedLocked(result.IssueID)
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.commitStateLocked(true)
 	o.mu.Unlock()
 
 	ctx := o.runtimeContext()
@@ -930,8 +931,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		errorText := decisionErr.Error()
 		o.mu.Lock()
 		o.scheduleRetryLocked(result.IssueID, identifier, retryAttempt+1, &errorText, false, stallCount, dispatch)
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -961,16 +961,14 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		}), reason, decision.FinalBranch, decision.PR, issueState)
 		o.mu.Lock()
 		o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount, retryDispatch)
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
 
 	o.mu.Lock()
 	o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount, continuationDispatchContext(dispatch, normalizeCompletionContract(o.currentWorkflow().Completion), model.ContinuationReasonUnfinishedIssue, result.FinalBranch, nil, issueState))
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.commitStateLocked(true)
 	o.mu.Unlock()
 }
 
@@ -1007,8 +1005,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 	if event.RateLimits != nil {
 		o.state.CodexRateLimits = event.RateLimits
 	}
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.commitStateLocked(false)
 }
 
 func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
@@ -1047,8 +1044,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 			Level:   "warn",
 			Message: err.Error(),
 		})
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return true, false
 	}
@@ -1076,8 +1072,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 		}
 		o.terminateRunningLocked(ctx, issueID, false, false, "")
 	}
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.commitStateLocked(true)
 	return true, true
 }
 
@@ -1125,8 +1120,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				if current != nil {
 					delete(o.state.AwaitingMerge, issueID)
 					delete(o.state.Claimed, issueID)
-					o.refreshSnapshotLocked()
-					o.publishSnapshotLocked()
+					o.commitStateLocked(true)
 				}
 				o.mu.Unlock()
 				continue
@@ -1135,8 +1129,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				current := o.state.AwaitingMerge[issueID]
 				if current != nil && current.State != issue.State {
 					current.State = issue.State
-					o.refreshSnapshotLocked()
-					o.publishSnapshotLocked()
+					o.commitStateLocked(true)
 				}
 				o.mu.Unlock()
 			}
@@ -1153,8 +1146,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 			current := o.state.AwaitingMerge[issueID]
 			if current != nil {
 				current.LastError = optionalError(errorText)
-				o.refreshSnapshotLocked()
-				o.publishSnapshotLocked()
+				o.commitStateLocked(true)
 			}
 			o.mu.Unlock()
 			continue
@@ -1189,8 +1181,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				current.PostMergeRetryCount = 0
 				current.NextPostMergeRetryAt = nil
 				if changed {
-					o.refreshSnapshotLocked()
-					o.publishSnapshotLocked()
+					o.commitStateLocked(true)
 				}
 			}
 			o.mu.Unlock()
@@ -1214,8 +1205,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				current.PRBaseRepo = pr.BaseRepo
 				current.PRHeadOwner = pr.HeadOwner
 				current.LastError = optionalError(errorText)
-				o.refreshSnapshotLocked()
-				o.publishSnapshotLocked()
+				o.commitStateLocked(true)
 			}
 			o.mu.Unlock()
 		}
@@ -1266,8 +1256,7 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 			if current != nil {
 				delete(o.state.AwaitingIntervention, issueID)
 				delete(o.state.Claimed, issueID)
-				o.refreshSnapshotLocked()
-				o.publishSnapshotLocked()
+				o.commitStateLocked(true)
 			}
 			o.mu.Unlock()
 		}
@@ -1290,7 +1279,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 		errorText := "retry poll failed"
 		o.mu.Lock()
 		o.scheduleRetryLocked(issueID, retryEntry.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount, retryEntry.Dispatch)
-		o.refreshSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -1306,8 +1295,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	if issue == nil {
 		o.mu.Lock()
 		delete(o.state.Claimed, issueID)
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -1316,8 +1304,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	if !o.isDispatchEligible(*issue, cfg, true) {
 		o.mu.Lock()
 		delete(o.state.Claimed, issueID)
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -1325,7 +1312,7 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 		errorText := "no available orchestrator slots"
 		o.mu.Lock()
 		o.scheduleRetryLocked(issueID, issue.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount, retryEntry.Dispatch)
-		o.refreshSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -1345,8 +1332,7 @@ func (o *Orchestrator) startupCleanup(ctx context.Context) {
 			Level:   "warn",
 			Message: err.Error(),
 		})
-		o.refreshSnapshotLocked()
-		o.publishSnapshotLocked()
+		o.commitStateLocked(true)
 		o.mu.Unlock()
 		return
 	}
@@ -1385,6 +1371,12 @@ func (o *Orchestrator) gracefulShutdown() {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
+	}
+	if o.persistence != nil {
+		o.persistence.Close()
+	}
+	if o.notifier != nil {
+		o.notifier.Close()
 	}
 }
 
@@ -1444,7 +1436,19 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 		retryAttempt := attempt
 		retryDispatch.RetryAttempt = &retryAttempt
 	}
-	o.state.Claimed[issueID] = struct{}{}
+	state := ""
+	if existing := o.state.Claimed[issueID]; existing != nil {
+		state = existing.State
+	}
+	o.setClaimedLocked(issueID, &model.ClaimedEntry{
+		Identifier:    identifier,
+		WorkspacePath: workspacePathForIdentifier(o.currentConfig().WorkspaceRoot, identifier),
+		State:         state,
+		RetryAttempt:  attempt,
+		StallCount:    stallCount,
+		ClaimedAt:     o.now().UTC(),
+		Dispatch:      model.CloneDispatchContext(retryDispatch),
+	})
 	o.state.RetryAttempts[issueID] = &model.RetryEntry{
 		IssueID:       issueID,
 		Identifier:    identifier,
@@ -1842,10 +1846,17 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	}
 
 	o.mu.Lock()
-	o.state.Claimed[issueID] = struct{}{}
+	o.setClaimedLocked(issueID, &model.ClaimedEntry{
+		Identifier:    identifier,
+		WorkspacePath: workspacePath,
+		State:         issueState,
+		RetryAttempt:  retryAttempt,
+		StallCount:    stallCount,
+		ClaimedAt:     o.now().UTC(),
+		Dispatch:      nil,
+	})
 	o.state.AwaitingMerge[issueID] = entry
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.commitStateLocked(true)
 	o.mu.Unlock()
 }
 
@@ -1875,10 +1886,18 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 
 	o.mu.Lock()
 	delete(o.state.AwaitingMerge, issueID)
-	o.state.Claimed[issueID] = struct{}{}
+	o.setClaimedLocked(issueID, &model.ClaimedEntry{
+		Identifier:    identifier,
+		WorkspacePath: workspacePath,
+		State:         issueState,
+		RetryAttempt:  retryAttempt,
+		StallCount:    stallCount,
+		ClaimedAt:     o.now().UTC(),
+		Dispatch:      nil,
+	})
 	o.state.AwaitingIntervention[issueID] = entry
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.emitNotificationLocked(o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, pr))
+	o.commitStateLocked(true)
 	o.mu.Unlock()
 }
 
@@ -1928,9 +1947,16 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 		current.PRHeadOwner = pr.HeadOwner
 	}
 	delete(o.state.AwaitingIntervention, issueID)
-	o.state.Claimed[issueID] = struct{}{}
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.setClaimedLocked(issueID, &model.ClaimedEntry{
+		Identifier:    identifier,
+		WorkspacePath: workspacePath,
+		State:         issueState,
+		RetryAttempt:  retryAttempt,
+		StallCount:    stallCount,
+		ClaimedAt:     o.now().UTC(),
+		Dispatch:      nil,
+	})
+	o.commitStateLocked(true)
 	o.mu.Unlock()
 	return false
 }
@@ -2029,8 +2055,8 @@ func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID stri
 	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
 	delete(o.state.Claimed, issueID)
-	o.refreshSnapshotLocked()
-	o.publishSnapshotLocked()
+	o.emitNotificationLocked(o.newIssueCompletedEvent(issueID, identifier))
+	o.commitStateLocked(true)
 	o.mu.Unlock()
 }
 
@@ -2128,14 +2154,34 @@ func (o *Orchestrator) setSystemAlertLocked(alert AlertSnapshot) {
 	if strings.TrimSpace(alert.Code) == "" {
 		return
 	}
+	if existing, ok := o.systemAlerts[alert.Code]; ok {
+		if existing.Level == alert.Level &&
+			existing.Message == alert.Message &&
+			existing.IssueID == alert.IssueID &&
+			existing.IssueIdentifier == alert.IssueIdentifier {
+			return
+		}
+	}
 	o.systemAlerts[alert.Code] = alert
+	if shouldSuppressAlertNotification(alert.Code) {
+		return
+	}
+	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlert, alert))
 }
 
 func (o *Orchestrator) clearSystemAlertLocked(code string) {
 	if strings.TrimSpace(code) == "" {
 		return
 	}
+	existing, ok := o.systemAlerts[code]
+	if !ok {
+		return
+	}
 	delete(o.systemAlerts, code)
+	if shouldSuppressAlertNotification(code) {
+		return
+	}
+	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlertCleared, existing))
 }
 
 func attemptCountFromRetry(retryAttempt int) int {

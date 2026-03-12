@@ -25,6 +25,8 @@ class SmokeConfig:
     linear_api_key: str
     linear_project_slug: str
     linear_branch_scope: str
+    session_state_path: Path | None = None
+    notification_port: int | None = None
 
 
 def allocate_port() -> int:
@@ -53,29 +55,66 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
 
     command = json.dumps(build_fake_app_server_command())
     workspace_root = str((temp_root() / f"workspaces-{config.namespace}").resolve()).replace("\\", "/")
+    project_lines = [
+        "runtime:",
+        "  polling:",
+        "    interval_ms: 3000",
+        "  workspace:",
+        f"    root: {workspace_root}",
+        f"    branch_namespace: {config.namespace}",
+        "  agent:",
+        "    max_turns: 1",
+        "  codex:",
+        f"    command: {command}",
+        "    turn_timeout_ms: 30000",
+        "    read_timeout_ms: 5000",
+        "    stall_timeout_ms: 30000",
+        "  server:",
+        f"    port: {config.port}",
+    ]
+    if config.session_state_path is not None:
+        session_state_path = str(config.session_state_path.resolve()).replace("\\", "/")
+        project_lines.extend(
+            [
+                "  session_persistence:",
+                "    enabled: true",
+                "    backend: file",
+                f"    path: {session_state_path}",
+                "    flush_interval_ms: 200",
+                "    fsync_on_critical: true",
+            ]
+        )
+    if config.notification_port is not None:
+        project_lines.extend(
+            [
+                "  notifications:",
+                "    channels:",
+                "      - name: local-webhook",
+                "        kind: webhook",
+                f"        url: http://127.0.0.1:{config.notification_port}/webhook",
+                "        events: [issue_intervention_required, issue_completed]",
+                "      - name: local-slack",
+                "        kind: slack",
+                f"        url: http://127.0.0.1:{config.notification_port}/slack",
+                "        events: [issue_intervention_required, issue_completed]",
+                "    defaults:",
+                "      timeout_ms: 3000",
+                "      retry_count: 0",
+                "      retry_delay_ms: 0",
+            ]
+        )
+    project_lines.extend(
+        [
+            "selection:",
+            "  dispatch_flow: implement",
+            "  enabled_sources:",
+            "    - linear-main",
+            "defaults:",
+            "  profile: null",
+        ]
+    )
     (config.base_dir / "project.yaml").write_text(
-        f"""runtime:
-  polling:
-    interval_ms: 3000
-  workspace:
-    root: {workspace_root}
-    branch_namespace: {config.namespace}
-  agent:
-    max_turns: 1
-  codex:
-    command: {command}
-    turn_timeout_ms: 30000
-    read_timeout_ms: 5000
-    stall_timeout_ms: 30000
-  server:
-    port: {config.port}
-selection:
-  dispatch_flow: implement
-  enabled_sources:
-    - linear-main
-defaults:
-  profile: null
-""",
+        "\n".join(project_lines) + "\n",
         encoding="utf-8",
     )
     (config.base_dir / "sources" / "linear-main.yaml").write_text(
@@ -256,8 +295,13 @@ terminal_states: ["Closed", "Done"]
         return False
 
 
-def start_symphony(binary_path: Path, config_dir: Path, *, echo: bool = True) -> ManagedProcess:
-    return ManagedProcess(symphony_command(binary_path, "--config-dir", str(config_dir), "--log-level", "debug"), cwd=repo_root(), echo=echo)
+def start_symphony(binary_path: Path, config_dir: Path, *, echo: bool = True, env: dict[str, str] | None = None) -> ManagedProcess:
+    return ManagedProcess(
+        symphony_command(binary_path, "--config-dir", str(config_dir), "--log-level", "debug"),
+        cwd=repo_root(),
+        env=env,
+        echo=echo,
+    )
 
 
 def fetch_json(url: str) -> dict[str, Any]:

@@ -312,6 +312,10 @@ func diagnoseStructuralErrors(cfg *model.ServiceConfig, fieldRefs map[string]str
 	if strings.TrimSpace(cfg.CodexCommand) == "" && !fieldMissingBecauseSecret(fieldRefs, "runtime.codex.command", missingEnvVars) {
 		errorsList = append(errorsList, model.NewWorkflowError(model.ErrInvalidCodexCommand, "codex.command is required", nil))
 	}
+	if err := validateSessionPersistenceConfig(cfg.SessionPersistence); err != nil {
+		errorsList = append(errorsList, err)
+	}
+	errorsList = append(errorsList, diagnoseNotificationsStructuralErrors(cfg.Notifications, fieldRefs, missingEnvVars)...)
 	return errorsList
 }
 
@@ -352,4 +356,62 @@ func joinDiagnosisPath(base string, path string) string {
 		return base + path
 	}
 	return base + "." + path
+}
+
+func diagnoseNotificationsStructuralErrors(cfg model.NotificationsConfig, fieldRefs map[string]string, missingEnvVars map[string]bool) []error {
+	errorsList := make([]error, 0)
+	if len(cfg.Channels) == 0 && cfg.Defaults.TimeoutMS == 0 && cfg.Defaults.RetryCount == 0 && cfg.Defaults.RetryDelayMS == 0 {
+		return errorsList
+	}
+	if cfg.Defaults.TimeoutMS <= 0 {
+		errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.timeout_ms must be > 0", nil))
+	}
+	if cfg.Defaults.RetryCount < 0 {
+		errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.retry_count must be >= 0", nil))
+	}
+	if cfg.Defaults.RetryDelayMS < 0 {
+		errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.retry_delay_ms must be >= 0", nil))
+	}
+
+	seenNames := make(map[string]struct{}, len(cfg.Channels))
+	allowedEvents := notificationEventSet()
+	for index, channel := range cfg.Channels {
+		if strings.TrimSpace(channel.Name) == "" {
+			errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].name is required", index), nil))
+			continue
+		}
+		if _, exists := seenNames[channel.Name]; exists {
+			errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].name %q is duplicated", index, channel.Name), nil))
+		}
+		seenNames[channel.Name] = struct{}{}
+
+		switch channel.Kind {
+		case model.NotificationChannelKindWebhook, model.NotificationChannelKindSlack:
+		default:
+			errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].kind %q is unsupported", index, channel.Kind), nil))
+		}
+
+		urlField := fmt.Sprintf("runtime.notifications.channels[%d].url", index)
+		if strings.TrimSpace(channel.URL) == "" && !fieldMissingBecauseSecret(fieldRefs, urlField, missingEnvVars) {
+			errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].url is required", index), nil))
+		}
+
+		for key, value := range channel.Headers {
+			if strings.TrimSpace(key) == "" {
+				errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].headers contains an empty key", index), nil))
+				continue
+			}
+			field := fmt.Sprintf("runtime.notifications.channels[%d].headers.%s", index, key)
+			if strings.TrimSpace(value) == "" && !fieldMissingBecauseSecret(fieldRefs, field, missingEnvVars) {
+				errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].headers.%s is required", index, key), nil))
+			}
+		}
+
+		for _, eventType := range channel.Events {
+			if _, ok := allowedEvents[eventType]; !ok {
+				errorsList = append(errorsList, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].events contains unsupported event %q", index, eventType), nil))
+			}
+		}
+	}
+	return errorsList
 }

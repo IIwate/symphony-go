@@ -245,6 +245,8 @@
 
 - `[核心规范]` invalid reload 不会导致服务崩溃，而是继续沿用最后一次有效配置。
 - `[核心规范]` reload 影响未来 dispatch、retry 调度、reconcile、hook 执行与 agent 启动。
+- `[实现现状]` `runtime.session_persistence` 与 `runtime.notifications` 首版属于 `restart-required`，变更后会被 reload gate 拒绝。
+- `[实现现状]` `automation/local/session-state.json` 只承载本地 runtime state，不保存 secret，也不会参与 watcher reload。
 - `[实现决策]` 当前 HTTP server 已经启动后不会因为 `server.port` 变化而热重绑；该类 listener 资源仍需重启进程。
 
 ---

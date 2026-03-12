@@ -2,10 +2,16 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,8 +159,8 @@ func TestReconcileRunningStopsTerminalAndInactiveIssues(t *testing.T) {
 			cancelled["2"]++
 		},
 	}
-	o.state.Claimed["1"] = struct{}{}
-	o.state.Claimed["2"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
+	o.state.Claimed["2"] = &model.ClaimedEntry{}
 
 	o.reconcileRunning(context.Background())
 
@@ -198,7 +204,7 @@ func TestReconcileRunningSchedulesRetryForStalledSession(t *testing.T) {
 		StartedAt:    now.Add(-2 * time.Second),
 		WorkerCancel: func() { cancelCount++ },
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileRunning(context.Background())
 
@@ -250,7 +256,7 @@ func TestReconcileRunningFirstStallAfterContinuationDoesNotTriggerRepeatedStall(
 		StartedAt:    now.Add(-2 * time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileRunning(context.Background())
 
@@ -297,7 +303,7 @@ func TestHandleRetryTimerRequeuesWhenNoSlotsAvailable(t *testing.T) {
 		Attempt:       1,
 		DueAt:         now,
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.handleRetryTimer(context.Background(), "1")
 
@@ -431,7 +437,7 @@ func TestRunOnceKeepsTrackerAlertWhenReconcileFails(t *testing.T) {
 		StartedAt:    now.Add(-time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.RunOnce(context.Background(), false)
 	snapshot := o.Snapshot()
@@ -473,7 +479,7 @@ func TestHandleWorkerExitPerformsDeferredCleanupAfterTerminalReconcile(t *testin
 		StartedAt:     now.Add(-time.Second),
 		WorkerCancel:  func() { cancelCount++ },
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.mu.Lock()
 	o.terminateRunningLocked(context.Background(), "1", true, false, "")
@@ -531,7 +537,7 @@ func TestRunOncePreflightFailureStillReconcilesRunningIssues(t *testing.T) {
 		StartedAt:    now.Add(-10 * time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.RunOnce(context.Background(), true)
 
@@ -659,7 +665,7 @@ func TestHandleWorkerExitAlreadyTerminal(t *testing.T) {
 		StartedAt:    now.Add(-time.Second),
 		WorkerCancel: func() {},
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.handleWorkerExit(WorkerResult{IssueID: "1", Identifier: "ABC-1", StartedAt: now, Phase: model.PhaseSucceeded})
 
@@ -709,7 +715,7 @@ func TestHandleWorkerExitHasNewOpenPRMergedTransitionsToDone(t *testing.T) {
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.handleWorkerExit(WorkerResult{
 		IssueID:      "1",
@@ -761,7 +767,7 @@ func TestHandleWorkerExitHasNewOpenPRMovesToAwaitingMerge(t *testing.T) {
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.handleWorkerExit(WorkerResult{
 		IssueID:      "1",
@@ -820,7 +826,7 @@ func TestHandleWorkerExitClosedPRMovesToAwaitingIntervention(t *testing.T) {
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.handleWorkerExit(WorkerResult{
 		IssueID:      "1",
@@ -956,7 +962,7 @@ func TestHandleWorkerExitMissingPRMovesToAwaitingInterventionForPullRequestMode(
 		WorkerCancel:  func() {},
 		Dispatch:      pullRequestDispatch(),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.handleWorkerExit(WorkerResult{
 		IssueID:     "1",
@@ -1238,7 +1244,7 @@ func TestReconcileAwaitingMergeMergedClosesIssue(t *testing.T) {
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileAwaitingMerge(context.Background())
 
@@ -1284,7 +1290,7 @@ func TestReconcileAwaitingMergeTerminalIssueCleansUpAndReleasesClaim(t *testing.
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileAwaitingMerge(context.Background())
 
@@ -1333,7 +1339,7 @@ func TestReconcileAwaitingMergeNonActiveIssueReleasesClaimWithoutCleanup(t *test
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileAwaitingMerge(context.Background())
 
@@ -1377,7 +1383,7 @@ func TestReconcileAwaitingMergeClosedMovesToAwaitingIntervention(t *testing.T) {
 		StallCount:    2,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileAwaitingMerge(context.Background())
 
@@ -1421,7 +1427,7 @@ func TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert(t *testing.T) 
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileAwaitingMerge(context.Background())
 
@@ -1462,7 +1468,7 @@ func TestReconcileAwaitingMergeLookupFailureDuringContextCancelIsIgnored(t *test
 		RetryAttempt:  0,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1499,7 +1505,7 @@ func TestReconcileAwaitingMergeMissingPRMovesToAwaitingIntervention(t *testing.T
 		StallCount:    2,
 		AwaitingSince: now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileAwaitingMerge(context.Background())
 
@@ -1598,7 +1604,7 @@ func TestReconcileAwaitingInterventionReleasesInactiveIssue(t *testing.T) {
 		RetryAttempt:  1,
 		ObservedAt:    now.Add(-time.Minute),
 	}
-	o.state.Claimed["1"] = struct{}{}
+	o.state.Claimed["1"] = &model.ClaimedEntry{}
 
 	o.reconcileAwaitingIntervention(context.Background())
 
@@ -1667,6 +1673,297 @@ func TestHandleCodexUpdateTurnCountIncrementsOnTurnChangeOnly(t *testing.T) {
 	entry := o.state.Running["1"]
 	if entry.Session.TurnCount != 2 {
 		t.Fatalf("turn count = %d, want 2", entry.Session.TurnCount)
+	}
+}
+
+func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
+	tempDir := t.TempDir()
+	statePath := filepath.Join(tempDir, "automation", "local", "session-state.json")
+	savedAt := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
+	dueAt := time.Now().Add(2 * time.Minute).UTC()
+
+	err := writePersistedSessionState(statePath, persistedSessionState{
+		Version: sessionStateVersion,
+		SavedAt: savedAt,
+		Retrying: []persistedRetryEntry{
+			{
+				IssueID:       "2",
+				Identifier:    "ISSUE-2",
+				WorkspacePath: "/tmp/ISSUE-2",
+				Attempt:       3,
+				StallCount:    1,
+				DueAt:         dueAt,
+				Dispatch:      &model.DispatchContext{Kind: model.DispatchKindFresh},
+			},
+		},
+		Claimed: []persistedClaimedEntry{
+			{
+				IssueID: "1",
+				ClaimedEntry: model.ClaimedEntry{
+					Identifier:    "ISSUE-1",
+					WorkspacePath: "/tmp/ISSUE-1",
+					State:         "In Progress",
+					RetryAttempt:  1,
+					StallCount:    2,
+					ClaimedAt:     savedAt,
+				},
+			},
+			{
+				IssueID: "5",
+				ClaimedEntry: model.ClaimedEntry{
+					Identifier:    "ISSUE-5",
+					WorkspacePath: "/tmp/ISSUE-5",
+					State:         "In Progress",
+					RetryAttempt:  4,
+					StallCount:    1,
+					ClaimedAt:     savedAt,
+				},
+			},
+		},
+		Running: []persistedRunningEntry{
+			{
+				IssueID:       "1",
+				Identifier:    "ISSUE-1",
+				State:         "In Progress",
+				WorkspacePath: "/tmp/ISSUE-1",
+				Session: model.LiveSession{
+					SessionID:        "thread-turn",
+					LastCodexMessage: "still running",
+					TurnCount:        2,
+				},
+				RetryAttempt: 1,
+				StallCount:   2,
+				StartedAt:    savedAt,
+			},
+		},
+		AwaitingMerge: []persistedAwaitingMergeEntry{
+			{
+				IssueID: "3",
+				AwaitingMergeEntry: model.AwaitingMergeEntry{
+					Identifier:    "ISSUE-3",
+					State:         "In Progress",
+					WorkspacePath: "/tmp/ISSUE-3",
+					Branch:        "feature/issue-3",
+					RetryAttempt:  1,
+					AwaitingSince: savedAt,
+				},
+			},
+		},
+		AwaitingIntervention: []persistedAwaitingInterventionEntry{
+			{
+				IssueID: "4",
+				AwaitingInterventionEntry: model.AwaitingInterventionEntry{
+					Identifier:          "ISSUE-4",
+					WorkspacePath:       "/tmp/ISSUE-4",
+					Branch:              "feature/issue-4",
+					RetryAttempt:        2,
+					ObservedAt:          savedAt,
+					Reason:              "missing_pr",
+					ExpectedOutcome:     string(model.CompletionModePullRequest),
+					LastKnownIssueState: "In Progress",
+				},
+			},
+		},
+		Alerts: []AlertSnapshot{
+			{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"},
+		},
+		TokenTotal: model.TokenTotals{InputTokens: 10, OutputTokens: 20, TotalTokens: 30},
+	}, true)
+	if err != nil {
+		t.Fatalf("writePersistedSessionState() error = %v", err)
+	}
+
+	cfg := testServiceConfig()
+	cfg.SessionPersistence.Enabled = true
+	cfg.SessionPersistence.Path = statePath
+
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, savedAt.Add(time.Minute))
+	t.Cleanup(func() {
+		if o.persistence != nil {
+			o.persistence.Close()
+		}
+	})
+
+	if len(o.state.Running) != 1 {
+		t.Fatalf("running size = %d, want 1", len(o.state.Running))
+	}
+	if got := o.state.Running["1"].Session.SessionID; got != "thread-turn" {
+		t.Fatalf("running session = %q, want thread-turn", got)
+	}
+	if len(o.state.RetryAttempts) != 2 {
+		t.Fatalf("retry size = %d, want 2", len(o.state.RetryAttempts))
+	}
+	if o.state.RetryAttempts["2"].TimerHandle == nil {
+		t.Fatal("restored retry timer = nil, want timer")
+	}
+	if _, ok := o.state.RetryAttempts["5"]; !ok {
+		t.Fatal("claimed-only entry was not converted into retry state")
+	}
+	if len(o.state.AwaitingMerge) != 1 {
+		t.Fatalf("awaiting merge size = %d, want 1", len(o.state.AwaitingMerge))
+	}
+	if len(o.state.AwaitingIntervention) != 1 {
+		t.Fatalf("awaiting intervention size = %d, want 1", len(o.state.AwaitingIntervention))
+	}
+	if got := o.state.CodexTotals.TotalTokens; got != 30 {
+		t.Fatalf("CodexTotals.TotalTokens = %d, want 30", got)
+	}
+
+	snapshot := o.Snapshot()
+	if !hasAlertCode(snapshot.Alerts, "tracker_unreachable") {
+		t.Fatalf("snapshot alerts = %+v, want tracker_unreachable", snapshot.Alerts)
+	}
+}
+
+func TestSystemAlertNotificationsEmitWebhookEvents(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		payload []webhookPayload
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var item webhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			t.Fatalf("Decode() error = %v", err)
+		}
+		mu.Lock()
+		payload = append(payload, item)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := testServiceConfig()
+	cfg.Notifications.Channels = []model.NotificationChannelConfig{
+		{
+			Name:   "ops",
+			Kind:   model.NotificationChannelKindWebhook,
+			URL:    server.URL,
+			Events: []model.NotificationEventType{model.NotificationEventSystemAlert, model.NotificationEventSystemAlertCleared},
+		},
+	}
+
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
+	o.mu.Lock()
+	o.setSystemAlertLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.commitStateLocked(true)
+	o.mu.Unlock()
+	waitForCondition(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(payload) == 1
+	})
+
+	o.mu.Lock()
+	o.clearSystemAlertLocked("tracker_unreachable")
+	o.commitStateLocked(true)
+	o.mu.Unlock()
+	waitForCondition(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(payload) == 2
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if payload[0].Type != string(model.NotificationEventSystemAlert) {
+		t.Fatalf("payload[0].Type = %q, want %q", payload[0].Type, model.NotificationEventSystemAlert)
+	}
+	if payload[1].Type != string(model.NotificationEventSystemAlertCleared) {
+		t.Fatalf("payload[1].Type = %q, want %q", payload[1].Type, model.NotificationEventSystemAlertCleared)
+	}
+}
+
+func TestMoveToAwaitingInterventionEmitsNotification(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		payload []webhookPayload
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var item webhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			t.Fatalf("Decode() error = %v", err)
+		}
+		mu.Lock()
+		payload = append(payload, item)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := testServiceConfig()
+	cfg.Notifications.Channels = []model.NotificationChannelConfig{
+		{
+			Name:   "ops",
+			Kind:   model.NotificationChannelKindWebhook,
+			URL:    server.URL,
+			Events: []model.NotificationEventType{model.NotificationEventIssueInterventionRequired},
+		},
+	}
+
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
+	o.moveToAwaitingIntervention("1", "ISSUE-1", "/tmp/ISSUE-1", "feature/issue-1", 1, 0, model.CompletionModePullRequest, "missing_pr", "In Progress", &PullRequestInfo{
+		Number: 11,
+		URL:    "https://example.test/pr/11",
+		State:  PullRequestStateClosed,
+	})
+
+	waitForCondition(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(payload) == 1
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if payload[0].Type != string(model.NotificationEventIssueInterventionRequired) {
+		t.Fatalf("payload[0].Type = %q, want %q", payload[0].Type, model.NotificationEventIssueInterventionRequired)
+	}
+	if got := payload[0].Details["reason"]; got != "missing_pr" {
+		t.Fatalf("payload[0].Details[reason] = %v, want missing_pr", got)
+	}
+}
+
+func TestNotificationDeliveryFailureCreatesInternalAlert(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		requestsHit int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestsHit++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := testServiceConfig()
+	cfg.Notifications.Channels = []model.NotificationChannelConfig{
+		{
+			Name:   "ops",
+			Kind:   model.NotificationChannelKindWebhook,
+			URL:    server.URL,
+			Events: []model.NotificationEventType{model.NotificationEventSystemAlert},
+		},
+	}
+
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
+	o.mu.Lock()
+	o.setSystemAlertLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.commitStateLocked(true)
+	o.mu.Unlock()
+
+	waitForCondition(t, time.Second, func() bool {
+		snapshot := o.Snapshot()
+		return hasAlertCode(snapshot.Alerts, "notification_delivery_failed_ops")
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if requestsHit != 1 {
+		t.Fatalf("request count = %d, want 1", requestsHit)
 	}
 }
 
@@ -1864,4 +2161,45 @@ func hasAlertCode(alerts []AlertSnapshot, code string) bool {
 		}
 	}
 	return false
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, check func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if check() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
+}
+
+func testServiceConfig() *model.ServiceConfig {
+	return &model.ServiceConfig{
+		TrackerKind:                "linear",
+		TrackerAPIKey:              "secret",
+		TrackerProjectSlug:         "demo",
+		ActiveStates:               []string{"Todo", "In Progress"},
+		TerminalStates:             []string{"Done", "Closed"},
+		MaxConcurrentAgents:        2,
+		MaxTurns:                   2,
+		MaxRetryBackoffMS:          10000,
+		CodexCommand:               "codex app-server",
+		CodexStallTimeoutMS:        300000,
+		WorkspaceLinearBranchScope: "demo-scope",
+		SessionPersistence: model.SessionPersistenceConfig{
+			Backend:         "file",
+			Path:            filepath.Join(os.TempDir(), "session-state.json"),
+			FlushIntervalMS: 1,
+			FsyncOnCritical: true,
+		},
+		Notifications: model.NotificationsConfig{
+			Defaults: model.NotificationDefaultsConfig{
+				TimeoutMS:    1000,
+				RetryCount:   0,
+				RetryDelayMS: 0,
+			},
+		},
+	}
 }

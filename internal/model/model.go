@@ -196,6 +196,63 @@ type ServiceConfig struct {
 	CodexReadTimeoutMS               int
 	CodexStallTimeoutMS              int
 	ServerPort                       *int
+	SessionPersistence               SessionPersistenceConfig
+	Notifications                    NotificationsConfig
+}
+
+type SessionPersistenceConfig struct {
+	Enabled         bool
+	Backend         string
+	Path            string
+	FlushIntervalMS int
+	FsyncOnCritical bool
+}
+
+type NotificationChannelKind string
+
+const (
+	NotificationChannelKindWebhook NotificationChannelKind = "webhook"
+	NotificationChannelKindSlack   NotificationChannelKind = "slack"
+)
+
+type NotificationEventType string
+
+const (
+	NotificationEventIssueDispatched           NotificationEventType = "issue_dispatched"
+	NotificationEventIssueCompleted            NotificationEventType = "issue_completed"
+	NotificationEventIssueFailed               NotificationEventType = "issue_failed"
+	NotificationEventIssueInterventionRequired NotificationEventType = "issue_intervention_required"
+	NotificationEventSystemAlert               NotificationEventType = "system_alert"
+	NotificationEventSystemAlertCleared        NotificationEventType = "system_alert_cleared"
+)
+
+type NotificationChannelConfig struct {
+	Name    string
+	Kind    NotificationChannelKind
+	URL     string
+	Headers map[string]string
+	Events  []NotificationEventType
+}
+
+type NotificationDefaultsConfig struct {
+	TimeoutMS    int
+	RetryCount   int
+	RetryDelayMS int
+}
+
+type NotificationsConfig struct {
+	Channels []NotificationChannelConfig
+	Defaults NotificationDefaultsConfig
+}
+
+type NotificationEvent struct {
+	Type       NotificationEventType
+	Level      string
+	Timestamp  time.Time
+	IssueID    string
+	Identifier string
+	Message    string
+	Details    map[string]any
 }
 
 type Workspace struct {
@@ -286,13 +343,23 @@ type AwaitingInterventionEntry struct {
 	LastKnownIssueState string
 }
 
+type ClaimedEntry struct {
+	Identifier    string
+	WorkspacePath string
+	State         string
+	RetryAttempt  int
+	StallCount    int
+	ClaimedAt     time.Time
+	Dispatch      *DispatchContext
+}
+
 type OrchestratorState struct {
 	PollIntervalMS       int
 	MaxConcurrentAgents  int
 	Running              map[string]*RunningEntry
 	AwaitingMerge        map[string]*AwaitingMergeEntry
 	AwaitingIntervention map[string]*AwaitingInterventionEntry
-	Claimed              map[string]struct{}
+	Claimed              map[string]*ClaimedEntry
 	RetryAttempts        map[string]*RetryEntry
 	Completed            map[string]struct{}
 	CodexTotals          TokenTotals

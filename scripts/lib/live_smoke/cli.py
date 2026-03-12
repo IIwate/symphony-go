@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import os
 from pathlib import Path
 import shutil
+from threading import Lock, Thread
 import time
 from typing import Callable
 
-from live_smoke.github import close_pull_request, ensure_gh_auth, merge_pull_request, prepare_pull_request
+from live_smoke.github import close_pull_request, ensure_gh_auth, git_env, merge_pull_request, prepare_pull_request
 from live_smoke.linear import LinearClient, TeamContext
 from live_smoke.paths import repo_root, temp_root
 from live_smoke.shell import require_command, run
@@ -45,6 +48,67 @@ class Resources:
     pull_request_numbers: list[int] = field(default_factory=list)
     processes: list[object] = field(default_factory=list)
     binary_path: Path | None = None
+
+
+class NotificationRecorder:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._events: list[dict[str, object]] = []
+
+    def add(self, item: dict[str, object]) -> None:
+        with self._lock:
+            self._events.append(item)
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._events)
+
+    def find(self, *, path: str, identifier: str, event_type: str) -> list[dict[str, object]]:
+        with self._lock:
+            items = list(self._events)
+        result: list[dict[str, object]] = []
+        for item in items:
+            if item.get("path") != path:
+                continue
+            body = item.get("body")
+            if not isinstance(body, dict):
+                continue
+            if path == "/webhook":
+                if body.get("identifier") != identifier or body.get("type") != event_type:
+                    continue
+            elif path == "/slack":
+                text = str(body.get("text", ""))
+                if identifier not in text or event_type not in text:
+                    continue
+            else:
+                continue
+            result.append(item)
+        return result
+
+
+class NotificationHandler(BaseHTTPRequestHandler):
+    recorder: NotificationRecorder
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            body = {"raw": raw.decode("utf-8", errors="replace")}
+        self.recorder.add(
+            {
+                "path": self.path,
+                "headers": dict(self.headers.items()),
+                "body": body,
+                "timestamp": time.time(),
+            }
+        )
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -159,6 +223,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             _run_step(
                 results,
+                "runtime_extensions",
+                lambda: _run_runtime_extensions_smoke(
+                    resources,
+                    linear,
+                    context,
+                    linear_project_slug,
+                    repo,
+                    repo_url,
+                    args.linear_branch_scope,
+                    args.branch_namespace,
+                    args.echo_process_output,
+                ),
+            )
+            _run_step(
+                results,
                 "awaiting_merge_to_done",
                 lambda: _run_merge_path_smoke(
                     resources,
@@ -208,6 +287,7 @@ def _preflight(repo: str) -> str:
     require_command("gh")
     require_command("py")
     ensure_gh_auth()
+    run(["gh", "auth", "setup-git"], cwd=repo_root())
     run(["gh", "repo", "view", repo, "--json", "nameWithOwner"], cwd=repo_root())
     return f"repo={repo}"
 
@@ -349,7 +429,7 @@ def _run_missing_pr_smoke(
         config,
         prompt_text="Do not modify repository contents. Exit successfully without creating or updating a pull request.",
     )
-    process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output)
+    process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
     resources.processes.append(process)
     base_url = f"http://127.0.0.1:{port}"
     _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="symphony startup")
@@ -409,7 +489,7 @@ def _run_merge_path_smoke(
         config,
         prompt_text="Do not modify repository contents. Exit successfully without creating or updating a pull request.",
     )
-    process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output)
+    process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
     resources.processes.append(process)
     base_url = f"http://127.0.0.1:{port}"
     _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="symphony startup")
@@ -440,6 +520,186 @@ def _run_merge_path_smoke(
     resources.processes.remove(process)
     resources.issue_ids.remove(str(issue["id"]))
     return f"{issue['identifier']} -> awaiting_merge -> done"
+
+
+def _run_runtime_extensions_smoke(
+    resources: Resources,
+    linear: LinearClient,
+    context: TeamContext,
+    project_slug: str,
+    repo: str,
+    repo_url: str,
+    branch_scope: str,
+    branch_namespace: str,
+    echo_output: bool,
+) -> str:
+    if resources.binary_path is None:
+        raise RuntimeError("symphony binary is not built")
+
+    recorder = NotificationRecorder()
+    notification_server = _start_notification_server(allocate_port(), recorder)
+    process = None
+
+    try:
+        port = allocate_port()
+        base_dir = resources.temp_dir / "runtime-extensions"
+        session_state_path = base_dir / "local" / "session-state.json"
+        config = SmokeConfig(
+            base_dir=base_dir,
+            port=port,
+            namespace=f"{branch_namespace}-feature",
+            repo_url=repo_url,
+            linear_api_key=linear.api_key,
+            linear_project_slug=project_slug,
+            linear_branch_scope=branch_scope,
+            session_state_path=session_state_path,
+            notification_port=notification_server.server_port,
+        )
+        write_smoke_config(
+            config,
+            prompt_text="Do not modify repository contents. Exit successfully without creating or updating a pull request.",
+        )
+
+        base_url = f"http://127.0.0.1:{port}"
+        process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
+        resources.processes.append(process)
+        _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="runtime_extensions startup")
+
+        persistence_issue = linear.create_issue(f"{LIVE_SMOKE_PREFIX} runtime_extensions persistence {int(time.time())}", context)
+        resources.issue_ids.append(str(persistence_issue["id"]))
+        persistence_identifier = str(persistence_issue["identifier"])
+        _wait_for(
+            lambda: _await_issue_status(base_url, persistence_identifier, "awaiting_intervention"),
+            process,
+            timeout_seconds=120,
+            description="runtime_extensions awaiting_intervention",
+        )
+        _wait_for(
+            lambda: recorder.find(path="/webhook", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
+            process,
+            timeout_seconds=30,
+            description="runtime_extensions webhook intervention notification",
+            interval_seconds=0.5,
+        )
+        _wait_for(
+            lambda: recorder.find(path="/slack", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
+            process,
+            timeout_seconds=30,
+            description="runtime_extensions slack intervention notification",
+            interval_seconds=0.5,
+        )
+        _wait_for(
+            lambda: session_state_path if session_state_path.exists() else None,
+            process,
+            timeout_seconds=10,
+            description="runtime_extensions session state file",
+            interval_seconds=0.2,
+        )
+        persisted = _load_session_state(session_state_path)
+        awaiting_intervention = persisted.get("AwaitingIntervention") or []
+        if not any(item.get("Identifier") == persistence_identifier for item in awaiting_intervention):
+            raise RuntimeError("session-state.json missing awaiting_intervention entry after intervention path")
+
+        notification_count_before_restart = recorder.count()
+        process.stop()
+        resources.processes.remove(process)
+        process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
+        resources.processes.append(process)
+        _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="runtime_extensions restart")
+        _wait_for(
+            lambda: _await_issue_status(base_url, persistence_identifier, "awaiting_intervention"),
+            process,
+            timeout_seconds=60,
+            description="runtime_extensions restored awaiting_intervention",
+        )
+        time.sleep(5)
+        notification_count_after_restart = recorder.count()
+        if notification_count_after_restart != notification_count_before_restart:
+            raise RuntimeError(
+                f"unexpected notification replay after restart: before={notification_count_before_restart}, after={notification_count_after_restart}"
+            )
+
+        merge_issue = linear.create_issue(f"{LIVE_SMOKE_PREFIX} runtime_extensions merge {int(time.time())}", context)
+        resources.issue_ids.append(str(merge_issue["id"]))
+        merge_identifier = str(merge_issue["identifier"])
+        branch = _linear_branch_name(f"{branch_namespace}-feature", branch_scope, merge_identifier)
+        pr = prepare_pull_request(
+            repo,
+            repo_url,
+            branch,
+            title=f"test: live smoke {merge_identifier}",
+            body="Temporary PR for runtime extensions smoke.",
+            work_root=resources.temp_dir / "runtime-extensions-pr",
+        )
+        resources.pull_request_numbers.append(pr.number)
+        _wait_for(
+            lambda: _await_issue_status(base_url, merge_identifier, "awaiting_merge"),
+            process,
+            timeout_seconds=120,
+            description="runtime_extensions awaiting_merge",
+        )
+
+        process.stop()
+        resources.processes.remove(process)
+        process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
+        resources.processes.append(process)
+        _wait_for(lambda: fetch_json(f"{base_url}/api/v1/state"), process, timeout_seconds=30, description="runtime_extensions second restart")
+        merge_payload = _wait_for(
+            lambda: _await_issue_status(base_url, merge_identifier, "awaiting_merge"),
+            process,
+            timeout_seconds=60,
+            description="runtime_extensions restored awaiting_merge",
+        )
+        if int(merge_payload["awaiting_merge"]["pr_number"]) != pr.number:
+            raise RuntimeError(
+                f"restored awaiting_merge pr_number mismatch: {merge_payload['awaiting_merge']['pr_number']} != {pr.number}"
+            )
+        persisted = _load_session_state(session_state_path)
+        awaiting_merge = persisted.get("AwaitingMerge") or []
+        if not any(item.get("Identifier") == merge_identifier for item in awaiting_merge):
+            raise RuntimeError("session-state.json missing awaiting_merge entry after restart")
+
+        merge_pull_request(repo, pr.number)
+        resources.pull_request_numbers.remove(pr.number)
+        _wait_for(
+            lambda: _await_linear_done(linear, str(merge_issue["id"])),
+            process,
+            timeout_seconds=180,
+            description="runtime_extensions issue done after merge",
+        )
+        _wait_for(
+            lambda: _await_issue_gone(base_url, merge_identifier),
+            process,
+            timeout_seconds=180,
+            description="runtime_extensions issue removed from runtime snapshot",
+        )
+        _wait_for(
+            lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_completed") or None,
+            process,
+            timeout_seconds=60,
+            description="runtime_extensions webhook completed notification",
+            interval_seconds=0.5,
+        )
+        _wait_for(
+            lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_completed") or None,
+            process,
+            timeout_seconds=60,
+            description="runtime_extensions slack completed notification",
+            interval_seconds=0.5,
+        )
+
+        linear.update_issue_state(str(persistence_issue["id"]), context.canceled_state_id)
+        resources.issue_ids.remove(str(persistence_issue["id"]))
+        resources.issue_ids.remove(str(merge_issue["id"]))
+
+        return (
+            f"{persistence_identifier} restored awaiting_intervention, "
+            f"{merge_identifier} restored awaiting_merge and completed, "
+            f"notifications={recorder.count()} no-replay={notification_count_before_restart == notification_count_after_restart}"
+        )
+    finally:
+        notification_server.shutdown()
+        notification_server.server_close()
 
 
 def _linear_branch_name(namespace: str, branch_scope: str, identifier: str) -> str:
@@ -507,6 +767,18 @@ def _await_linear_done(linear: LinearClient, issue_id: str) -> dict[str, object]
     if str(issue["state"]["name"]) == "Done":
         return issue
     return None
+
+
+def _load_session_state(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _start_notification_server(port: int, recorder: NotificationRecorder) -> ThreadingHTTPServer:
+    NotificationHandler.recorder = recorder
+    server = ThreadingHTTPServer(("127.0.0.1", port), NotificationHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 def _run_step(results: list[StepResult], name: str, func: Callable[[], str]) -> None:
