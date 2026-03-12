@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -140,6 +141,40 @@ func TestGitHubPRLookupFallsBackToGHAPIOnForbidden(t *testing.T) {
 	}
 	if pr.Number != 52 || pr.State != PullRequestStateMerged {
 		t.Fatalf("pull request = %+v", pr)
+	}
+}
+
+func TestGitHubPRLookupFindByHeadBranchReturnsErrorWhenPreferredLookupFailsBeforeEmptyFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/upstream/linear-test/pulls" && r.URL.Query().Get("head") == "fork-user:feature/test" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	lookup := &gitHubPRLookup{
+		httpClient: server.Client(),
+		apiBaseURL: server.URL,
+		remoteURLsFn: func(context.Context, string) (map[string]string, error) {
+			return map[string]string{
+				"origin":   "https://github.com/fork-user/linear-test.git",
+				"upstream": "https://github.com/upstream/linear-test.git",
+			}, nil
+		},
+	}
+
+	pr, err := lookup.FindByHeadBranch(context.Background(), "unused", "feature/test")
+	if err == nil {
+		t.Fatal("FindByHeadBranch() error = nil, want github api status 503")
+	}
+	if pr != nil {
+		t.Fatalf("FindByHeadBranch() pull request = %+v, want nil", pr)
+	}
+	var statusErr *gitHubHTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("FindByHeadBranch() error = %v, want github api status 503", err)
 	}
 }
 

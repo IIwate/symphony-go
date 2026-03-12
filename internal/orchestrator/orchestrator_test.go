@@ -887,6 +887,52 @@ func TestHandleWorkerExitNoNewPRSchedulesContinuation(t *testing.T) {
 	}
 }
 
+func TestDispatchIssueBranchDetectionFailureSchedulesRetry(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.gitBranchFn = func(context.Context, string) (string, error) {
+		return "", errors.New("git branch failed")
+	}
+
+	o.dispatchIssue(context.Background(), model.Issue{
+		ID:         "1",
+		Identifier: "ABC-1",
+		Title:      "test",
+		State:      "Todo",
+	}, nil)
+
+	var result WorkerResult
+	select {
+	case result = <-o.workerResultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker result not received")
+	}
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "detect final branch") {
+		t.Fatalf("worker result error = %v, want detect final branch failure", result.Err)
+	}
+	if result.Phase != model.PhaseFailed {
+		t.Fatalf("worker result phase = %s, want failed", result.Phase.String())
+	}
+
+	o.handleWorkerExit(result)
+
+	if _, ok := o.state.AwaitingIntervention["1"]; ok {
+		t.Fatal("awaiting intervention should not be created for branch detection failure")
+	}
+	retry := o.state.RetryAttempts["1"]
+	if retry == nil {
+		t.Fatal("retry entry missing")
+	}
+	if retry.Error == nil || !strings.Contains(*retry.Error, "detect final branch") {
+		t.Fatalf("retry entry = %+v, want detect final branch error", retry)
+	}
+}
+
 func TestHandleWorkerExitMissingPRMovesToAwaitingInterventionForPullRequestMode(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
@@ -1633,7 +1679,7 @@ func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient tracker.Client,
 	o.now = func() time.Time { return now }
 	o.startedAt = now
 	o.serviceVersion = "test"
-	o.gitBranchFn = func(context.Context, string) (string, error) { return "", nil }
+	o.gitBranchFn = func(context.Context, string) (string, error) { return "test/branch", nil }
 	o.prLookup = &fakePRLookup{byBranch: map[string]*PullRequestInfo{}}
 	return o
 }

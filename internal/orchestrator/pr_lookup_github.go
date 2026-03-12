@@ -89,7 +89,6 @@ func (l *gitHubPRLookup) FindByHeadBranch(ctx context.Context, workspacePath str
 	}
 
 	var lastErr error
-	hadSuccessfulLookup := false
 	for _, baseRepo := range orderedBaseRepos(remotes) {
 		for _, headOwner := range orderedHeadOwners(remotes) {
 			prs, lookupErr := l.lookupByHead(ctx, workspacePath, baseRepo, headOwner, branch)
@@ -97,14 +96,10 @@ func (l *gitHubPRLookup) FindByHeadBranch(ctx context.Context, workspacePath str
 				lastErr = lookupErr
 				continue
 			}
-			hadSuccessfulLookup = true
 			if pr := selectLatestPullRequest(branch, prs); pr != nil {
 				return pr, nil
 			}
 		}
-	}
-	if hadSuccessfulLookup {
-		return nil, nil
 	}
 	if lastErr != nil {
 		return nil, lastErr

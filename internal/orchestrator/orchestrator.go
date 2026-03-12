@@ -589,8 +589,15 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			result.Err = runErr
 			result.Phase = phaseFromError(runErr)
 		} else {
-			result.Phase = model.PhaseSucceeded
-			result.FinalBranch = o.currentBranch(workerCtx, workspaceRef.Path)
+			result.Phase = model.PhaseFinishing
+			finalBranch, branchErr := o.currentBranch(workerCtx, workspaceRef.Path)
+			if branchErr != nil {
+				result.Err = branchErr
+				result.Phase = phaseFromError(branchErr)
+			} else {
+				result.Phase = model.PhaseSucceeded
+				result.FinalBranch = finalBranch
+			}
 		}
 		o.sendWorkerResult(result)
 	}()
@@ -732,16 +739,20 @@ func pullRequestInfoFromContext(pr *model.PRContext) *PullRequestInfo {
 	}
 }
 
-func (o *Orchestrator) currentBranch(ctx context.Context, workspacePath string) string {
+func (o *Orchestrator) currentBranch(ctx context.Context, workspacePath string) (string, error) {
 	if o.gitBranchFn == nil {
-		return ""
+		return "", model.NewAgentError(model.ErrResponseError, "detect final branch", errors.New("branch detection is not configured"))
 	}
 	branch, err := o.gitBranchFn(ctx, workspacePath)
 	if err != nil {
 		o.logger.Warn("post-run branch detection failed", "workspace_path", workspacePath, "error", err.Error())
-		return ""
+		return "", model.NewAgentError(model.ErrResponseError, "detect final branch", err)
 	}
-	return strings.TrimSpace(branch)
+	trimmed := strings.TrimSpace(branch)
+	if trimmed == "" {
+		return "", model.NewAgentError(model.ErrResponseError, "detect final branch: branch is empty", nil)
+	}
+	return trimmed, nil
 }
 
 func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath string, finalBranch string, dispatch *model.DispatchContext, autoCloseOnPR bool, issueState string) (*SuccessfulRunDecision, error) {
