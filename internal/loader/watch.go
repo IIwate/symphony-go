@@ -17,10 +17,15 @@ import (
 const watchDebounce = 250 * time.Millisecond
 
 func Watch(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition)) error {
-	return WatchWithErrors(ctx, dir, profile, onChange, nil)
+	return WatchWithErrors(ctx, dir, profile, func(def *model.AutomationDefinition) error {
+		if onChange != nil {
+			onChange(def)
+		}
+		return nil
+	}, nil)
 }
 
-func WatchWithErrors(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition), onError func(error)) error {
+func WatchWithErrors(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
 	initialDef, err := Load(dir, profile)
 	if err != nil {
 		return err
@@ -42,7 +47,8 @@ func WatchWithErrors(ctx context.Context, dir string, profile string, onChange f
 
 		var timer *time.Timer
 		var timerC <-chan time.Time
-		activeProfile := strings.TrimSpace(initialDef.Profile)
+		explicitProfile := strings.TrimSpace(profile)
+		acceptedProfile := strings.TrimSpace(initialDef.Profile)
 
 		resetTimer := func() {
 			if timer == nil {
@@ -84,28 +90,56 @@ func WatchWithErrors(ctx context.Context, dir string, profile string, onChange f
 						}
 					}
 				}
-				if !matchesWatchedPath(initialDef.RootDir, activeProfile, event.Name) {
+				if !matchesWatchedPath(initialDef.RootDir, acceptedProfile, event.Name) {
 					continue
 				}
 				resetTimer()
 			case <-timerC:
 				timerC = nil
-				definition, loadErr := Load(initialDef.RootDir, profile)
+				definition, loadErr := Load(initialDef.RootDir, acceptedProfile)
 				if loadErr != nil {
 					if onError != nil {
 						onError(loadErr)
 					}
 					continue
 				}
+				if explicitProfile == "" {
+					selectedDefinition, selectedErr := Load(initialDef.RootDir, "")
+					switch {
+					case selectedErr == nil && strings.TrimSpace(selectedDefinition.Profile) != acceptedProfile:
+						if onChange == nil {
+							definition = selectedDefinition
+							acceptedProfile = strings.TrimSpace(selectedDefinition.Profile)
+						} else if err := onChange(selectedDefinition); err != nil {
+							if onError != nil {
+								onError(err)
+							}
+						} else {
+							definition = selectedDefinition
+							acceptedProfile = strings.TrimSpace(selectedDefinition.Profile)
+							if err := addWatchDirectories(watcher, watchedDirs, definition.RootDir); err != nil && onError != nil {
+								onError(err)
+							}
+							continue
+						}
+					case selectedErr != nil && onError != nil:
+						onError(selectedErr)
+					}
+				}
 				if err := addWatchDirectories(watcher, watchedDirs, definition.RootDir); err != nil {
 					if onError != nil {
 						onError(err)
 					}
 				}
-				activeProfile = strings.TrimSpace(definition.Profile)
 				if onChange != nil {
-					onChange(definition)
+					if err := onChange(definition); err != nil {
+						if onError != nil {
+							onError(err)
+						}
+						continue
+					}
 				}
+				acceptedProfile = strings.TrimSpace(definition.Profile)
 			case watchErr, ok := <-watcher.Errors:
 				if !ok {
 					return
@@ -184,7 +218,10 @@ func matchesWatchedPath(rootDir string, activeProfile string, eventPath string) 
 
 	switch {
 	case strings.HasPrefix(relativePath, "profiles/"):
-		return activeProfile != "" && relativePath == path.Join("profiles", activeProfile+".yaml")
+		if activeProfile == "" {
+			return matchesDirectoryFile(relativePath, "profiles", ".yaml")
+		}
+		return relativePath == path.Join("profiles", activeProfile+".yaml")
 	case strings.HasPrefix(relativePath, "sources/"):
 		return matchesDirectoryFile(relativePath, "sources", ".yaml")
 	case strings.HasPrefix(relativePath, "flows/"):

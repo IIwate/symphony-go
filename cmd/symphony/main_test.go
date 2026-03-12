@@ -456,13 +456,17 @@ func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{notifyReload: func(_ *model.WorkflowDefinition) { reloadCount++ }}
 	}
-	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition), onError func(error)) error {
+	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
 		watchCalled = true
 		reloaded, err := loader.Load(dir, profile)
 		if err != nil {
 			return err
 		}
-		onChange(reloaded)
+		if err := onChange(reloaded); err != nil {
+			if onError != nil {
+				onError(err)
+			}
+		}
 		go func() { <-ctx.Done() }()
 		return nil
 	}
@@ -523,7 +527,7 @@ func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
 			},
 		}, nil
 	}
-	watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition), func(error)) error {
+	watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition) error, func(error)) error {
 		return nil
 	}
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
@@ -589,7 +593,7 @@ func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
 			},
 		}, nil
 	}
-	watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition), func(error)) error {
+	watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition) error, func(error)) error {
 		return nil
 	}
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
@@ -670,7 +674,7 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 			},
 		}, nil
 	}
-	watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition), func(error)) error {
+	watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition) error, func(error)) error {
 		return nil
 	}
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
@@ -728,7 +732,9 @@ func stubDependencies(t *testing.T) func() {
 	loadEnvFile = envfile.Load
 	loadAutomationDefinition = loader.Load
 	resolveActiveWorkflow = loader.ResolveActiveWorkflow
-	watchAutomationDefinition = loader.WatchWithErrors
+	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
+		return loader.WatchWithErrors(ctx, dir, profile, onChange, onError)
+	}
 	newLoggerFactory = func(opts logging.Options) (*slog.Logger, io.Closer, error) {
 		return logging.NewLogger(opts)
 	}

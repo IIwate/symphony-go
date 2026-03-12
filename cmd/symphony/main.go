@@ -51,10 +51,12 @@ var (
 	loadEnvFile               = envfile.Load
 	loadAutomationDefinition  = loader.Load
 	resolveActiveWorkflow     = loader.ResolveActiveWorkflow
-	watchAutomationDefinition = loader.WatchWithErrors
-	buildVersion              = "dev"
-	newLoggerFactory          = logging.NewLogger
-	newTrackerFactory         = func(configFn func() *model.ServiceConfig) (tracker.Client, error) {
+	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
+		return loader.WatchWithErrors(ctx, dir, profile, onChange, onError)
+	}
+	buildVersion      = "dev"
+	newLoggerFactory  = logging.NewLogger
+	newTrackerFactory = func(configFn func() *model.ServiceConfig) (tracker.Client, error) {
 		return tracker.NewDynamicClient(configFn, nil)
 	}
 	newWorkspaceFactory = func(configFn func() *model.ServiceConfig, logger *slog.Logger) (workspace.Manager, error) {

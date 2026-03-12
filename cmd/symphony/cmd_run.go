@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -100,15 +101,19 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 	ctx, cancel := notifySignalContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := watchAutomationDefinition(ctx, repoDef.RootDir, opts.profile, func(newRepoDef *model.AutomationDefinition) {
+	if err := watchAutomationDefinition(ctx, repoDef.RootDir, opts.profile, func(newRepoDef *model.AutomationDefinition) error {
 		newDefinition, reloadErr := state.ApplyReload(newRepoDef)
 		if reloadErr != nil {
-			logger.Warn("automation reload rejected", "error", reloadErr.Error())
-			return
+			return reloadErr
 		}
 		orch.NotifyWorkflowReload(newDefinition)
 		logger.Info("automation reloaded", slog.String("config_dir", newRepoDef.RootDir))
+		return nil
 	}, func(watchErr error) {
+		if strings.Contains(strings.ToLower(watchErr.Error()), "restart required") {
+			logger.Warn("automation reload rejected", "error", watchErr.Error())
+			return
+		}
 		logger.Warn("automation reload failed", "error", watchErr.Error())
 	}); err != nil {
 		return err

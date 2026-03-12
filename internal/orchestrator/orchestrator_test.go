@@ -932,7 +932,7 @@ func TestHandleWorkerExitMissingPRMovesToAwaitingInterventionForPullRequestMode(
 	}
 }
 
-func TestHandleWorkerExitMergedPRTransitionFailureKeepsAwaitingMerge(t *testing.T) {
+func TestHandleWorkerExitMergedPRTransitionFailureMovesToAwaitingIntervention(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
 		ActiveStates:              []string{"Todo", "In Progress"},
@@ -977,18 +977,80 @@ func TestHandleWorkerExitMergedPRTransitionFailureKeepsAwaitingMerge(t *testing.
 	if len(o.state.RetryAttempts) != 0 {
 		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
 	}
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatal("awaiting merge entry should be cleared for non-retryable transition failure")
+	}
+	awaiting := o.state.AwaitingIntervention["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting intervention entry missing")
+	}
+	if awaiting.Reason != "post_merge_transition_failed" {
+		t.Fatalf("awaiting intervention entry = %+v, want post_merge_transition_failed", awaiting)
+	}
+	if awaiting.PRState != string(PullRequestStateMerged) {
+		t.Fatalf("awaiting intervention entry = %+v, want merged PR state", awaiting)
+	}
+	if _, ok := o.state.Claimed["1"]; !ok {
+		t.Fatal("claimed entry should be retained while awaiting intervention")
+	}
+}
+
+func TestHandleWorkerExitMergedPRRetryableTransitionFailureSchedulesBackoff(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:              []string{"Todo", "In Progress"},
+		TerminalStates:            []string{"Done"},
+		MaxConcurrentAgents:       1,
+		MaxRetryBackoffMS:         300000,
+		OrchestratorAutoCloseOnPR: true,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+		transitionErr: model.NewTrackerError(model.ErrLinearAPIRequest, "temporary", nil),
+	}
+	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	branch := "iiwate4268/iiwate-33-test"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 42, URL: "https://example.test/pr/42", HeadBranch: branch, State: PullRequestStateMerged, BaseOwner: "IIwate", BaseRepo: "linear-test"},
+		},
+	}
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		RetryAttempt:  0,
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
+		Dispatch:      pullRequestDispatch(),
+	}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:      "1",
+		Identifier:   "ABC-1",
+		StartedAt:    now,
+		Phase:        model.PhaseSucceeded,
+		HasNewOpenPR: true,
+		FinalBranch:  branch,
+	})
+
 	awaiting := o.state.AwaitingMerge["1"]
 	if awaiting == nil {
 		t.Fatal("awaiting merge entry missing")
 	}
+	if awaiting.PostMergeRetryCount != 1 {
+		t.Fatalf("awaiting merge entry = %+v, want PostMergeRetryCount=1", awaiting)
+	}
+	if awaiting.NextPostMergeRetryAt == nil || !awaiting.NextPostMergeRetryAt.Equal(now.Add(10*time.Second)) {
+		t.Fatalf("awaiting merge entry = %+v, want next retry at %s", awaiting, now.Add(10*time.Second))
+	}
 	if awaiting.LastError == nil || !strings.Contains(*awaiting.LastError, "post-merge transition failed") {
 		t.Fatalf("awaiting merge entry = %+v, want post-merge transition error", awaiting)
 	}
-	if awaiting.PRState != string(PullRequestStateMerged) {
-		t.Fatalf("awaiting merge entry = %+v, want merged PR state", awaiting)
-	}
-	if _, ok := o.state.Claimed["1"]; !ok {
-		t.Fatal("claimed entry should be retained while awaiting merge retry")
+	if _, ok := o.state.AwaitingIntervention["1"]; ok {
+		t.Fatal("awaiting intervention entry should not be created for retryable transition failure")
 	}
 }
 
@@ -1681,6 +1743,8 @@ type fakeRunner struct {
 type fakePRLookup struct {
 	byBranch    map[string]*PullRequestInfo
 	errByBranch map[string]error
+	byNumber    map[int]*PullRequestInfo
+	errByNumber map[int]error
 }
 
 func (f *fakeRunner) Run(ctx context.Context, params agent.RunParams) error {
@@ -1712,6 +1776,25 @@ func (f *fakePRLookup) FindByHeadBranch(_ context.Context, _ string, headBranch 
 	}
 	copyPR := *pr
 	return &copyPR, nil
+}
+
+func (f *fakePRLookup) Refresh(_ context.Context, _ string, pr *PullRequestInfo) (*PullRequestInfo, error) {
+	if pr == nil {
+		return nil, nil
+	}
+	if f.errByNumber != nil {
+		if err := f.errByNumber[pr.Number]; err != nil {
+			return nil, err
+		}
+	}
+	if f.byNumber != nil {
+		if refreshed := f.byNumber[pr.Number]; refreshed != nil {
+			copyPR := *refreshed
+			return &copyPR, nil
+		}
+		return nil, nil
+	}
+	return f.FindByHeadBranch(context.Background(), "", pr.HeadBranch)
 }
 
 func stringPtr(value string) *string {

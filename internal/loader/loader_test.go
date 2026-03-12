@@ -678,6 +678,124 @@ defaults:
 	}
 }
 
+func TestWatchKeepsAcceptedProfileWhenProfileSwitchRejected(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		ProjectYAML: `runtime:
+  codex:
+    command: codex app-server
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: dev
+`,
+		ProfileName: "dev",
+		ProfileYAML: "runtime:\n  polling:\n    interval_ms: 10000\n",
+	})
+	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "runtime:\n  polling:\n    interval_ms: 20000\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 4)
+	watchErrs := make(chan error, 4)
+	if err := WatchWithErrors(ctx, root, "", func(def *model.AutomationDefinition) error {
+		if def.Profile == "prod" {
+			return errors.New("profile selection changed: restart required")
+		}
+		updates <- def
+		return nil
+	}, func(err error) {
+		watchErrs <- err
+	}); err != nil {
+		t.Fatalf("WatchWithErrors() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
+  codex:
+    command: codex app-server
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: prod
+`)
+	if err := awaitWatchError(t, watchErrs); err == nil {
+		t.Fatal("expected rejected profile-switch error")
+	}
+	time.Sleep(300 * time.Millisecond)
+	drainWatchUpdates(updates)
+
+	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "runtime:\n  polling:\n    interval_ms: 15000\n")
+	updated := awaitWatchUpdate(t, updates)
+	if updated.Profile != "dev" {
+		t.Fatalf("Profile = %q, want dev", updated.Profile)
+	}
+	if got := getMapValue(updated.Runtime, "polling")["interval_ms"]; got != 15000 {
+		t.Fatalf("runtime.polling.interval_ms = %v, want 15000", got)
+	}
+}
+
+func TestWatchKeepsAcceptedProfileWhenSelectedProfileIsInvalid(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{
+		ProjectYAML: `runtime:
+  codex:
+    command: codex app-server
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: dev
+`,
+		ProfileName: "dev",
+		ProfileYAML: "runtime:\n  polling:\n    interval_ms: 10000\n",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 4)
+	watchErrs := make(chan error, 4)
+	if err := WatchWithErrors(ctx, root, "", func(def *model.AutomationDefinition) error {
+		updates <- def
+		return nil
+	}, func(err error) {
+		watchErrs <- err
+	}); err != nil {
+		t.Fatalf("WatchWithErrors() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
+  codex:
+    command: codex app-server
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: prod
+`)
+	if err := awaitWatchError(t, watchErrs); err == nil {
+		t.Fatal("expected invalid selected-profile error")
+	}
+	time.Sleep(300 * time.Millisecond)
+	drainWatchUpdates(updates)
+
+	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "runtime:\n  polling:\n    interval_ms: 16000\n")
+	updated := awaitWatchUpdate(t, updates)
+	if updated.Profile != "dev" {
+		t.Fatalf("Profile = %q, want dev", updated.Profile)
+	}
+	if got := getMapValue(updated.Runtime, "polling")["interval_ms"]; got != 16000 {
+		t.Fatalf("runtime.polling.interval_ms = %v, want 16000", got)
+	}
+}
+
 func awaitWatchUpdate(t *testing.T, updates <-chan *model.AutomationDefinition) *model.AutomationDefinition {
 	t.Helper()
 
@@ -687,6 +805,28 @@ func awaitWatchUpdate(t *testing.T, updates <-chan *model.AutomationDefinition) 
 	case <-time.After(5 * time.Second):
 		t.Fatal("watch callback not triggered")
 		return nil
+	}
+}
+
+func awaitWatchError(t *testing.T, watchErrs <-chan error) error {
+	t.Helper()
+
+	select {
+	case err := <-watchErrs:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch error callback not triggered")
+		return nil
+	}
+}
+
+func drainWatchUpdates(updates <-chan *model.AutomationDefinition) {
+	for {
+		select {
+		case <-updates:
+		default:
+			return
+		}
 	}
 }
 

@@ -249,17 +249,22 @@ type RetryEntry struct {
 }
 
 type AwaitingMergeEntry struct {
-	Identifier    string
-	State         string
-	WorkspacePath string
-	Branch        string
-	PRNumber      int
-	PRURL         string
-	PRState       string
-	RetryAttempt  int
-	StallCount    int
-	AwaitingSince time.Time
-	LastError     *string
+	Identifier           string
+	State                string
+	WorkspacePath        string
+	Branch               string
+	PRNumber             int
+	PRURL                string
+	PRState              string
+	PRBaseOwner          string
+	PRBaseRepo           string
+	PRHeadOwner          string
+	RetryAttempt         int
+	StallCount           int
+	AwaitingSince        time.Time
+	LastError            *string
+	PostMergeRetryCount  int
+	NextPostMergeRetryAt *time.Time
 }
 
 type AwaitingInterventionEntry struct {
@@ -269,6 +274,9 @@ type AwaitingInterventionEntry struct {
 	PRNumber            int
 	PRURL               string
 	PRState             string
+	PRBaseOwner         string
+	PRBaseRepo          string
+	PRHeadOwner         string
 	RetryAttempt        int
 	StallCount          int
 	ObservedAt          time.Time
