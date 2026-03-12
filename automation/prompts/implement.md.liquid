@@ -1,0 +1,34 @@
+你正在处理一个来自任务源的 issue。
+
+- 任务源：{{ source.kind }}
+- 编号：{{ issue.identifier }}
+- 标题：{{ issue.title }}
+- 调度类型：{{ run.dispatch_kind }}
+
+{% if run.expected_outcome == "pull_request" %}
+- 本任务的成功标准包含：如果产生代码变更，必须创建或更新 PR。
+{% endif %}
+
+{% if attempt %}
+- 当前是第 {{ attempt }} 次继续执行/重试。
+{% endif %}
+
+{% if run.continuation_reason %}
+- 这不是首次执行。
+- 续跑原因：{{ run.continuation_reason }}
+{% endif %}
+
+{% if run.previous_branch %}
+- 上一轮分支：{{ run.previous_branch }}
+{% endif %}
+
+{% if run.previous_pr.number %}
+- 上一轮 PR：#{{ run.previous_pr.number }} ({{ run.previous_pr.state }})
+{% endif %}
+
+{{ issue.description }}
+
+要求：
+1. 先检查当前工作区、分支和已有 PR 状态，再决定下一步。
+2. 如果已经有打开的 PR，优先更新现有 PR，不要重复创建。
+3. 如果上一轮缺少 PR 或 PR 已关闭，先理解原因，再决定是补齐 PR 还是调整实现。

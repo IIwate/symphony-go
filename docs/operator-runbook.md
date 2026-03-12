@@ -21,13 +21,14 @@
 ### 2.1 基础环境
 
 - 操作系统已具备运行 Go 二进制和 `codex app-server` 的条件
-- 当前已发布版本：当前工作目录或显式传入路径下存在可用的 `WORKFLOW.md`
-- Cycle 5 草案目录模式：仓库根部存在 `automation/project.yaml`
-- 使用哪种模式启动，就要保证对应配置中的 tracker / source / hooks / codex 参数与目标环境匹配
+- 仓库根部或显式 `--config-dir` 指向的目录下存在可用的 `automation/project.yaml`
+- 当前实现只接受 `automation/` 目录模式，不再接受 `WORKFLOW.md` 位置参数
+- 使用目录模式启动时，要保证对应配置中的 runtime / source / flow / hooks / codex 参数与目标环境匹配
 
 ### 2.2 必要凭证
 
 - 当前版本仅支持 `tracker.kind=linear`：注入 `LINEAR_API_KEY`
+- 若使用仓库内 `scripts/live_smoke.py` 做真实链路验证，还需要提供 `LINEAR_PROJECT_SLUG`
 - Cycle 5 草案目录模式下，推荐把本地 secrets 放在 `automation/local/env.local`
 - `GITHUB_TOKEN` / GitHub source 属于 Cycle 5 之后的扩展，不适用于当前已发布实现
 - 不要把 token 明文写入日志、命令历史或共享文档
@@ -61,14 +62,14 @@ $env:LINEAR_API_KEY="<your-token>"
 go run ./cmd/symphony --dry-run
 ```
 
-若 `WORKFLOW.md` 不在当前目录：
+若配置目录不在当前目录：
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony --dry-run ./path/to/WORKFLOW.md
+go run ./cmd/symphony --dry-run --config-dir ./path/to/automation
 ```
 
-Cycle 5 草案目录模式下，建议的本地 secrets 形式为：
+推荐的本地 secrets 形式为：
 
 ```powershell
 # automation/local/env.local
@@ -76,32 +77,29 @@ LINEAR_API_KEY=<your-token>
 GITHUB_TOKEN=<your-token>
 ```
 
-> 当前已发布版本尚未支持 `automation/` 目录模式，因此这里没有可直接执行的 `--config-dir` 示例命令。
-> `docs/examples/automation-github-issues.md` 是目录模式参考文档，不是可直接作为位置参数传入的单文件 workflow 示例。
-
 ### 3.2 正常启动（无 HTTP server）
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony --log-level info --log-file ./logs/symphony.log ./WORKFLOW.md
+go run ./cmd/symphony --log-level info --log-file ./logs/symphony.log
 ```
 
 ### 3.3 正常启动（启用 HTTP server）
 
 ```powershell
 $env:LINEAR_API_KEY="<your-token>"
-go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.log ./WORKFLOW.md
+go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.log
 ```
 
 ### 3.4 常用参数
 
-- `WORKFLOW.md` 路径：可选位置参数；未传时默认 `./WORKFLOW.md`
-- 当前 CLI 基于标准库 `flag`，请将 `--dry-run` / `--port` / `--log-file` / `--log-level` 写在路径参数之前
+- `--config-dir`：配置目录路径；未传时默认 `./automation`
+- `--profile`：选择 `automation/profiles/<name>.yaml`
+- 当前 CLI 基于标准库 `flag`
 - `--dry-run`：执行单次 poll cycle 验证后退出；注意当前实现仍会访问 tracker，并执行 `startupCleanup`
 - `--port`：启用 HTTP server，当前实现绑定 loopback 地址
 - `--log-file`：同时输出到 stderr 与指定文件
 - `--log-level`：`debug` / `info` / `warn` / `error`
-- Cycle 5 草案中预期会新增 `--config-dir` 与 `--profile`，用于 `automation/` 目录模式；当前已发布版本尚未实现
 
 ## 4. 启动后应观察什么
 
@@ -138,13 +136,11 @@ curl http://127.0.0.1:8080/api/v1/state
 
 ## 5. Workflow 热加载操作
 
-- 当前已发布版本启动后会监听 `WORKFLOW.md`
-- 文件变更后会尝试 reload
+- 当前版本启动后会监听 `automation/` 下的活动配置文件
+- 变更后会尝试 reload
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
 - `orchestrator.auto_close_on_pr` 也支持热更新；默认值为 `true`
-
-Cycle 5 草案目录模式下，预期监听对象会扩展为：
 
 - `automation/project.yaml`
 - 当前激活的 `automation/profiles/*.yaml`
@@ -195,6 +191,58 @@ Cycle 5 草案目录模式下，预期监听对象会扩展为：
 ```powershell
 curl -X POST http://127.0.0.1:8080/api/v1/refresh
 ```
+
+### 6.4 仓库内 Live Smoke 脚本
+
+仓库提供了一个面向真实环境的验证脚本：
+
+- 入口：`scripts/live_smoke.py`
+- 目标：把 dry-run、`config doctor/set`、inline hook、symlink 逃逸、`missing_pr`、`awaiting_merge -> merged -> Done` 这些链路做成可重复执行的 smoke
+- 默认会在 `.codex-tmp/live-smoke/` 下生成临时配置、工作区和临时 binary；脚本结束后默认自动清理
+- 若需要保留现场排障，传 `--keep-artifacts`
+- 若需要清理历史已终态 smoke issue，显式传 `--purge-history`
+
+前置条件：
+
+- 已安装 `go`、`git`、`gh`、`py`
+- `gh auth status` 已通过
+- 已设置 `LINEAR_API_KEY`
+- 已设置 `LINEAR_PROJECT_SLUG`
+- 默认测试仓库为 `IIwate/linear-test`
+
+推荐命令：
+
+```powershell
+# 轻量 smoke：不创建真实 issue / PR
+$env:LINEAR_API_KEY="..."
+$env:LINEAR_PROJECT_SLUG="..."
+py -3 scripts/live_smoke.py --phase light
+
+# 完整 smoke：包含真实 issue / PR / merge 路径
+$env:LINEAR_API_KEY="..."
+$env:LINEAR_PROJECT_SLUG="..."
+py -3 scripts/live_smoke.py --phase all
+```
+
+脚本阶段说明：
+
+- `--phase light`
+  - `config doctor` / `config set --non-interactive`
+  - 单行 hook 含 `/` 的解析
+  - symlink 逃逸拦截
+- `--phase heavy`
+  - 创建隔离测试 issue
+  - 验证 `missing_pr -> awaiting_intervention`
+  - 创建测试分支和 PR
+  - 验证 `awaiting_merge -> merged -> issue Done`
+- `--phase all`
+  - 同时执行 light + heavy
+
+补充说明：
+
+- heavy 阶段默认使用显式 branch namespace `live-smoke`，便于识别和清理测试分支
+- summary 末尾会明确打印 `artifacts cleaned from ...` 或 `artifacts kept at ...`
+- `--purge-history` 会归档旧的 terminal smoke issue；默认关闭，以保留审计痕迹
 
 ## 7. 日志使用说明
 
@@ -307,14 +355,15 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 常见原因：
 
 - 关联 PR 仍为 open，系统正在等待 merge，而不是继续重跑 agent
-- `gh` CLI 不可用、未认证，或当前工作区无法按 head branch 查询 PR
+- GitHub API 查询失败，且 fallback 到 `gh api` 也失败
 - PR 状态查询失败，`/api/v1/state` 中出现 `merge_status_unknown` 告警
 - PR 已 closed 但未 merged，issue 被转入 `awaiting_intervention`，不会自动 retry / re-dispatch
 
 处理：
 
-- 先看 `/api/v1/state` 的 `awaiting_merge` / `awaiting_intervention` 列表，确认 `branch`、`pr_state`、`last_error`
-- 在对应工作区内手动执行 `gh pr list --state all --head <branch> --json number,url,state,mergedAt,headRefName`
+- 先看 `/api/v1/state` 的 `awaiting_merge` / `awaiting_intervention` 列表，确认 `branch`、`pr_state`、`reason`、`expected_outcome`、`last_error`
+- 当前实现默认按 worker 成功退出后的 `FinalBranch` 使用 GitHub API 查询 PR；若命中 auth 类状态（401/403/404），才 fallback 到 `gh api`
+- 手动排查时可在对应工作区内执行 `gh pr view <number>` 或 `gh pr list --state all --head <branch> --json number,url,state,mergedAt,headRefName`
 - 若 PR 已 merged 但 issue 未收口，检查 tracker 状态流转权限和日志中的 `post-merge transition` 错误
 - 若 PR 已 closed 但未 merged，按人工决策处理：手动收口 issue，或先把 issue 调整到非 active state 释放 claim，再恢复到 active state 重新参与调度
 
@@ -370,10 +419,11 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 
 1. 本地 `go test ./...`
 2. 目标环境 `--dry-run`
-3. 启动服务并完成最小 smoke test
-4. 若启用 HTTP，验证 `/api/v1/state`、`/api/v1/events`、`/api/v1/refresh`
-5. 若启用 `linear_graphql`，验证一次成功调用与一次错误调用
-6. 完成 `docs/release-checklist.md` 勾选
+3. 运行 `py -3 scripts/live_smoke.py --phase light`
+4. 若需要做完整真实链路验证，运行 `py -3 scripts/live_smoke.py --phase heavy`
+5. 若启用 HTTP，验证 `/api/v1/state`、`/api/v1/events`、`/api/v1/refresh`
+6. 若启用 `linear_graphql`，验证一次成功调用与一次错误调用
+7. 完成 `docs/release-checklist.md` 勾选
 
 ## 11. 相关文档
 
@@ -381,6 +431,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - `docs/cycles/cycle-04-extension-release.md`
 - `docs/rfcs/github-issues-tracker.md`（Cycle 5 草案）
 - `docs/examples/automation-github-issues.md`（Cycle 5 目录模式示例）
+- `scripts/live_smoke.py`
 - `IMPLEMENTATION.md`
 - `REQUIREMENTS.md`
 - `SPEC.md`

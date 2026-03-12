@@ -447,7 +447,9 @@ CLI 当前支持：
 `PrepareForRun` 的行为：
 
 - `[实现决策]` 清理 `tmp`、`.elixir_ls`
-- 执行 `hooks.before_run`（fatal）
+- fresh dispatch 执行 `hooks.before_run`（fatal）
+- continuation / intervention retry 优先执行 `hooks.before_run_continuation`（fatal）
+- 若 continuation / intervention retry 未配置 `before_run_continuation`，且工作区已存在，则跳过 destructive 的 fresh `before_run`
 - 若工作区没有 `.git`，跳过分支准备
 - 若存在 `.git`，执行 `ensureWorkBranch`
 
@@ -459,6 +461,7 @@ CLI 当前支持：
 |---|---|
 | `after_create` | Fatal，工作区创建失败 |
 | `before_run` | Fatal，当前 run attempt 失败 |
+| `before_run_continuation` | Fatal，continuation / intervention retry 的当前 run attempt 失败 |
 | `after_run` | Best-effort，仅记录 |
 | `before_remove` | Best-effort，仅记录，清理继续 |
 
@@ -467,19 +470,23 @@ CLI 当前支持：
 - `[核心规范]` hook 运行有超时，取 `hooks.timeout_ms`，默认 `60000ms`
 - `[核心规范]` hook 输出会记日志
 - `[实现决策]` 当前实现会把 `stdout/stderr` 截断到 256 字符后写日志
+- `[实现扩展]` continuation / intervention retry 的 hook 会额外收到结构化环境变量：`SYMPHONY_DISPATCH_KIND`、`SYMPHONY_EXPECTED_OUTCOME`、`SYMPHONY_CONTINUATION_REASON`、`SYMPHONY_PREVIOUS_BRANCH`、`SYMPHONY_PREVIOUS_PR_NUMBER`、`SYMPHONY_PREVIOUS_PR_STATE`、`SYMPHONY_PREVIOUS_ISSUE_STATE`
 
 ### 7.5 工作分支准备
 
 `ensureWorkBranch` 的规则：
 
-1. 读取 `git config user.name` 作为 `<namespace>`。
+1. 优先使用显式配置的 `runtime.workspace.branch_namespace`；若未配置，则回退到本地稳定 alias 作为 `<namespace>`。
 2. 根据 tracker 类型生成 `<issue-short>`：
    - `linear`：`linear-<source.branch_scope>-<issue-identifier>`（首版内部 bridge 仍经由 `workspace.linear_branch_scope`）
    - `github`：`github-<source.repo>-<issue-number>`（首版内部 bridge 仍经由 `tracker.repo`）
    - 其他：退化为 identifier slug
-3. 读取当前分支、本地分支、远端分支。
-4. 选择已有分支或创建新分支。
-5. 使用 `git switch` / `git switch -c` 切换。
+3. 解析当前 run 的 commit identity：显式配置优先，其次 repo-local/global git config，最后回退到 `symphony-runner <namespace@symphony.invalid>`。
+4. 优先读取 issue 对应的 branch binding；若已绑定，则继续复用该分支。
+5. 若尚未绑定，则按 `<issue-short>` 在本地/远端发现唯一候选旧分支；命中后写入 binding。
+6. 命中远端旧分支时，会先精确执行 `git fetch origin +refs/heads/<branch>:refs/remotes/origin/<branch>`，再从 `refs/remotes/origin/<branch>` 创建本地工作分支，避免依赖 fresh clone 是否预先拉到所有 remote-tracking refs。
+7. 若没有候选旧分支，再按当前命名规则生成新分支并写入 binding。
+8. 使用 `git switch` / `git switch -c` 切换。
 
 边界说明：
 
@@ -498,6 +505,7 @@ CLI 当前支持：
 - 路径不存在则视为成功。
 - 若配置了 `hooks.before_remove`，以 best-effort 执行。
 - 最终执行 `os.RemoveAll` 删除工作区目录。
+- 工作区删除成功后，同时删除 issue 对应的 branch binding。
 
 ---
 
@@ -895,18 +903,18 @@ tracker 当前做的归一化包括：
 worker goroutine 的真实顺序是：
 
 1. `workspace.CreateForIssue`
-2. 成功拿到 workspace 后，把 `WorkspacePath` 写回 `RunningEntry` 并发布新快照
+2. 成功拿到 workspace 后，把 `WorkspacePath` 和 dispatch context 写回 `RunningEntry` 并发布新快照
 3. 若 workspace 支持 `PrepareForRun`，执行 `PrepareForRun`
-4. 记录运行前的 PR 上下文
-5. 调用 `runner.Run`
-6. 若 workspace 支持 `FinalizeRun`，执行 `FinalizeRun`
-7. 根据 `runner.Run` 结果构造 `WorkerResult`
-8. 若运行成功，检查是否产生关联 PR，并根据 `open` / `merged` / `closed` 进入不同成功路径
+4. 调用 `runner.Run`
+5. 若 workspace 支持 `FinalizeRun`，执行 `FinalizeRun`
+6. 根据 `runner.Run` 结果构造 `WorkerResult`
+7. 若运行成功，统一采集 `FinalBranch`
+8. `handleWorkerExit` 根据 issue 终态、flow completion contract 和 `FinalBranch -> PR lookup` 的结果进入不同成功路径
 9. 通过 `workerResultCh` 回传结果
 
 ### 10.8 正常退出与 continuation retry
 
-`handleWorkerExit` 收到成功结果后，不会简单把任务标记为永久完成，而是分三段处理：
+`handleWorkerExit` 收到成功结果后，不会简单把任务标记为永久完成，而是先按 flow completion contract 做结果分类。
 
 #### 路径 A：issue 已经是终态
 
@@ -914,46 +922,37 @@ worker goroutine 的真实顺序是：
 - 清理工作区
 - 释放 `Claimed`
 
-#### 路径 B：本轮运行创建了关联 PR
+#### 路径 B：`completion.mode = pull_request`
 
-- `[实现扩展 — 超出 SPEC 边界]` 这是当前 Go 实现加出来的成功路径。
-- `[核心规范]` 按 SPEC 16.6，正常 worker 退出后的标准行为应是：记录 bookkeeping 后安排短延迟 continuation retry，而不是由 orchestrator 主动推断 PR 并写 tracker。
+当前实现不再依赖“运行前/运行后 open PR heads 对比”判断“是否是新 PR”，而是统一按 `FinalBranch` 查询该分支对应的真实 PR 状态。
 
-当前实现的前提是：
+默认 lookup 策略：
 
-- `detectNewOpenPR` 检测到：
-  - 运行后 branch 发生变化
-  - 新 branch 不在运行前 open PR heads 里
-  - 运行后该 branch 已出现在 open PR heads 里
+1. 优先使用 GitHub REST API 按 `FinalBranch` 查询 PR
+2. 若命中 auth 类状态（401/403/404），再 fallback 到 `gh api`
+3. worker 启动前不再做 PR 网络探测
 
-并且：
+分类结果：
 
-- `orchestrator.auto_close_on_pr=true`（默认开启）
-
-然后：
-
-1. 通过 `gh pr list --state all --head <branch>` 查询该 head branch 的真实 PR 状态
-2. 若 PR 仍 open：把 issue 放入 `AwaitingMerge`
-3. 若 PR 已 merged：尝试 `TransitionIssue("Done")`
-4. 再刷新 issue 状态；若已进入终态，则清理工作区并释放 claim
-5. 若 merge 后仍未进入终态，则进入错误重试
-6. 若 PR 已 closed 但未 merged，则进入 `AwaitingIntervention`，停止自动 retry / re-dispatch，等待 operator 决策
-
-若 `orchestrator.auto_close_on_pr=false`：
-
-1. orchestrator 不再调用 `TransitionIssue`
-2. 直接回退到标准 continuation retry 路径
+1. PR open：把 issue 放入 `AwaitingMerge`
+2. PR merged 且 `orchestrator.auto_close_on_pr=true`：尝试 `TransitionIssue("Done")`
+3. PR merged 且 `orchestrator.auto_close_on_pr=false`：进入 `AwaitingIntervention(reason=merged_pr_auto_close_disabled)`
+4. PR closed 但未 merged：进入 `AwaitingIntervention(reason=pr_closed_unmerged)`
+5. 未查到 PR：若 `completion.on_missing_pr=intervention`，进入 `AwaitingIntervention(reason=missing_pr)`；否则才允许 continuation retry
 
 #### 路径 C：运行成功但 issue 仍非终态
 
-当前实现会安排 **continuation retry**：
+只有以下前提同时成立时，当前实现才会安排 **continuation retry**：
+
+- issue 仍非终态
+- 当前 flow 没有要求 `pull_request` 收口，或对应 completion action 显式允许 `continue`
 
 - `attempt` 重置为 `1`
 - 无错误文本
 - 固定延迟约 `1s`
 - 保留当前 `StallCount`
 
-这部分与 SPEC 的标准路径一致。
+continuation retry 不再是“正常成功退出后的唯一默认路径”，而是 completion contract 决策后的一个分支。
 
 ### 10.9 失败重试、退避与 stall 计数
 
@@ -1210,8 +1209,12 @@ worker goroutine 的真实顺序是：
 - `service.started_at`
 - `service.uptime_seconds`
 - `counts.running`
+- `counts.awaiting_merge`
+- `counts.awaiting_intervention`
 - `counts.retrying`
 - `running[]`
+- `awaiting_merge[]`
+- `awaiting_intervention[]`
 - `retrying[]`
 - `alerts[]`
 - `codex_totals`
@@ -1223,6 +1226,9 @@ worker goroutine 的真实顺序是：
   - `issue_id`
   - `issue_identifier`
   - `state`
+  - `dispatch_kind`
+  - `expected_outcome`
+  - `continuation_reason`
   - `session_id`
   - `turn_count`
   - `last_event`
@@ -1231,9 +1237,36 @@ worker goroutine 的真实顺序是：
   - `last_event_at`
   - `current_retry_attempt`
   - `tokens`
+- `awaiting_merge[]`
+  - `issue_id`
+  - `issue_identifier`
+  - `workspace_path`
+  - `state`
+  - `branch`
+  - `pr_number`
+  - `pr_url`
+  - `pr_state`
+  - `awaiting_since`
+  - `last_error`
+- `awaiting_intervention[]`
+  - `issue_id`
+  - `issue_identifier`
+  - `workspace_path`
+  - `branch`
+  - `pr_number`
+  - `pr_url`
+  - `pr_state`
+  - `reason`
+  - `expected_outcome`
+  - `previous_branch`
+  - `last_known_issue_state`
+  - `observed_at`
 - `retrying[]`
   - `issue_id`
   - `issue_identifier`
+  - `dispatch_kind`
+  - `expected_outcome`
+  - `continuation_reason`
   - `attempt`
   - `due_at`
   - `error`

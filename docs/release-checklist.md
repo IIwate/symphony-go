@@ -103,6 +103,7 @@
 ### 7.1 Headless 基础烟测
 
 - [x] `go run ./cmd/symphony --dry-run` 在目标环境下通过
+- [ ] `py -3 scripts/live_smoke.py --phase light` 在目标环境下通过
 - [ ] 正常启动后日志中可看到 automation 配置加载、服务启动等关键事件
 - [ ] 修改 `automation/` 后可观察到 reload 日志
 
@@ -111,6 +112,7 @@
 - [x] 准备一条可安全测试的活跃 issue
 - [x] 服务能拉取候选 issue 并创建/复用工作区
 - [x] 能完成至少一次 agent turn
+- [ ] `py -3 scripts/live_smoke.py --phase heavy` 已覆盖 `missing_pr` 与 `awaiting_merge -> merged -> Done`
 
 ### 7.3 可观测性烟测（如 shipped HTTP）
 
@@ -124,6 +126,7 @@
 - [x] operator runbook 已更新（`docs/operator-runbook.md`）
 - [x] Release checklist 已附带勾选结果
 - [x] 关键配置示例已更新
+- [x] 真实 smoke 脚本已入仓（`scripts/live_smoke.py`）
 - [x] 若有 shipped HTTP server，接口说明已更新
 - [x] 若有 shipped `linear_graphql`，扩展说明已更新
 
@@ -139,9 +142,10 @@
 ## 附：建议记录
 
 - Config 目录：`./automation`
+- 真实 smoke 脚本：`py -3 scripts/live_smoke.py --phase all`
 - 目标环境：Windows 11 / PowerShell / Git Bash / `codex-cli 0.111.0`
 - 是否启用 HTTP server：是
 - 是否启用 `linear_graphql`：是
-- 真实验证结果摘要：记录 active source、profile、dry-run、reload、HTTP/SSE/refresh、真实 issue 调度与动态工具链路验证结果
+- 真实验证结果摘要：记录 active source、profile、dry-run、reload、HTTP/SSE/refresh、`scripts/live_smoke.py` 的 light/heavy 结果
 - 已知问题：token totals 在 session 初期可能短暂为 `0`，待绝对 usage 事件到达后更新；不阻塞本轮收口
 - 回滚方案：如需回退本轮配置，回退 `automation/` 中对应配置文件并重新做真实 smoke 验证

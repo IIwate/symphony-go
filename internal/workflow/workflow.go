@@ -35,8 +35,14 @@ func Load(path string) (*model.WorkflowDefinition, error) {
 	}
 
 	return &model.WorkflowDefinition{
+		RootDir:        filepath.Dir(workflowPath),
 		Config:         config,
 		PromptTemplate: prompt,
+		Completion: model.CompletionContract{
+			Mode:        model.CompletionModeNone,
+			OnMissingPR: model.CompletionActionContinue,
+			OnClosedPR:  model.CompletionActionContinue,
+		},
 	}, nil
 }
 
@@ -130,16 +136,16 @@ func WatchWithErrors(ctx context.Context, path string, onChange func(*model.Work
 	return nil
 }
 
-func RenderPrompt(tmpl string, issue *model.Issue, attempt *int) (string, error) {
-	source := strings.TrimSpace(tmpl)
-	if source == "" {
-		source = DefaultPrompt
+func RenderPrompt(tmpl string, issue *model.Issue, attempt *int, source map[string]any, dispatch *model.DispatchContext) (string, error) {
+	templateSource := strings.TrimSpace(tmpl)
+	if templateSource == "" {
+		templateSource = DefaultPrompt
 	}
 
 	engine := liquid.NewEngine()
 	engine.StrictVariables()
 
-	template, err := engine.ParseString(source)
+	template, err := engine.ParseString(templateSource)
 	if err != nil {
 		return "", model.NewWorkflowError(model.ErrTemplateParseError, "parse liquid template", err)
 	}
@@ -147,6 +153,8 @@ func RenderPrompt(tmpl string, issue *model.Issue, attempt *int) (string, error)
 	rendered, err := template.RenderString(liquid.Bindings{
 		"issue":   issueBindings(issue),
 		"attempt": attemptValue(attempt),
+		"source":  sourceBindings(source),
+		"run":     runBindings(dispatch),
 	})
 	if err != nil {
 		return "", model.NewWorkflowError(model.ErrTemplateRenderError, "render liquid template", err)
@@ -310,6 +318,73 @@ func attemptValue(attempt *int) any {
 	}
 
 	return *attempt
+}
+
+func sourceBindings(source map[string]any) liquid.Bindings {
+	bindings := liquid.Bindings{
+		"kind":            nil,
+		"project_slug":    nil,
+		"owner":           nil,
+		"repo":            nil,
+		"branch_scope":    nil,
+		"active_states":   nil,
+		"terminal_states": nil,
+	}
+	for _, key := range []string{"kind", "project_slug", "owner", "repo", "branch_scope", "active_states", "terminal_states"} {
+		if value, ok := source[key]; ok {
+			bindings[key] = value
+		}
+	}
+	return bindings
+}
+
+func runBindings(dispatch *model.DispatchContext) liquid.Bindings {
+	bindings := liquid.Bindings{
+		"dispatch_kind":       string(model.DispatchKindFresh),
+		"retry_attempt":       nil,
+		"expected_outcome":    string(model.CompletionModeNone),
+		"continuation_reason": nil,
+		"previous_branch":     nil,
+		"previous_pr": liquid.Bindings{
+			"number":      nil,
+			"url":         nil,
+			"state":       nil,
+			"merged":      nil,
+			"head_branch": nil,
+		},
+		"previous_issue_state": nil,
+	}
+	if dispatch == nil {
+		return bindings
+	}
+	if dispatch.Kind != "" {
+		bindings["dispatch_kind"] = string(dispatch.Kind)
+	}
+	if dispatch.RetryAttempt != nil {
+		bindings["retry_attempt"] = *dispatch.RetryAttempt
+	}
+	if dispatch.ExpectedOutcome != "" {
+		bindings["expected_outcome"] = string(dispatch.ExpectedOutcome)
+	}
+	if dispatch.Reason != nil {
+		bindings["continuation_reason"] = string(*dispatch.Reason)
+	}
+	if dispatch.PreviousBranch != nil {
+		bindings["previous_branch"] = *dispatch.PreviousBranch
+	}
+	if dispatch.PreviousIssueState != nil {
+		bindings["previous_issue_state"] = *dispatch.PreviousIssueState
+	}
+	if dispatch.PreviousPR != nil {
+		bindings["previous_pr"] = liquid.Bindings{
+			"number":      dispatch.PreviousPR.Number,
+			"url":         dispatch.PreviousPR.URL,
+			"state":       dispatch.PreviousPR.State,
+			"merged":      dispatch.PreviousPR.Merged,
+			"head_branch": dispatch.PreviousPR.HeadBranch,
+		}
+	}
+	return bindings
 }
 
 func matchesWatchedPath(watchedPath string, eventPath string) bool {

@@ -47,8 +47,8 @@ Symphony 是一个长运行自动化服务，持续从 issue tracker（Linear）
 
 ### 1.3 Go 版本
 
-- **Go 1.23+**
-- 利用：`log/slog` 结构化日志（1.21+）、`net/http` 路由模式匹配（1.22+）、增强的标准库特性
+- **Go 1.25.8+**
+- 利用：`log/slog` 结构化日志（1.21+）、`net/http` 路由模式匹配（1.22+）、`charm.land/huh/v2` 的最低 Go 版本要求（1.25.8+）以及增强的标准库特性
 
 ### 1.4 不做的事项（对齐 SPEC §2.2 Non-Goals）
 
@@ -165,8 +165,19 @@ type BlockerRef struct {
 
 ```go
 type WorkflowDefinition struct {
-    Config         map[string]any // active workflow 的 bridge config map
-    PromptTemplate string         // active flow 对应的 prompt 模板内容（已 trim）
+    RootDir        string
+    Config         map[string]any
+    PromptTemplate string
+    Source         map[string]any
+    Completion     CompletionContract
+}
+```
+
+```go
+type CompletionContract struct {
+    Mode        CompletionMode
+    OnMissingPR CompletionAction
+    OnClosedPR  CompletionAction
 }
 ```
 
@@ -187,14 +198,20 @@ type ServiceConfig struct {
     PollIntervalMS int // 默认 30000
 
     // workspace
-    WorkspaceRoot string // 默认 <os.TempDir()>/symphony_workspaces
+    AutomationRootDir        string
+    WorkspaceRoot            string
+    WorkspaceLinearBranchScope string
+    WorkspaceBranchNamespace string
+    WorkspaceGitAuthorName   string
+    WorkspaceGitAuthorEmail  string
 
     // hooks
-    HookAfterCreate  *string // nullable shell 脚本
-    HookBeforeRun    *string
-    HookAfterRun     *string
-    HookBeforeRemove *string
-    HookTimeoutMS    int     // 默认 60000
+    HookAfterCreate           *string
+    HookBeforeRun             *string
+    HookBeforeRunContinuation *string
+    HookAfterRun              *string
+    HookBeforeRemove          *string
+    HookTimeoutMS             int
 
     // agent
     MaxConcurrentAgents       int            // 默认 10
@@ -220,9 +237,14 @@ type ServiceConfig struct {
 
 ```go
 type Workspace struct {
-    Path         string // 绝对工作区路径
-    WorkspaceKey string // 消毒后的 issue identifier
-    CreatedNow   bool   // 本次调用是否新创建
+    Path            string
+    WorkspaceKey    string
+    Identifier      string
+    CreatedNow      bool
+    BranchNamespace string
+    GitAuthorName   string
+    GitAuthorEmail  string
+    Dispatch        *DispatchContext
 }
 ```
 
@@ -265,12 +287,15 @@ type LiveSession struct {
 
 ```go
 type RetryEntry struct {
-    IssueID     string
-    Identifier  string       // 人类可读 ID，用于日志/状态面
-    Attempt     int          // 1-based
-    DueAt       time.Time    // 到期时间
-    TimerHandle *time.Timer  // 运行时定时器引用
-    Error       *string      // nullable
+    IssueID       string
+    Identifier    string
+    WorkspacePath string
+    Attempt       int
+    StallCount    int
+    DueAt         time.Time
+    TimerHandle   *time.Timer
+    Error         *string
+    Dispatch      *DispatchContext
 }
 ```
 
@@ -280,21 +305,26 @@ type RetryEntry struct {
 type OrchestratorState struct {
     PollIntervalMS      int
     MaxConcurrentAgents int
-    Running             map[string]*RunningEntry   // key=issue_id
-    Claimed             map[string]struct{}         // issue_id 集合
-    RetryAttempts       map[string]*RetryEntry     // key=issue_id
-    Completed           map[string]struct{}         // 记账用，非调度门控
+    Running             map[string]*RunningEntry
+    AwaitingMerge       map[string]*AwaitingMergeEntry
+    AwaitingIntervention map[string]*AwaitingInterventionEntry
+    Claimed             map[string]struct{}
+    RetryAttempts       map[string]*RetryEntry
+    Completed           map[string]struct{}
     CodexTotals         TokenTotals
-    CodexRateLimits     any                        // 最新速率限制快照
+    CodexRateLimits     any
 }
 
 type RunningEntry struct {
-    Issue                *Issue
-    Identifier           string
-    Session              LiveSession
-    RetryAttempt         int
-    StartedAt            time.Time
-    WorkerCancel         context.CancelFunc         // 终止 worker goroutine
+    Issue         *Issue
+    Identifier    string
+    WorkspacePath string
+    Session       LiveSession
+    RetryAttempt  int
+    StallCount    int
+    StartedAt     time.Time
+    WorkerCancel  context.CancelFunc
+    Dispatch      *DispatchContext
 }
 
 type TokenTotals struct {
@@ -384,9 +414,10 @@ func Watch(ctx context.Context, dir string, profile string, onChange func(*model
 **模板渲染**（SPEC §5.4）：
 - `internal/workflow.RenderPrompt` 使用 `github.com/osteele/liquid` Liquid 模板引擎
 - 启用严格模式：未知变量和未知过滤器均报错
-- 输入变量：`issue`、`attempt`、`source`
+- 输入变量：`issue`、`attempt`、`source`、`run`
 - 保留嵌套数组/map（labels, blockers），使模板可用 `{% for %}` 遍历
 - `source` 至少暴露 `kind`、`project_slug`、`owner`、`repo`、`branch_scope`、`active_states`、`terminal_states`
+- `run` 暴露 dispatch/continuation 上下文：`dispatch_kind`、`retry_attempt`、`expected_outcome`、`continuation_reason`、`previous_branch`、`previous_pr`、`previous_issue_state`
 - 空 prompt body 时使用默认提示词：`"You are working on an issue from Linear."`
 - prompt 文件读取/解析失败是配置错误，**不**静默回退到默认提示词
 
@@ -776,6 +807,7 @@ type Manager interface {
 |---|---|
 | `after_create` | 致命：中止工作区创建，可清理已创建目录 |
 | `before_run` | 致命：中止当前运行尝试 |
+| `before_run_continuation` | 致命：中止 continuation / intervention retry 的当前运行尝试 |
 | `after_run` | 记录日志，忽略 |
 | `before_remove` | 记录日志，忽略；清理仍继续 |
 
@@ -787,6 +819,8 @@ type Manager interface {
 - [ ] workspace key 消毒正确（特殊字符替换为 `_`）
 - [ ] `after_create` 仅在新建时执行
 - [ ] `before_run` 失败/超时中止当前尝试
+- [ ] continuation / intervention retry 优先使用 `before_run_continuation`
+- [ ] 若 continuation 未配置 `before_run_continuation` 且工作区已存在，则跳过 destructive 的 fresh `before_run`
 - [ ] `after_run` 失败/超时仅记录
 - [ ] `before_remove` 失败/超时仅记录，清理继续
 - [ ] 钩子超时正确杀进程

@@ -4,48 +4,57 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
-	"symphony-go/internal/config"
+	"symphony-go/internal/loader"
 	"symphony-go/internal/testutil"
-	"symphony-go/internal/workflow"
 )
 
 func TestMainIntegration_DryRun(t *testing.T) {
-	_ = testutil.RequireEnv(t, "LINEAR_API_KEY")
+	apiKey := testutil.RequireEnv(t, "LINEAR_API_KEY")
 
-	workflowPath := filepath.Join(t.TempDir(), "WORKFLOW.md")
+	configDir := filepath.Join(t.TempDir(), "automation")
 	workspaceRoot := filepath.ToSlash(filepath.Join(t.TempDir(), "workspaces"))
 	projectSlug := integrationProjectSlug(t)
 
-	content := fmt.Sprintf(`---
-tracker:
-  kind: linear
-  api_key: $LINEAR_API_KEY
-  project_slug: %s
-workspace:
-  root: %s
-codex:
-  command: codex app-server
----
+	writeAutomationConfig(t, configDir, automationFixtureOptions{
+		WorkspaceRoot:  workspaceRoot,
+		PromptTemplate: "integration dry run",
+	})
+	writeFile(t, filepath.Join(configDir, "sources", "linear-main.yaml"), `kind: linear
+api_key: $LINEAR_API_KEY
+project_slug: $LINEAR_PROJECT_SLUG
+branch_scope: $LINEAR_BRANCH_SCOPE
+active_states: ["Todo", "In Progress"]
+terminal_states: ["Closed", "Done"]
+`)
+	writeFile(
+		t,
+		filepath.Join(configDir, "local", "env.local"),
+		"LINEAR_API_KEY="+apiKey+"\n"+"LINEAR_PROJECT_SLUG="+projectSlug+"\n"+"LINEAR_BRANCH_SCOPE=integration-scope\n",
+	)
 
-integration dry run
-`, projectSlug, workspaceRoot)
-
-	if err := os.WriteFile(workflowPath, []byte(content), 0o644); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
+	originalValue, hadValue := os.LookupEnv("LINEAR_API_KEY")
+	if err := os.Unsetenv("LINEAR_API_KEY"); err != nil {
+		t.Fatalf("Unsetenv() error = %v", err)
 	}
+	defer func() {
+		if hadValue {
+			_ = os.Setenv("LINEAR_API_KEY", originalValue)
+			return
+		}
+		_ = os.Unsetenv("LINEAR_API_KEY")
+	}()
 
-	var stderr bytes.Buffer
-	if exitCode := runCLI([]string{"--dry-run", workflowPath}, &stderr); exitCode != 0 {
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"--dry-run", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "dry-run 校验通过") {
+	if !bytes.Contains(stderr.Bytes(), []byte("dry-run 校验通过")) {
 		t.Fatalf("stderr = %q, want dry-run success message", stderr.String())
 	}
 }
@@ -53,26 +62,37 @@ integration dry run
 func integrationProjectSlug(t *testing.T) string {
 	t.Helper()
 
-	definition, err := workflow.Load(repoWorkflowPath(t))
-	if err != nil {
-		t.Fatalf("workflow.Load() error = %v", err)
-	}
-	cfg, err := config.NewFromWorkflow(definition)
-	if err != nil {
-		t.Fatalf("config.NewFromWorkflow() error = %v", err)
-	}
 	if projectSlug := strings.TrimSpace(os.Getenv("LINEAR_PROJECT_SLUG")); projectSlug != "" {
 		return projectSlug
 	}
-	return cfg.TrackerProjectSlug
+
+	repoDef, err := loader.Load(repoConfigDir(t), "")
+	if err != nil {
+		t.Fatalf("loader.Load() error = %v", err)
+	}
+	for _, sourceName := range repoDef.Selection.EnabledSources {
+		sourceDef := repoDef.Sources[strings.TrimSpace(sourceName)]
+		if sourceDef == nil {
+			continue
+		}
+		if projectSlug, ok := sourceDef.Raw["project_slug"].(string); ok && strings.TrimSpace(projectSlug) != "" {
+			projectSlug = strings.TrimSpace(projectSlug)
+			if strings.HasPrefix(projectSlug, "$") {
+				t.Fatalf("LINEAR_PROJECT_SLUG is required when repo automation config uses %q", projectSlug)
+			}
+			return projectSlug
+		}
+	}
+	t.Fatal("project_slug not found in repo automation config")
+	return ""
 }
 
-func repoWorkflowPath(t *testing.T) string {
+func repoConfigDir(t *testing.T) string {
 	t.Helper()
 
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller() failed")
 	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "WORKFLOW.md"))
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "automation"))
 }

@@ -1,0 +1,14 @@
+kind: linear
+api_key: $LINEAR_API_KEY
+endpoint: https://api.linear.app/graphql
+project_slug: $LINEAR_PROJECT_SLUG
+branch_scope: $LINEAR_BRANCH_SCOPE
+active_states:
+  - Todo
+  - In Progress
+terminal_states:
+  - Closed
+  - Cancelled
+  - Canceled
+  - Duplicate
+  - Done

@@ -169,6 +169,43 @@ func TestRunnerTurnTimeout(t *testing.T) {
 	}
 }
 
+func TestRunnerInjectsProcessEnvIntoAgentProcess(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+		ProcessEnv: map[string]string{
+			"GIT_AUTHOR_NAME":     "symphony-runner",
+			"GIT_AUTHOR_EMAIL":    "runner-a1b2c3@symphony.invalid",
+			"GIT_COMMITTER_NAME":  "symphony-runner",
+			"GIT_COMMITTER_EMAIL": "runner-a1b2c3@symphony.invalid",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if factory.lastEnv["GIT_AUTHOR_NAME"] != "symphony-runner" {
+		t.Fatalf("GIT_AUTHOR_NAME = %q, want symphony-runner", factory.lastEnv["GIT_AUTHOR_NAME"])
+	}
+	if factory.lastEnv["GIT_AUTHOR_EMAIL"] != "runner-a1b2c3@symphony.invalid" {
+		t.Fatalf("GIT_AUTHOR_EMAIL = %q, want runner-a1b2c3@symphony.invalid", factory.lastEnv["GIT_AUTHOR_EMAIL"])
+	}
+	if factory.lastEnv["GIT_COMMITTER_NAME"] != "symphony-runner" {
+		t.Fatalf("GIT_COMMITTER_NAME = %q, want symphony-runner", factory.lastEnv["GIT_COMMITTER_NAME"])
+	}
+	if factory.lastEnv["GIT_COMMITTER_EMAIL"] != "runner-a1b2c3@symphony.invalid" {
+		t.Fatalf("GIT_COMMITTER_EMAIL = %q, want runner-a1b2c3@symphony.invalid", factory.lastEnv["GIT_COMMITTER_EMAIL"])
+	}
+}
+
 func TestWaitForTurnEndEmitsPlainStderrAsNotification(t *testing.T) {
 	runner := newTestRunner(&fakeProcessFactory{process: newFakeProcess(nil, nil, false)}, 200, 200).(*AppServerRunner)
 	events := make([]AgentEvent, 0)
@@ -226,10 +263,10 @@ func TestHandleStreamMessageLogsWriteFailures(t *testing.T) {
 	runner.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	writer := &failingWriteCloser{writeErr: errors.New("broken pipe")}
 
-	if err, done := runner.handleStreamMessage(writer, map[string]any{"id": "approval-1", "method": "approval/request"}, RunParams{}, nil, "", "", ""); err != nil || done {
+	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "approval-1", "method": "approval/request"}, RunParams{}, nil, "", "", ""); err != nil || done {
 		t.Fatalf("approval handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
 	}
-	if err, done := runner.handleStreamMessage(writer, map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "unknown_tool"}}, RunParams{}, nil, "", "", ""); err != nil || done {
+	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "unknown_tool"}}, RunParams{}, nil, "", "", ""); err != nil || done {
 		t.Fatalf("tool handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
 	}
 
@@ -782,6 +819,42 @@ func TestRunnerLinearGraphQLToolTransportFailure(t *testing.T) {
 	}
 }
 
+func TestExecuteLinearGraphQLUsesRequestContext(t *testing.T) {
+	runner := newTestRunnerWithConfig(&fakeProcessFactory{process: newFakeProcess(nil, nil, false)}, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerEndpoint:        "http://linear.invalid",
+		TrackerAPIKey:          "secret-key",
+		CodexCommand:           "codex app-server",
+		CodexApprovalPolicy:    "never",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+	}).(*AppServerRunner)
+
+	transportCalled := false
+	runner.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			transportCalled = true
+			if err := req.Context().Err(); err == nil {
+				t.Fatal("request context was not cancelled")
+			}
+			return nil, req.Context().Err()
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := runner.executeLinearGraphQL(ctx, map[string]any{"query": "query Viewer { viewer { id } }"})
+	if !transportCalled {
+		t.Fatal("transport was not called")
+	}
+	if result["success"] != false || result["error"] != "transport_failure" {
+		t.Fatalf("executeLinearGraphQL() = %+v, want transport_failure", result)
+	}
+}
+
 func newTestRunner(factory *fakeProcessFactory, readTimeout int, turnTimeout int) Runner {
 	return newTestRunnerWithConfig(factory, &model.ServiceConfig{
 		TrackerKind:            "linear",
@@ -803,6 +876,7 @@ func newTestRunnerWithConfig(factory *fakeProcessFactory, cfg *model.ServiceConf
 
 type fakeProcessFactory struct {
 	process *fakeProcess
+	lastEnv map[string]string
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -811,7 +885,13 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
 
-func (f *fakeProcessFactory) StartProcess(_ context.Context, _ string, _ string) (Process, error) {
+func (f *fakeProcessFactory) StartProcess(_ context.Context, _ string, _ string, env map[string]string) (Process, error) {
+	if len(env) > 0 {
+		f.lastEnv = make(map[string]string, len(env))
+		for key, value := range env {
+			f.lastEnv[key] = value
+		}
+	}
 	f.process.start()
 	return f.process, nil
 }

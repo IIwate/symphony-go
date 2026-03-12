@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"symphony-go/internal/config"
+	"symphony-go/internal/loader"
 	"symphony-go/internal/model"
 	"symphony-go/internal/testutil"
-	"symphony-go/internal/workflow"
 )
 
 func TestLinearIntegration_FetchCandidates(t *testing.T) {
@@ -110,9 +110,13 @@ func integrationLinearConfig(t *testing.T) *model.ServiceConfig {
 
 	_ = testutil.RequireEnv(t, "LINEAR_API_KEY")
 
-	definition, err := workflow.Load(repoWorkflowPath(t))
+	repoDef, err := loader.Load(repoConfigDir(t), "")
 	if err != nil {
-		t.Fatalf("workflow.Load() error = %v", err)
+		t.Fatalf("loader.Load() error = %v", err)
+	}
+	definition, err := loader.ResolveActiveWorkflow(repoDef)
+	if err != nil {
+		t.Fatalf("loader.ResolveActiveWorkflow() error = %v", err)
 	}
 	cfg, err := config.NewFromWorkflow(definition)
 	if err != nil {
@@ -124,14 +128,14 @@ func integrationLinearConfig(t *testing.T) *model.ServiceConfig {
 	return cfg
 }
 
-func repoWorkflowPath(t *testing.T) string {
+func repoConfigDir(t *testing.T) string {
 	t.Helper()
 
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller() failed")
 	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "WORKFLOW.md"))
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "automation"))
 }
 
 type countingTransport struct {

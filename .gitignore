@@ -11,3 +11,12 @@ bin/
 dist/
 .ace-tool/
 logs/
+.codex-tmp/
+tmp/live-smoke/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+automation/local/*
+!automation/local/.gitkeep

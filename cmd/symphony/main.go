@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,17 +9,18 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
+
+	"github.com/spf13/cobra"
 
 	"symphony-go/internal/agent"
 	"symphony-go/internal/config"
+	"symphony-go/internal/envfile"
+	"symphony-go/internal/loader"
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
 	"symphony-go/internal/orchestrator"
 	"symphony-go/internal/server"
 	"symphony-go/internal/tracker"
-	"symphony-go/internal/workflow"
 	"symphony-go/internal/workspace"
 )
 
@@ -40,17 +40,23 @@ type httpServer interface {
 
 type runtimeState struct {
 	mu           sync.RWMutex
+	repoDef      *model.AutomationDefinition
 	definition   *model.WorkflowDefinition
 	config       *model.ServiceConfig
 	portOverride *int
+	configDir    string
 }
 
 var (
-	loadWorkflowDefinition  = workflow.Load
-	watchWorkflowDefinition = workflow.WatchWithErrors
-	buildVersion            = "dev"
-	newLoggerFactory        = logging.NewLogger
-	newTrackerFactory       = func(configFn func() *model.ServiceConfig) (tracker.Client, error) {
+	loadEnvFile               = envfile.Load
+	loadAutomationDefinition  = loader.Load
+	resolveActiveWorkflow     = loader.ResolveActiveWorkflow
+	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
+		return loader.WatchWithErrors(ctx, dir, profile, onChange, onError)
+	}
+	buildVersion      = "dev"
+	newLoggerFactory  = logging.NewLogger
+	newTrackerFactory = func(configFn func() *model.ServiceConfig) (tracker.Client, error) {
 		return tracker.NewDynamicClient(configFn, nil)
 	}
 	newWorkspaceFactory = func(configFn func() *model.ServiceConfig, logger *slog.Logger) (workspace.Manager, error) {
@@ -71,15 +77,18 @@ var (
 )
 
 func main() {
-	os.Exit(runCLI(os.Args[1:], os.Stderr))
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func runCLI(args []string, stderr io.Writer) int {
+func runCLI(args []string, stdout io.Writer, stderr io.Writer) int {
+	if stdout == nil {
+		stdout = os.Stdout
+	}
 	if stderr == nil {
 		stderr = os.Stderr
 	}
 
-	if err := execute(args, stderr); err != nil {
+	if err := execute(args, stdout, stderr); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -87,123 +96,73 @@ func runCLI(args []string, stderr io.Writer) int {
 	return 0
 }
 
-func execute(args []string, stderr io.Writer) error {
-	flags := flag.NewFlagSet("symphony", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-
-	port := -1
-	dryRun := false
-	logFile := ""
-	logLevel := "info"
-
-	flags.IntVar(&port, "port", -1, "HTTP server port")
-	flags.BoolVar(&dryRun, "dry-run", false, "run a single validation cycle and exit")
-	flags.StringVar(&logFile, "log-file", "", "path to log file")
-	flags.StringVar(&logLevel, "log-level", "info", "debug/info/warn/error")
-
-	if err := flags.Parse(args); err != nil {
-		return err
+func execute(args []string, stdout io.Writer, stderr io.Writer) error {
+	rootCmd := newRootCommand(stdout, stderr)
+	if args == nil {
+		rootCmd.SetArgs([]string{})
+	} else {
+		rootCmd.SetArgs(args)
 	}
-	if err := validateLogLevel(logLevel); err != nil {
-		return err
+	err := rootCmd.Execute()
+	if err != nil && hasLegacyWorkflowArg(args) && strings.Contains(err.Error(), "unknown command") {
+		return fmt.Errorf("workflow path argument is no longer supported; use --config-dir")
 	}
+	return err
+}
 
-	remaining := flags.Args()
-	if len(remaining) > 1 {
-		return fmt.Errorf("expected at most one workflow path argument, got %d", len(remaining))
+func newRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
+	if stdout == nil {
+		stdout = os.Stdout
 	}
-
-	workflowPath := "./WORKFLOW.md"
-	if len(remaining) == 1 {
-		workflowPath = remaining[0]
+	if stderr == nil {
+		stderr = os.Stderr
 	}
-
-	definition, err := loadWorkflowDefinition(workflowPath)
-	if err != nil {
-		return err
+	rootCmd := &cobra.Command{
+		Use:   "symphony",
+		Short: "Symphony automation runner",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("workflow path argument is no longer supported; use --config-dir")
+			}
+			return nil
+		},
+		RunE:          runRunCmd,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
+	rootCmd.SetIn(os.Stdin)
+	rootCmd.SetOut(stdout)
+	rootCmd.SetErr(stderr)
 
-	cfg, err := config.NewFromWorkflow(definition)
-	if err != nil {
-		return err
-	}
-	portOverride := applyPortOverride(cfg, port)
+	rootCmd.PersistentFlags().String("config-dir", "automation", "path to automation config directory")
+	rootCmd.PersistentFlags().String("profile", "", "runtime profile name")
+	rootCmd.PersistentFlags().String("log-level", "info", "debug/info/warn/error")
+	rootCmd.PersistentFlags().String("log-file", "", "path to log file")
+	rootCmd.PersistentFlags().Bool("non-interactive", false, "disable interactive prompts and setup wizard")
 
-	logger, closer, err := newLoggerFactory(logging.Options{Level: logLevel, FilePath: logFile, Stderr: stderr})
-	if err != nil {
-		return err
-	}
-	defer closer.Close()
-	logger.Info("workflow loaded", slog.String("workflow_path", workflowPath))
+	rootCmd.Flags().Int("port", -1, "HTTP server port")
+	rootCmd.Flags().Bool("dry-run", false, "run a single validation cycle and exit")
 
-	if err := config.ValidateForDispatch(cfg); err != nil {
-		return err
-	}
+	rootCmd.AddCommand(newSetupCommand())
+	rootCmd.AddCommand(newConfigCommand())
+	return rootCmd
+}
 
-	state := &runtimeState{definition: definition, config: cfg, portOverride: portOverride}
-	orchestrator.BuildVersion = buildVersion
-	trackerClient, err := newTrackerFactory(state.CurrentConfig)
-	if err != nil {
-		return err
-	}
-	workspaceManager, err := newWorkspaceFactory(state.CurrentConfig, logger)
-	if err != nil {
-		return err
-	}
-	runner := newAgentRunnerFactory(state.CurrentConfig, logger)
-	orch := newOrchestratorFactory(trackerClient, workspaceManager, runner, state.CurrentConfig, state.CurrentWorkflow, logger)
-
-	if dryRun {
-		logger.Warn("dry-run 仍会访问 tracker 并执行 startupCleanup，可能产生副作用", slog.String("workflow_path", workflowPath))
-		orch.RunOnce(context.Background(), false)
-		logger.Info("dry-run 校验通过")
-		return nil
-	}
-
-	ctx, cancel := notifySignalContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	if err := watchWorkflowDefinition(ctx, workflowPath, func(def *model.WorkflowDefinition) {
-		if _, reloadErr := state.ApplyReload(def); reloadErr != nil {
-			logger.Warn("workflow reload rejected", "error", reloadErr.Error())
-			return
+func hasLegacyWorkflowArg(args []string) bool {
+	for _, raw := range args {
+		arg := strings.TrimSpace(raw)
+		if arg == "" || strings.HasPrefix(arg, "-") {
+			continue
 		}
-		orch.NotifyWorkflowReload(def)
-		logger.Info("workflow reloaded", slog.String("workflow_path", workflowPath))
-	}, func(watchErr error) {
-		logger.Warn("workflow reload failed", "error", watchErr.Error())
-	}); err != nil {
-		return err
-	}
-
-	var httpSrv httpServer
-	if cfg.ServerPort != nil {
-		httpSrv, err = newHTTPServerFactory(orch, logger, *cfg.ServerPort)
-		if err != nil {
-			return err
+		if strings.ContainsAny(arg, `/\`) {
+			return true
 		}
-		logger.Info("http server started", "addr", httpSrv.Addr())
-	}
-
-	if err := orch.Start(ctx); err != nil {
-		if httpSrv != nil {
-			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancelShutdown()
-			_ = httpSrv.Shutdown(shutdownCtx)
-		}
-		return err
-	}
-	logger.Info("symphony started", slog.String("workflow_path", workflowPath))
-	orch.Wait()
-	if httpSrv != nil {
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancelShutdown()
-		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("http server shutdown failed", "error", err.Error())
+		lower := strings.ToLower(arg)
+		if strings.HasSuffix(lower, ".md") || strings.HasSuffix(lower, ".markdown") {
+			return true
 		}
 	}
-	logger.Info("symphony stopped")
-	return nil
+	return false
 }
 
 func (s *runtimeState) CurrentConfig() *model.ServiceConfig {
@@ -218,8 +177,12 @@ func (s *runtimeState) CurrentWorkflow() *model.WorkflowDefinition {
 	return s.definition
 }
 
-func (s *runtimeState) ApplyReload(def *model.WorkflowDefinition) (*model.ServiceConfig, error) {
-	newCfg, err := config.NewFromWorkflow(def)
+func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.WorkflowDefinition, error) {
+	newDefinition, err := resolveActiveWorkflow(repoDef)
+	if err != nil {
+		return nil, err
+	}
+	newCfg, err := config.NewFromWorkflow(newDefinition)
 	if err != nil {
 		return nil, err
 	}
@@ -227,16 +190,43 @@ func (s *runtimeState) ApplyReload(def *model.WorkflowDefinition) (*model.Servic
 		port := *s.portOverride
 		newCfg.ServerPort = &port
 	}
+
+	s.mu.RLock()
+	currentRepoDef := s.repoDef
+	currentCfg := s.config
+	s.mu.RUnlock()
+
+	if currentRepoDef != nil {
+		if strings.TrimSpace(currentRepoDef.Profile) != strings.TrimSpace(repoDef.Profile) {
+			return nil, fmt.Errorf("profile selection changed: restart required")
+		}
+		if selectedSourceKind(currentRepoDef) != selectedSourceKind(repoDef) {
+			return nil, fmt.Errorf("source.kind changed: restart required")
+		}
+		if !enabledSourcesEqual(currentRepoDef, repoDef) {
+			return nil, fmt.Errorf("selection.enabled_sources changed: restart required")
+		}
+	}
+	if currentCfg != nil {
+		if currentCfg.WorkspaceRoot != newCfg.WorkspaceRoot {
+			return nil, fmt.Errorf("runtime.workspace.root changed: restart required")
+		}
+		if !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort) {
+			return nil, fmt.Errorf("runtime.server.port changed: restart required")
+		}
+	}
 	if err := config.ValidateForDispatch(newCfg); err != nil {
 		return nil, err
 	}
 
 	s.mu.Lock()
-	s.definition = def
+	s.repoDef = repoDef
+	s.definition = newDefinition
 	s.config = newCfg
+	s.configDir = repoDef.RootDir
 	s.mu.Unlock()
 
-	return newCfg, nil
+	return newDefinition, nil
 }
 
 func applyPortOverride(cfg *model.ServiceConfig, port int) *int {
@@ -254,4 +244,56 @@ func validateLogLevel(value string) error {
 	default:
 		return fmt.Errorf("unsupported log level %q", value)
 	}
+}
+
+func serverPortEqual(left *int, right *int) bool {
+	switch {
+	case left == nil && right == nil:
+		return true
+	case left == nil || right == nil:
+		return false
+	default:
+		return *left == *right
+	}
+}
+
+func enabledSourcesEqual(left *model.AutomationDefinition, right *model.AutomationDefinition) bool {
+	leftSources := nilSafeSources(left)
+	rightSources := nilSafeSources(right)
+	if len(leftSources) != len(rightSources) {
+		return false
+	}
+	for i := range leftSources {
+		if leftSources[i] != rightSources[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func nilSafeSources(def *model.AutomationDefinition) []string {
+	if def == nil {
+		return nil
+	}
+	sources := append([]string(nil), def.Selection.EnabledSources...)
+	for i := range sources {
+		sources[i] = strings.TrimSpace(sources[i])
+	}
+	return sources
+}
+
+func selectedSourceKind(def *model.AutomationDefinition) string {
+	if def == nil || len(def.Selection.EnabledSources) != 1 {
+		return ""
+	}
+	sourceName := strings.TrimSpace(def.Selection.EnabledSources[0])
+	if sourceName == "" {
+		return ""
+	}
+	sourceDef := def.Sources[sourceName]
+	if sourceDef == nil {
+		return ""
+	}
+	value, _ := sourceDef.Raw["kind"].(string)
+	return model.NormalizeState(value)
 }

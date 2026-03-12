@@ -4,13 +4,17 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/secret"
 )
 
 func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "secret-key")
+	t.Setenv("LINEAR_PROJECT_SLUG", "demo-from-env")
+	t.Setenv("LINEAR_BRANCH_SCOPE", "Demo Scope")
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("UserHomeDir() error = %v", err)
@@ -21,7 +25,7 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 			"tracker": map[string]any{
 				"kind":            "linear",
 				"api_key":         "$LINEAR_API_KEY",
-				"project_slug":    "demo",
+				"project_slug":    "$LINEAR_PROJECT_SLUG",
 				"linear":          map[string]any{"children_block_parent": false},
 				"repo":            "ignored-repo",
 				"active_states":   "Todo, In Progress",
@@ -30,7 +34,12 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 			"polling": map[string]any{"interval_ms": "45000"},
 			"workspace": map[string]any{
 				"root":                "~/symphony",
-				"linear_branch_scope": "Symphony Go",
+				"linear_branch_scope": "$LINEAR_BRANCH_SCOPE",
+				"branch_namespace":    " Runner Alias ",
+				"git": map[string]any{
+					"author_name":  " runner-bot ",
+					"author_email": " runner-bot@symphony.invalid ",
+				},
 			},
 			"hooks": map[string]any{
 				"before_run": "echo hi",
@@ -63,6 +72,9 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	if cfg.TrackerAPIKey != "secret-key" {
 		t.Fatalf("TrackerAPIKey = %q, want secret-key", cfg.TrackerAPIKey)
 	}
+	if cfg.TrackerProjectSlug != "demo-from-env" {
+		t.Fatalf("TrackerProjectSlug = %q, want demo-from-env", cfg.TrackerProjectSlug)
+	}
 	if cfg.TrackerLinearChildrenBlockParent {
 		t.Fatal("TrackerLinearChildrenBlockParent = true, want false")
 	}
@@ -72,8 +84,17 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	if cfg.WorkspaceRoot != filepath.Join(homeDir, "symphony") {
 		t.Fatalf("WorkspaceRoot = %q, want %q", cfg.WorkspaceRoot, filepath.Join(homeDir, "symphony"))
 	}
-	if cfg.WorkspaceLinearBranchScope != "symphony-go" {
-		t.Fatalf("WorkspaceLinearBranchScope = %q, want symphony-go", cfg.WorkspaceLinearBranchScope)
+	if cfg.WorkspaceLinearBranchScope != "demo-scope" {
+		t.Fatalf("WorkspaceLinearBranchScope = %q, want demo-scope", cfg.WorkspaceLinearBranchScope)
+	}
+	if cfg.WorkspaceBranchNamespace != "Runner Alias" {
+		t.Fatalf("WorkspaceBranchNamespace = %q, want Runner Alias", cfg.WorkspaceBranchNamespace)
+	}
+	if cfg.WorkspaceGitAuthorName != "runner-bot" {
+		t.Fatalf("WorkspaceGitAuthorName = %q, want runner-bot", cfg.WorkspaceGitAuthorName)
+	}
+	if cfg.WorkspaceGitAuthorEmail != "runner-bot@symphony.invalid" {
+		t.Fatalf("WorkspaceGitAuthorEmail = %q, want runner-bot@symphony.invalid", cfg.WorkspaceGitAuthorEmail)
 	}
 	if cfg.HookBeforeRun == nil || *cfg.HookBeforeRun != "echo hi" {
 		t.Fatalf("HookBeforeRun = %v, want echo hi", cfg.HookBeforeRun)
@@ -109,6 +130,7 @@ func TestValidateForDispatch(t *testing.T) {
 	base.TrackerKind = "linear"
 	base.TrackerAPIKey = "secret"
 	base.TrackerProjectSlug = "demo"
+	base.WorkspaceLinearBranchScope = "demo-scope"
 
 	tests := []struct {
 		name   string
@@ -137,6 +159,13 @@ func TestValidateForDispatch(t *testing.T) {
 			target: model.ErrMissingTrackerProjectSlug,
 		},
 		{
+			name: "missing branch scope",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.WorkspaceLinearBranchScope = ""
+			},
+			target: model.ErrWorkflowParseError,
+		},
+		{
 			name: "missing codex command",
 			mutate: func(cfg *model.ServiceConfig) {
 				cfg.CodexCommand = ""
@@ -156,6 +185,25 @@ func TestValidateForDispatch(t *testing.T) {
 				t.Fatalf("ValidateForDispatch() error = %v, want %v", err, tc.target)
 			}
 		})
+	}
+}
+
+func TestValidateForDispatchFailsWhenHookRequiresMissingEnv(t *testing.T) {
+	t.Setenv("SYMPHONY_GIT_REPO_URL", "")
+
+	cfg := defaultServiceConfig()
+	cfg.TrackerKind = "linear"
+	cfg.TrackerAPIKey = "secret"
+	cfg.TrackerProjectSlug = "demo"
+	cfg.WorkspaceLinearBranchScope = "demo-scope"
+	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"`)
+
+	err := ValidateForDispatch(cfg)
+	if !errors.Is(err, model.ErrWorkflowParseError) {
+		t.Fatalf("ValidateForDispatch() error = %v, want ErrWorkflowParseError", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "SYMPHONY_GIT_REPO_URL") {
+		t.Fatalf("ValidateForDispatch() error = %v, want missing env detail", err)
 	}
 }
 
@@ -188,5 +236,54 @@ func TestNewFromWorkflowFallsBackToDefaultHookTimeoutForNonPositiveValues(t *tes
 				t.Fatal("TrackerLinearChildrenBlockParent = false, want default true")
 			}
 		})
+	}
+}
+
+func TestNewFromWorkflowUsesDefaultResolver(t *testing.T) {
+	originalResolver := secret.DefaultResolver
+	secret.DefaultResolver = func(key string) (string, bool) {
+		if key == "LINEAR_API_KEY" {
+			return "resolver-secret", true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
+
+	cfg, err := NewFromWorkflow(&model.WorkflowDefinition{
+		Config: map[string]any{
+			"tracker": map[string]any{
+				"kind":     "linear",
+				"api_key":  "$LINEAR_API_KEY",
+				"endpoint": "https://api.linear.app/graphql",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewFromWorkflow() error = %v", err)
+	}
+	if cfg.TrackerAPIKey != "resolver-secret" {
+		t.Fatalf("TrackerAPIKey = %q, want resolver-secret", cfg.TrackerAPIKey)
+	}
+}
+
+func TestValidateForDispatchUsesDefaultResolverForHookEnv(t *testing.T) {
+	originalResolver := secret.DefaultResolver
+	secret.DefaultResolver = func(key string) (string, bool) {
+		if key == "SYMPHONY_GIT_REPO_URL" {
+			return "https://example.com/repo.git", true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
+
+	cfg := defaultServiceConfig()
+	cfg.TrackerKind = "linear"
+	cfg.TrackerAPIKey = "secret"
+	cfg.TrackerProjectSlug = "demo"
+	cfg.WorkspaceLinearBranchScope = "demo-scope"
+	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"`)
+
+	if err := ValidateForDispatch(cfg); err != nil {
+		t.Fatalf("ValidateForDispatch() error = %v, want nil", err)
 	}
 }
