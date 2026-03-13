@@ -390,11 +390,9 @@ func TestNewFromWorkflowRejectsLegacyRuntimeExtensionKeys(t *testing.T) {
 				"notifications": map[string]any{
 					"channels": []any{
 						map[string]any{
-							"id":     "ops",
-							"kind":   "webhook",
-							"name":   "Ops",
-							"url":    "https://hooks.example.com/symphony",
-							"events": []any{"system_alert"},
+							"id":   "ops",
+							"kind": "webhook",
+							"name": "Ops",
 						},
 					},
 				},
