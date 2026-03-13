@@ -165,6 +165,124 @@ func TestHandleWorkerExitSuccessPersistsRecoveringStateBeforeResume(t *testing.T
 	})
 }
 
+func TestHandleSessionPersistenceWriteFailureEntersProtectedModeOnce(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	store := &fakeStateStore{}
+	o.stateStore = store
+
+	o.handleSessionPersistenceWriteFailure(errors.New("disk full"))
+	o.handleSessionPersistenceWriteFailure(errors.New("disk still full"))
+
+	snapshot := o.Snapshot()
+	if snapshot.Service.Mode != model.ServiceModeProtected {
+		t.Fatalf("service mode = %q, want protected", snapshot.Service.Mode)
+	}
+	if snapshot.Service.ProtectionReason != "disk full" {
+		t.Fatalf("service protection reason = %q, want first failure", snapshot.Service.ProtectionReason)
+	}
+	if !snapshot.Service.RestartRequired {
+		t.Fatal("service restart_required = false, want true")
+	}
+	if store.disableCalls == 0 {
+		t.Fatal("state store Disable() was not called")
+	}
+	if len(snapshot.Health.Alerts) != 1 || snapshot.Health.Alerts[0].Code != serviceProtectedModeCode {
+		t.Fatalf("health alerts = %+v, want only %q", snapshot.Health.Alerts, serviceProtectedModeCode)
+	}
+}
+
+func TestProtectedModeBlocksRefreshDispatchAndRetry(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	runner := &fakeRunner{runCh: make(chan string, 1), block: make(chan struct{})}
+	tracker := &fakeTracker{
+		candidateIssues: []model.Issue{
+			{ID: "1", Identifier: "ABC-1", Title: "Retry me", State: "Todo"},
+		},
+	}
+	o := newTestOrchestrator(testServiceConfig(), tracker, &fakeWorkspaceManager{}, runner, now)
+	o.state.RetryAttempts["1"] = &model.RetryEntry{
+		IssueID:    "1",
+		Identifier: "ABC-1",
+		Attempt:    1,
+		DueAt:      now,
+	}
+	o.mu.Lock()
+	o.enterProtectedModeLocked("disk full")
+	o.mu.Unlock()
+
+	refresh := o.RequestRefresh()
+	if refresh.Accepted {
+		t.Fatalf("refresh result = %+v, want rejected", refresh)
+	}
+	if refresh.RejectedCode != serviceProtectedModeCode {
+		t.Fatalf("refresh rejected code = %q, want %q", refresh.RejectedCode, serviceProtectedModeCode)
+	}
+
+	o.RunOnce(context.Background(), true)
+	if tracker.candidateFetchCalls != 0 {
+		t.Fatalf("candidate fetch calls = %d, want 0 in protected mode", tracker.candidateFetchCalls)
+	}
+	o.handleRetryTimer(context.Background(), "1")
+	if _, ok := o.state.RetryAttempts["1"]; !ok {
+		t.Fatal("retry entry was consumed in protected mode")
+	}
+	select {
+	case identifier := <-runner.runCh:
+		t.Fatalf("unexpected dispatch in protected mode: %s", identifier)
+	default:
+	}
+}
+
+func TestHandleWorkerExitInProtectedModeRecordsObservationOnly(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		RetryAttempt:  1,
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
+		Dispatch: &model.DispatchContext{
+			Kind:            model.DispatchKindContinuation,
+			ExpectedOutcome: model.CompletionModePullRequest,
+		},
+	}
+	o.mu.Lock()
+	o.enterProtectedModeLocked("disk full")
+	o.mu.Unlock()
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:     "1",
+		Identifier:  "ABC-1",
+		StartedAt:   now,
+		Phase:       model.PhaseSucceeded,
+		FinalBranch: "feature/abc-1",
+	})
+
+	if _, ok := o.state.Running["1"]; ok {
+		t.Fatal("running entry still exists after protected worker exit")
+	}
+	if len(o.state.Recovering) != 0 {
+		t.Fatalf("recovering state = %+v, want empty", o.state.Recovering)
+	}
+	if len(o.state.RetryAttempts) != 0 {
+		t.Fatalf("retry state = %+v, want empty", o.state.RetryAttempts)
+	}
+	protected := o.state.ProtectedResults["1"]
+	if protected == nil {
+		t.Fatal("protected result missing")
+	}
+	if protected.FinalBranch != "feature/abc-1" {
+		t.Fatalf("protected final branch = %q, want feature/abc-1", protected.FinalBranch)
+	}
+	snapshot := o.Snapshot()
+	if len(snapshot.Observations.ProtectedResults) != 1 {
+		t.Fatalf("protected results snapshot = %+v, want 1 item", snapshot.Observations.ProtectedResults)
+	}
+}
+
 func TestRunOnceProcessesOverdueRetryWithoutTimerSignal(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := testServiceConfig()
@@ -421,8 +539,8 @@ func TestReconcileRunningFirstStallAfterContinuationDoesNotTriggerRepeatedStall(
 	if retry.StallCount != 1 {
 		t.Fatalf("stall count = %d, want 1", retry.StallCount)
 	}
-	if hasAlertCode(o.Snapshot().Alerts, "repeated_stall") {
-		t.Fatalf("alerts = %+v, want no repeated_stall", o.Snapshot().Alerts)
+	if hasObservationCode(o.Snapshot().Observations.Derived, "repeated_stall") {
+		t.Fatalf("observations = %+v, want no repeated_stall", o.Snapshot().Observations.Derived)
 	}
 }
 
@@ -479,7 +597,7 @@ func TestSnapshotIncludesAlertsAndWorkspaceContext(t *testing.T) {
 		MaxConcurrentAgents: 2,
 	}
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
-	o.systemAlerts["tracker_unreachable"] = AlertSnapshot{
+	o.healthAlerts["tracker_unreachable"] = AlertSnapshot{
 		Code:    "tracker_unreachable",
 		Level:   "warn",
 		Message: "tracker down",
@@ -522,13 +640,16 @@ func TestSnapshotIncludesAlertsAndWorkspaceContext(t *testing.T) {
 	if snapshot.Running[0].AttemptCount != 2 {
 		t.Fatalf("running attempt count = %d, want 2", snapshot.Running[0].AttemptCount)
 	}
-	codes := make(map[string]struct{}, len(snapshot.Alerts))
-	for _, alert := range snapshot.Alerts {
+	codes := make(map[string]struct{}, len(snapshot.Health.Alerts)+len(snapshot.Observations.Derived))
+	for _, alert := range snapshot.Health.Alerts {
 		codes[alert.Code] = struct{}{}
+	}
+	for _, observation := range snapshot.Observations.Derived {
+		codes[observation.Code] = struct{}{}
 	}
 	for _, code := range []string{"tracker_unreachable", "repeated_stall", "workspace_hook_failure"} {
 		if _, ok := codes[code]; !ok {
-			t.Fatalf("missing alert code %q in %+v", code, snapshot.Alerts)
+			t.Fatalf("missing code %q in alerts=%+v observations=%+v", code, snapshot.Health.Alerts, snapshot.Observations.Derived)
 		}
 	}
 }
@@ -550,16 +671,16 @@ func TestRunOnceSetsAndClearsTrackerAlert(t *testing.T) {
 
 	o.RunOnce(context.Background(), false)
 	snapshot := o.Snapshot()
-	if !hasAlertCode(snapshot.Alerts, "tracker_unreachable") {
-		t.Fatalf("alerts = %+v, want tracker_unreachable", snapshot.Alerts)
+	if !hasAlertCode(snapshot.Health.Alerts, "tracker_unreachable") {
+		t.Fatalf("alerts = %+v, want tracker_unreachable", snapshot.Health.Alerts)
 	}
 
 	tracker.candidateErr = nil
 	tracker.candidateIssues = []model.Issue{}
 	o.RunOnce(context.Background(), false)
 	snapshot = o.Snapshot()
-	if hasAlertCode(snapshot.Alerts, "tracker_unreachable") {
-		t.Fatalf("alerts = %+v, want tracker_unreachable cleared", snapshot.Alerts)
+	if hasAlertCode(snapshot.Health.Alerts, "tracker_unreachable") {
+		t.Fatalf("alerts = %+v, want tracker_unreachable cleared", snapshot.Health.Alerts)
 	}
 }
 
@@ -588,8 +709,8 @@ func TestRunOnceKeepsTrackerAlertWhenReconcileFails(t *testing.T) {
 	}
 	o.RunOnce(context.Background(), false)
 	snapshot := o.Snapshot()
-	if !hasAlertCode(snapshot.Alerts, "tracker_unreachable") {
-		t.Fatalf("alerts = %+v, want tracker_unreachable", snapshot.Alerts)
+	if !hasAlertCode(snapshot.Health.Alerts, "tracker_unreachable") {
+		t.Fatalf("alerts = %+v, want tracker_unreachable", snapshot.Health.Alerts)
 	}
 	if tracker.candidateFetchCalls != 1 {
 		t.Fatalf("candidate fetch calls = %d, want 1", tracker.candidateFetchCalls)
@@ -604,8 +725,8 @@ func TestRunOnceKeepsTrackerAlertWhenReconcileFails(t *testing.T) {
 	}
 	o.RunOnce(context.Background(), false)
 	snapshot = o.Snapshot()
-	if hasAlertCode(snapshot.Alerts, "tracker_unreachable") {
-		t.Fatalf("alerts = %+v, want tracker_unreachable cleared", snapshot.Alerts)
+	if hasAlertCode(snapshot.Health.Alerts, "tracker_unreachable") {
+		t.Fatalf("alerts = %+v, want tracker_unreachable cleared", snapshot.Health.Alerts)
 	}
 }
 
@@ -1587,8 +1708,8 @@ func TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert(t *testing.T) 
 	if len(o.state.RetryAttempts) != 0 {
 		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
 	}
-	if !hasAlertCode(o.Snapshot().Alerts, "merge_status_unknown") {
-		t.Fatalf("snapshot alerts = %+v, want merge_status_unknown", o.Snapshot().Alerts)
+	if !hasObservationCode(o.Snapshot().Observations.Derived, "merge_status_unknown") {
+		t.Fatalf("snapshot observations = %+v, want merge_status_unknown", o.Snapshot().Observations.Derived)
 	}
 }
 
@@ -1625,8 +1746,8 @@ func TestReconcileAwaitingMergeLookupFailureDuringContextCancelIsIgnored(t *test
 	if awaiting.LastError != nil {
 		t.Fatalf("awaiting merge error = %v, want nil during shutdown", awaiting.LastError)
 	}
-	if hasAlertCode(o.Snapshot().Alerts, "merge_status_unknown") {
-		t.Fatalf("snapshot alerts = %+v, want no merge_status_unknown during shutdown", o.Snapshot().Alerts)
+	if hasObservationCode(o.Snapshot().Observations.Derived, "merge_status_unknown") {
+		t.Fatalf("snapshot observations = %+v, want no merge_status_unknown during shutdown", o.Snapshot().Observations.Derived)
 	}
 }
 
@@ -2089,7 +2210,7 @@ func TestNotificationDeliveryFailureCreatesInternalAlert(t *testing.T) {
 		return requestsHit >= 1
 	})
 	waitForCondition(t, time.Second, func() bool {
-		return hasAlertCode(o.Snapshot().Alerts, "notification_delivery_failed_ops")
+		return hasAlertCode(o.Snapshot().Health.Alerts, "notification_delivery_failed_ops")
 	})
 
 	mu.Lock()
@@ -2097,8 +2218,8 @@ func TestNotificationDeliveryFailureCreatesInternalAlert(t *testing.T) {
 	if requestsHit < 1 {
 		t.Fatalf("request count = %d, want >= 1", requestsHit)
 	}
-	if !hasAlertCode(o.Snapshot().Alerts, "notification_delivery_failed_ops") {
-		t.Fatalf("snapshot alerts = %+v, want notification_delivery_failed_ops", o.Snapshot().Alerts)
+	if !hasAlertCode(o.Snapshot().Health.Alerts, "notification_delivery_failed_ops") {
+		t.Fatalf("snapshot alerts = %+v, want notification_delivery_failed_ops", o.Snapshot().Health.Alerts)
 	}
 }
 
@@ -2254,7 +2375,7 @@ func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 	o.emitNotificationLocked(o.newIssueCompletedEvent("2", "ISSUE-2"))
 
 	waitForCondition(t, time.Second, func() bool {
-		return hasAlertCode(o.Snapshot().Alerts, notificationQueueOverflowCode("ops"))
+		return hasAlertCode(o.Snapshot().Health.Alerts, notificationQueueOverflowCode("ops"))
 	})
 }
 
@@ -2282,8 +2403,8 @@ func TestNotificationReloadIgnoresStaleHealthCallbacks(t *testing.T) {
 	if len(snapshot.Health.Notifications) != 0 {
 		t.Fatalf("notification health = %+v, want none after stale callback", snapshot.Health.Notifications)
 	}
-	if hasAlertCode(snapshot.Alerts, notificationQueueOverflowCode("ops")) || hasAlertCode(snapshot.Alerts, notificationDeliveryFailedCode("ops")) {
-		t.Fatalf("snapshot alerts = %+v, want stale notification alerts ignored", snapshot.Alerts)
+	if hasAlertCode(snapshot.Health.Alerts, notificationQueueOverflowCode("ops")) || hasAlertCode(snapshot.Health.Alerts, notificationDeliveryFailedCode("ops")) {
+		t.Fatalf("snapshot alerts = %+v, want stale notification alerts ignored", snapshot.Health.Alerts)
 	}
 }
 
@@ -2496,6 +2617,36 @@ func hasAlertCode(alerts []AlertSnapshot, code string) bool {
 		}
 	}
 	return false
+}
+
+func hasObservationCode(observations []ObservationSnapshot, code string) bool {
+	for _, observation := range observations {
+		if observation.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+type fakeStateStore struct {
+	disableCalls  int
+	scheduleCalls int
+}
+
+func (f *fakeStateStore) Load() (*durableRuntimeState, error) {
+	return nil, nil
+}
+
+func (f *fakeStateStore) Schedule(_ durableRuntimeState, _ bool) {
+	f.scheduleCalls++
+}
+
+func (f *fakeStateStore) Disable() {
+	f.disableCalls++
+}
+
+func (f *fakeStateStore) Close(_ context.Context) error {
+	return nil
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, check func() bool) {

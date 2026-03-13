@@ -133,36 +133,25 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	}
 
 	sessionPersistence := getMap(configMap, "session_persistence")
+	if err := rejectLegacySessionPersistenceKeys(sessionPersistence); err != nil {
+		return nil, err
+	}
 	if enabled, ok := getBool(sessionPersistence, "enabled"); ok {
 		cfg.SessionPersistence.Enabled = enabled
 	}
 	if kind := strings.TrimSpace(getString(sessionPersistence, "kind", "")); kind != "" {
 		cfg.SessionPersistence.Kind = model.SessionPersistenceKind(model.NormalizeState(kind))
 	}
-	if cfg.SessionPersistence.Kind == "" {
-		if backend := strings.TrimSpace(getString(sessionPersistence, "backend", "")); backend != "" {
-			cfg.SessionPersistence.Kind = model.SessionPersistenceKind(model.NormalizeState(backend))
-		}
-	}
 	filePersistence := getMap(sessionPersistence, "file")
 	path := expandHomePath(strings.TrimSpace(getString(filePersistence, "path", "")))
-	if path == "" {
-		path = expandHomePath(strings.TrimSpace(getString(sessionPersistence, "path", "")))
-	}
 	if path != "" {
 		cfg.SessionPersistence.File.Path = path
 	}
 	flushInterval, ok := getInt(filePersistence, "flush_interval_ms")
-	if !ok {
-		flushInterval, ok = getInt(sessionPersistence, "flush_interval_ms")
-	}
 	if ok {
 		cfg.SessionPersistence.File.FlushIntervalMS = flushInterval
 	}
 	fsyncOnCritical, ok := getBool(filePersistence, "fsync_on_critical")
-	if !ok {
-		fsyncOnCritical, ok = getBool(sessionPersistence, "fsync_on_critical")
-	}
 	if ok {
 		cfg.SessionPersistence.File.FsyncOnCritical = fsyncOnCritical
 	}
@@ -190,18 +179,15 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	channelMaps := getMapSlice(notifications, "channels")
 	if len(channelMaps) > 0 {
 		cfg.Notifications.Channels = make([]model.NotificationChannelConfig, 0, len(channelMaps))
-		for _, channel := range channelMaps {
+		for index, channel := range channelMaps {
+			if err := rejectLegacyNotificationChannelKeys(channel, index); err != nil {
+				return nil, err
+			}
 			parsed := model.NotificationChannelConfig{
 				ID:          strings.TrimSpace(getString(channel, "id", "")),
 				DisplayName: strings.TrimSpace(getString(channel, "display_name", "")),
 				Kind:        model.NotificationChannelKind(model.NormalizeState(getString(channel, "kind", ""))),
 				Delivery:    cfg.Notifications.Defaults,
-			}
-			if parsed.ID == "" {
-				parsed.ID = strings.TrimSpace(getString(channel, "name", ""))
-			}
-			if parsed.DisplayName == "" {
-				parsed.DisplayName = strings.TrimSpace(getString(channel, "name", ""))
 			}
 			if parsed.DisplayName == "" {
 				parsed.DisplayName = parsed.ID
@@ -215,9 +201,6 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 				}
 			}
 			eventNames, ok := getStringSlice(subscriptions, "types")
-			if !ok || len(eventNames) == 0 {
-				eventNames, ok = getStringSlice(channel, "events")
-			}
 			if ok && len(eventNames) > 0 {
 				parsed.Subscriptions.Types = make([]model.NotificationEventType, 0, len(eventNames))
 				for _, eventName := range eventNames {
@@ -246,13 +229,7 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 			case model.NotificationChannelKindWebhook:
 				webhook := getMap(channel, "webhook")
 				urlText := strings.TrimSpace(getString(webhook, "url", ""))
-				if urlText == "" {
-					urlText = strings.TrimSpace(getString(channel, "url", ""))
-				}
 				headers := getStringMap(getMap(webhook, "headers"))
-				if len(headers) == 0 {
-					headers = getStringMap(getMap(channel, "headers"))
-				}
 				parsed.Webhook = &model.WebhookNotificationConfig{
 					URL:     urlText,
 					Headers: headers,
@@ -260,9 +237,6 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 			case model.NotificationChannelKindSlack:
 				slack := getMap(channel, "slack")
 				urlText := strings.TrimSpace(getString(slack, "incoming_webhook_url", ""))
-				if urlText == "" {
-					urlText = strings.TrimSpace(getString(channel, "url", ""))
-				}
 				parsed.Slack = &model.SlackNotificationConfig{
 					IncomingWebhookURL: urlText,
 				}
@@ -272,6 +246,36 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	}
 
 	return cfg, nil
+}
+
+func rejectLegacySessionPersistenceKeys(cfg map[string]any) error {
+	legacyMessages := map[string]string{
+		"backend":           "runtime.session_persistence.backend is no longer supported; use runtime.session_persistence.kind",
+		"path":              "runtime.session_persistence.path is no longer supported; use runtime.session_persistence.file.path",
+		"flush_interval_ms": "runtime.session_persistence.flush_interval_ms is no longer supported; use runtime.session_persistence.file.flush_interval_ms",
+		"fsync_on_critical": "runtime.session_persistence.fsync_on_critical is no longer supported; use runtime.session_persistence.file.fsync_on_critical",
+	}
+	for key, message := range legacyMessages {
+		if _, ok := cfg[key]; ok {
+			return model.NewWorkflowError(model.ErrWorkflowParseError, message, nil)
+		}
+	}
+	return nil
+}
+
+func rejectLegacyNotificationChannelKeys(channel map[string]any, index int) error {
+	legacyMessages := map[string]string{
+		"name":    fmt.Sprintf("runtime.notifications.channels[%d].name is no longer supported; use id and display_name", index),
+		"events":  fmt.Sprintf("runtime.notifications.channels[%d].events is no longer supported; use subscriptions.types", index),
+		"url":     fmt.Sprintf("runtime.notifications.channels[%d].url is no longer supported; use webhook.url or slack.incoming_webhook_url", index),
+		"headers": fmt.Sprintf("runtime.notifications.channels[%d].headers is no longer supported; use webhook.headers", index),
+	}
+	for key, message := range legacyMessages {
+		if _, ok := channel[key]; ok {
+			return model.NewWorkflowError(model.ErrWorkflowParseError, message, nil)
+		}
+	}
+	return nil
 }
 
 func ValidateForDispatch(cfg *model.ServiceConfig) error {

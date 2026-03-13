@@ -97,12 +97,21 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 			return
 		}
 		result := runtime.RequestRefresh()
-		writeJSON(w, http.StatusAccepted, map[string]any{
+		payload := map[string]any{
 			"accepted":     result.Accepted,
 			"coalesced":    result.Coalesced,
 			"requested_at": result.RequestedAt.UTC().Format(time.RFC3339),
 			"operations":   result.Operations,
-		}, logger)
+		}
+		if !result.Accepted {
+			payload["error"] = map[string]any{
+				"code":    result.RejectedCode,
+				"message": result.RejectedMessage,
+			}
+			writeJSON(w, http.StatusConflict, payload, logger)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, payload, logger)
 	})
 	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -165,20 +174,25 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 }
 
 type stateResponse struct {
-	GeneratedAt string            `json:"generated_at"`
-	Service     serviceResponse   `json:"service"`
-	Counts      stateCounts       `json:"counts"`
-	Running     []runningResponse `json:"running"`
-	Recovery    recoveryResponse  `json:"recovery"`
-	Health      healthResponse    `json:"health"`
-	CodexTotals totalsResponse    `json:"codex_totals"`
-	RateLimits  any               `json:"rate_limits"`
+	GeneratedAt  string               `json:"generated_at"`
+	Service      serviceResponse      `json:"service"`
+	Counts       stateCounts          `json:"counts"`
+	Running      []runningResponse    `json:"running"`
+	Recovery     recoveryResponse     `json:"recovery"`
+	Health       healthResponse       `json:"health"`
+	Observations observationsResponse `json:"observations"`
+	CodexTotals  totalsResponse       `json:"codex_totals"`
+	RateLimits   any                  `json:"rate_limits"`
 }
 
 type serviceResponse struct {
-	Version       string  `json:"version"`
-	StartedAt     string  `json:"started_at"`
-	UptimeSeconds float64 `json:"uptime_seconds"`
+	Version          string  `json:"version"`
+	StartedAt        string  `json:"started_at"`
+	UptimeSeconds    float64 `json:"uptime_seconds"`
+	Mode             string  `json:"mode"`
+	ProtectionReason string  `json:"protection_reason,omitempty"`
+	ProtectedAt      *string `json:"protected_at"`
+	RestartRequired  bool    `json:"restart_required"`
 }
 
 type stateCounts struct {
@@ -200,6 +214,11 @@ type healthResponse struct {
 	Alerts        []alertResponse                     `json:"alerts"`
 	Notifications []notificationChannelHealthResponse `json:"notifications"`
 	Persistence   persistenceHealthResponse           `json:"persistence"`
+}
+
+type observationsResponse struct {
+	Derived          []observationResponse     `json:"derived"`
+	ProtectedResults []protectedResultResponse `json:"protected_results"`
 }
 
 type runningResponse struct {
@@ -280,6 +299,30 @@ type alertResponse struct {
 	IssueIdentifier string `json:"issue_identifier,omitempty"`
 }
 
+type observationResponse struct {
+	Code            string `json:"code"`
+	Level           string `json:"level"`
+	Message         string `json:"message"`
+	IssueID         string `json:"issue_id,omitempty"`
+	IssueIdentifier string `json:"issue_identifier,omitempty"`
+}
+
+type protectedResultResponse struct {
+	IssueID             string  `json:"issue_id"`
+	IssueIdentifier     string  `json:"issue_identifier"`
+	WorkspacePath       string  `json:"workspace_path,omitempty"`
+	Outcome             string  `json:"outcome"`
+	Phase               string  `json:"phase"`
+	Error               *string `json:"error"`
+	FinalBranch         string  `json:"final_branch,omitempty"`
+	DispatchKind        string  `json:"dispatch_kind,omitempty"`
+	ExpectedOutcome     string  `json:"expected_outcome,omitempty"`
+	ContinuationReason  *string `json:"continuation_reason"`
+	ObservedAt          string  `json:"observed_at"`
+	CurrentRetryAttempt int     `json:"current_retry_attempt"`
+	AttemptCount        int     `json:"attempt_count"`
+}
+
 type notificationChannelHealthResponse struct {
 	ChannelID           string  `json:"channel_id"`
 	DisplayName         string  `json:"display_name,omitempty"`
@@ -320,27 +363,10 @@ type issueResponse struct {
 	AwaitingMerge        *awaitingMergeResponse        `json:"awaiting_merge"`
 	AwaitingIntervention *awaitingInterventionResponse `json:"awaiting_intervention"`
 	Retry                *retryResponse                `json:"retry"`
+	ProtectedResult      *protectedResultResponse      `json:"protected_result"`
 }
 
 func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
-	recovery := snapshot.Recovery
-	if len(recovery.Recovering) == 0 && len(snapshot.Recovering) > 0 {
-		recovery.Recovering = snapshot.Recovering
-	}
-	if len(recovery.AwaitingMerge) == 0 && len(snapshot.AwaitingMerge) > 0 {
-		recovery.AwaitingMerge = snapshot.AwaitingMerge
-	}
-	if len(recovery.AwaitingIntervention) == 0 && len(snapshot.AwaitingIntervention) > 0 {
-		recovery.AwaitingIntervention = snapshot.AwaitingIntervention
-	}
-	if len(recovery.Retrying) == 0 && len(snapshot.Retrying) > 0 {
-		recovery.Retrying = snapshot.Retrying
-	}
-	health := snapshot.Health
-	if len(health.Alerts) == 0 && len(snapshot.Alerts) > 0 {
-		health.Alerts = snapshot.Alerts
-	}
-
 	serviceStartedAt := ""
 	uptimeSeconds := 0.0
 	if !snapshot.Service.StartedAt.IsZero() {
@@ -349,6 +375,11 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		if uptimeSeconds < 0 {
 			uptimeSeconds = 0
 		}
+	}
+	var protectedAt *string
+	if snapshot.Service.ProtectedAt != nil {
+		text := snapshot.Service.ProtectedAt.UTC().Format(time.RFC3339)
+		protectedAt = &text
 	}
 
 	running := make([]runningResponse, 0, len(snapshot.Running))
@@ -380,8 +411,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	recoveringItems := make([]recoveringResponse, 0, len(recovery.Recovering))
-	for _, item := range recovery.Recovering {
+	recoveringItems := make([]recoveringResponse, 0, len(snapshot.Recovery.Recovering))
+	for _, item := range snapshot.Recovery.Recovering {
 		recoveringItems = append(recoveringItems, recoveringResponse{
 			IssueID:            item.IssueID,
 			IssueIdentifier:    item.IssueIdentifier,
@@ -397,8 +428,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	awaitingMerge := make([]awaitingMergeResponse, 0, len(recovery.AwaitingMerge))
-	for _, item := range recovery.AwaitingMerge {
+	awaitingMerge := make([]awaitingMergeResponse, 0, len(snapshot.Recovery.AwaitingMerge))
+	for _, item := range snapshot.Recovery.AwaitingMerge {
 		awaitingMerge = append(awaitingMerge, awaitingMergeResponse{
 			IssueID:         item.IssueID,
 			IssueIdentifier: item.IssueIdentifier,
@@ -413,8 +444,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	awaitingIntervention := make([]awaitingInterventionResponse, 0, len(recovery.AwaitingIntervention))
-	for _, item := range recovery.AwaitingIntervention {
+	awaitingIntervention := make([]awaitingInterventionResponse, 0, len(snapshot.Recovery.AwaitingIntervention))
+	for _, item := range snapshot.Recovery.AwaitingIntervention {
 		awaitingIntervention = append(awaitingIntervention, awaitingInterventionResponse{
 			IssueID:             item.IssueID,
 			IssueIdentifier:     item.IssueIdentifier,
@@ -431,8 +462,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	retrying := make([]retryResponse, 0, len(recovery.Retrying))
-	for _, item := range recovery.Retrying {
+	retrying := make([]retryResponse, 0, len(snapshot.Recovery.Retrying))
+	for _, item := range snapshot.Recovery.Retrying {
 		retrying = append(retrying, retryResponse{
 			IssueID:            item.IssueID,
 			IssueIdentifier:    item.IssueIdentifier,
@@ -445,8 +476,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	alerts := make([]alertResponse, 0, len(health.Alerts))
-	for _, item := range health.Alerts {
+	alerts := make([]alertResponse, 0, len(snapshot.Health.Alerts))
+	for _, item := range snapshot.Health.Alerts {
 		alerts = append(alerts, alertResponse{
 			Code:            item.Code,
 			Level:           item.Level,
@@ -456,8 +487,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	notifications := make([]notificationChannelHealthResponse, 0, len(health.Notifications))
-	for _, item := range health.Notifications {
+	notifications := make([]notificationChannelHealthResponse, 0, len(snapshot.Health.Notifications))
+	for _, item := range snapshot.Health.Notifications {
 		var lastAttemptAt *string
 		if item.LastAttemptAt != nil {
 			text := item.LastAttemptAt.UTC().Format(time.RFC3339)
@@ -481,22 +512,54 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 	}
 
 	var persistenceAttemptAt *string
-	if health.Persistence.LastAttemptAt != nil {
-		text := health.Persistence.LastAttemptAt.UTC().Format(time.RFC3339)
+	if snapshot.Health.Persistence.LastAttemptAt != nil {
+		text := snapshot.Health.Persistence.LastAttemptAt.UTC().Format(time.RFC3339)
 		persistenceAttemptAt = &text
 	}
 	var persistenceSuccessAt *string
-	if health.Persistence.LastSuccessAt != nil {
-		text := health.Persistence.LastSuccessAt.UTC().Format(time.RFC3339)
+	if snapshot.Health.Persistence.LastSuccessAt != nil {
+		text := snapshot.Health.Persistence.LastSuccessAt.UTC().Format(time.RFC3339)
 		persistenceSuccessAt = &text
+	}
+	derived := make([]observationResponse, 0, len(snapshot.Observations.Derived))
+	for _, item := range snapshot.Observations.Derived {
+		derived = append(derived, observationResponse{
+			Code:            item.Code,
+			Level:           item.Level,
+			Message:         item.Message,
+			IssueID:         item.IssueID,
+			IssueIdentifier: item.IssueIdentifier,
+		})
+	}
+	protectedResults := make([]protectedResultResponse, 0, len(snapshot.Observations.ProtectedResults))
+	for _, item := range snapshot.Observations.ProtectedResults {
+		protectedResults = append(protectedResults, protectedResultResponse{
+			IssueID:             item.IssueID,
+			IssueIdentifier:     item.IssueIdentifier,
+			WorkspacePath:       item.WorkspacePath,
+			Outcome:             item.Outcome,
+			Phase:               item.Phase,
+			Error:               item.Error,
+			FinalBranch:         item.FinalBranch,
+			DispatchKind:        item.DispatchKind,
+			ExpectedOutcome:     item.ExpectedOutcome,
+			ContinuationReason:  item.ContinuationReason,
+			ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
+			CurrentRetryAttempt: item.CurrentRetryAttempt,
+			AttemptCount:        item.AttemptCount,
+		})
 	}
 
 	return stateResponse{
 		GeneratedAt: snapshot.GeneratedAt.UTC().Format(time.RFC3339),
 		Service: serviceResponse{
-			Version:       snapshot.Service.Version,
-			StartedAt:     serviceStartedAt,
-			UptimeSeconds: uptimeSeconds,
+			Version:          snapshot.Service.Version,
+			StartedAt:        serviceStartedAt,
+			UptimeSeconds:    uptimeSeconds,
+			Mode:             string(snapshot.Service.Mode),
+			ProtectionReason: snapshot.Service.ProtectionReason,
+			ProtectedAt:      protectedAt,
+			RestartRequired:  snapshot.Service.RestartRequired,
 		},
 		Counts: stateCounts{
 			Recovering:           snapshot.Counts.Recovering,
@@ -516,14 +579,18 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 			Alerts:        alerts,
 			Notifications: notifications,
 			Persistence: persistenceHealthResponse{
-				Enabled:             health.Persistence.Enabled,
-				Kind:                health.Persistence.Kind,
-				Status:              health.Persistence.Status,
-				LastError:           health.Persistence.LastError,
+				Enabled:             snapshot.Health.Persistence.Enabled,
+				Kind:                snapshot.Health.Persistence.Kind,
+				Status:              snapshot.Health.Persistence.Status,
+				LastError:           snapshot.Health.Persistence.LastError,
 				LastAttemptAt:       persistenceAttemptAt,
 				LastSuccessAt:       persistenceSuccessAt,
-				ConsecutiveFailures: health.Persistence.ConsecutiveFailures,
+				ConsecutiveFailures: snapshot.Health.Persistence.ConsecutiveFailures,
 			},
+		},
+		Observations: observationsResponse{
+			Derived:          derived,
+			ProtectedResults: protectedResults,
 		},
 		CodexTotals: totalsResponse{
 			InputTokens:    snapshot.CodexTotals.InputTokens,
@@ -536,20 +603,6 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 }
 
 func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issueResponse, bool) {
-	recovery := snapshot.Recovery
-	if len(recovery.Recovering) == 0 && len(snapshot.Recovering) > 0 {
-		recovery.Recovering = snapshot.Recovering
-	}
-	if len(recovery.AwaitingMerge) == 0 && len(snapshot.AwaitingMerge) > 0 {
-		recovery.AwaitingMerge = snapshot.AwaitingMerge
-	}
-	if len(recovery.AwaitingIntervention) == 0 && len(snapshot.AwaitingIntervention) > 0 {
-		recovery.AwaitingIntervention = snapshot.AwaitingIntervention
-	}
-	if len(recovery.Retrying) == 0 && len(snapshot.Retrying) > 0 {
-		recovery.Retrying = snapshot.Retrying
-	}
-
 	for _, item := range snapshot.Running {
 		var runningLastEventAt *string
 		if item.LastEventAt != nil {
@@ -587,7 +640,7 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 			}, true
 		}
 	}
-	for _, item := range recovery.Recovering {
+	for _, item := range snapshot.Recovery.Recovering {
 		if item.IssueIdentifier == identifier {
 			copyItem := recoveringResponse{
 				IssueID:            item.IssueID,
@@ -612,7 +665,7 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 			}, true
 		}
 	}
-	for _, item := range recovery.AwaitingMerge {
+	for _, item := range snapshot.Recovery.AwaitingMerge {
 		if item.IssueIdentifier == identifier {
 			copyItem := awaitingMergeResponse{
 				IssueID:         item.IssueID,
@@ -637,7 +690,7 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 			}, true
 		}
 	}
-	for _, item := range recovery.AwaitingIntervention {
+	for _, item := range snapshot.Recovery.AwaitingIntervention {
 		if item.IssueIdentifier == identifier {
 			copyItem := awaitingInterventionResponse{
 				IssueID:             item.IssueID,
@@ -663,7 +716,7 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 			}, true
 		}
 	}
-	for _, item := range recovery.Retrying {
+	for _, item := range snapshot.Recovery.Retrying {
 		if item.IssueIdentifier == identifier {
 			copyItem := retryResponse{
 				IssueID:            item.IssueID,
@@ -683,6 +736,34 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 				LastError:     item.Error,
 				AttemptCount:  item.Attempt,
 				Retry:         &copyItem,
+			}, true
+		}
+	}
+	for _, item := range snapshot.Observations.ProtectedResults {
+		if item.IssueIdentifier == identifier {
+			copyItem := protectedResultResponse{
+				IssueID:             item.IssueID,
+				IssueIdentifier:     item.IssueIdentifier,
+				WorkspacePath:       item.WorkspacePath,
+				Outcome:             item.Outcome,
+				Phase:               item.Phase,
+				Error:               item.Error,
+				FinalBranch:         item.FinalBranch,
+				DispatchKind:        item.DispatchKind,
+				ExpectedOutcome:     item.ExpectedOutcome,
+				ContinuationReason:  item.ContinuationReason,
+				ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
+				CurrentRetryAttempt: item.CurrentRetryAttempt,
+				AttemptCount:        item.AttemptCount,
+			}
+			return issueResponse{
+				GeneratedAt:     snapshot.GeneratedAt.UTC().Format(time.RFC3339),
+				Identifier:      identifier,
+				Status:          "protected_result",
+				WorkspacePath:   item.WorkspacePath,
+				LastError:       item.Error,
+				AttemptCount:    item.AttemptCount,
+				ProtectedResult: &copyItem,
 			}, true
 		}
 	}

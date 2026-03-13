@@ -533,10 +533,12 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
 	workspaceRoot := filepath.ToSlash(filepath.Join(tmpDir, "workspaces"))
 	writeAutomationConfig(t, configDir, automationFixtureOptions{WorkspaceRoot: workspaceRoot})
 
-	writeProject := func(sessionPath string, notificationURL string) {
+	writeProject := func(workspaceValue string, sessionPath string, notificationURL string, pollInterval int) {
 		projectYAML := fmt.Sprintf(`runtime:
   workspace:
     root: %s
+  polling:
+    interval_ms: %d
   codex:
     command: codex app-server
   session_persistence:
@@ -567,11 +569,11 @@ selection:
     - linear-main
 defaults:
   profile: null
-`, workspaceRoot, sessionPath, notificationURL)
+`, workspaceValue, pollInterval, sessionPath, notificationURL)
 		writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	}
 
-	writeProject("./automation/local/session-state.json", "https://hooks.example.com/a")
+	writeProject(workspaceRoot, "./automation/local/session-state.json", "https://hooks.example.com/a", 30000)
 
 	repoDef, err := loader.Load(configDir, "")
 	if err != nil {
@@ -594,29 +596,52 @@ defaults:
 	}
 
 	tests := []struct {
-		name        string
-		sessionPath string
-		url         string
-		wantErr     string
-		wantURL     string
+		name         string
+		workspace    string
+		sessionPath  string
+		url          string
+		pollInterval int
+		wantErr      string
+		wantURL      string
+		wantPoll     int
 	}{
 		{
-			name:        "session persistence",
-			sessionPath: "./automation/local/other-session-state.json",
-			url:         "https://hooks.example.com/a",
-			wantErr:     "runtime.session_persistence changed: restart required",
+			name:         "session persistence",
+			workspace:    workspaceRoot,
+			sessionPath:  "./automation/local/other-session-state.json",
+			url:          "https://hooks.example.com/a",
+			pollInterval: 30000,
+			wantErr:      "runtime.session_persistence changed: restart required",
 		},
 		{
-			name:        "notifications",
-			sessionPath: "./automation/local/session-state.json",
-			url:         "https://hooks.example.com/b",
-			wantURL:     "https://hooks.example.com/b",
+			name:         "workspace root",
+			workspace:    filepath.ToSlash(filepath.Join(tmpDir, "other-workspaces")),
+			sessionPath:  "./automation/local/session-state.json",
+			url:          "https://hooks.example.com/a",
+			pollInterval: 30000,
+			wantErr:      "runtime.workspace.root changed: restart required",
+		},
+		{
+			name:         "notifications",
+			workspace:    workspaceRoot,
+			sessionPath:  "./automation/local/session-state.json",
+			url:          "https://hooks.example.com/b",
+			pollInterval: 30000,
+			wantURL:      "https://hooks.example.com/b",
+		},
+		{
+			name:         "poll interval",
+			workspace:    workspaceRoot,
+			sessionPath:  "./automation/local/session-state.json",
+			url:          "https://hooks.example.com/a",
+			pollInterval: 45000,
+			wantPoll:     45000,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			writeProject(tc.sessionPath, tc.url)
+			writeProject(tc.workspace, tc.sessionPath, tc.url, tc.pollInterval)
 			reloaded, err := loader.Load(configDir, "")
 			if err != nil {
 				t.Fatalf("loader.Load() reload error = %v", err)
@@ -631,8 +656,13 @@ defaults:
 			if err != nil {
 				t.Fatalf("ApplyReload() error = %v", err)
 			}
-			if got := state.CurrentConfig().Notifications.Channels[0].Webhook.URL; got != tc.wantURL {
-				t.Fatalf("Notifications.Channels[0].Webhook.URL = %q, want %q", got, tc.wantURL)
+			if tc.wantURL != "" {
+				if got := state.CurrentConfig().Notifications.Channels[0].Webhook.URL; got != tc.wantURL {
+					t.Fatalf("Notifications.Channels[0].Webhook.URL = %q, want %q", got, tc.wantURL)
+				}
+			}
+			if tc.wantPoll != 0 && state.CurrentConfig().PollIntervalMS != tc.wantPoll {
+				t.Fatalf("PollIntervalMS = %d, want %d", state.CurrentConfig().PollIntervalMS, tc.wantPoll)
 			}
 		})
 	}

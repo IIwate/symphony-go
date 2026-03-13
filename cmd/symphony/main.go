@@ -205,33 +205,8 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 	currentCfg := s.config
 	s.mu.RUnlock()
 
-	if currentRepoDef != nil {
-		if strings.TrimSpace(currentRepoDef.Profile) != strings.TrimSpace(repoDef.Profile) {
-			return nil, fmt.Errorf("profile selection changed: restart required")
-		}
-	}
-	if currentCfg != nil {
-		if !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort) {
-			return nil, fmt.Errorf("runtime.server.port changed: restart required")
-		}
-	}
-	if currentCfg != nil && currentRepoDef != nil && sessionPersistenceCompatibilityRequired(currentCfg, newCfg) {
-		switch {
-		case selectedSourceKind(currentRepoDef) != selectedSourceKind(repoDef):
-			return nil, fmt.Errorf("source.kind changed: restart required")
-		case !enabledSourcesEqual(currentRepoDef, repoDef):
-			return nil, fmt.Errorf("selection.enabled_sources changed: restart required")
-		case strings.TrimSpace(currentRepoDef.Selection.DispatchFlow) != strings.TrimSpace(repoDef.Selection.DispatchFlow):
-			return nil, fmt.Errorf("selection.dispatch_flow changed: restart required")
-		case currentCfg.TrackerKind != newCfg.TrackerKind:
-			return nil, fmt.Errorf("runtime.tracker.kind changed: restart required")
-		case currentCfg.TrackerRepo != newCfg.TrackerRepo:
-			return nil, fmt.Errorf("runtime.tracker.repo changed: restart required")
-		case currentCfg.TrackerProjectSlug != newCfg.TrackerProjectSlug:
-			return nil, fmt.Errorf("runtime.tracker.project changed: restart required")
-		case !reflect.DeepEqual(currentCfg.SessionPersistence, newCfg.SessionPersistence):
-			return nil, fmt.Errorf("runtime.session_persistence changed: restart required")
-		}
+	if reason := reloadRestartRequiredReason(currentRepoDef, repoDef, currentCfg, newCfg); reason != "" {
+		return nil, fmt.Errorf("%s: restart required", reason)
 	}
 	if err := config.ValidateForDispatch(newCfg); err != nil {
 		return nil, err
@@ -290,8 +265,90 @@ func enabledSourcesEqual(left *model.AutomationDefinition, right *model.Automati
 	return true
 }
 
-func sessionPersistenceCompatibilityRequired(currentCfg *model.ServiceConfig, newCfg *model.ServiceConfig) bool {
-	return (currentCfg != nil && currentCfg.SessionPersistence.Enabled) || (newCfg != nil && newCfg.SessionPersistence.Enabled)
+func reloadRestartRequiredReason(currentRepoDef *model.AutomationDefinition, newRepoDef *model.AutomationDefinition, currentCfg *model.ServiceConfig, newCfg *model.ServiceConfig) string {
+	if currentRepoDef != nil && strings.TrimSpace(currentRepoDef.Profile) != strings.TrimSpace(newRepoDef.Profile) {
+		return "profile selection changed"
+	}
+	if currentRepoDef != nil {
+		switch {
+		case selectedSourceKind(currentRepoDef) != selectedSourceKind(newRepoDef):
+			return "source.kind changed"
+		case !enabledSourcesEqual(currentRepoDef, newRepoDef):
+			return "selection.enabled_sources changed"
+		case strings.TrimSpace(currentRepoDef.Selection.DispatchFlow) != strings.TrimSpace(newRepoDef.Selection.DispatchFlow):
+			return "selection.dispatch_flow changed"
+		}
+	}
+	if currentCfg == nil || newCfg == nil {
+		return ""
+	}
+	switch {
+	case !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort):
+		return "runtime.server.port changed"
+	case currentCfg.TrackerKind != newCfg.TrackerKind:
+		return "runtime.tracker.kind changed"
+	case currentCfg.TrackerEndpoint != newCfg.TrackerEndpoint:
+		return "runtime.tracker.endpoint changed"
+	case currentCfg.TrackerAPIKey != newCfg.TrackerAPIKey:
+		return "runtime.tracker.api_key changed"
+	case currentCfg.TrackerProjectSlug != newCfg.TrackerProjectSlug:
+		return "runtime.tracker.project changed"
+	case currentCfg.TrackerLinearChildrenBlockParent != newCfg.TrackerLinearChildrenBlockParent:
+		return "runtime.tracker.linear.children_block_parent changed"
+	case currentCfg.TrackerRepo != newCfg.TrackerRepo:
+		return "runtime.tracker.repo changed"
+	case !reflect.DeepEqual(currentCfg.ActiveStates, newCfg.ActiveStates):
+		return "runtime.tracker.active_states changed"
+	case !reflect.DeepEqual(currentCfg.TerminalStates, newCfg.TerminalStates):
+		return "runtime.tracker.terminal_states changed"
+	case currentCfg.AutomationRootDir != newCfg.AutomationRootDir:
+		return "runtime.automation_root changed"
+	case currentCfg.WorkspaceRoot != newCfg.WorkspaceRoot:
+		return "runtime.workspace.root changed"
+	case currentCfg.WorkspaceLinearBranchScope != newCfg.WorkspaceLinearBranchScope:
+		return "runtime.workspace.linear_branch_scope changed"
+	case currentCfg.WorkspaceBranchNamespace != newCfg.WorkspaceBranchNamespace:
+		return "runtime.workspace.branch_namespace changed"
+	case currentCfg.WorkspaceGitAuthorName != newCfg.WorkspaceGitAuthorName:
+		return "runtime.workspace.git.author_name changed"
+	case currentCfg.WorkspaceGitAuthorEmail != newCfg.WorkspaceGitAuthorEmail:
+		return "runtime.workspace.git.author_email changed"
+	case !reflect.DeepEqual(currentCfg.HookAfterCreate, newCfg.HookAfterCreate):
+		return "runtime.hooks.after_create changed"
+	case !reflect.DeepEqual(currentCfg.HookBeforeRun, newCfg.HookBeforeRun):
+		return "runtime.hooks.before_run changed"
+	case !reflect.DeepEqual(currentCfg.HookBeforeRunContinuation, newCfg.HookBeforeRunContinuation):
+		return "runtime.hooks.before_run_continuation changed"
+	case !reflect.DeepEqual(currentCfg.HookAfterRun, newCfg.HookAfterRun):
+		return "runtime.hooks.after_run changed"
+	case !reflect.DeepEqual(currentCfg.HookBeforeRemove, newCfg.HookBeforeRemove):
+		return "runtime.hooks.before_remove changed"
+	case currentCfg.HookTimeoutMS != newCfg.HookTimeoutMS:
+		return "runtime.hooks.timeout_ms changed"
+	case currentCfg.MaxTurns != newCfg.MaxTurns:
+		return "runtime.agent.max_turns changed"
+	case currentCfg.MaxRetryBackoffMS != newCfg.MaxRetryBackoffMS:
+		return "runtime.agent.max_retry_backoff_ms changed"
+	case currentCfg.OrchestratorAutoCloseOnPR != newCfg.OrchestratorAutoCloseOnPR:
+		return "runtime.orchestrator.auto_close_on_pr changed"
+	case currentCfg.CodexCommand != newCfg.CodexCommand:
+		return "runtime.codex.command changed"
+	case currentCfg.CodexApprovalPolicy != newCfg.CodexApprovalPolicy:
+		return "runtime.codex.approval_policy changed"
+	case currentCfg.CodexThreadSandbox != newCfg.CodexThreadSandbox:
+		return "runtime.codex.thread_sandbox changed"
+	case currentCfg.CodexTurnSandboxPolicy != newCfg.CodexTurnSandboxPolicy:
+		return "runtime.codex.turn_sandbox_policy changed"
+	case currentCfg.CodexTurnTimeoutMS != newCfg.CodexTurnTimeoutMS:
+		return "runtime.codex.turn_timeout_ms changed"
+	case currentCfg.CodexReadTimeoutMS != newCfg.CodexReadTimeoutMS:
+		return "runtime.codex.read_timeout_ms changed"
+	case currentCfg.CodexStallTimeoutMS != newCfg.CodexStallTimeoutMS:
+		return "runtime.codex.stall_timeout_ms changed"
+	case !reflect.DeepEqual(currentCfg.SessionPersistence, newCfg.SessionPersistence):
+		return "runtime.session_persistence changed"
+	}
+	return ""
 }
 
 func runtimeIdentityForConfig(configDir string, profile string, repoDef *model.AutomationDefinition, cfg *model.ServiceConfig) orchestrator.RuntimeIdentity {

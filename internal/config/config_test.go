@@ -368,6 +368,54 @@ func TestNewFromWorkflowParsesSessionPersistenceAndNotifications(t *testing.T) {
 	}
 }
 
+func TestNewFromWorkflowRejectsLegacyRuntimeExtensionKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  map[string]any
+		wantErr string
+	}{
+		{
+			name: "session persistence backend alias",
+			config: map[string]any{
+				"session_persistence": map[string]any{
+					"enabled": true,
+					"backend": "file",
+				},
+			},
+			wantErr: "runtime.session_persistence.backend",
+		},
+		{
+			name: "notification legacy channel fields",
+			config: map[string]any{
+				"notifications": map[string]any{
+					"channels": []any{
+						map[string]any{
+							"id":     "ops",
+							"kind":   "webhook",
+							"name":   "Ops",
+							"url":    "https://hooks.example.com/symphony",
+							"events": []any{"system_alert"},
+						},
+					},
+				},
+			},
+			wantErr: "runtime.notifications.channels[0].name",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewFromWorkflow(&model.WorkflowDefinition{Config: tc.config})
+			if !errors.Is(err, model.ErrWorkflowParseError) {
+				t.Fatalf("NewFromWorkflow() error = %v, want ErrWorkflowParseError", err)
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("NewFromWorkflow() error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateForDispatchRejectsInvalidRuntimeExtensions(t *testing.T) {
 	base := defaultServiceConfig()
 	base.TrackerKind = "linear"

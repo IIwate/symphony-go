@@ -39,24 +39,24 @@ type CodexUpdate struct {
 }
 
 type Snapshot struct {
-	GeneratedAt          time.Time
-	Service              ServiceSnapshot
-	Counts               SnapshotCounts
-	Running              []RunningSnapshot
-	Recovering           []RecoveringSnapshot
-	AwaitingMerge        []AwaitingMergeSnapshot
-	AwaitingIntervention []AwaitingInterventionSnapshot
-	Retrying             []RetrySnapshot
-	Alerts               []AlertSnapshot
-	Recovery             RecoverySnapshot
-	Health               RuntimeHealthSnapshot
-	CodexTotals          model.TokenTotals
-	RateLimits           any
+	GeneratedAt  time.Time
+	Service      ServiceSnapshot
+	Counts       SnapshotCounts
+	Running      []RunningSnapshot
+	Recovery     RecoverySnapshot
+	Health       RuntimeHealthSnapshot
+	Observations RuntimeObservationsSnapshot
+	CodexTotals  model.TokenTotals
+	RateLimits   any
 }
 
 type ServiceSnapshot struct {
-	Version   string
-	StartedAt time.Time
+	Version          string
+	StartedAt        time.Time
+	Mode             model.ServiceMode
+	ProtectionReason string
+	ProtectedAt      *time.Time
+	RestartRequired  bool
 }
 
 type SnapshotCounts struct {
@@ -78,6 +78,11 @@ type RuntimeHealthSnapshot struct {
 	Alerts        []AlertSnapshot
 	Notifications []NotificationChannelHealthSnapshot
 	Persistence   PersistenceHealthSnapshot
+}
+
+type RuntimeObservationsSnapshot struct {
+	Derived          []ObservationSnapshot
+	ProtectedResults []ProtectedResultSnapshot
 }
 
 type RunningSnapshot struct {
@@ -163,6 +168,30 @@ type AlertSnapshot struct {
 	Message         string
 	IssueID         string
 	IssueIdentifier string
+}
+
+type ObservationSnapshot struct {
+	Code            string
+	Level           string
+	Message         string
+	IssueID         string
+	IssueIdentifier string
+}
+
+type ProtectedResultSnapshot struct {
+	IssueID             string
+	IssueIdentifier     string
+	WorkspacePath       string
+	Outcome             string
+	Phase               string
+	Error               *string
+	FinalBranch         string
+	ObservedAt          time.Time
+	DispatchKind        string
+	ExpectedOutcome     string
+	ContinuationReason  *string
+	CurrentRetryAttempt int
+	AttemptCount        int
 }
 
 type NotificationChannelHealthSnapshot struct {
@@ -252,10 +281,12 @@ type RuntimeIdentity struct {
 }
 
 type RefreshRequestResult struct {
-	Accepted    bool
-	Coalesced   bool
-	RequestedAt time.Time
-	Operations  []string
+	Accepted        bool
+	Coalesced       bool
+	RequestedAt     time.Time
+	Operations      []string
+	RejectedCode    string
+	RejectedMessage string
 }
 
 type Orchestrator struct {
@@ -294,7 +325,6 @@ type Orchestrator struct {
 	subscribers        map[int]chan Snapshot
 	nextSubscriberID   int
 	healthAlerts       map[string]AlertSnapshot
-	systemAlerts       map[string]AlertSnapshot
 	notificationHealth map[string]*NotificationChannelHealthSnapshot
 	persistenceHealth  PersistenceHealthSnapshot
 	pendingCleanup     map[string]string
@@ -311,6 +341,7 @@ type Orchestrator struct {
 var BuildVersion = "dev"
 
 const defaultMaxCompletedEntries = 4096
+const serviceProtectedModeCode = "service_protected_mode"
 
 func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, runtimeIdentityFn func() RuntimeIdentity, logger *slog.Logger) *Orchestrator {
 	if logger == nil {
@@ -338,16 +369,17 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		shutdownCh:        make(chan struct{}),
 		doneCh:            make(chan struct{}),
 		state: model.OrchestratorState{
+			Mode:                 model.ServiceModeNormal,
 			Running:              map[string]*model.RunningEntry{},
 			Recovering:           recovering,
 			AwaitingMerge:        map[string]*model.AwaitingMergeEntry{},
 			AwaitingIntervention: map[string]*model.AwaitingInterventionEntry{},
 			RetryAttempts:        map[string]*model.RetryEntry{},
+			ProtectedResults:     map[string]*model.ProtectedResultEntry{},
 			Completed:            map[string]struct{}{},
 		},
 		subscribers:        map[int]chan Snapshot{},
 		healthAlerts:       healthAlerts,
-		systemAlerts:       healthAlerts,
 		notificationHealth: map[string]*NotificationChannelHealthSnapshot{},
 		pendingCleanup:     map[string]string{},
 		recoveredPending:   recovering,
@@ -429,12 +461,79 @@ func (o *Orchestrator) Wait() {
 	<-o.doneCh
 }
 
-func (o *Orchestrator) RequestRefresh() RefreshRequestResult {
-	result := RefreshRequestResult{
-		Accepted:    true,
-		RequestedAt: o.now().UTC(),
-		Operations:  []string{"poll", "reconcile"},
+func (o *Orchestrator) serviceModeLocked() model.ServiceMode {
+	if o.state.Mode == "" {
+		return model.ServiceModeNormal
 	}
+	return o.state.Mode
+}
+
+func (o *Orchestrator) isProtectedLocked() bool {
+	return o.serviceModeLocked() == model.ServiceModeProtected
+}
+
+func (o *Orchestrator) enterProtectedModeLocked(reason string) bool {
+	if o.isProtectedLocked() {
+		return false
+	}
+	now := o.now().UTC()
+	o.state.Mode = model.ServiceModeProtected
+	o.state.Protection = &model.ProtectedState{
+		Reason:      reason,
+		EnteredAt:   now,
+		MustRestart: true,
+	}
+	o.setHealthAlertAndNotifyLocked(AlertSnapshot{
+		Code:    serviceProtectedModeCode,
+		Level:   "warn",
+		Message: fmt.Sprintf("service entered protected mode: %s", reason),
+	})
+	return true
+}
+
+func (o *Orchestrator) rememberProtectedResultLocked(issueID string, entry *model.RunningEntry, result WorkerResult) {
+	if strings.TrimSpace(issueID) == "" || entry == nil {
+		return
+	}
+	outcome := model.ProtectedResultOutcomeSucceeded
+	var errText *string
+	if result.Err != nil {
+		outcome = model.ProtectedResultOutcomeFailed
+		text := result.Err.Error()
+		errText = &text
+	}
+	resultEntry := &model.ProtectedResultEntry{
+		Identifier:    entry.Identifier,
+		WorkspacePath: entry.WorkspacePath,
+		Outcome:       outcome,
+		Phase:         result.Phase,
+		Error:         errText,
+		FinalBranch:   strings.TrimSpace(result.FinalBranch),
+		ObservedAt:    o.now().UTC(),
+		RetryAttempt:  entry.RetryAttempt,
+		Dispatch:      model.CloneDispatchContext(entry.Dispatch),
+	}
+	o.state.ProtectedResults[issueID] = resultEntry
+}
+
+func (o *Orchestrator) RequestRefresh() RefreshRequestResult {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	protection := o.state.Protection
+	o.mu.RUnlock()
+
+	result := RefreshRequestResult{RequestedAt: o.now().UTC()}
+	if protected {
+		result.RejectedCode = serviceProtectedModeCode
+		result.RejectedMessage = "service is in protected mode; restart is required after fixing session persistence"
+		if protection != nil && strings.TrimSpace(protection.Reason) != "" {
+			result.RejectedMessage = fmt.Sprintf("%s: %s", result.RejectedMessage, protection.Reason)
+		}
+		return result
+	}
+
+	result.Accepted = true
+	result.Operations = []string{"poll", "reconcile"}
 	select {
 	case o.refreshCh <- struct{}{}:
 		return result
@@ -503,6 +602,15 @@ func (o *Orchestrator) tick(ctx context.Context) {
 }
 
 func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
+	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.mu.Unlock()
+		return
+	}
+	o.mu.Unlock()
+
 	stateRefreshAttempted, stateRefreshSucceeded := o.reconcileRunning(ctx)
 	o.reconcileRecovering(ctx)
 	o.reconcileAwaitingMerge(ctx)
@@ -569,6 +677,12 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 }
 
 func (o *Orchestrator) dispatchEligibleIssues(ctx context.Context, candidates []model.Issue) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
 	cfg := o.currentConfig()
 	sorted := append([]model.Issue(nil), candidates...)
 	sort.SliceStable(sorted, func(i int, j int) bool {
@@ -586,6 +700,12 @@ func (o *Orchestrator) dispatchEligibleIssues(ctx context.Context, candidates []
 }
 
 func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, attempt *int) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
 	workerCtx := ctx
 	if o.runCtx != nil {
 		workerCtx = o.runCtx
@@ -1016,6 +1136,13 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		"error", errorString(result.Err),
 	)
 
+	if o.isProtectedLocked() {
+		o.rememberProtectedResultLocked(result.IssueID, entry, result)
+		o.publishViewLocked()
+		o.mu.Unlock()
+		return
+	}
+
 	if result.Err != nil {
 		nextAttempt := retryAttempt + 1
 		if nextAttempt <= 0 {
@@ -1085,6 +1212,13 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 }
 
 func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return false, false
+	}
+
 	cfg := o.currentConfig()
 
 	o.mu.Lock()
@@ -1156,6 +1290,13 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 }
 
 func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
+
 	o.mu.RLock()
 	pending := make(map[string]model.AwaitingMergeEntry, len(o.state.AwaitingMerge))
 	for issueID, entry := range o.state.AwaitingMerge {
@@ -1292,6 +1433,13 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 
 func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
+
+	o.mu.RLock()
 	pending := make(map[string]model.AwaitingInterventionEntry, len(o.state.AwaitingIntervention))
 	for issueID, entry := range o.state.AwaitingIntervention {
 		if entry == nil {
@@ -1348,14 +1496,20 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 }
 
 func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
 	o.processRetryIssue(ctx, issueID)
 }
 
 func (o *Orchestrator) processDueRetries(ctx context.Context) {
 	type dueRetry struct {
-		IssueID     string
-		Identifier  string
-		DueAt       time.Time
+		IssueID    string
+		Identifier string
+		DueAt      time.Time
 	}
 
 	now := o.now().UTC()
@@ -1393,6 +1547,12 @@ func (o *Orchestrator) processDueRetries(ctx context.Context) {
 }
 
 func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
 	now := o.now().UTC()
 
 	o.mu.Lock()
@@ -1769,10 +1929,21 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return retrying[i].IssueID < retrying[j].IssueID
 	})
 
-	alerts := make([]AlertSnapshot, 0, len(o.healthAlerts)+len(o.state.RetryAttempts))
+	alerts := make([]AlertSnapshot, 0, len(o.healthAlerts))
 	for _, alert := range o.healthAlerts {
 		alerts = append(alerts, alert)
 	}
+	sort.SliceStable(alerts, func(i int, j int) bool {
+		if alerts[i].Code != alerts[j].Code {
+			return alerts[i].Code < alerts[j].Code
+		}
+		if alerts[i].IssueIdentifier != alerts[j].IssueIdentifier {
+			return alerts[i].IssueIdentifier < alerts[j].IssueIdentifier
+		}
+		return alerts[i].Message < alerts[j].Message
+	})
+
+	derived := make([]ObservationSnapshot, 0, len(o.state.RetryAttempts)+len(o.state.AwaitingMerge))
 	for issueID, entry := range o.state.RetryAttempts {
 		if entry.Error == nil {
 			continue
@@ -1781,7 +1952,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		lowerError := strings.ToLower(errorText)
 		switch {
 		case isStallErrorText(errorText) && entry.StallCount > 1:
-			alerts = append(alerts, AlertSnapshot{
+			derived = append(derived, ObservationSnapshot{
 				Code:            "repeated_stall",
 				Level:           "warn",
 				Message:         errorText,
@@ -1789,7 +1960,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 				IssueIdentifier: entry.Identifier,
 			})
 		case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
-			alerts = append(alerts, AlertSnapshot{
+			derived = append(derived, ObservationSnapshot{
 				Code:            "workspace_hook_failure",
 				Level:           "warn",
 				Message:         errorText,
@@ -1802,7 +1973,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		if entry.LastError == nil {
 			continue
 		}
-		alerts = append(alerts, AlertSnapshot{
+		derived = append(derived, ObservationSnapshot{
 			Code:            "merge_status_unknown",
 			Level:           "warn",
 			Message:         *entry.LastError,
@@ -1810,14 +1981,48 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			IssueIdentifier: entry.Identifier,
 		})
 	}
-	sort.SliceStable(alerts, func(i int, j int) bool {
-		if alerts[i].Code != alerts[j].Code {
-			return alerts[i].Code < alerts[j].Code
+	sort.SliceStable(derived, func(i int, j int) bool {
+		if derived[i].Code != derived[j].Code {
+			return derived[i].Code < derived[j].Code
 		}
-		if alerts[i].IssueIdentifier != alerts[j].IssueIdentifier {
-			return alerts[i].IssueIdentifier < alerts[j].IssueIdentifier
+		if derived[i].IssueIdentifier != derived[j].IssueIdentifier {
+			return derived[i].IssueIdentifier < derived[j].IssueIdentifier
 		}
-		return alerts[i].Message < alerts[j].Message
+		return derived[i].Message < derived[j].Message
+	})
+
+	protectedResults := make([]ProtectedResultSnapshot, 0, len(o.state.ProtectedResults))
+	for issueID, entry := range o.state.ProtectedResults {
+		if entry == nil {
+			continue
+		}
+		row := ProtectedResultSnapshot{
+			IssueID:             issueID,
+			IssueIdentifier:     entry.Identifier,
+			WorkspacePath:       entry.WorkspacePath,
+			Outcome:             string(entry.Outcome),
+			Phase:               entry.Phase.String(),
+			Error:               optionalError(pointerString(entry.Error)),
+			FinalBranch:         entry.FinalBranch,
+			ObservedAt:          entry.ObservedAt,
+			CurrentRetryAttempt: entry.RetryAttempt,
+			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
+		}
+		if entry.Dispatch != nil {
+			row.DispatchKind = string(entry.Dispatch.Kind)
+			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
+			if entry.Dispatch.Reason != nil {
+				reason := string(*entry.Dispatch.Reason)
+				row.ContinuationReason = &reason
+			}
+		}
+		protectedResults = append(protectedResults, row)
+	}
+	sort.SliceStable(protectedResults, func(i int, j int) bool {
+		if protectedResults[i].IssueIdentifier != protectedResults[j].IssueIdentifier {
+			return protectedResults[i].IssueIdentifier < protectedResults[j].IssueIdentifier
+		}
+		return protectedResults[i].IssueID < protectedResults[j].IssueID
 	})
 
 	notificationHealth := make([]NotificationChannelHealthSnapshot, 0, len(o.notificationHealth))
@@ -1840,6 +2045,16 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	persistenceHealth.LastSuccessAt = cloneTimePtr(o.persistenceHealth.LastSuccessAt)
 	persistenceHealth.LastError = optionalError(pointerString(o.persistenceHealth.LastError))
 
+	mode := o.serviceModeLocked()
+	protectionReason := ""
+	protectedAt := (*time.Time)(nil)
+	restartRequired := false
+	if o.state.Protection != nil {
+		protectionReason = o.state.Protection.Reason
+		protectedAt = cloneTimePtr(&o.state.Protection.EnteredAt)
+		restartRequired = o.state.Protection.MustRestart
+	}
+
 	totals := o.state.CodexTotals
 	for _, entry := range o.state.Running {
 		totals.SecondsRunning += now.Sub(entry.StartedAt).Seconds()
@@ -1848,8 +2063,12 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	o.snapshot = Snapshot{
 		GeneratedAt: now,
 		Service: ServiceSnapshot{
-			Version:   o.serviceVersion,
-			StartedAt: o.startedAt,
+			Version:          o.serviceVersion,
+			StartedAt:        o.startedAt,
+			Mode:             mode,
+			ProtectionReason: protectionReason,
+			ProtectedAt:      protectedAt,
+			RestartRequired:  restartRequired,
 		},
 		Counts: SnapshotCounts{
 			Recovering:           len(recovering),
@@ -1858,12 +2077,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			AwaitingIntervention: len(awaitingIntervention),
 			Retrying:             len(retrying),
 		},
-		Running:              running,
-		Recovering:           recovering,
-		AwaitingMerge:        awaitingMerge,
-		AwaitingIntervention: awaitingIntervention,
-		Retrying:             retrying,
-		Alerts:               alerts,
+		Running: running,
 		Recovery: RecoverySnapshot{
 			Recovering:           recovering,
 			AwaitingMerge:        awaitingMerge,
@@ -1874,6 +2088,10 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			Alerts:        alerts,
 			Notifications: notificationHealth,
 			Persistence:   persistenceHealth,
+		},
+		Observations: RuntimeObservationsSnapshot{
+			Derived:          derived,
+			ProtectedResults: protectedResults,
 		},
 		CodexTotals: totals,
 		RateLimits:  o.state.CodexRateLimits,
@@ -2024,6 +2242,13 @@ func (o *Orchestrator) runtimeContext() context.Context {
 }
 
 func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, issueState string, workspacePath string, branch string, retryAttempt int, stallCount int, pr *PullRequestInfo, lastError *string) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
+
 	var errorCopy *string
 	if lastError != nil {
 		errorCopy = optionalError(*lastError)
@@ -2055,6 +2280,13 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 }
 
 func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, expectedOutcome model.CompletionMode, reason string, issueState string, pr *PullRequestInfo) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
+
 	entry := &model.AwaitingInterventionEntry{
 		Identifier:          identifier,
 		WorkspacePath:       workspacePath,
@@ -2225,6 +2457,13 @@ func (o *Orchestrator) lookupAwaitingMergePullRequest(ctx context.Context, works
 }
 
 func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID string, identifier string) {
+	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
+
 	if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
 		o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
 	}

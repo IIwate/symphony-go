@@ -38,6 +38,9 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	if service["version"] != "test-build" {
 		t.Fatalf("service.version = %v, want test-build", service["version"])
 	}
+	if service["mode"] != "normal" {
+		t.Fatalf("service.mode = %v, want normal", service["mode"])
+	}
 	if service["started_at"] == nil {
 		t.Fatalf("service.started_at missing: %+v", service)
 	}
@@ -172,6 +175,35 @@ func TestRefreshEndpointAndMethodNotAllowed(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestRefreshEndpointRejectsProtectedMode(t *testing.T) {
+	runtime := newFakeRuntime(sampleSnapshot())
+	runtime.refreshResult = &orchestrator.RefreshRequestResult{
+		Accepted:        false,
+		RequestedAt:     time.Date(2026, 3, 7, 12, 2, 0, 0, time.UTC),
+		RejectedCode:    "service_protected_mode",
+		RejectedMessage: "service is in protected mode",
+	}
+	handler := NewHandler(runtime, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/refresh", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if payload["accepted"] != false {
+		t.Fatalf("accepted = %v, want false", payload["accepted"])
+	}
+	errPayload := payload["error"].(map[string]any)
+	if errPayload["code"] != "service_protected_mode" {
+		t.Fatalf("error.code = %v, want service_protected_mode", errPayload["code"])
 	}
 }
 
@@ -333,11 +365,12 @@ func TestWriteJSONLogsEncodeFailure(t *testing.T) {
 }
 
 type fakeRuntime struct {
-	mu           sync.Mutex
-	snapshot     orchestrator.Snapshot
-	refreshCount int
-	nextID       int
-	subscribers  map[int]chan orchestrator.Snapshot
+	mu            sync.Mutex
+	snapshot      orchestrator.Snapshot
+	refreshCount  int
+	refreshResult *orchestrator.RefreshRequestResult
+	nextID        int
+	subscribers   map[int]chan orchestrator.Snapshot
 }
 
 func newFakeRuntime(snapshot orchestrator.Snapshot) *fakeRuntime {
@@ -357,6 +390,9 @@ func (f *fakeRuntime) RequestRefresh() orchestrator.RefreshRequestResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refreshCount++
+	if f.refreshResult != nil {
+		return *f.refreshResult
+	}
 	return orchestrator.RefreshRequestResult{
 		Accepted:    true,
 		RequestedAt: time.Date(2026, 3, 7, 12, 1, 0, 0, time.UTC),
@@ -408,6 +444,7 @@ func sampleSnapshot() orchestrator.Snapshot {
 		Service: orchestrator.ServiceSnapshot{
 			Version:   "test-build",
 			StartedAt: now.Add(-5 * time.Minute),
+			Mode:      "normal",
 		},
 		Counts: orchestrator.SnapshotCounts{
 			Running:              1,
@@ -433,48 +470,52 @@ func sampleSnapshot() orchestrator.Snapshot {
 				AttemptCount:        2,
 			},
 		},
-		AwaitingMerge: []orchestrator.AwaitingMergeSnapshot{
-			{
-				IssueID:         "3",
-				IssueIdentifier: "ABC-3",
-				WorkspacePath:   "C:/work/ABC-3",
-				State:           "In Progress",
-				Branch:          "testuser/linear-demo-scope-abc-3",
-				PRNumber:        99,
-				PRURL:           "https://example.test/pr/99",
-				PRState:         "open",
-				AwaitingSince:   now.Add(-2 * time.Minute),
-				AttemptCount:    1,
+		Recovery: orchestrator.RecoverySnapshot{
+			AwaitingMerge: []orchestrator.AwaitingMergeSnapshot{
+				{
+					IssueID:         "3",
+					IssueIdentifier: "ABC-3",
+					WorkspacePath:   "C:/work/ABC-3",
+					State:           "In Progress",
+					Branch:          "testuser/linear-demo-scope-abc-3",
+					PRNumber:        99,
+					PRURL:           "https://example.test/pr/99",
+					PRState:         "open",
+					AwaitingSince:   now.Add(-2 * time.Minute),
+					AttemptCount:    1,
+				},
+			},
+			AwaitingIntervention: []orchestrator.AwaitingInterventionSnapshot{
+				{
+					IssueID:         "4",
+					IssueIdentifier: "ABC-4",
+					WorkspacePath:   "C:/work/ABC-4",
+					Branch:          "testuser/linear-demo-scope-abc-4",
+					PRNumber:        100,
+					PRURL:           "https://example.test/pr/100",
+					PRState:         "closed",
+					ObservedAt:      now.Add(-3 * time.Minute),
+					AttemptCount:    2,
+				},
+			},
+			Retrying: []orchestrator.RetrySnapshot{
+				{
+					IssueID:         "2",
+					IssueIdentifier: "ABC-2",
+					WorkspacePath:   "C:/work/ABC-2",
+					Attempt:         3,
+					DueAt:           now.Add(time.Minute),
+					Error:           stringPtr("workspace_hook_failed: before_run failed"),
+				},
 			},
 		},
-		AwaitingIntervention: []orchestrator.AwaitingInterventionSnapshot{
-			{
-				IssueID:         "4",
-				IssueIdentifier: "ABC-4",
-				WorkspacePath:   "C:/work/ABC-4",
-				Branch:          "testuser/linear-demo-scope-abc-4",
-				PRNumber:        100,
-				PRURL:           "https://example.test/pr/100",
-				PRState:         "closed",
-				ObservedAt:      now.Add(-3 * time.Minute),
-				AttemptCount:    2,
-			},
-		},
-		Retrying: []orchestrator.RetrySnapshot{
-			{
-				IssueID:         "2",
-				IssueIdentifier: "ABC-2",
-				WorkspacePath:   "C:/work/ABC-2",
-				Attempt:         3,
-				DueAt:           now.Add(time.Minute),
-				Error:           stringPtr("workspace_hook_failed: before_run failed"),
-			},
-		},
-		Alerts: []orchestrator.AlertSnapshot{
-			{
-				Code:    "tracker_unreachable",
-				Level:   "warn",
-				Message: "tracker down",
+		Health: orchestrator.RuntimeHealthSnapshot{
+			Alerts: []orchestrator.AlertSnapshot{
+				{
+					Code:    "tracker_unreachable",
+					Level:   "warn",
+					Message: "tracker down",
+				},
 			},
 		},
 		CodexTotals: orchestrator.Snapshot{}.CodexTotals,

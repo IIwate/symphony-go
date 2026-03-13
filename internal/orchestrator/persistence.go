@@ -27,6 +27,7 @@ const (
 type stateStore interface {
 	Load() (*durableRuntimeState, error)
 	Schedule(state durableRuntimeState, critical bool)
+	Disable()
 	Close(ctx context.Context) error
 }
 
@@ -145,6 +146,7 @@ type fileStateStore struct {
 	onFailure func(error)
 
 	mu          sync.Mutex
+	disabled    bool
 	desired     *scheduledDurableState
 	nextVersion uint64
 	signalCh    chan struct{}
@@ -194,6 +196,10 @@ func (s *fileStateStore) Load() (*durableRuntimeState, error) {
 
 func (s *fileStateStore) Schedule(state durableRuntimeState, critical bool) {
 	s.mu.Lock()
+	if s.disabled {
+		s.mu.Unlock()
+		return
+	}
 	s.nextVersion++
 	force := critical && s.config.File.FsyncOnCritical
 	if s.desired != nil && s.desired.force {
@@ -204,6 +210,18 @@ func (s *fileStateStore) Schedule(state durableRuntimeState, critical bool) {
 		force:   force,
 		state:   cloneDurableRuntimeState(state),
 	}
+	s.mu.Unlock()
+
+	select {
+	case s.signalCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *fileStateStore) Disable() {
+	s.mu.Lock()
+	s.disabled = true
+	s.desired = nil
 	s.mu.Unlock()
 
 	select {
@@ -366,7 +384,7 @@ func (s *fileStateStore) drain(ctx context.Context) error {
 func (s *fileStateStore) snapshotDesired() *scheduledDurableState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.desired == nil {
+	if s.disabled || s.desired == nil {
 		return nil
 	}
 	copyState := cloneDurableRuntimeState(s.desired.state)
@@ -587,6 +605,9 @@ func (o *Orchestrator) scheduleStatePersistLocked(critical bool) {
 func (o *Orchestrator) commitStateLocked(critical bool) {
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
+	if o.isProtectedLocked() {
+		return
+	}
 	o.scheduleStatePersistLocked(critical)
 }
 
@@ -821,6 +842,13 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 
 func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 	o.mu.RLock()
+	protected := o.isProtectedLocked()
+	o.mu.RUnlock()
+	if protected {
+		return
+	}
+
+	o.mu.RLock()
 	pending := make(map[string]model.RecoveryEntry, len(o.state.Recovering))
 	for issueID, entry := range o.state.Recovering {
 		if entry == nil {
@@ -1003,6 +1031,9 @@ func (o *Orchestrator) reportSessionPersistenceWriteFailure(err error) {
 func (o *Orchestrator) handleSessionPersistenceWriteSuccess() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.isProtectedLocked() {
+		return
+	}
 
 	now := o.now().UTC()
 	o.persistenceHealth.Status = "healthy"
@@ -1025,11 +1056,10 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.persistenceHealth.LastAttemptAt = cloneTimePtr(&now)
 	o.persistenceHealth.LastError = optionalError(errorText)
 	o.persistenceHealth.ConsecutiveFailures++
-	o.setHealthAlertAndNotifyLocked(AlertSnapshot{
-		Code:    sessionPersistenceWriteFailCode,
-		Level:   "warn",
-		Message: errorText,
-	})
+	if o.stateStore != nil {
+		o.stateStore.Disable()
+	}
+	o.enterProtectedModeLocked(errorText)
 	o.publishViewLocked()
 }
 

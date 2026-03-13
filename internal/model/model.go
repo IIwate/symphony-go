@@ -58,6 +58,13 @@ type CompletionContract struct {
 	OnClosedPR  CompletionAction
 }
 
+type ServiceMode string
+
+const (
+	ServiceModeNormal    ServiceMode = "normal"
+	ServiceModeProtected ServiceMode = "protected"
+)
+
 type DispatchKind string
 
 const (
@@ -452,14 +459,42 @@ type RecoveryEntry struct {
 	Dispatch      *DispatchContext
 }
 
+type ProtectedResultOutcome string
+
+const (
+	ProtectedResultOutcomeSucceeded ProtectedResultOutcome = "succeeded"
+	ProtectedResultOutcomeFailed    ProtectedResultOutcome = "failed"
+)
+
+type ProtectedState struct {
+	Reason      string
+	EnteredAt   time.Time
+	MustRestart bool
+}
+
+type ProtectedResultEntry struct {
+	Identifier    string
+	WorkspacePath string
+	Outcome       ProtectedResultOutcome
+	Phase         RunPhase
+	Error         *string
+	FinalBranch   string
+	ObservedAt    time.Time
+	RetryAttempt  int
+	Dispatch      *DispatchContext
+}
+
 type OrchestratorState struct {
 	PollIntervalMS       int
 	MaxConcurrentAgents  int
+	Mode                 ServiceMode
+	Protection           *ProtectedState
 	Running              map[string]*RunningEntry
 	Recovering           map[string]*RecoveryEntry
 	AwaitingMerge        map[string]*AwaitingMergeEntry
 	AwaitingIntervention map[string]*AwaitingInterventionEntry
 	RetryAttempts        map[string]*RetryEntry
+	ProtectedResults     map[string]*ProtectedResultEntry
 	Completed            map[string]struct{}
 	CodexTotals          TokenTotals
 	CodexRateLimits      any
