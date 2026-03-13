@@ -64,7 +64,11 @@ func TestHandleWorkerExitSchedulesContinuationAndBackoffRetry(t *testing.T) {
 		MaxConcurrentAgents: 2,
 		MaxRetryBackoffMS:   300000,
 	}
-	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o := newTestOrchestrator(cfg, &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "Todo"},
+		},
+	}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
 	o.randFloat = func() float64 { return 0 }
 
 	o.state.Running["1"] = &model.RunningEntry{
@@ -97,6 +101,160 @@ func TestHandleWorkerExitSchedulesContinuationAndBackoffRetry(t *testing.T) {
 	}
 	if retry.DueAt.Sub(now) != 20*time.Second {
 		t.Fatalf("failure retry delay = %v, want 20s", retry.DueAt.Sub(now))
+	}
+}
+
+func TestHandleWorkerExitSuccessPersistsRecoveringStateBeforeResume(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	statePath := filepath.Join(t.TempDir(), "automation", "local", "session-state.json")
+	cfg := testServiceConfig()
+	cfg.AutomationRootDir = filepath.Dir(filepath.Dir(statePath))
+	cfg.SessionPersistence.Enabled = true
+	cfg.SessionPersistence.File.Path = statePath
+
+	tracker := &fakeTracker{stateErr: errors.New("tracker down")}
+	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	if err := o.ensureRuntimeExtensions(); err != nil {
+		t.Fatalf("ensureRuntimeExtensions() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if o.stateStore != nil {
+			o.closeStateStore(o.stateStore)
+		}
+	})
+
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		StartedAt:     now.Add(-5 * time.Second),
+		WorkerCancel:  func() {},
+		Dispatch:      pullRequestDispatch(),
+	}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:     "1",
+		Identifier:  "ABC-1",
+		StartedAt:   now,
+		Phase:       model.PhaseSucceeded,
+		FinalBranch: "feature/abc-1",
+	})
+
+	recovering := o.state.Recovering["1"]
+	if recovering == nil {
+		t.Fatal("recovering entry missing after successful worker exit")
+	}
+	if recovering.Strategy != model.RecoveryStrategyPostRunResume {
+		t.Fatalf("recovering strategy = %q, want %q", recovering.Strategy, model.RecoveryStrategyPostRunResume)
+	}
+	if recovering.FinalBranch != "feature/abc-1" {
+		t.Fatalf("recovering final branch = %q, want feature/abc-1", recovering.FinalBranch)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		state, err := loadPersistedState(statePath)
+		if err != nil {
+			return false
+		}
+		for _, item := range state.Recovering {
+			if item.IssueID == "1" && item.FinalBranch == "feature/abc-1" && item.Strategy == string(model.RecoveryStrategyPostRunResume) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestRunOnceProcessesOverdueRetryWithoutTimerSignal(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := testServiceConfig()
+	runner := &fakeRunner{runCh: make(chan string, 1), block: make(chan struct{})}
+	tracker := &fakeTracker{
+		candidateIssues: []model.Issue{
+			{ID: "1", Identifier: "ABC-1", Title: "Retry me", State: "Todo"},
+		},
+	}
+	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, runner, now)
+	o.state.RetryAttempts["1"] = &model.RetryEntry{
+		IssueID:       "1",
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		Attempt:       2,
+		StallCount:    1,
+		DueAt:         now.Add(-time.Second),
+		Dispatch:      &model.DispatchContext{Kind: model.DispatchKindContinuation},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		o.RunOnce(context.Background(), false)
+	}()
+
+	select {
+	case identifier := <-runner.runCh:
+		if identifier != "ABC-1" {
+			t.Fatalf("runner identifier = %q, want ABC-1", identifier)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("overdue retry was not dispatched without timer signal")
+	}
+
+	close(runner.block)
+	<-done
+}
+
+func TestHandleRetryTimerIgnoresFutureRetryEntry(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := testServiceConfig()
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	future := now.Add(30 * time.Second)
+	o.state.RetryAttempts["1"] = &model.RetryEntry{
+		IssueID:    "1",
+		Identifier: "ABC-1",
+		Attempt:    1,
+		DueAt:      future,
+	}
+
+	o.handleRetryTimer(context.Background(), "1")
+
+	retry := o.state.RetryAttempts["1"]
+	if retry == nil {
+		t.Fatal("future retry entry should still exist")
+	}
+	if !retry.DueAt.Equal(future) {
+		t.Fatalf("retry due_at = %v, want %v", retry.DueAt, future)
+	}
+}
+
+func TestReconcileRecoveringMissingIssueMovesToAwaitingIntervention(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := testServiceConfig()
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.Recovering["1"] = &model.RecoveryEntry{
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		FinalBranch:   "feature/abc-1",
+		State:         "In Progress",
+		RetryAttempt:  1,
+		StallCount:    2,
+		ObservedAt:    now.Add(-time.Minute),
+		Strategy:      model.RecoveryStrategyPostRunResume,
+		Source:        model.RecoverySourceSucceeded,
+		Dispatch:      pullRequestDispatch(),
+	}
+
+	o.reconcileRecovering(context.Background())
+
+	if _, ok := o.state.Recovering["1"]; ok {
+		t.Fatal("recovering entry still exists")
+	}
+	awaiting := o.state.AwaitingIntervention["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting intervention entry missing")
+	}
+	if awaiting.Reason != string(model.ContinuationReasonTrackerIssueMissing) {
+		t.Fatalf("awaiting intervention reason = %q, want %q", awaiting.Reason, model.ContinuationReasonTrackerIssueMissing)
 	}
 }
 
@@ -1351,6 +1509,50 @@ func TestReconcileAwaitingMergeClosedMovesToAwaitingIntervention(t *testing.T) {
 	}
 }
 
+func TestReconcileRecoveringPostRunResumeMovesToAwaitingMerge(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done"},
+		MaxConcurrentAgents: 1,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	o := newTestOrchestrator(cfg, tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	branch := "feature/abc-1"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 48, URL: "https://example.test/pr/48", HeadBranch: branch, State: PullRequestStateOpen},
+		},
+	}
+	o.state.Recovering["1"] = &model.RecoveryEntry{
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		FinalBranch:   branch,
+		State:         "In Progress",
+		ObservedAt:    now.Add(-time.Minute),
+		Strategy:      model.RecoveryStrategyPostRunResume,
+		Source:        model.RecoverySourceSucceeded,
+		Dispatch:      pullRequestDispatch(),
+	}
+
+	o.reconcileRecovering(context.Background())
+
+	if _, ok := o.state.Recovering["1"]; ok {
+		t.Fatal("recovering entry still exists")
+	}
+	awaiting := o.state.AwaitingMerge["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting merge entry missing")
+	}
+	if awaiting.Branch != branch || awaiting.PRNumber != 48 {
+		t.Fatalf("awaiting merge entry = %+v", awaiting)
+	}
+}
+
 func TestReconcileAwaitingMergeLookupFailureKeepsAwaitingAndAlert(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	cfg := &model.ServiceConfig{
@@ -1557,6 +1759,30 @@ func TestReconcileAwaitingInterventionReleasesInactiveIssue(t *testing.T) {
 	}
 	if len(o.state.RetryAttempts) != 0 {
 		t.Fatalf("retry attempts = %+v, want none", o.state.RetryAttempts)
+	}
+}
+
+func TestReconcileAwaitingInterventionMissingIssueUpdatesReason(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := testServiceConfig()
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.AwaitingIntervention["1"] = &model.AwaitingInterventionEntry{
+		Identifier:      "ABC-1",
+		WorkspacePath:   "C:/work/ABC-1",
+		Branch:          "feature/abc-1",
+		ObservedAt:      now.Add(-time.Minute),
+		Reason:          string(model.ContinuationReasonMissingPR),
+		ExpectedOutcome: string(model.CompletionModePullRequest),
+	}
+
+	o.reconcileAwaitingIntervention(context.Background())
+
+	awaiting := o.state.AwaitingIntervention["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting intervention entry missing")
+	}
+	if awaiting.Reason != string(model.ContinuationReasonTrackerIssueMissing) {
+		t.Fatalf("awaiting intervention reason = %q, want %q", awaiting.Reason, model.ContinuationReasonTrackerIssueMissing)
 	}
 }
 
@@ -2001,6 +2227,7 @@ func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		emitters: []*notificationEmitter{
 			{
+				generation: 1,
 				channel: notificationChannel{
 					id: "ops",
 					types: map[model.NotificationEventType]struct{}{
@@ -2017,6 +2244,7 @@ func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 		},
 		enqueueResult: o.reportNotificationEnqueueResult,
 	}
+	o.notifierGeneration = 1
 	o.notifier = customNotifier
 	t.Cleanup(func() {
 		o.closeNotifier(customNotifier)
@@ -2028,6 +2256,35 @@ func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 	waitForCondition(t, time.Second, func() bool {
 		return hasAlertCode(o.Snapshot().Alerts, notificationQueueOverflowCode("ops"))
 	})
+}
+
+func TestNotificationReloadIgnoresStaleHealthCallbacks(t *testing.T) {
+	cfg := testServiceConfig()
+	cfg.Notifications.Channels = []model.NotificationChannelConfig{
+		testWebhookChannel("ops", "https://example.test/webhook", model.NotificationEventSystemAlert),
+	}
+	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
+
+	o.mu.Lock()
+	staleGeneration := o.notifierGeneration
+	cfg.Notifications.Channels = nil
+	oldNotifier := o.reloadNotifierLocked()
+	o.reconcileNotificationHealthLocked()
+	o.mu.Unlock()
+	t.Cleanup(func() {
+		o.closeNotifier(oldNotifier)
+	})
+
+	o.handleNotificationEnqueueResult(staleGeneration, "ops", errors.New("queue full"))
+	o.handleNotificationDeliveryResult(staleGeneration, "ops", errors.New("boom"))
+
+	snapshot := o.Snapshot()
+	if len(snapshot.Health.Notifications) != 0 {
+		t.Fatalf("notification health = %+v, want none after stale callback", snapshot.Health.Notifications)
+	}
+	if hasAlertCode(snapshot.Alerts, notificationQueueOverflowCode("ops")) || hasAlertCode(snapshot.Alerts, notificationDeliveryFailedCode("ops")) {
+		t.Fatalf("snapshot alerts = %+v, want stale notification alerts ignored", snapshot.Alerts)
+	}
 }
 
 func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient tracker.Client, workspaceManager *fakeWorkspaceManager, runner *fakeRunner, now time.Time) *Orchestrator {
@@ -2251,6 +2508,18 @@ func waitForCondition(t *testing.T, timeout time.Duration, check func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition was not met before timeout")
+}
+
+func loadPersistedState(path string) (*durableRuntimeState, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var state durableRuntimeState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return nil, err
+	}
+	return &state, nil
 }
 
 func testServiceConfig() *model.ServiceConfig {

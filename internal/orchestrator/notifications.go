@@ -30,15 +30,16 @@ type notifier interface {
 type asyncNotifier struct {
 	logger        *slog.Logger
 	emitters      []*notificationEmitter
-	enqueueResult func(channelID string, err error)
+	enqueueResult func(generation uint64, channelID string, err error)
 }
 
 type notificationEmitter struct {
 	logger         *slog.Logger
+	generation     uint64
 	channel        notificationChannel
 	normalQueue    chan model.RuntimeEvent
 	criticalQueue  chan model.RuntimeEvent
-	deliveryResult func(channelID string, err error)
+	deliveryResult func(generation uint64, channelID string, err error)
 
 	mu             sync.Mutex
 	closed         bool
@@ -60,8 +61,9 @@ type notificationChannel struct {
 func newAsyncNotifier(
 	cfg model.NotificationsConfig,
 	logger *slog.Logger,
-	deliveryResult func(channelID string, err error),
-	enqueueResult func(channelID string, err error),
+	generation uint64,
+	deliveryResult func(generation uint64, channelID string, err error),
+	enqueueResult func(generation uint64, channelID string, err error),
 ) notifier {
 	if len(cfg.Channels) == 0 {
 		return nil
@@ -82,7 +84,8 @@ func newAsyncNotifier(
 		}
 
 		emitter := &notificationEmitter{
-			logger: logger,
+			logger:     logger,
+			generation: generation,
 			channel: notificationChannel{
 				id:          channelCfg.ID,
 				displayName: channelCfg.DisplayName,
@@ -120,7 +123,7 @@ func (n *asyncNotifier) Emit(event model.RuntimeEvent) {
 		}
 		err, shouldReport := emitter.emit(event)
 		if shouldReport && n.enqueueResult != nil {
-			go n.enqueueResult(emitter.channel.id, err)
+			go n.enqueueResult(emitter.generation, emitter.channel.id, err)
 		}
 		if err != nil {
 			n.logger.Warn("notification queue is full", "channel_id", emitter.channel.id, "event_type", event.Type, "event_id", event.EventID)
@@ -225,7 +228,7 @@ func (e *notificationEmitter) worker(queue <-chan model.RuntimeEvent) {
 	for event := range queue {
 		err := e.deliver(event)
 		if e.deliveryResult != nil {
-			e.deliveryResult(e.channel.id, err)
+			e.deliveryResult(e.generation, e.channel.id, err)
 		}
 	}
 }
@@ -308,7 +311,8 @@ func (o *Orchestrator) nextEventID() string {
 }
 
 func (o *Orchestrator) reloadNotifierLocked() notifier {
-	next := newAsyncNotifier(o.currentConfig().Notifications, o.logger, o.reportNotificationDeliveryResult, o.reportNotificationEnqueueResult)
+	o.notifierGeneration++
+	next := newAsyncNotifier(o.currentConfig().Notifications, o.logger, o.notifierGeneration, o.reportNotificationDeliveryResult, o.reportNotificationEnqueueResult)
 	previous := o.notifier
 	o.notifier = next
 	return previous
@@ -365,12 +369,12 @@ func notificationDeliveryFailedCode(channelID string) string {
 	return notificationDeliveryFailPrefix + model.SanitizeWorkspaceKey(channelID)
 }
 
-func (o *Orchestrator) reportNotificationEnqueueResult(channelID string, err error) {
-	o.handleNotificationEnqueueResult(channelID, err)
+func (o *Orchestrator) reportNotificationEnqueueResult(generation uint64, channelID string, err error) {
+	o.handleNotificationEnqueueResult(generation, channelID, err)
 }
 
-func (o *Orchestrator) reportNotificationDeliveryResult(channelID string, err error) {
-	o.handleNotificationDeliveryResult(channelID, err)
+func (o *Orchestrator) reportNotificationDeliveryResult(generation uint64, channelID string, err error) {
+	o.handleNotificationDeliveryResult(generation, channelID, err)
 }
 
 func (o *Orchestrator) ensureNotificationChannelHealthLocked(channelID string) *NotificationChannelHealthSnapshot {
@@ -391,11 +395,15 @@ func (o *Orchestrator) ensureNotificationChannelHealthLocked(channelID string) *
 	return entry
 }
 
-func (o *Orchestrator) handleNotificationEnqueueResult(channelID string, err error) {
+func (o *Orchestrator) handleNotificationEnqueueResult(generation uint64, channelID string, err error) {
 	code := notificationQueueOverflowCode(channelID)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if generation != o.notifierGeneration {
+		o.logger.Debug("ignoring stale notification enqueue result", "channel_id", channelID, "generation", generation, "active_generation", o.notifierGeneration)
+		return
+	}
 
 	entry := o.ensureNotificationChannelHealthLocked(channelID)
 	now := o.now().UTC()
@@ -424,11 +432,15 @@ func (o *Orchestrator) handleNotificationEnqueueResult(channelID string, err err
 	o.publishViewLocked()
 }
 
-func (o *Orchestrator) handleNotificationDeliveryResult(channelID string, err error) {
+func (o *Orchestrator) handleNotificationDeliveryResult(generation uint64, channelID string, err error) {
 	code := notificationDeliveryFailedCode(channelID)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if generation != o.notifierGeneration {
+		o.logger.Debug("ignoring stale notification delivery result", "channel_id", channelID, "generation", generation, "active_generation", o.notifierGeneration)
+		return
+	}
 
 	entry := o.ensureNotificationChannelHealthLocked(channelID)
 	now := o.now().UTC()

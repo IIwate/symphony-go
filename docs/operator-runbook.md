@@ -259,6 +259,57 @@ py -3 scripts/live_smoke.py --phase all
 - summary 末尾会明确打印 `artifacts cleaned from ...` 或 `artifacts kept at ...`
 - `--purge-history` 会归档旧的 terminal smoke issue；默认关闭，以保留审计痕迹
 
+### 6.5 本地开发与 CI 使用建议
+
+- 日常开发默认先跑本地快速反馈：
+  - `go test ./...`
+  - 或定向跑 `go test ./internal/orchestrator ./cmd/symphony`
+- `live smoke` 不是每次改动的默认步骤；更适合以下场景：
+  - 改动 `orchestrator / persistence / notifications / tracker / scripts/live_smoke`
+  - 需要验证真实 `Linear + GitHub PR + restart recovery + notification delivery` 链路
+  - 准备合并高风险运行时改动
+- 推荐节奏：
+  - 本地开发：先跑 `go test`
+  - PR 提交后：等待普通 CI 复验
+  - 需要验收真实外部链路时：本地手动跑 `py -3 scripts/live_smoke.py --phase heavy`，或在 GitHub Actions 手动触发 `Live Smoke`
+
+### 6.6 GitHub Actions 工作流
+
+- `CI`
+  - 文件：`.github/workflows/ci.yml`
+  - 触发：`pull_request`、`push` 到 `main`
+  - 作用：在标准环境再次执行 `go test ./...`
+- `Live Smoke`
+  - 文件：`.github/workflows/live-smoke.yml`
+  - 触发：`workflow_dispatch`
+  - 输入：
+    - `phase`：`heavy` 或 `all`
+    - `repo`：默认 `IIwate/linear-test`
+- 手动触发示例：
+
+```powershell
+gh workflow run live-smoke.yml --ref <branch> -f phase=heavy -f repo=IIwate/linear-test
+```
+
+### 6.7 Live Smoke 所需 Secret
+
+- `LIVE_SMOKE_GH_TOKEN`
+  - 映射到 workflow 里的环境变量 `GH_TOKEN`
+  - workflow 会执行 `gh auth status` 与 `gh auth setup-git`，让 `gh` 和后续 `git clone/push` 复用同一套凭据
+  - token 不会写入仓库文件；认证通过 runner 进程环境和 git credential helper 生效
+  - 需要对 smoke 目标仓库具备至少：
+    - `contents: write`
+    - `pull_requests: write`
+- `LIVE_SMOKE_LINEAR_API_KEY`
+  - 用于创建、查询、更新 smoke issue
+- `LIVE_SMOKE_LINEAR_PROJECT_SLUG`
+  - 指向 smoke 使用的 Linear project
+
+补充：
+
+- 若 smoke 目标仓库不是当前仓库，默认 `GITHUB_TOKEN` 不适合作为跨仓库 push/merge 凭据；应使用显式配置的 `LIVE_SMOKE_GH_TOKEN`
+- 公开仓库里的普通 `CI` 用于持续复验；`Live Smoke` 保持手动触发，避免每次 PR 都消耗外部链路时间
+
 ## 7. 日志使用说明
 
 ### 7.1 推荐配置

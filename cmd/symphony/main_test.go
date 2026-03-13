@@ -671,10 +671,11 @@ defaults:
 `, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
 	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	writeFile(t, statePath, fmt.Sprintf(`{
-  "version": 4,
+  "version": 5,
   "identity": {
     "compatibility": {
       "profile": "",
+      "active_source": "linear-main",
       "source_kind": "",
       "flow_name": "implement",
       "tracker_kind": "different",

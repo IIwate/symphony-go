@@ -617,6 +617,7 @@ def _run_runtime_extensions_smoke(
         persisted = _load_session_state(session_state_path)
         _assert_session_identity(
             persisted,
+            active_source="linear-main",
             flow_name="implement",
             tracker_project_slug=project_slug,
             workspace_root=str((resources.temp_dir.parent / f"workspaces-{branch_namespace}-feature").resolve()).replace("\\", "/"),
@@ -640,7 +641,11 @@ def _run_runtime_extensions_smoke(
             compatibility = identity.get("Compatibility")
         if not isinstance(compatibility, dict):
             raise RuntimeError("session-state.json missing identity.compatibility object")
-        if "flow_name" in compatibility:
+        if "active_source" in compatibility:
+            compatibility["active_source"] = "tampered-source"
+        elif "ActiveSource" in compatibility:
+            compatibility["ActiveSource"] = "tampered-source"
+        elif "flow_name" in compatibility:
             compatibility["flow_name"] = "tampered-flow"
         else:
             compatibility["FlowName"] = "tampered-flow"
@@ -889,6 +894,7 @@ def _assert_notification_details(event: dict[str, object], **expected_details: s
 def _assert_session_identity(
     payload: dict[str, object],
     *,
+    active_source: str,
     flow_name: str,
     tracker_project_slug: str,
     workspace_root: str,
@@ -907,6 +913,7 @@ def _assert_session_identity(
     if not isinstance(descriptor, dict):
         raise RuntimeError("session-state.json missing identity.descriptor object")
     required = [
+        ("active_source", "ActiveSource", active_source),
         ("flow_name", "FlowName", flow_name),
         ("tracker_project_slug", "TrackerProjectSlug", tracker_project_slug),
     ]

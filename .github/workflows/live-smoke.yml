@@ -1,0 +1,72 @@
+name: Live Smoke
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Smoke phase
+        required: true
+        default: heavy
+        type: choice
+        options:
+          - heavy
+          - all
+      repo:
+        description: GitHub repository used by live smoke
+        required: true
+        default: IIwate/linear-test
+        type: string
+
+jobs:
+  live-smoke:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      GH_TOKEN: ${{ secrets.LIVE_SMOKE_GH_TOKEN }}
+      LINEAR_API_KEY: ${{ secrets.LIVE_SMOKE_LINEAR_API_KEY }}
+      LINEAR_PROJECT_SLUG: ${{ secrets.LIVE_SMOKE_LINEAR_PROJECT_SLUG }}
+      GIT_TERMINAL_PROMPT: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Configure Git Identity
+        shell: pwsh
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global credential.interactive never
+
+      - name: Configure GitHub Auth For Git
+        shell: pwsh
+        run: |
+          if (-not $env:GH_TOKEN) { throw "Missing secret LIVE_SMOKE_GH_TOKEN" }
+          gh auth status
+          gh auth setup-git
+
+      - name: Run Live Smoke
+        shell: pwsh
+        run: |
+          if (-not $env:GH_TOKEN) { throw "Missing secret LIVE_SMOKE_GH_TOKEN" }
+          if (-not $env:LINEAR_API_KEY) { throw "Missing secret LIVE_SMOKE_LINEAR_API_KEY" }
+          if (-not $env:LINEAR_PROJECT_SLUG) { throw "Missing secret LIVE_SMOKE_LINEAR_PROJECT_SLUG" }
+          py -3 scripts/live_smoke.py --phase "${{ inputs.phase }}" --repo "${{ inputs.repo }}"

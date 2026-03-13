@@ -304,6 +304,7 @@ func runtimeIdentityForConfig(configDir string, profile string, repoDef *model.A
 		},
 	}
 	if repoDef != nil {
+		identity.Compatibility.ActiveSource = selectedSourceName(repoDef)
 		identity.Compatibility.SourceKind = selectedSourceKind(repoDef)
 		identity.Compatibility.FlowName = strings.TrimSpace(repoDef.Selection.DispatchFlow)
 	}
@@ -333,7 +334,7 @@ func selectedSourceKind(def *model.AutomationDefinition) string {
 	if def == nil || len(def.Selection.EnabledSources) != 1 {
 		return ""
 	}
-	sourceName := strings.TrimSpace(def.Selection.EnabledSources[0])
+	sourceName := selectedSourceName(def)
 	if sourceName == "" {
 		return ""
 	}
@@ -343,4 +344,11 @@ func selectedSourceKind(def *model.AutomationDefinition) string {
 	}
 	value, _ := sourceDef.Raw["kind"].(string)
 	return model.NormalizeState(value)
+}
+
+func selectedSourceName(def *model.AutomationDefinition) string {
+	if def == nil || len(def.Selection.EnabledSources) != 1 {
+		return ""
+	}
+	return strings.TrimSpace(def.Selection.EnabledSources[0])
 }

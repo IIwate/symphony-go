@@ -231,6 +231,7 @@ type PullRequestLookup interface {
 
 type RuntimeCompatibility struct {
 	Profile            string
+	ActiveSource       string
 	SourceKind         string
 	FlowName           string
 	TrackerKind        string
@@ -304,6 +305,7 @@ type Orchestrator struct {
 	serviceVersion     string
 	extensionsReady    bool
 	eventSeq           uint64
+	notifierGeneration uint64
 }
 
 var BuildVersion = "dev"
@@ -525,6 +527,8 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 		o.publishViewLocked()
 	}
 	o.mu.Unlock()
+
+	o.processDueRetries(ctx)
 
 	candidates, err := o.tracker.FetchCandidateIssues(ctx)
 	if err != nil {
@@ -1025,65 +1029,23 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		return
 	}
 
-	o.rememberCompletedLocked(result.IssueID)
+	o.state.Recovering[result.IssueID] = &model.RecoveryEntry{
+		Identifier:    identifier,
+		WorkspacePath: workspacePath,
+		FinalBranch:   strings.TrimSpace(result.FinalBranch),
+		State:         issueState,
+		RetryAttempt:  retryAttempt,
+		StallCount:    stallCount,
+		ObservedAt:    o.now().UTC(),
+		Strategy:      model.RecoveryStrategyPostRunResume,
+		Source:        model.RecoverySourceSucceeded,
+		Dispatch:      model.CloneDispatchContext(dispatch),
+	}
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 
 	ctx := o.runtimeContext()
-	cfg := o.currentConfig()
-	issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{result.IssueID})
-	if err == nil && len(issues) > 0 {
-		issueState = issues[0].State
-		if o.isTerminalState(issues[0].State, cfg) {
-			o.completeSuccessfulIssue(ctx, result.IssueID, identifier)
-			return
-		}
-	}
-	decision, decisionErr := o.classifySuccessfulRun(ctx, workspacePath, result.FinalBranch, dispatch, cfg.OrchestratorAutoCloseOnPR, issueState)
-	if decisionErr != nil {
-		o.logger.Warn("post-run completion classification failed", "issue_id", result.IssueID, "issue_identifier", identifier, "branch", result.FinalBranch, "error", decisionErr.Error())
-		errorText := decisionErr.Error()
-		o.mu.Lock()
-		o.scheduleRetryLocked(result.IssueID, identifier, retryAttempt+1, &errorText, false, stallCount, dispatch)
-		o.commitStateLocked(true)
-		o.mu.Unlock()
-		return
-	}
-	switch decision.Disposition {
-	case DispositionTryCompleteMergedPR:
-		o.tryCompleteMergedPullRequest(ctx, result.IssueID, identifier, workspacePath, decision.FinalBranch, retryAttempt, stallCount, issueState, decision.PR)
-		return
-	case DispositionAwaitingMerge:
-		o.moveToAwaitingMerge(result.IssueID, identifier, issueState, workspacePath, decision.FinalBranch, retryAttempt, stallCount, decision.PR, nil)
-		return
-	case DispositionAwaitingIntervention:
-		reason := ""
-		if decision.Reason != nil {
-			reason = string(*decision.Reason)
-		}
-		o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, decision.FinalBranch, retryAttempt, stallCount, decision.ExpectedOutcome, reason, issueState, decision.PR)
-		return
-	case DispositionContinuation:
-		reason := model.ContinuationReasonUnfinishedIssue
-		if decision.Reason != nil {
-			reason = *decision.Reason
-		}
-		retryDispatch := continuationDispatchContext(dispatch, normalizeCompletionContract(model.CompletionContract{
-			Mode:        decision.ExpectedOutcome,
-			OnMissingPR: dispatchCompletionAction(dispatch, "missing"),
-			OnClosedPR:  dispatchCompletionAction(dispatch, "closed"),
-		}), reason, decision.FinalBranch, decision.PR, issueState)
-		o.mu.Lock()
-		o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount, retryDispatch)
-		o.commitStateLocked(true)
-		o.mu.Unlock()
-		return
-	}
-
-	o.mu.Lock()
-	o.scheduleRetryLocked(result.IssueID, identifier, 1, nil, true, stallCount, continuationDispatchContext(dispatch, normalizeCompletionContract(o.currentWorkflow().Completion), model.ContinuationReasonUnfinishedIssue, result.FinalBranch, nil, issueState))
-	o.commitStateLocked(true)
-	o.mu.Unlock()
+	o.reconcileRecovering(ctx)
 }
 
 func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
@@ -1361,6 +1323,13 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 	for issueID, entry := range pending {
 		issue, ok := byID[issueID]
 		if !ok {
+			o.mu.Lock()
+			current := o.state.AwaitingIntervention[issueID]
+			if current != nil && current.Reason != string(model.ContinuationReasonTrackerIssueMissing) {
+				current.Reason = string(model.ContinuationReasonTrackerIssueMissing)
+				o.commitStateLocked(true)
+			}
+			o.mu.Unlock()
 			continue
 		}
 		switch {
@@ -1379,22 +1348,77 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 }
 
 func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
+	o.processRetryIssue(ctx, issueID)
+}
+
+func (o *Orchestrator) processDueRetries(ctx context.Context) {
+	type dueRetry struct {
+		IssueID     string
+		Identifier  string
+		DueAt       time.Time
+	}
+
+	now := o.now().UTC()
+	o.mu.Lock()
+	due := make([]dueRetry, 0, len(o.state.RetryAttempts))
+	for issueID, entry := range o.state.RetryAttempts {
+		if entry == nil || entry.DueAt.After(now) {
+			continue
+		}
+		if entry.TimerHandle != nil {
+			entry.TimerHandle.Stop()
+			entry.TimerHandle = nil
+		}
+		due = append(due, dueRetry{
+			IssueID:    issueID,
+			Identifier: entry.Identifier,
+			DueAt:      entry.DueAt,
+		})
+	}
+	o.mu.Unlock()
+
+	sort.SliceStable(due, func(i int, j int) bool {
+		if !due[i].DueAt.Equal(due[j].DueAt) {
+			return due[i].DueAt.Before(due[j].DueAt)
+		}
+		if due[i].Identifier != due[j].Identifier {
+			return due[i].Identifier < due[j].Identifier
+		}
+		return due[i].IssueID < due[j].IssueID
+	})
+
+	for _, item := range due {
+		o.processRetryIssue(ctx, item.IssueID)
+	}
+}
+
+func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
+	now := o.now().UTC()
+
 	o.mu.Lock()
 	retryEntry := o.state.RetryAttempts[issueID]
-	if retryEntry == nil {
+	if retryEntry == nil || retryEntry.DueAt.After(now) {
 		o.mu.Unlock()
 		return
 	}
-	delete(o.state.RetryAttempts, issueID)
-	o.refreshSnapshotLocked()
+	if retryEntry.TimerHandle != nil {
+		retryEntry.TimerHandle.Stop()
+		retryEntry.TimerHandle = nil
+	}
+	snapshot := *retryEntry
+	snapshot.Error = optionalError(pointerString(retryEntry.Error))
+	snapshot.Dispatch = model.CloneDispatchContext(retryEntry.Dispatch)
 	o.mu.Unlock()
 
 	candidates, err := o.tracker.FetchCandidateIssues(ctx)
 	if err != nil {
 		errorText := "retry poll failed"
 		o.mu.Lock()
-		o.scheduleRetryLocked(issueID, retryEntry.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount, retryEntry.Dispatch)
-		o.commitStateLocked(true)
+		current := o.state.RetryAttempts[issueID]
+		if current != nil && !current.DueAt.After(o.now().UTC()) {
+			o.scheduleRetryLocked(issueID, current.Identifier, current.Attempt+1, &errorText, false, current.StallCount, current.Dispatch)
+			o.commitStateLocked(true)
+		}
 		o.mu.Unlock()
 		return
 	}
@@ -1409,7 +1433,11 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	}
 	if issue == nil {
 		o.mu.Lock()
-		o.commitStateLocked(true)
+		current := o.state.RetryAttempts[issueID]
+		if current != nil && !current.DueAt.After(o.now().UTC()) {
+			delete(o.state.RetryAttempts, issueID)
+			o.commitStateLocked(true)
+		}
 		o.mu.Unlock()
 		return
 	}
@@ -1417,20 +1445,27 @@ func (o *Orchestrator) handleRetryTimer(ctx context.Context, issueID string) {
 	cfg := o.currentConfig()
 	if !o.isDispatchEligible(*issue, cfg, true) {
 		o.mu.Lock()
-		o.commitStateLocked(true)
+		current := o.state.RetryAttempts[issueID]
+		if current != nil && !current.DueAt.After(o.now().UTC()) {
+			delete(o.state.RetryAttempts, issueID)
+			o.commitStateLocked(true)
+		}
 		o.mu.Unlock()
 		return
 	}
 	if !o.hasAvailableSlots(*issue, cfg) {
 		errorText := "no available orchestrator slots"
 		o.mu.Lock()
-		o.scheduleRetryLocked(issueID, issue.Identifier, retryEntry.Attempt+1, &errorText, false, retryEntry.StallCount, retryEntry.Dispatch)
-		o.commitStateLocked(true)
+		current := o.state.RetryAttempts[issueID]
+		if current != nil && !current.DueAt.After(o.now().UTC()) {
+			o.scheduleRetryLocked(issueID, issue.Identifier, current.Attempt+1, &errorText, false, current.StallCount, current.Dispatch)
+			o.commitStateLocked(true)
+		}
 		o.mu.Unlock()
 		return
 	}
 
-	attempt := retryEntry.Attempt
+	attempt := snapshot.Attempt
 	o.dispatchIssue(ctx, *issue, &attempt)
 }
 
@@ -1910,10 +1945,9 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 	if _, ok := o.state.AwaitingIntervention[issue.ID]; ok {
 		return false
 	}
-	if _, ok := o.state.RetryAttempts[issue.ID]; ok {
+	if _, ok := o.state.RetryAttempts[issue.ID]; ok && !ignoreClaim {
 		return false
 	}
-	_ = ignoreClaim
 
 	if model.NormalizeState(issue.State) == "todo" {
 		for _, blocker := range issue.BlockedBy {
@@ -2014,6 +2048,7 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	}
 
 	o.mu.Lock()
+	delete(o.state.Recovering, issueID)
 	o.state.AwaitingMerge[issueID] = entry
 	o.commitStateLocked(true)
 	o.mu.Unlock()
@@ -2044,6 +2079,7 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	o.logger.Warn("issue awaiting manual intervention", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "pr_state", entry.PRState, "reason", reason)
 
 	o.mu.Lock()
+	delete(o.state.Recovering, issueID)
 	delete(o.state.AwaitingMerge, issueID)
 	o.state.AwaitingIntervention[issueID] = entry
 	o.emitNotificationLocked(o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, pr))
@@ -2096,6 +2132,7 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 		current.PRBaseRepo = pr.BaseRepo
 		current.PRHeadOwner = pr.HeadOwner
 	}
+	delete(o.state.Recovering, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
 	o.commitStateLocked(true)
 	o.mu.Unlock()
@@ -2193,8 +2230,10 @@ func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID stri
 	}
 
 	o.mu.Lock()
+	delete(o.state.Recovering, issueID)
 	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
+	o.rememberCompletedLocked(issueID)
 	o.emitNotificationLocked(o.newIssueCompletedEvent(issueID, identifier))
 	o.commitStateLocked(true)
 	o.mu.Unlock()

@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	durableStateVersion             = 4
+	durableStateVersion             = 5
 	sessionPersistenceWriteFailCode = "session_persistence_write_failed"
 	stateStoreDrainTimeout          = 5 * time.Second
 	initialStateStoreRetryDelay     = time.Second
@@ -76,6 +76,7 @@ type durableRecoveryEntry struct {
 	IssueID       string                  `json:"issue_id"`
 	Identifier    string                  `json:"identifier"`
 	WorkspacePath string                  `json:"workspace_path"`
+	FinalBranch   string                  `json:"final_branch,omitempty"`
 	State         string                  `json:"state,omitempty"`
 	RetryAttempt  int                     `json:"retry_attempt"`
 	StallCount    int                     `json:"stall_count"`
@@ -447,6 +448,7 @@ func writeDurableRuntimeState(path string, state durableRuntimeState, force bool
 
 func normalizeRuntimeIdentity(identity RuntimeIdentity) RuntimeIdentity {
 	identity.Compatibility.Profile = strings.TrimSpace(identity.Compatibility.Profile)
+	identity.Compatibility.ActiveSource = strings.TrimSpace(identity.Compatibility.ActiveSource)
 	identity.Compatibility.SourceKind = model.NormalizeState(identity.Compatibility.SourceKind)
 	identity.Compatibility.FlowName = strings.TrimSpace(identity.Compatibility.FlowName)
 	identity.Compatibility.TrackerKind = model.NormalizeState(identity.Compatibility.TrackerKind)
@@ -632,6 +634,7 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 			IssueID:       issueID,
 			Identifier:    entry.Identifier,
 			WorkspacePath: entry.WorkspacePath,
+			FinalBranch:   entry.FinalBranch,
 			State:         entry.State,
 			RetryAttempt:  entry.RetryAttempt,
 			StallCount:    entry.StallCount,
@@ -762,6 +765,7 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 		o.state.Recovering[item.IssueID] = &model.RecoveryEntry{
 			Identifier:    item.Identifier,
 			WorkspacePath: item.WorkspacePath,
+			FinalBranch:   item.FinalBranch,
 			State:         item.State,
 			RetryAttempt:  item.RetryAttempt,
 			StallCount:    item.StallCount,
@@ -861,35 +865,118 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 	}
 
 	o.mu.Lock()
-	changed := false
-	clearedAlert := o.clearHealthAlertAndNotifyLocked("tracker_unreachable")
-	for issueID, entry := range pending {
-		current := o.state.Recovering[issueID]
-		if current == nil {
-			continue
-		}
+	if o.clearHealthAlertAndNotifyLocked("tracker_unreachable") {
+		o.publishViewLocked()
+	}
+	o.mu.Unlock()
 
+	for issueID, entry := range pending {
 		issue, ok := byID[issueID]
 		if !ok {
+			o.moveRecoveringIssueToAwaitingIntervention(issueID, entry, model.ContinuationReasonTrackerIssueMissing, entry.State)
 			continue
 		}
 
 		switch {
-		case o.isTerminalState(issue.State, cfg), !o.isActiveState(issue.State, cfg):
-			delete(o.state.Recovering, issueID)
-			changed = true
+		case o.isTerminalState(issue.State, cfg):
+			o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
+			continue
+		case !o.isActiveState(issue.State, cfg):
+			o.mu.Lock()
+			current := o.state.Recovering[issueID]
+			if current != nil {
+				delete(o.state.Recovering, issueID)
+				o.commitStateLocked(true)
+			}
+			o.mu.Unlock()
+			continue
+		}
+
+		switch entry.Strategy {
+		case model.RecoveryStrategyPostRunResume:
+			_ = o.resumeRecoveredSuccessPath(ctx, issueID, entry, issue.State)
 		default:
-			delete(o.state.Recovering, issueID)
-			o.scheduleRetryLocked(issueID, entry.Identifier, entry.RetryAttempt, nil, true, entry.StallCount, entry.Dispatch)
-			changed = true
+			o.mu.Lock()
+			current := o.state.Recovering[issueID]
+			if current != nil {
+				delete(o.state.Recovering, issueID)
+				o.scheduleRetryLocked(issueID, entry.Identifier, entry.RetryAttempt, nil, true, entry.StallCount, entry.Dispatch)
+				o.commitStateLocked(true)
+			}
+			o.mu.Unlock()
 		}
 	}
-	if changed {
-		o.commitStateLocked(true)
-	} else if clearedAlert {
-		o.publishViewLocked()
+}
+
+func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID string, entry model.RecoveryEntry, issueState string) error {
+	decision, err := o.classifySuccessfulRun(ctx, entry.WorkspacePath, entry.FinalBranch, entry.Dispatch, o.currentConfig().OrchestratorAutoCloseOnPR, issueState)
+	if err != nil {
+		o.logger.Warn("post-run completion classification failed", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.FinalBranch, "error", err.Error())
+		o.mu.Lock()
+		current := o.state.Recovering[issueID]
+		if current != nil && current.State != issueState {
+			current.State = issueState
+			o.commitStateLocked(false)
+		}
+		o.mu.Unlock()
+		return err
 	}
-	o.mu.Unlock()
+
+	switch decision.Disposition {
+	case DispositionTryCompleteMergedPR:
+		o.tryCompleteMergedPullRequest(ctx, issueID, entry.Identifier, entry.WorkspacePath, decision.FinalBranch, entry.RetryAttempt, entry.StallCount, issueState, decision.PR)
+	case DispositionAwaitingMerge:
+		o.moveToAwaitingMerge(issueID, entry.Identifier, issueState, entry.WorkspacePath, decision.FinalBranch, entry.RetryAttempt, entry.StallCount, decision.PR, nil)
+	case DispositionAwaitingIntervention:
+		reason := ""
+		if decision.Reason != nil {
+			reason = string(*decision.Reason)
+		}
+		o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, decision.FinalBranch, entry.RetryAttempt, entry.StallCount, decision.ExpectedOutcome, reason, issueState, decision.PR)
+	case DispositionContinuation:
+		reason := model.ContinuationReasonUnfinishedIssue
+		if decision.Reason != nil {
+			reason = *decision.Reason
+		}
+		retryDispatch := continuationDispatchContext(entry.Dispatch, normalizeCompletionContract(model.CompletionContract{
+			Mode:        decision.ExpectedOutcome,
+			OnMissingPR: dispatchCompletionAction(entry.Dispatch, "missing"),
+			OnClosedPR:  dispatchCompletionAction(entry.Dispatch, "closed"),
+		}), reason, decision.FinalBranch, decision.PR, issueState)
+		o.mu.Lock()
+		current := o.state.Recovering[issueID]
+		if current != nil {
+			delete(o.state.Recovering, issueID)
+			o.scheduleRetryLocked(issueID, entry.Identifier, 1, nil, true, entry.StallCount, retryDispatch)
+			o.commitStateLocked(true)
+		}
+		o.mu.Unlock()
+	default:
+		o.mu.Lock()
+		current := o.state.Recovering[issueID]
+		if current != nil {
+			delete(o.state.Recovering, issueID)
+			o.scheduleRetryLocked(issueID, entry.Identifier, 1, nil, true, entry.StallCount, continuationDispatchContext(entry.Dispatch, normalizeCompletionContract(o.currentWorkflow().Completion), model.ContinuationReasonUnfinishedIssue, entry.FinalBranch, nil, issueState))
+			o.commitStateLocked(true)
+		}
+		o.mu.Unlock()
+	}
+
+	return nil
+}
+
+func (o *Orchestrator) moveRecoveringIssueToAwaitingIntervention(issueID string, entry model.RecoveryEntry, reason model.ContinuationReason, issueState string) {
+	expectedOutcome := model.CompletionMode("")
+	var pr *PullRequestInfo
+	branch := strings.TrimSpace(entry.FinalBranch)
+	if entry.Dispatch != nil {
+		expectedOutcome = entry.Dispatch.ExpectedOutcome
+		pr = pullRequestInfoFromContext(entry.Dispatch.PreviousPR)
+		if branch == "" && entry.Dispatch.PreviousBranch != nil {
+			branch = strings.TrimSpace(*entry.Dispatch.PreviousBranch)
+		}
+	}
+	o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, branch, entry.RetryAttempt, entry.StallCount, expectedOutcome, string(reason), issueState, pr)
 }
 
 func (o *Orchestrator) newRetryTimer(issueID string, dueAt time.Time) *time.Timer {

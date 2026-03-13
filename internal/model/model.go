@@ -73,6 +73,7 @@ const (
 	ContinuationReasonMissingPR            ContinuationReason = "missing_pr"
 	ContinuationReasonClosedUnmergedPR     ContinuationReason = "pr_closed_unmerged"
 	ContinuationReasonMergedPRAutoCloseOff ContinuationReason = "merged_pr_auto_close_disabled"
+	ContinuationReasonTrackerIssueMissing  ContinuationReason = "tracker_issue_missing_during_recovery"
 )
 
 type PRContext struct {
@@ -427,6 +428,7 @@ type RecoveryStrategy string
 
 const (
 	RecoveryStrategyContinuationRetry RecoveryStrategy = "continuation_retry"
+	RecoveryStrategyPostRunResume     RecoveryStrategy = "post_run_resume"
 )
 
 type RecoverySource string
@@ -434,11 +436,13 @@ type RecoverySource string
 const (
 	RecoverySourceRunning   RecoverySource = "running"
 	RecoverySourceRecovered RecoverySource = "recovered"
+	RecoverySourceSucceeded RecoverySource = "succeeded"
 )
 
 type RecoveryEntry struct {
 	Identifier    string
 	WorkspacePath string
+	FinalBranch   string
 	State         string
 	RetryAttempt  int
 	StallCount    int
