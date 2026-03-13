@@ -319,23 +319,25 @@ type Orchestrator struct {
 
 	state model.OrchestratorState
 
-	mu                 sync.RWMutex
-	snapshot           Snapshot
-	started            bool
-	subscribers        map[int]chan Snapshot
-	nextSubscriberID   int
-	healthAlerts       map[string]AlertSnapshot
-	notificationHealth map[string]*NotificationChannelHealthSnapshot
-	persistenceHealth  PersistenceHealthSnapshot
-	pendingCleanup     map[string]string
-	recoveredPending   map[string]*model.RecoveryEntry
-	completedOrder     []string
-	maxCompleted       int
-	startedAt          time.Time
-	serviceVersion     string
-	extensionsReady    bool
-	eventSeq           uint64
-	notifierGeneration uint64
+	mu                        sync.RWMutex
+	snapshot                  Snapshot
+	started                   bool
+	subscribers               map[int]chan Snapshot
+	nextSubscriberID          int
+	healthAlerts              map[string]AlertSnapshot
+	notificationHealth        map[string]*NotificationChannelHealthSnapshot
+	persistenceHealth         PersistenceHealthSnapshot
+	pendingCleanup            map[string]string
+	recoveredPending          map[string]*model.RecoveryEntry
+	pendingResume             map[string]uint64
+	completedOrder            []string
+	maxCompleted              int
+	startedAt                 time.Time
+	serviceVersion            string
+	extensionsReady           bool
+	eventSeq                  uint64
+	notifierGeneration        uint64
+	lastPersistedStateVersion uint64
 }
 
 var BuildVersion = "dev"
@@ -383,6 +385,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		notificationHealth: map[string]*NotificationChannelHealthSnapshot{},
 		pendingCleanup:     map[string]string{},
 		recoveredPending:   recovering,
+		pendingResume:      map[string]uint64{},
 		maxCompleted:       defaultMaxCompletedEntries,
 		startedAt:          time.Now().UTC(),
 		serviceVersion:     BuildVersion,
@@ -1168,11 +1171,16 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		Source:        model.RecoverySourceSucceeded,
 		Dispatch:      model.CloneDispatchContext(dispatch),
 	}
-	o.commitStateLocked(true)
+	version := o.commitStateLocked(true)
+	if version > 0 {
+		o.pendingResume[result.IssueID] = version
+	}
 	o.mu.Unlock()
 
-	ctx := o.runtimeContext()
-	o.reconcileRecovering(ctx)
+	if version == 0 {
+		ctx := o.runtimeContext()
+		o.reconcileRecovering(ctx)
+	}
 }
 
 func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
@@ -1203,7 +1211,16 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 		entry.Session.TurnCount++
 	}
 	if event.Usage != nil {
-		o.applyUsageLocked(&entry.Session, event.Usage)
+		if o.isProtectedLocked() {
+			entry.Session.CodexInputTokens = event.Usage.InputTokens
+			entry.Session.CodexOutputTokens = event.Usage.OutputTokens
+			entry.Session.CodexTotalTokens = event.Usage.TotalTokens
+			entry.Session.LastReportedInputTokens = event.Usage.InputTokens
+			entry.Session.LastReportedOutputTokens = event.Usage.OutputTokens
+			entry.Session.LastReportedTotalTokens = event.Usage.TotalTokens
+		} else {
+			o.applyUsageLocked(&entry.Session, event.Usage)
+		}
 	}
 	if event.RateLimits != nil {
 		o.state.CodexRateLimits = event.RateLimits
@@ -2242,13 +2259,6 @@ func (o *Orchestrator) runtimeContext() context.Context {
 }
 
 func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, issueState string, workspacePath string, branch string, retryAttempt int, stallCount int, pr *PullRequestInfo, lastError *string) {
-	o.mu.RLock()
-	protected := o.isProtectedLocked()
-	o.mu.RUnlock()
-	if protected {
-		return
-	}
-
 	var errorCopy *string
 	if lastError != nil {
 		errorCopy = optionalError(*lastError)
@@ -2273,6 +2283,11 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	}
 
 	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.mu.Unlock()
+		return
+	}
+	delete(o.pendingResume, issueID)
 	delete(o.state.Recovering, issueID)
 	o.state.AwaitingMerge[issueID] = entry
 	o.commitStateLocked(true)
@@ -2280,13 +2295,6 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 }
 
 func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, expectedOutcome model.CompletionMode, reason string, issueState string, pr *PullRequestInfo) {
-	o.mu.RLock()
-	protected := o.isProtectedLocked()
-	o.mu.RUnlock()
-	if protected {
-		return
-	}
-
 	entry := &model.AwaitingInterventionEntry{
 		Identifier:          identifier,
 		WorkspacePath:       workspacePath,
@@ -2311,6 +2319,11 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	o.logger.Warn("issue awaiting manual intervention", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "pr_state", entry.PRState, "reason", reason)
 
 	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.mu.Unlock()
+		return
+	}
+	delete(o.pendingResume, issueID)
 	delete(o.state.Recovering, issueID)
 	delete(o.state.AwaitingMerge, issueID)
 	o.state.AwaitingIntervention[issueID] = entry
@@ -2326,6 +2339,10 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 	}
 
 	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.mu.Unlock()
+		return false
+	}
 	current := o.state.AwaitingMerge[issueID]
 	awaitingSince := o.now().UTC()
 	postMergeRetryCount := 0
@@ -2364,6 +2381,7 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 		current.PRBaseRepo = pr.BaseRepo
 		current.PRHeadOwner = pr.HeadOwner
 	}
+	delete(o.pendingResume, issueID)
 	delete(o.state.Recovering, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
 	o.commitStateLocked(true)
@@ -2457,18 +2475,12 @@ func (o *Orchestrator) lookupAwaitingMergePullRequest(ctx context.Context, works
 }
 
 func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID string, identifier string) {
-	o.mu.RLock()
-	protected := o.isProtectedLocked()
-	o.mu.RUnlock()
-	if protected {
+	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.mu.Unlock()
 		return
 	}
-
-	if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
-		o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
-	}
-
-	o.mu.Lock()
+	delete(o.pendingResume, issueID)
 	delete(o.state.Recovering, issueID)
 	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
@@ -2476,6 +2488,10 @@ func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID stri
 	o.emitNotificationLocked(o.newIssueCompletedEvent(issueID, identifier))
 	o.commitStateLocked(true)
 	o.mu.Unlock()
+
+	if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
+		o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
+	}
 }
 
 func defaultGitBranch(ctx context.Context, workspacePath string) (string, error) {

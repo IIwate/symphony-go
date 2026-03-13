@@ -97,19 +97,15 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 			return
 		}
 		result := runtime.RequestRefresh()
+		if !result.Accepted {
+			writeError(w, http.StatusConflict, result.RejectedCode, result.RejectedMessage, logger)
+			return
+		}
 		payload := map[string]any{
 			"accepted":     result.Accepted,
 			"coalesced":    result.Coalesced,
 			"requested_at": result.RequestedAt.UTC().Format(time.RFC3339),
 			"operations":   result.Operations,
-		}
-		if !result.Accepted {
-			payload["error"] = map[string]any{
-				"code":    result.RejectedCode,
-				"message": result.RejectedMessage,
-			}
-			writeJSON(w, http.StatusConflict, payload, logger)
-			return
 		}
 		writeJSON(w, http.StatusAccepted, payload, logger)
 	})

@@ -121,13 +121,16 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 
 其中：
 
-- `/api/v1/state` 当前按 `running / recovery / health` 三层返回状态
-- `health.alerts` 汇总 tracker 不可达、重复 stall、workspace hook 失败、PR merge 状态未知等需要 operator 关注的问题
+- `/api/v1/state` 当前按 `running / recovery / health / observations` 返回状态
+- `service` 会额外暴露 `mode`、`protection_reason`、`protected_at`、`restart_required`
+- `health.alerts` 只保留真正有 set/clear 生命周期的系统告警
+- `observations.derived` 汇总由 retry / awaiting_merge 派生出的观察项，例如 repeated stall、workspace hook failure、merge status unknown
 - `health.notifications` 汇总每个通知通道的瞬时健康状态，不会跨重启持久化
 - `health.persistence` 汇总 session persistence 当前健康状态，不再把这类瞬时运行健康直接当成 durable state
 - `/api/v1/state` 也会返回 `service.version`、`service.started_at`、`service.uptime_seconds`，用于快速确认当前进程版本和在线时长
 - `/api/v1/state` 也会返回 `recovery.awaiting_merge`、`recovery.awaiting_intervention`、`recovery.recovering`、`recovery.retrying` 以及对应计数
-- `/api/v1/{identifier}` 会返回 `status`、`workspace_path`、`last_error`、`attempt_count`，并按状态选择 `running / recovering / awaiting_merge / awaiting_intervention / retry`
+- `/api/v1/{identifier}` 会返回 `status`、`workspace_path`、`last_error`、`attempt_count`，并按状态选择 `running / recovering / awaiting_merge / awaiting_intervention / retrying / protected_result`
+- 若服务已进入 protected mode，`POST /api/v1/refresh` 会返回 `409` 和统一错误 envelope，要求 operator 修复后重启
 - 服务内部的 `Completed` 集合默认最多保留 `4096` 个 issue ID，仅用于 bookkeeping / 可观测性；它不是完整历史，也不参与重启恢复
 
 建议先检查：
@@ -142,8 +145,8 @@ curl http://127.0.0.1:8080/api/v1/state
 - 变更后会尝试 reload
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
-- `orchestrator.auto_close_on_pr` 与 `runtime.notifications` 支持热更新；默认值分别为 `true` 和“关闭”
-- `runtime.session_persistence` 仍属于 `restart-required`；当前实现不会在 reload 时热切换 state store
+- 仅 `runtime.notifications` 与纯节奏类配置（如 `polling.interval_ms`、并发上限）支持热更新
+- `workspace.*`、`runtime.session_persistence.*`、source / enabled_sources / dispatch_flow / profile、tracker 身份与状态语义、会改变 completion/恢复语义的关键运行配置一律属于 `restart-required`
 
 - `automation/project.yaml`
 - 当前激活的 `automation/profiles/*.yaml`
@@ -412,7 +415,7 @@ gh workflow run live-smoke.yml --ref <branch> -f phase=heavy -f repo=IIwate/line
 - 检查 `codex.command`
 - 提升日志级别到 `debug`
 - 检查目标环境对 `codex app-server` 的可执行性
-- 检查 `/api/v1/state` 的 `alerts` 和 issue 级 `last_error`，确认是否出现 repeated stall / `stalled session`
+- 检查 `/api/v1/state` 的 `health.alerts`、`observations.derived` 和 issue 级 `last_error`，确认是否出现 repeated stall / `stalled session`
 - 结合日志里的 `session_id`、`turn_id`、最后一条 agent event，判断是真停滞还是 `codex.stall_timeout_ms` 阈值过紧
 - 对确实会长时间无输出的任务，临时调大 `codex.stall_timeout_ms`；若仅用于短时排障，也可设为 `<=0` 暂时关闭 stall detection
 - 在 Windows 上用 `Get-Command bash` 或 `where.exe bash` 确认优先命中 Git Bash；该兼容逻辑为保留项，不应删除
@@ -423,7 +426,7 @@ gh workflow run live-smoke.yml --ref <branch> -f phase=heavy -f repo=IIwate/line
 
 - 关联 PR 仍为 open，系统正在等待 merge，而不是继续重跑 agent
 - GitHub API 查询失败，且 fallback 到 `gh api` 也失败
-- PR 状态查询失败，`/api/v1/state` 中出现 `merge_status_unknown` 告警
+- PR 状态查询失败，`/api/v1/state` 的 `observations.derived` 中出现 `merge_status_unknown`
 - PR 已 closed 但未 merged，issue 被转入 `awaiting_intervention`，不会自动 retry / re-dispatch
 
 处理：

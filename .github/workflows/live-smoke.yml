@@ -69,6 +69,6 @@ jobs:
           if (-not $env:GH_TOKEN) { throw "Missing secret LIVE_SMOKE_GH_TOKEN" }
           if (-not $env:LINEAR_API_KEY) { throw "Missing secret LIVE_SMOKE_LINEAR_API_KEY" }
           if (-not $env:LINEAR_PROJECT_SLUG) { throw "Missing secret LIVE_SMOKE_LINEAR_PROJECT_SLUG" }
-          $phase = "${{ github.event_name == 'workflow_dispatch' && inputs.phase || 'heavy' }}"
+          $phase = "${{ github.event_name == 'workflow_dispatch' && inputs.phase || 'all' }}"
           $repo = "${{ github.event_name == 'workflow_dispatch' && inputs.repo || 'IIwate/linear-test' }}"
           py -3 scripts/live_smoke.py --phase $phase --repo $repo

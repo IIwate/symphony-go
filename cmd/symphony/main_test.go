@@ -532,15 +532,18 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
 	configDir := filepath.Join(tmpDir, "automation")
 	workspaceRoot := filepath.ToSlash(filepath.Join(tmpDir, "workspaces"))
 	writeAutomationConfig(t, configDir, automationFixtureOptions{WorkspaceRoot: workspaceRoot})
+	writeFile(t, filepath.Join(configDir, "flows", "other-flow.yaml"), "prompt: prompts/other.md.liquid\n")
+	writeFile(t, filepath.Join(configDir, "prompts", "other.md.liquid"), "other flow\n")
 
-	writeProject := func(workspaceValue string, sessionPath string, notificationURL string, pollInterval int) {
+	writeProject := func(workspaceValue string, branchNamespace string, sessionPath string, notificationURL string, pollInterval int, dispatchFlow string, codexCommand string) {
 		projectYAML := fmt.Sprintf(`runtime:
   workspace:
     root: %s
+    branch_namespace: %s
   polling:
     interval_ms: %d
   codex:
-    command: codex app-server
+    command: %s
   session_persistence:
     enabled: true
     kind: file
@@ -564,16 +567,16 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
       queue_size: 64
       critical_queue_size: 16
 selection:
-  dispatch_flow: implement
+  dispatch_flow: %s
   enabled_sources:
     - linear-main
 defaults:
   profile: null
-`, workspaceValue, pollInterval, sessionPath, notificationURL)
+`, workspaceValue, branchNamespace, pollInterval, codexCommand, sessionPath, notificationURL, dispatchFlow)
 		writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	}
 
-	writeProject(workspaceRoot, "./automation/local/session-state.json", "https://hooks.example.com/a", 30000)
+	writeProject(workspaceRoot, "runner-a", "./automation/local/session-state.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server")
 
 	repoDef, err := loader.Load(configDir, "")
 	if err != nil {
@@ -596,52 +599,100 @@ defaults:
 	}
 
 	tests := []struct {
-		name         string
-		workspace    string
-		sessionPath  string
-		url          string
-		pollInterval int
-		wantErr      string
-		wantURL      string
-		wantPoll     int
+		name            string
+		workspace       string
+		branchNamespace string
+		sessionPath     string
+		url             string
+		pollInterval    int
+		dispatchFlow    string
+		codexCommand    string
+		wantErr         string
+		wantURL         string
+		wantPoll        int
 	}{
 		{
-			name:         "session persistence",
-			workspace:    workspaceRoot,
-			sessionPath:  "./automation/local/other-session-state.json",
-			url:          "https://hooks.example.com/a",
-			pollInterval: 30000,
-			wantErr:      "runtime.session_persistence changed: restart required",
+			name:            "session persistence",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/other-session-state.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			wantErr:         "runtime.session_persistence changed: restart required",
 		},
 		{
-			name:         "workspace root",
-			workspace:    filepath.ToSlash(filepath.Join(tmpDir, "other-workspaces")),
-			sessionPath:  "./automation/local/session-state.json",
-			url:          "https://hooks.example.com/a",
-			pollInterval: 30000,
-			wantErr:      "runtime.workspace.root changed: restart required",
+			name:            "workspace root",
+			workspace:       filepath.ToSlash(filepath.Join(tmpDir, "other-workspaces")),
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/session-state.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			wantErr:         "runtime.workspace.root changed: restart required",
 		},
 		{
-			name:         "notifications",
-			workspace:    workspaceRoot,
-			sessionPath:  "./automation/local/session-state.json",
-			url:          "https://hooks.example.com/b",
-			pollInterval: 30000,
-			wantURL:      "https://hooks.example.com/b",
+			name:            "workspace branch namespace",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-b",
+			sessionPath:     "./automation/local/session-state.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			wantErr:         "runtime.workspace.branch_namespace changed: restart required",
 		},
 		{
-			name:         "poll interval",
-			workspace:    workspaceRoot,
-			sessionPath:  "./automation/local/session-state.json",
-			url:          "https://hooks.example.com/a",
-			pollInterval: 45000,
-			wantPoll:     45000,
+			name:            "dispatch flow",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/session-state.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "other-flow",
+			codexCommand:    "codex app-server",
+			wantErr:         "selection.dispatch_flow changed: restart required",
+		},
+		{
+			name:            "codex command",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/session-state.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex next-server",
+			wantErr:         "runtime.codex.command changed: restart required",
+		},
+		{
+			name:            "notifications",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/session-state.json",
+			url:             "https://hooks.example.com/b",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			wantURL:         "https://hooks.example.com/b",
+		},
+		{
+			name:            "poll interval",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/session-state.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    45000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			wantPoll:        45000,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			writeProject(tc.workspace, tc.sessionPath, tc.url, tc.pollInterval)
+			writeProject(tc.workspace, tc.branchNamespace, tc.sessionPath, tc.url, tc.pollInterval, tc.dispatchFlow, tc.codexCommand)
 			reloaded, err := loader.Load(configDir, "")
 			if err != nil {
 				t.Fatalf("loader.Load() reload error = %v", err)

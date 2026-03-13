@@ -48,10 +48,14 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 		t.Fatalf("service.uptime_seconds = %v, want positive", service["uptime_seconds"])
 	}
 	counts := payload["counts"].(map[string]any)
-	if counts["running"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["awaiting_intervention"].(float64) != 1 || counts["retrying"].(float64) != 1 {
+	if counts["running"].(float64) != 1 || counts["recovering"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["awaiting_intervention"].(float64) != 1 || counts["retrying"].(float64) != 1 {
 		t.Fatalf("counts = %+v", counts)
 	}
 	recovery := payload["recovery"].(map[string]any)
+	recovering := recovery["recovering"].([]any)
+	if len(recovering) != 1 {
+		t.Fatalf("recovering = %+v, want 1 entry", recovering)
+	}
 	awaitingMerge := recovery["awaiting_merge"].([]any)
 	if len(awaitingMerge) != 1 {
 		t.Fatalf("awaiting_merge = %+v, want 1 entry", awaitingMerge)
@@ -64,6 +68,21 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	alerts := health["alerts"].([]any)
 	if len(alerts) != 1 {
 		t.Fatalf("alerts = %+v, want 1 alert", alerts)
+	}
+	notifications := health["notifications"].([]any)
+	if len(notifications) != 1 {
+		t.Fatalf("notifications = %+v, want 1 channel", notifications)
+	}
+	persistence := health["persistence"].(map[string]any)
+	if persistence["status"] != "healthy" {
+		t.Fatalf("persistence.status = %v, want healthy", persistence["status"])
+	}
+	observations := payload["observations"].(map[string]any)
+	if len(observations["derived"].([]any)) != 1 {
+		t.Fatalf("observations.derived = %+v, want 1 entry", observations["derived"])
+	}
+	if len(observations["protected_results"].([]any)) != 1 {
+		t.Fatalf("observations.protected_results = %+v, want 1 entry", observations["protected_results"])
 	}
 	rateLimits := payload["rate_limits"].(map[string]any)
 	if rateLimits["remaining"] != float64(9) {
@@ -148,6 +167,37 @@ func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
 		t.Fatalf("awaiting_intervention.pr_state = %v, want closed", interventionEntry["pr_state"])
 	}
 
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-5", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var recoveringPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &recoveringPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if recoveringPayload["status"] != "recovering" {
+		t.Fatalf("status = %v, want recovering", recoveringPayload["status"])
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-6", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var protectedPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &protectedPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if protectedPayload["status"] != "protected_result" {
+		t.Fatalf("status = %v, want protected_result", protectedPayload["status"])
+	}
+	if protectedPayload["protected_result"] == nil {
+		t.Fatalf("protected_result missing: %+v", protectedPayload)
+	}
+
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/MISSING", nil)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -198,8 +248,8 @@ func TestRefreshEndpointRejectsProtectedMode(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if payload["accepted"] != false {
-		t.Fatalf("accepted = %v, want false", payload["accepted"])
+	if _, ok := payload["accepted"]; ok {
+		t.Fatalf("payload = %+v, want canonical error envelope only", payload)
 	}
 	errPayload := payload["error"].(map[string]any)
 	if errPayload["code"] != "service_protected_mode" {
@@ -447,6 +497,7 @@ func sampleSnapshot() orchestrator.Snapshot {
 			Mode:      "normal",
 		},
 		Counts: orchestrator.SnapshotCounts{
+			Recovering:           1,
 			Running:              1,
 			AwaitingMerge:        1,
 			AwaitingIntervention: 1,
@@ -471,6 +522,18 @@ func sampleSnapshot() orchestrator.Snapshot {
 			},
 		},
 		Recovery: orchestrator.RecoverySnapshot{
+			Recovering: []orchestrator.RecoveringSnapshot{
+				{
+					IssueID:         "5",
+					IssueIdentifier: "ABC-5",
+					WorkspacePath:   "C:/work/ABC-5",
+					State:           "In Progress",
+					Strategy:        "post_run_resume",
+					Source:          "succeeded",
+					ObservedAt:      now.Add(-90 * time.Second),
+					AttemptCount:    1,
+				},
+			},
 			AwaitingMerge: []orchestrator.AwaitingMergeSnapshot{
 				{
 					IssueID:         "3",
@@ -515,6 +578,43 @@ func sampleSnapshot() orchestrator.Snapshot {
 					Code:    "tracker_unreachable",
 					Level:   "warn",
 					Message: "tracker down",
+				},
+			},
+			Notifications: []orchestrator.NotificationChannelHealthSnapshot{
+				{
+					ChannelID:           "ops",
+					DisplayName:         "Ops",
+					Status:              "healthy",
+					ConsecutiveFailures: 0,
+				},
+			},
+			Persistence: orchestrator.PersistenceHealthSnapshot{
+				Enabled:             true,
+				Kind:                "file",
+				Status:              "healthy",
+				ConsecutiveFailures: 0,
+			},
+		},
+		Observations: orchestrator.RuntimeObservationsSnapshot{
+			Derived: []orchestrator.ObservationSnapshot{
+				{
+					Code:            "merge_status_unknown",
+					Level:           "warn",
+					Message:         "gh unavailable",
+					IssueID:         "3",
+					IssueIdentifier: "ABC-3",
+				},
+			},
+			ProtectedResults: []orchestrator.ProtectedResultSnapshot{
+				{
+					IssueID:         "6",
+					IssueIdentifier: "ABC-6",
+					WorkspacePath:   "C:/work/ABC-6",
+					Outcome:         "succeeded",
+					Phase:           "succeeded",
+					FinalBranch:     "feature/abc-6",
+					ObservedAt:      now.Add(-30 * time.Second),
+					AttemptCount:    2,
 				},
 			},
 		},

@@ -192,6 +192,66 @@ func TestHandleSessionPersistenceWriteFailureEntersProtectedModeOnce(t *testing.
 	}
 }
 
+func TestHandleWorkerExitSuccessWaitsForPersistenceBeforeResume(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	o := newTestOrchestrator(testServiceConfig(), tracker, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			"feature/abc-1": {
+				Number:     99,
+				URL:        "https://example.test/pr/99",
+				HeadBranch: "feature/abc-1",
+				State:      PullRequestStateOpen,
+			},
+		},
+	}
+	store := &fakeStateStore{}
+	o.stateStore = store
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
+		Dispatch:      pullRequestDispatch(),
+	}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:     "1",
+		Identifier:  "ABC-1",
+		StartedAt:   now,
+		Phase:       model.PhaseSucceeded,
+		FinalBranch: "feature/abc-1",
+	})
+
+	if o.state.Recovering["1"] == nil {
+		t.Fatal("recovering entry missing before persistence success")
+	}
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatalf("awaiting merge = %+v, want empty before persistence success", o.state.AwaitingMerge)
+	}
+	if got := o.pendingResume["1"]; got != 1 {
+		t.Fatalf("pending resume version = %d, want 1", got)
+	}
+
+	o.handleSessionPersistenceWriteSuccess(1)
+
+	if _, ok := o.pendingResume["1"]; ok {
+		t.Fatalf("pending resume should be cleared: %+v", o.pendingResume)
+	}
+	if o.state.Recovering["1"] != nil {
+		t.Fatalf("recovering entry still exists after persistence success: %+v", o.state.Recovering["1"])
+	}
+	if o.state.AwaitingMerge["1"] == nil {
+		t.Fatalf("awaiting merge entry missing after persistence success: %+v", o.state.AwaitingMerge)
+	}
+}
+
 func TestProtectedModeBlocksRefreshDispatchAndRetry(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	runner := &fakeRunner{runCh: make(chan string, 1), block: make(chan struct{})}
@@ -280,6 +340,43 @@ func TestHandleWorkerExitInProtectedModeRecordsObservationOnly(t *testing.T) {
 	snapshot := o.Snapshot()
 	if len(snapshot.Observations.ProtectedResults) != 1 {
 		t.Fatalf("protected results snapshot = %+v, want 1 item", snapshot.Observations.ProtectedResults)
+	}
+}
+
+func TestHandleCodexUpdateInProtectedModeDoesNotAdvanceDurableTotals(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.CodexTotals = model.TokenTotals{InputTokens: 10, OutputTokens: 20, TotalTokens: 30}
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		Identifier:   "ABC-1",
+		StartedAt:    now.Add(-time.Second),
+		WorkerCancel: func() {},
+	}
+	o.mu.Lock()
+	o.enterProtectedModeLocked("disk full")
+	o.mu.Unlock()
+
+	o.handleCodexUpdate(CodexUpdate{
+		IssueID: "1",
+		Event: agent.AgentEvent{
+			Event:     "turn_completed",
+			Message:   "ok",
+			Timestamp: now,
+			Usage: &agent.TokenUsage{
+				InputTokens:  100,
+				OutputTokens: 50,
+				TotalTokens:  150,
+			},
+		},
+	})
+
+	if o.state.CodexTotals.InputTokens != 10 || o.state.CodexTotals.OutputTokens != 20 || o.state.CodexTotals.TotalTokens != 30 {
+		t.Fatalf("codex totals advanced in protected mode: %+v", o.state.CodexTotals)
+	}
+	entry := o.state.Running["1"]
+	if entry == nil || entry.Session.CodexTotalTokens != 150 {
+		t.Fatalf("running session tokens = %+v, want observed totals only", entry)
 	}
 }
 
@@ -640,16 +737,12 @@ func TestSnapshotIncludesAlertsAndWorkspaceContext(t *testing.T) {
 	if snapshot.Running[0].AttemptCount != 2 {
 		t.Fatalf("running attempt count = %d, want 2", snapshot.Running[0].AttemptCount)
 	}
-	codes := make(map[string]struct{}, len(snapshot.Health.Alerts)+len(snapshot.Observations.Derived))
-	for _, alert := range snapshot.Health.Alerts {
-		codes[alert.Code] = struct{}{}
+	if !hasAlertCode(snapshot.Health.Alerts, "tracker_unreachable") {
+		t.Fatalf("alerts = %+v, want tracker_unreachable", snapshot.Health.Alerts)
 	}
-	for _, observation := range snapshot.Observations.Derived {
-		codes[observation.Code] = struct{}{}
-	}
-	for _, code := range []string{"tracker_unreachable", "repeated_stall", "workspace_hook_failure"} {
-		if _, ok := codes[code]; !ok {
-			t.Fatalf("missing code %q in alerts=%+v observations=%+v", code, snapshot.Health.Alerts, snapshot.Observations.Derived)
+	for _, code := range []string{"repeated_stall", "workspace_hook_failure"} {
+		if !hasObservationCode(snapshot.Observations.Derived, code) {
+			t.Fatalf("missing observation %q in %+v", code, snapshot.Observations.Derived)
 		}
 	}
 }
@@ -2631,14 +2724,17 @@ func hasObservationCode(observations []ObservationSnapshot, code string) bool {
 type fakeStateStore struct {
 	disableCalls  int
 	scheduleCalls int
+	nextVersion   uint64
 }
 
 func (f *fakeStateStore) Load() (*durableRuntimeState, error) {
 	return nil, nil
 }
 
-func (f *fakeStateStore) Schedule(_ durableRuntimeState, _ bool) {
+func (f *fakeStateStore) Schedule(_ durableRuntimeState, _ bool) uint64 {
 	f.scheduleCalls++
+	f.nextVersion++
+	return f.nextVersion
 }
 
 func (f *fakeStateStore) Disable() {

@@ -858,11 +858,39 @@ def _assert_public_state_surface(payload: dict[str, object]) -> None:
     counts = payload.get("counts")
     if isinstance(counts, dict) and "recovered_pending" in counts:
         raise RuntimeError("/api/v1/state counts still expose recovered_pending")
+    for legacy_key in ["recovering", "awaiting_merge", "awaiting_intervention", "retrying", "alerts"]:
+        if legacy_key in payload:
+            raise RuntimeError(f"/api/v1/state still exposes legacy top-level field {legacy_key}")
+    service = payload.get("service")
+    if not isinstance(service, dict) or not str(service.get("mode", "")).strip():
+        raise RuntimeError(f"/api/v1/state service.mode missing: {payload}")
+    health = payload.get("health")
+    if not isinstance(health, dict):
+        raise RuntimeError(f"/api/v1/state health missing: {payload}")
+    if not isinstance(health.get("alerts"), list):
+        raise RuntimeError(f"/api/v1/state health.alerts missing: {payload}")
+    if not isinstance(health.get("notifications"), list):
+        raise RuntimeError(f"/api/v1/state health.notifications missing: {payload}")
+    if not isinstance(health.get("persistence"), dict):
+        raise RuntimeError(f"/api/v1/state health.persistence missing: {payload}")
+    observations = payload.get("observations")
+    if not isinstance(observations, dict):
+        raise RuntimeError(f"/api/v1/state observations missing: {payload}")
+    if not isinstance(observations.get("derived"), list):
+        raise RuntimeError(f"/api/v1/state observations.derived missing: {payload}")
+    if not isinstance(observations.get("protected_results"), list):
+        raise RuntimeError(f"/api/v1/state observations.protected_results missing: {payload}")
 
 
 def _assert_issue_surface(payload: dict[str, object]) -> None:
     if "recovered_pending" in payload:
         raise RuntimeError("issue detail still exposes recovered_pending")
+    status = str(payload.get("status", "")).strip()
+    allowed = {"running", "recovering", "awaiting_merge", "awaiting_intervention", "retrying", "protected_result"}
+    if status not in allowed:
+        raise RuntimeError(f"issue detail status is unsupported: {payload}")
+    if status == "protected_result" and not isinstance(payload.get("protected_result"), dict):
+        raise RuntimeError(f"issue detail protected_result missing: {payload}")
 
 
 def _assert_refresh_contract(base_url: str) -> None:

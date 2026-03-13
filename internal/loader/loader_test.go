@@ -583,6 +583,28 @@ func TestWatchIgnoresEnvLocalChange(t *testing.T) {
 	}
 }
 
+func TestWatchIgnoresSessionStateChange(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 1)
+	if err := Watch(ctx, root, "", func(def *model.AutomationDefinition) {
+		updates <- def
+	}); err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(root, "local", "session-state.json"), "{\"version\":1}\n")
+
+	select {
+	case definition := <-updates:
+		t.Fatalf("unexpected update received for session-state.json change: %+v", definition)
+	case <-time.After(750 * time.Millisecond):
+	}
+}
+
 func TestWatchReloadsActiveDefaultProfileFile(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		ProfileName: "dev",

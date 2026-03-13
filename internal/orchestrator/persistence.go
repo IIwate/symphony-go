@@ -26,7 +26,7 @@ const (
 
 type stateStore interface {
 	Load() (*durableRuntimeState, error)
-	Schedule(state durableRuntimeState, critical bool)
+	Schedule(state durableRuntimeState, critical bool) uint64
 	Disable()
 	Close(ctx context.Context) error
 }
@@ -142,7 +142,7 @@ type fileStateStore struct {
 	logger    *slog.Logger
 	config    model.SessionPersistenceConfig
 	identity  RuntimeIdentity
-	onSuccess func()
+	onSuccess func(uint64)
 	onFailure func(error)
 
 	mu          sync.Mutex
@@ -153,7 +153,7 @@ type fileStateStore struct {
 	closeCh     chan closeRequest
 }
 
-func newFileStateStore(cfg model.SessionPersistenceConfig, identity RuntimeIdentity, logger *slog.Logger, onSuccess func(), onFailure func(error)) stateStore {
+func newFileStateStore(cfg model.SessionPersistenceConfig, identity RuntimeIdentity, logger *slog.Logger, onSuccess func(uint64), onFailure func(error)) stateStore {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -194,19 +194,20 @@ func (s *fileStateStore) Load() (*durableRuntimeState, error) {
 	return &state, nil
 }
 
-func (s *fileStateStore) Schedule(state durableRuntimeState, critical bool) {
+func (s *fileStateStore) Schedule(state durableRuntimeState, critical bool) uint64 {
 	s.mu.Lock()
 	if s.disabled {
 		s.mu.Unlock()
-		return
+		return 0
 	}
 	s.nextVersion++
+	version := s.nextVersion
 	force := critical && s.config.File.FsyncOnCritical
 	if s.desired != nil && s.desired.force {
 		force = true
 	}
 	s.desired = &scheduledDurableState{
-		version: s.nextVersion,
+		version: version,
 		force:   force,
 		state:   cloneDurableRuntimeState(state),
 	}
@@ -216,6 +217,7 @@ func (s *fileStateStore) Schedule(state durableRuntimeState, critical bool) {
 	case s.signalCh <- struct{}{}:
 	default:
 	}
+	return version
 }
 
 func (s *fileStateStore) Disable() {
@@ -409,7 +411,7 @@ func (s *fileStateStore) flushPending(pending *scheduledDurableState, force bool
 
 	hasMore, nextForce := s.markFlushed(pending.version)
 	if s.onSuccess != nil {
-		s.onSuccess()
+		s.onSuccess(pending.version)
 	}
 	return hasMore, nextForce, nil
 }
@@ -595,20 +597,20 @@ func (o *Orchestrator) currentRuntimeIdentity() RuntimeIdentity {
 	return normalizeRuntimeIdentity(o.runtimeIdentityFn())
 }
 
-func (o *Orchestrator) scheduleStatePersistLocked(critical bool) {
+func (o *Orchestrator) scheduleStatePersistLocked(critical bool) uint64 {
 	if o.stateStore == nil {
-		return
+		return 0
 	}
-	o.stateStore.Schedule(o.buildPersistedStateLocked(), critical)
+	return o.stateStore.Schedule(o.buildPersistedStateLocked(), critical)
 }
 
-func (o *Orchestrator) commitStateLocked(critical bool) {
+func (o *Orchestrator) commitStateLocked(critical bool) uint64 {
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
 	if o.isProtectedLocked() {
-		return
+		return 0
 	}
-	o.scheduleStatePersistLocked(critical)
+	return o.scheduleStatePersistLocked(critical)
 }
 
 func (o *Orchestrator) publishViewLocked() {
@@ -913,6 +915,7 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 			o.mu.Lock()
 			current := o.state.Recovering[issueID]
 			if current != nil {
+				delete(o.pendingResume, issueID)
 				delete(o.state.Recovering, issueID)
 				o.commitStateLocked(true)
 			}
@@ -927,6 +930,7 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 			o.mu.Lock()
 			current := o.state.Recovering[issueID]
 			if current != nil {
+				delete(o.pendingResume, issueID)
 				delete(o.state.Recovering, issueID)
 				o.scheduleRetryLocked(issueID, entry.Identifier, entry.RetryAttempt, nil, true, entry.StallCount, entry.Dispatch)
 				o.commitStateLocked(true)
@@ -974,6 +978,7 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 		o.mu.Lock()
 		current := o.state.Recovering[issueID]
 		if current != nil {
+			delete(o.pendingResume, issueID)
 			delete(o.state.Recovering, issueID)
 			o.scheduleRetryLocked(issueID, entry.Identifier, 1, nil, true, entry.StallCount, retryDispatch)
 			o.commitStateLocked(true)
@@ -983,6 +988,7 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 		o.mu.Lock()
 		current := o.state.Recovering[issueID]
 		if current != nil {
+			delete(o.pendingResume, issueID)
 			delete(o.state.Recovering, issueID)
 			o.scheduleRetryLocked(issueID, entry.Identifier, 1, nil, true, entry.StallCount, continuationDispatchContext(entry.Dispatch, normalizeCompletionContract(o.currentWorkflow().Completion), model.ContinuationReasonUnfinishedIssue, entry.FinalBranch, nil, issueState))
 			o.commitStateLocked(true)
@@ -1020,22 +1026,25 @@ func (o *Orchestrator) newRetryTimer(issueID string, dueAt time.Time) *time.Time
 	})
 }
 
-func (o *Orchestrator) reportSessionPersistenceWriteSuccess() {
-	o.handleSessionPersistenceWriteSuccess()
+func (o *Orchestrator) reportSessionPersistenceWriteSuccess(version uint64) {
+	o.handleSessionPersistenceWriteSuccess(version)
 }
 
 func (o *Orchestrator) reportSessionPersistenceWriteFailure(err error) {
 	o.handleSessionPersistenceWriteFailure(err)
 }
 
-func (o *Orchestrator) handleSessionPersistenceWriteSuccess() {
+func (o *Orchestrator) handleSessionPersistenceWriteSuccess(version uint64) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.isProtectedLocked() {
+		o.mu.Unlock()
 		return
 	}
 
 	now := o.now().UTC()
+	if version > o.lastPersistedStateVersion {
+		o.lastPersistedStateVersion = version
+	}
 	o.persistenceHealth.Status = "healthy"
 	o.persistenceHealth.LastAttemptAt = cloneTimePtr(&now)
 	o.persistenceHealth.LastSuccessAt = cloneTimePtr(&now)
@@ -1043,6 +1052,17 @@ func (o *Orchestrator) handleSessionPersistenceWriteSuccess() {
 	o.persistenceHealth.ConsecutiveFailures = 0
 	o.clearHealthAlertAndNotifyLocked(sessionPersistenceWriteFailCode)
 	o.publishViewLocked()
+	shouldResume := false
+	for issueID, requiredVersion := range o.pendingResume {
+		if requiredVersion <= version {
+			delete(o.pendingResume, issueID)
+			shouldResume = true
+		}
+	}
+	o.mu.Unlock()
+	if shouldResume {
+		o.reconcileRecovering(o.runtimeContext())
+	}
 }
 
 func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
@@ -1056,6 +1076,7 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.persistenceHealth.LastAttemptAt = cloneTimePtr(&now)
 	o.persistenceHealth.LastError = optionalError(errorText)
 	o.persistenceHealth.ConsecutiveFailures++
+	clear(o.pendingResume)
 	if o.stateStore != nil {
 		o.stateStore.Disable()
 	}
