@@ -614,7 +614,18 @@ def _run_runtime_extensions_smoke(
             description="runtime_extensions session state file",
             interval_seconds=0.2,
         )
-        persisted = _load_session_state(session_state_path)
+        persisted = _wait_for(
+            lambda: _load_session_state(session_state_path)
+            if any(
+                str(item.get("identifier", "")).strip() == persistence_identifier
+                for item in _session_state_entries(_load_session_state(session_state_path), "awaiting_intervention")
+            )
+            else None,
+            process,
+            timeout_seconds=10,
+            description="runtime_extensions awaiting_intervention persisted",
+            interval_seconds=0.2,
+        )
         _assert_session_identity(
             persisted,
             active_source="linear-main",
@@ -624,9 +635,6 @@ def _run_runtime_extensions_smoke(
         )
         if "recovered_pending" in persisted:
             raise RuntimeError("session-state.json still exposes legacy recovered_pending key")
-        awaiting_intervention = _session_state_entries(persisted, "awaiting_intervention")
-        if not any(str(item.get("identifier", "")).strip() == persistence_identifier for item in awaiting_intervention):
-            raise RuntimeError("session-state.json missing awaiting_intervention entry after intervention path")
 
         notification_count_before_restart = recorder.count()
         process.stop()
