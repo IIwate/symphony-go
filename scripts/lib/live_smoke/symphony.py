@@ -78,9 +78,11 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
             [
                 "  session_persistence:",
                 "    enabled: true",
-                f"    path: {session_state_path}",
-                "    flush_interval_ms: 200",
-                "    fsync_on_critical: true",
+                "    kind: file",
+                "    file:",
+                f"      path: {session_state_path}",
+                "      flush_interval_ms: 200",
+                "      fsync_on_critical: true",
             ]
         )
     if config.notification_port is not None:
@@ -88,18 +90,26 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
             [
                 "  notifications:",
                 "    channels:",
-                "      - name: local-webhook",
+                "      - id: local-webhook",
+                "        display_name: Local Webhook",
                 "        kind: webhook",
-                f"        url: http://127.0.0.1:{config.notification_port}/webhook",
-                "        events: [issue_intervention_required, issue_completed]",
-                "      - name: local-slack",
+                "        subscriptions:",
+                "          types: [issue_intervention_required, issue_completed]",
+                "        webhook:",
+                f"          url: http://127.0.0.1:{config.notification_port}/webhook",
+                "      - id: local-slack",
+                "        display_name: Local Slack",
                 "        kind: slack",
-                f"        url: http://127.0.0.1:{config.notification_port}/slack",
-                "        events: [issue_intervention_required, issue_completed]",
+                "        subscriptions:",
+                "          types: [issue_intervention_required, issue_completed]",
+                "        slack:",
+                f"          incoming_webhook_url: http://127.0.0.1:{config.notification_port}/slack",
                 "    defaults:",
                 "      timeout_ms: 3000",
                 "      retry_count: 0",
                 "      retry_delay_ms: 0",
+                "      queue_size: 32",
+                "      critical_queue_size: 8",
             ]
         )
     project_lines.extend(

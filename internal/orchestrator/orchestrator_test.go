@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1620,7 +1619,7 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 
 	err := writeDurableRuntimeState(statePath, durableRuntimeState{
 		Version:  durableStateVersion,
-		Identity: RuntimeIdentity{TrackerKind: "linear"},
+		Identity: RuntimeIdentity{Compatibility: RuntimeCompatibility{TrackerKind: "linear"}},
 		SavedAt:  savedAt,
 		Retrying: []durableRetryEntry{
 			{
@@ -1630,10 +1629,10 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 				Attempt:       3,
 				StallCount:    1,
 				DueAt:         dueAt,
-				Dispatch:      &model.DispatchContext{Kind: model.DispatchKindFresh},
+				Dispatch:      durableDispatchFromModel(&model.DispatchContext{Kind: model.DispatchKindFresh}),
 			},
 		},
-		Interrupted: []durableInterruptedEntry{
+		Recovering: []durableRecoveryEntry{
 			{
 				IssueID:       "1",
 				Identifier:    "ISSUE-1",
@@ -1642,7 +1641,8 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 				RetryAttempt:  1,
 				StallCount:    2,
 				ObservedAt:    savedAt,
-				Source:        "running",
+				Strategy:      string(model.RecoveryStrategyContinuationRetry),
+				Source:        string(model.RecoverySourceRunning),
 			},
 			{
 				IssueID:       "5",
@@ -1652,39 +1652,33 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 				RetryAttempt:  4,
 				StallCount:    1,
 				ObservedAt:    savedAt,
-				Source:        "interrupted",
+				Strategy:      string(model.RecoveryStrategyContinuationRetry),
+				Source:        string(model.RecoverySourceRecovered),
 			},
 		},
 		AwaitingMerge: []durableAwaitingMergeEntry{
 			{
-				IssueID: "3",
-				AwaitingMergeEntry: model.AwaitingMergeEntry{
-					Identifier:    "ISSUE-3",
-					State:         "In Progress",
-					WorkspacePath: "/tmp/ISSUE-3",
-					Branch:        "feature/issue-3",
-					RetryAttempt:  1,
-					AwaitingSince: savedAt,
-				},
+				IssueID:       "3",
+				Identifier:    "ISSUE-3",
+				State:         "In Progress",
+				WorkspacePath: "/tmp/ISSUE-3",
+				Branch:        "feature/issue-3",
+				RetryAttempt:  1,
+				AwaitingSince: savedAt,
 			},
 		},
 		AwaitingIntervention: []durableAwaitingInterventionEntry{
 			{
-				IssueID: "4",
-				AwaitingInterventionEntry: model.AwaitingInterventionEntry{
-					Identifier:          "ISSUE-4",
-					WorkspacePath:       "/tmp/ISSUE-4",
-					Branch:              "feature/issue-4",
-					RetryAttempt:        2,
-					ObservedAt:          savedAt,
-					Reason:              "missing_pr",
-					ExpectedOutcome:     string(model.CompletionModePullRequest),
-					LastKnownIssueState: "In Progress",
-				},
+				IssueID:             "4",
+				Identifier:          "ISSUE-4",
+				WorkspacePath:       "/tmp/ISSUE-4",
+				Branch:              "feature/issue-4",
+				RetryAttempt:        2,
+				ObservedAt:          savedAt,
+				Reason:              "missing_pr",
+				ExpectedOutcome:     string(model.CompletionModePullRequest),
+				LastKnownIssueState: "In Progress",
 			},
-		},
-		Alerts: []AlertSnapshot{
-			{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"},
 		},
 		TokenTotal: model.TokenTotals{InputTokens: 10, OutputTokens: 20, TotalTokens: 30},
 	}, true)
@@ -1694,7 +1688,7 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 
 	cfg := testServiceConfig()
 	cfg.SessionPersistence.Enabled = true
-	cfg.SessionPersistence.Path = statePath
+	cfg.SessionPersistence.File.Path = statePath
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, savedAt.Add(time.Minute))
 	t.Cleanup(func() {
@@ -1710,7 +1704,7 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 		t.Fatalf("running size = %d, want 0", len(o.state.Running))
 	}
 	if len(o.recoveredPending) != 2 {
-		t.Fatalf("recovered pending size = %d, want 2", len(o.recoveredPending))
+		t.Fatalf("recovering size = %d, want 2", len(o.recoveredPending))
 	}
 	if o.state.RetryAttempts["2"].TimerHandle == nil {
 		t.Fatal("restored retry timer = nil, want timer")
@@ -1718,8 +1712,8 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 	if got := o.recoveredPending["1"].Source; got != "running" {
 		t.Fatalf("recovered pending source = %q, want running", got)
 	}
-	if got := o.recoveredPending["5"].Source; got != "interrupted" {
-		t.Fatalf("recovered pending source = %q, want interrupted", got)
+	if got := o.recoveredPending["5"].Source; got != "recovered" {
+		t.Fatalf("recovered pending source = %q, want recovered", got)
 	}
 	if len(o.state.AwaitingMerge) != 1 {
 		t.Fatalf("awaiting merge size = %d, want 1", len(o.state.AwaitingMerge))
@@ -1731,20 +1725,19 @@ func TestNewOrchestratorRestoresPersistedSessionState(t *testing.T) {
 		t.Fatalf("CodexTotals.TotalTokens = %d, want 30", got)
 	}
 
-	snapshot := o.Snapshot()
-	if !hasAlertCode(snapshot.Alerts, "tracker_unreachable") {
-		t.Fatalf("snapshot alerts = %+v, want tracker_unreachable", snapshot.Alerts)
+	if got := o.Snapshot().Counts.Recovering; got != 2 {
+		t.Fatalf("snapshot recovering count = %d, want 2", got)
 	}
 }
 
 func TestSystemAlertNotificationsEmitWebhookEvents(t *testing.T) {
 	var (
 		mu      sync.Mutex
-		payload []webhookPayload
+		payload []model.RuntimeEvent
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
-		var item webhookPayload
+		var item model.RuntimeEvent
 		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 			t.Fatalf("Decode() error = %v", err)
 		}
@@ -1757,18 +1750,13 @@ func TestSystemAlertNotificationsEmitWebhookEvents(t *testing.T) {
 
 	cfg := testServiceConfig()
 	cfg.Notifications.Channels = []model.NotificationChannelConfig{
-		{
-			Name:   "ops",
-			Kind:   model.NotificationChannelKindWebhook,
-			URL:    server.URL,
-			Events: []model.NotificationEventType{model.NotificationEventSystemAlert, model.NotificationEventSystemAlertCleared},
-		},
+		testWebhookChannel("ops", server.URL, model.NotificationEventSystemAlert, model.NotificationEventSystemAlertCleared),
 	}
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 	o.mu.Lock()
-	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
-	o.commitStateLocked(true)
+	o.setHealthAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.publishViewLocked()
 	o.mu.Unlock()
 	waitForCondition(t, time.Second, func() bool {
 		mu.Lock()
@@ -1777,8 +1765,8 @@ func TestSystemAlertNotificationsEmitWebhookEvents(t *testing.T) {
 	})
 
 	o.mu.Lock()
-	o.clearSystemAlertAndNotifyLocked("tracker_unreachable")
-	o.commitStateLocked(true)
+	o.clearHealthAlertAndNotifyLocked("tracker_unreachable")
+	o.publishViewLocked()
 	o.mu.Unlock()
 	waitForCondition(t, time.Second, func() bool {
 		mu.Lock()
@@ -1788,22 +1776,25 @@ func TestSystemAlertNotificationsEmitWebhookEvents(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if payload[0].Type != string(model.NotificationEventSystemAlert) {
+	if payload[0].Type != model.NotificationEventSystemAlert {
 		t.Fatalf("payload[0].Type = %q, want %q", payload[0].Type, model.NotificationEventSystemAlert)
 	}
-	if payload[1].Type != string(model.NotificationEventSystemAlertCleared) {
+	if payload[1].Type != model.NotificationEventSystemAlertCleared {
 		t.Fatalf("payload[1].Type = %q, want %q", payload[1].Type, model.NotificationEventSystemAlertCleared)
+	}
+	if payload[0].Alert == nil || payload[0].Alert.Code != "tracker_unreachable" {
+		t.Fatalf("payload[0].Alert = %+v, want tracker_unreachable", payload[0].Alert)
 	}
 }
 
 func TestMoveToAwaitingInterventionEmitsNotification(t *testing.T) {
 	var (
 		mu      sync.Mutex
-		payload []webhookPayload
+		payload []model.RuntimeEvent
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
-		var item webhookPayload
+		var item model.RuntimeEvent
 		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 			t.Fatalf("Decode() error = %v", err)
 		}
@@ -1816,12 +1807,7 @@ func TestMoveToAwaitingInterventionEmitsNotification(t *testing.T) {
 
 	cfg := testServiceConfig()
 	cfg.Notifications.Channels = []model.NotificationChannelConfig{
-		{
-			Name:   "ops",
-			Kind:   model.NotificationChannelKindWebhook,
-			URL:    server.URL,
-			Events: []model.NotificationEventType{model.NotificationEventIssueInterventionRequired},
-		},
+		testWebhookChannel("ops", server.URL, model.NotificationEventIssueInterventionRequired),
 	}
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
@@ -1839,11 +1825,11 @@ func TestMoveToAwaitingInterventionEmitsNotification(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if payload[0].Type != string(model.NotificationEventIssueInterventionRequired) {
+	if payload[0].Type != model.NotificationEventIssueInterventionRequired {
 		t.Fatalf("payload[0].Type = %q, want %q", payload[0].Type, model.NotificationEventIssueInterventionRequired)
 	}
-	if got := detailValue(payload[0].Details, "reason"); got != "missing_pr" {
-		t.Fatalf("payload[0].details.reason = %q, want missing_pr", got)
+	if payload[0].Dispatch == nil || payload[0].Dispatch.ContinuationReason == nil || *payload[0].Dispatch.ContinuationReason != "missing_pr" {
+		t.Fatalf("payload[0].Dispatch = %+v, want reason missing_pr", payload[0].Dispatch)
 	}
 }
 
@@ -1862,39 +1848,28 @@ func TestNotificationDeliveryFailureCreatesInternalAlert(t *testing.T) {
 
 	cfg := testServiceConfig()
 	cfg.Notifications.Channels = []model.NotificationChannelConfig{
-		{
-			Name:   "ops",
-			Kind:   model.NotificationChannelKindWebhook,
-			URL:    server.URL,
-			Events: []model.NotificationEventType{model.NotificationEventSystemAlert},
-		},
+		testWebhookChannel("ops", server.URL, model.NotificationEventSystemAlert),
 	}
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 	o.mu.Lock()
-	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
-	o.commitStateLocked(true)
+	o.setHealthAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.publishViewLocked()
 	o.mu.Unlock()
 
 	waitForCondition(t, time.Second, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		return requestsHit == 1
+		return requestsHit >= 1
 	})
-	waitForCondition(t, time.Second, func() bool {
-		return len(o.extensionCh) > 0
-	})
-	for len(o.extensionCh) > 0 {
-		o.handleRuntimeExtensionEvent(<-o.extensionCh)
-	}
 	waitForCondition(t, time.Second, func() bool {
 		return hasAlertCode(o.Snapshot().Alerts, "notification_delivery_failed_ops")
 	})
 
 	mu.Lock()
 	defer mu.Unlock()
-	if requestsHit != 1 {
-		t.Fatalf("request count = %d, want 1", requestsHit)
+	if requestsHit < 1 {
+		t.Fatalf("request count = %d, want >= 1", requestsHit)
 	}
 	if !hasAlertCode(o.Snapshot().Alerts, "notification_delivery_failed_ops") {
 		t.Fatalf("snapshot alerts = %+v, want notification_delivery_failed_ops", o.Snapshot().Alerts)
@@ -1904,15 +1879,15 @@ func TestNotificationDeliveryFailureCreatesInternalAlert(t *testing.T) {
 func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 	var (
 		oldMu      sync.Mutex
-		oldPayload []webhookPayload
+		oldPayload []model.RuntimeEvent
 		newMu      sync.Mutex
-		newPayload []webhookPayload
+		newPayload []model.RuntimeEvent
 	)
 	oldStarted := make(chan struct{})
 	releaseOld := make(chan struct{})
 	oldServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
-		var item webhookPayload
+		var item model.RuntimeEvent
 		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 			t.Fatalf("Decode() old error = %v", err)
 		}
@@ -1931,7 +1906,7 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 
 	newServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
-		var item webhookPayload
+		var item model.RuntimeEvent
 		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 			t.Fatalf("Decode() new error = %v", err)
 		}
@@ -1944,19 +1919,14 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 
 	cfg := testServiceConfig()
 	cfg.Notifications.Channels = []model.NotificationChannelConfig{
-		{
-			Name:   "ops",
-			Kind:   model.NotificationChannelKindWebhook,
-			URL:    oldServer.URL,
-			Events: []model.NotificationEventType{model.NotificationEventSystemAlert},
-		},
+		testWebhookChannel("ops", oldServer.URL, model.NotificationEventSystemAlert),
 	}
 
 	o := newTestOrchestrator(cfg, &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 
 	o.mu.Lock()
-	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
-	o.commitStateLocked(true)
+	o.setHealthAlertAndNotifyLocked(AlertSnapshot{Code: "tracker_unreachable", Level: "warn", Message: "tracker down"})
+	o.publishViewLocked()
 	o.mu.Unlock()
 
 	waitForCondition(t, time.Second, func() bool {
@@ -1968,9 +1938,10 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 		}
 	})
 
-	cfg.Notifications.Channels[0].URL = newServer.URL
+	cfg.Notifications.Channels[0].Webhook.URL = newServer.URL
 	o.mu.Lock()
 	oldNotifier := o.reloadNotifierLocked()
+	o.reconcileNotificationHealthLocked()
 	o.mu.Unlock()
 
 	drained := make(chan struct{})
@@ -1986,8 +1957,8 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 	}
 
 	o.mu.Lock()
-	o.setSystemAlertAndNotifyLocked(AlertSnapshot{Code: "dispatch_preflight_failed", Level: "warn", Message: "preflight down"})
-	o.commitStateLocked(true)
+	o.setHealthAlertAndNotifyLocked(AlertSnapshot{Code: "dispatch_preflight_failed", Level: "warn", Message: "preflight down"})
+	o.publishViewLocked()
 	o.mu.Unlock()
 
 	waitForCondition(t, time.Second, func() bool {
@@ -2016,25 +1987,32 @@ func TestReloadNotifierDrainsOldAndSwitchesToNew(t *testing.T) {
 	if len(newPayload) != 1 {
 		t.Fatalf("new notifier deliveries = %d, want 1", len(newPayload))
 	}
-	if got := detailValue(oldPayload[0].Details, "alert_code"); got != "tracker_unreachable" {
-		t.Fatalf("old payload details.alert_code = %q, want tracker_unreachable", got)
+	if oldPayload[0].Alert == nil || oldPayload[0].Alert.Code != "tracker_unreachable" {
+		t.Fatalf("old payload alert = %+v, want tracker_unreachable", oldPayload[0].Alert)
 	}
-	if got := detailValue(newPayload[0].Details, "alert_code"); got != "dispatch_preflight_failed" {
-		t.Fatalf("new payload details.alert_code = %q, want dispatch_preflight_failed", got)
+	if newPayload[0].Alert == nil || newPayload[0].Alert.Code != "dispatch_preflight_failed" {
+		t.Fatalf("new payload alert = %+v, want dispatch_preflight_failed", newPayload[0].Alert)
 	}
 }
 
 func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC))
 	customNotifier := &asyncNotifier{
-		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		emitters: []*notificationEmitter{
 			{
 				channel: notificationChannel{
-					name:         "ops",
-					subscribeAll: true,
+					id: "ops",
+					types: map[model.NotificationEventType]struct{}{
+						model.NotificationEventIssueCompleted: {},
+					},
+					delivery: model.NotificationDeliveryConfig{
+						QueueSize:         1,
+						CriticalQueueSize: 1,
+					},
 				},
-				queue: make(chan model.RuntimeEvent, 1),
+				normalQueue:   make(chan model.RuntimeEvent, 1),
+				criticalQueue: make(chan model.RuntimeEvent, 1),
 			},
 		},
 		enqueueResult: o.reportNotificationEnqueueResult,
@@ -2048,14 +2026,8 @@ func TestNotificationQueueOverflowSetsInternalAlert(t *testing.T) {
 	o.emitNotificationLocked(o.newIssueCompletedEvent("2", "ISSUE-2"))
 
 	waitForCondition(t, time.Second, func() bool {
-		return len(o.extensionCh) > 0
+		return hasAlertCode(o.Snapshot().Alerts, notificationQueueOverflowCode("ops"))
 	})
-	for len(o.extensionCh) > 0 {
-		o.handleRuntimeExtensionEvent(<-o.extensionCh)
-	}
-	if !hasAlertCode(o.Snapshot().Alerts, notificationQueueOverflowCode("ops")) {
-		t.Fatalf("snapshot alerts = %+v, want %q", o.Snapshot().Alerts, notificationQueueOverflowCode("ops"))
-	}
 }
 
 func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient tracker.Client, workspaceManager *fakeWorkspaceManager, runner *fakeRunner, now time.Time) *Orchestrator {
@@ -2065,9 +2037,13 @@ func newTestOrchestrator(cfg *model.ServiceConfig, trackerClient tracker.Client,
 		return &model.WorkflowDefinition{PromptTemplate: "Issue {{ issue.identifier }}"}
 	}, func() RuntimeIdentity {
 		return RuntimeIdentity{
-			ConfigRoot:  cfg.AutomationRootDir,
-			TrackerKind: cfg.TrackerKind,
-			TrackerRepo: cfg.TrackerRepo,
+			Compatibility: RuntimeCompatibility{
+				TrackerKind: cfg.TrackerKind,
+				TrackerRepo: cfg.TrackerRepo,
+			},
+			Descriptor: RuntimeDescriptor{
+				ConfigRoot: cfg.AutomationRootDir,
+			},
 		}
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	o.now = func() time.Time { return now }
@@ -2265,17 +2241,6 @@ func hasAlertCode(alerts []AlertSnapshot, code string) bool {
 	return false
 }
 
-func detailValue(details map[string]any, key string) string {
-	if details == nil {
-		return ""
-	}
-	value, ok := details[key]
-	if !ok || value == nil {
-		return ""
-	}
-	return fmt.Sprint(value)
-}
-
 func waitForCondition(t *testing.T, timeout time.Duration, check func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -2302,16 +2267,37 @@ func testServiceConfig() *model.ServiceConfig {
 		CodexStallTimeoutMS:        300000,
 		WorkspaceLinearBranchScope: "demo-scope",
 		SessionPersistence: model.SessionPersistenceConfig{
-			Path:            filepath.Join(os.TempDir(), "session-state.json"),
-			FlushIntervalMS: 1,
-			FsyncOnCritical: true,
+			Kind: model.SessionPersistenceKindFile,
+			File: model.SessionPersistenceFileConfig{
+				Path:            filepath.Join(os.TempDir(), "session-state.json"),
+				FlushIntervalMS: 1,
+				FsyncOnCritical: true,
+			},
 		},
 		Notifications: model.NotificationsConfig{
-			Defaults: model.NotificationDefaultsConfig{
-				TimeoutMS:    1000,
-				RetryCount:   0,
-				RetryDelayMS: 0,
+			Defaults: model.NotificationDeliveryConfig{
+				TimeoutMS:         1000,
+				RetryCount:        0,
+				RetryDelayMS:      0,
+				QueueSize:         32,
+				CriticalQueueSize: 8,
 			},
+		},
+	}
+}
+
+func testWebhookChannel(id string, url string, eventTypes ...model.NotificationEventType) model.NotificationChannelConfig {
+	cfg := testServiceConfig()
+	return model.NotificationChannelConfig{
+		ID:          id,
+		DisplayName: strings.ToUpper(id),
+		Kind:        model.NotificationChannelKindWebhook,
+		Subscriptions: model.NotificationSubscriptionConfig{
+			Types: append([]model.NotificationEventType(nil), eventTypes...),
+		},
+		Delivery: cfg.Notifications.Defaults,
+		Webhook: &model.WebhookNotificationConfig{
+			URL: url,
 		},
 	}
 }

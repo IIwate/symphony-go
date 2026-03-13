@@ -121,10 +121,13 @@ go run ./cmd/symphony --port 8080 --log-level info --log-file ./logs/symphony.lo
 
 其中：
 
-- `/api/v1/state` 会返回 `alerts` 字段，用于汇总 tracker 不可达、重复 stall、workspace hook 失败、PR merge 状态未知等需要 operator 关注的问题
+- `/api/v1/state` 当前按 `running / recovery / health` 三层返回状态
+- `health.alerts` 汇总 tracker 不可达、重复 stall、workspace hook 失败、PR merge 状态未知等需要 operator 关注的问题
+- `health.notifications` 汇总每个通知通道的瞬时健康状态，不会跨重启持久化
+- `health.persistence` 汇总 session persistence 当前健康状态，不再把这类瞬时运行健康直接当成 durable state
 - `/api/v1/state` 也会返回 `service.version`、`service.started_at`、`service.uptime_seconds`，用于快速确认当前进程版本和在线时长
-- `/api/v1/state` 也会返回 `awaiting_merge`、`awaiting_intervention` 以及对应计数，用于确认哪些 issue 正在等待 PR 合并或等待人工介入
-- `/api/v1/{identifier}` 会返回 `status`、`workspace_path`、`last_error`、`attempt_count`，便于按单 issue 排障
+- `/api/v1/state` 也会返回 `recovery.awaiting_merge`、`recovery.awaiting_intervention`、`recovery.recovering`、`recovery.retrying` 以及对应计数
+- `/api/v1/{identifier}` 会返回 `status`、`workspace_path`、`last_error`、`attempt_count`，并按状态选择 `running / recovering / awaiting_merge / awaiting_intervention / retry`
 - 服务内部的 `Completed` 集合默认最多保留 `4096` 个 issue ID，仅用于 bookkeeping / 可观测性；它不是完整历史，也不参与重启恢复
 
 建议先检查：
@@ -139,8 +142,8 @@ curl http://127.0.0.1:8080/api/v1/state
 - 变更后会尝试 reload
 - 若 reload 成功，新配置会应用到后续 dispatch / retry / reconcile
 - 若 reload 失败，系统保留最后一次有效配置，并记录 warning 日志
-- `orchestrator.auto_close_on_pr` 与 `runtime.notifications` 也支持热更新；默认值分别为 `true` 和“关闭”
-- `runtime.session_persistence` 仍属于 `restart-required`
+- `orchestrator.auto_close_on_pr` 与 `runtime.notifications` 支持热更新；默认值分别为 `true` 和“关闭”
+- `runtime.session_persistence` 仍属于 `restart-required`；当前实现不会在 reload 时热切换 state store
 
 - `automation/project.yaml`
 - 当前激活的 `automation/profiles/*.yaml`
@@ -160,7 +163,7 @@ curl http://127.0.0.1:8080/api/v1/state
 
 - 先修改一小处可验证字段，再观察日志是否出现 reload 成功
 - 对高风险字段（tracker、workspace.root、selection.dispatch_flow、hooks、codex、orchestrator.auto_close_on_pr、session_persistence）变更，先用 `--dry-run` 验证再上服务；`notifications` 支持热更新，但建议先小流量验证
-- 若启用 `runtime.session_persistence`，默认状态文件位于 `local/session-state.json`，该文件默认被 Git 忽略，不参与热重载；若文件格式、identity 或运行实例版本不兼容，启动会明确失败并要求删除旧文件
+- 若启用 `runtime.session_persistence`，默认状态文件位于 `local/session-state.json`，该文件默认被 Git 忽略，不参与热重载；若状态文件版本或兼容签名不匹配，启动会明确失败并要求删除旧文件
 - 若启用 `runtime.notifications`，通知仅针对进程存活期间的新事件发送；reload 只影响后续事件，不会补发旧通知
 
 ## 6. Smoke Test 操作指南
@@ -242,9 +245,9 @@ py -3 scripts/live_smoke.py --phase all
 - `--phase heavy`
   - 创建隔离测试 issue
   - 验证 `missing_pr -> awaiting_intervention`
-  - 验证 `session_persistence.identity` 落盘，并在 identity 不匹配时 fail-fast
+  - 验证 `session_persistence` 的兼容签名落盘，并在 compatibility 不匹配时 fail-fast
   - 验证 `session_persistence` 可恢复 `awaiting_intervention` / `awaiting_merge`
-  - 验证 `notifications` 的 webhook / slack 通道实际投递、Webhook payload 使用 `details`、且重启后不补发旧通知
+  - 验证 `notifications` 的 webhook / slack 通道实际投递、Webhook payload 使用版本化事件 envelope、且重启后不补发旧通知
   - 创建测试分支和 PR
   - 验证 `awaiting_merge -> merged -> issue Done`
 - `--phase all`
@@ -439,7 +442,7 @@ py -3 scripts/live_smoke.py --phase all
 ## 11. 相关文档
 
 - `docs/release-checklist.md`
-- `docs/cycles/archive/cycle-04-extension-release.md`
+- `docs/cycles/archive/README.md`
 - `docs/rfcs/github-issues-tracker.md`（Cycle 5 草案）
 - `scripts/live_smoke.py`
 - `IMPLEMENTATION.md`

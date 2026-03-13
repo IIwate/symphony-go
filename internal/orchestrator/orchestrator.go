@@ -43,10 +43,13 @@ type Snapshot struct {
 	Service              ServiceSnapshot
 	Counts               SnapshotCounts
 	Running              []RunningSnapshot
+	Recovering           []RecoveringSnapshot
 	AwaitingMerge        []AwaitingMergeSnapshot
 	AwaitingIntervention []AwaitingInterventionSnapshot
 	Retrying             []RetrySnapshot
 	Alerts               []AlertSnapshot
+	Recovery             RecoverySnapshot
+	Health               RuntimeHealthSnapshot
 	CodexTotals          model.TokenTotals
 	RateLimits           any
 }
@@ -57,10 +60,24 @@ type ServiceSnapshot struct {
 }
 
 type SnapshotCounts struct {
+	Recovering           int
 	Running              int
 	AwaitingMerge        int
 	AwaitingIntervention int
 	Retrying             int
+}
+
+type RecoverySnapshot struct {
+	Recovering           []RecoveringSnapshot
+	AwaitingMerge        []AwaitingMergeSnapshot
+	AwaitingIntervention []AwaitingInterventionSnapshot
+	Retrying             []RetrySnapshot
+}
+
+type RuntimeHealthSnapshot struct {
+	Alerts        []AlertSnapshot
+	Notifications []NotificationChannelHealthSnapshot
+	Persistence   PersistenceHealthSnapshot
 }
 
 type RunningSnapshot struct {
@@ -82,6 +99,20 @@ type RunningSnapshot struct {
 	TotalTokens         int64
 	CurrentRetryAttempt int
 	AttemptCount        int
+}
+
+type RecoveringSnapshot struct {
+	IssueID            string
+	IssueIdentifier    string
+	WorkspacePath      string
+	State              string
+	Strategy           string
+	Source             string
+	DispatchKind       string
+	ExpectedOutcome    string
+	ContinuationReason *string
+	ObservedAt         time.Time
+	AttemptCount       int
 }
 
 type RetrySnapshot struct {
@@ -134,6 +165,27 @@ type AlertSnapshot struct {
 	IssueIdentifier string
 }
 
+type NotificationChannelHealthSnapshot struct {
+	ChannelID           string
+	DisplayName         string
+	Status              string
+	QueueOverflow       bool
+	LastError           *string
+	LastAttemptAt       *time.Time
+	LastSuccessAt       *time.Time
+	ConsecutiveFailures int
+}
+
+type PersistenceHealthSnapshot struct {
+	Enabled             bool
+	Kind                string
+	Status              string
+	LastError           *string
+	LastAttemptAt       *time.Time
+	LastSuccessAt       *time.Time
+	ConsecutiveFailures int
+}
+
 type PullRequestState string
 
 const (
@@ -177,19 +229,25 @@ type PullRequestLookup interface {
 	Refresh(ctx context.Context, workspacePath string, pr *PullRequestInfo) (*PullRequestInfo, error)
 }
 
+type RuntimeCompatibility struct {
+	Profile            string
+	SourceKind         string
+	FlowName           string
+	TrackerKind        string
+	TrackerRepo        string
+	TrackerProjectSlug string
+}
+
+type RuntimeDescriptor struct {
+	ConfigRoot             string
+	WorkspaceRoot          string
+	SessionPersistenceKind string
+	SessionStatePath       string
+}
+
 type RuntimeIdentity struct {
-	ConfigRoot               string
-	Profile                  string
-	SourceName               string
-	SourceKind               string
-	FlowName                 string
-	TrackerKind              string
-	TrackerRepo              string
-	TrackerProjectSlug       string
-	WorkspaceRoot            string
-	SessionStatePath         string
-	SessionFlushIntervalMS   int
-	SessionFsyncOnCritical   bool
+	Compatibility RuntimeCompatibility
+	Descriptor    RuntimeDescriptor
 }
 
 type RefreshRequestResult struct {
@@ -197,21 +255,6 @@ type RefreshRequestResult struct {
 	Coalesced   bool
 	RequestedAt time.Time
 	Operations  []string
-}
-
-type runtimeExtensionEventKind string
-
-const (
-	runtimeExtensionEventNotificationEnqueue runtimeExtensionEventKind = "notification_enqueue"
-	runtimeExtensionEventNotificationDeliver runtimeExtensionEventKind = "notification_delivery"
-	runtimeExtensionEventPersistenceSuccess  runtimeExtensionEventKind = "persistence_success"
-	runtimeExtensionEventPersistenceFailure  runtimeExtensionEventKind = "persistence_failure"
-)
-
-type runtimeExtensionEvent struct {
-	Kind    runtimeExtensionEventKind
-	Channel string
-	Err     error
 }
 
 type Orchestrator struct {
@@ -235,7 +278,6 @@ type Orchestrator struct {
 	configReloadCh chan struct{}
 	refreshCh      chan struct{}
 	retryFireCh    chan string
-	extensionCh    chan runtimeExtensionEvent
 	shutdownCh     chan struct{}
 	doneCh         chan struct{}
 
@@ -245,20 +287,23 @@ type Orchestrator struct {
 
 	state model.OrchestratorState
 
-	mu               sync.RWMutex
-	snapshot         Snapshot
-	started          bool
-	subscribers      map[int]chan Snapshot
-	nextSubscriberID int
-	systemAlerts     map[string]AlertSnapshot
-	pendingCleanup   map[string]string
-	recoveredPending map[string]*recoveredPendingEntry
-	completedOrder   []string
-	maxCompleted     int
-	startedAt        time.Time
-	serviceVersion   string
-	extensionsReady  bool
-	eventSeq         uint64
+	mu                 sync.RWMutex
+	snapshot           Snapshot
+	started            bool
+	subscribers        map[int]chan Snapshot
+	nextSubscriberID   int
+	healthAlerts       map[string]AlertSnapshot
+	systemAlerts       map[string]AlertSnapshot
+	notificationHealth map[string]*NotificationChannelHealthSnapshot
+	persistenceHealth  PersistenceHealthSnapshot
+	pendingCleanup     map[string]string
+	recoveredPending   map[string]*model.RecoveryEntry
+	completedOrder     []string
+	maxCompleted       int
+	startedAt          time.Time
+	serviceVersion     string
+	extensionsReady    bool
+	eventSeq           uint64
 }
 
 var BuildVersion = "dev"
@@ -269,6 +314,8 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	recovering := map[string]*model.RecoveryEntry{}
+	healthAlerts := map[string]AlertSnapshot{}
 
 	o := &Orchestrator{
 		tracker:           trackerClient,
@@ -286,23 +333,25 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		configReloadCh:    make(chan struct{}, 8),
 		refreshCh:         make(chan struct{}, 8),
 		retryFireCh:       make(chan string, 128),
-		extensionCh:       make(chan runtimeExtensionEvent, 256),
 		shutdownCh:        make(chan struct{}),
 		doneCh:            make(chan struct{}),
 		state: model.OrchestratorState{
 			Running:              map[string]*model.RunningEntry{},
+			Recovering:           recovering,
 			AwaitingMerge:        map[string]*model.AwaitingMergeEntry{},
 			AwaitingIntervention: map[string]*model.AwaitingInterventionEntry{},
 			RetryAttempts:        map[string]*model.RetryEntry{},
 			Completed:            map[string]struct{}{},
 		},
-		subscribers:      map[int]chan Snapshot{},
-		systemAlerts:     map[string]AlertSnapshot{},
-		pendingCleanup:   map[string]string{},
-		recoveredPending: map[string]*recoveredPendingEntry{},
-		maxCompleted:     defaultMaxCompletedEntries,
-		startedAt:        time.Now().UTC(),
-		serviceVersion:   BuildVersion,
+		subscribers:        map[int]chan Snapshot{},
+		healthAlerts:       healthAlerts,
+		systemAlerts:       healthAlerts,
+		notificationHealth: map[string]*NotificationChannelHealthSnapshot{},
+		pendingCleanup:     map[string]string{},
+		recoveredPending:   recovering,
+		maxCompleted:       defaultMaxCompletedEntries,
+		startedAt:          time.Now().UTC(),
+		serviceVersion:     BuildVersion,
 	}
 	o.prLookup = newGitHubPRLookup()
 	o.applyCurrentConfigLocked()
@@ -352,14 +401,12 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 				o.tick(ctx)
 			case issueID := <-o.retryFireCh:
 				o.handleRetryTimer(ctx, issueID)
-			case event := <-o.extensionCh:
-				o.handleRuntimeExtensionEvent(event)
 			case <-o.configReloadCh:
 				o.mu.Lock()
 				o.applyCurrentConfigLocked()
 				oldNotifier := o.reloadNotifierLocked()
-				o.refreshSnapshotLocked()
-				o.publishSnapshotLocked()
+				o.reconcileNotificationHealthLocked()
+				o.publishViewLocked()
 				o.mu.Unlock()
 				o.closeNotifier(oldNotifier)
 			}
@@ -392,27 +439,6 @@ func (o *Orchestrator) RequestRefresh() RefreshRequestResult {
 	default:
 		result.Coalesced = true
 		return result
-	}
-}
-
-func (o *Orchestrator) postRuntimeExtensionEvent(event runtimeExtensionEvent) {
-	select {
-	case o.extensionCh <- event:
-	default:
-		o.logger.Warn("runtime extension event dropped", "kind", event.Kind, "channel", event.Channel, "error", errorString(event.Err))
-	}
-}
-
-func (o *Orchestrator) handleRuntimeExtensionEvent(event runtimeExtensionEvent) {
-	switch event.Kind {
-	case runtimeExtensionEventNotificationEnqueue:
-		o.handleNotificationEnqueueResult(event.Channel, event.Err)
-	case runtimeExtensionEventNotificationDeliver:
-		o.handleNotificationDeliveryResult(event.Channel, event.Err)
-	case runtimeExtensionEventPersistenceSuccess:
-		o.handleSessionPersistenceWriteSuccess()
-	case runtimeExtensionEventPersistenceFailure:
-		o.handleSessionPersistenceWriteFailure(event.Err)
 	}
 }
 
@@ -476,7 +502,7 @@ func (o *Orchestrator) tick(ctx context.Context) {
 
 func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	stateRefreshAttempted, stateRefreshSucceeded := o.reconcileRunning(ctx)
-	o.reconcileRecoveredPending(ctx)
+	o.reconcileRecovering(ctx)
 	o.reconcileAwaitingMerge(ctx)
 	o.reconcileAwaitingIntervention(ctx)
 
@@ -484,35 +510,41 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		o.logger.Warn("dispatch preflight failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
+		if o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "dispatch_preflight_failed",
 			Level:   "warn",
 			Message: err.Error(),
-		})
-		o.commitStateLocked(true)
+		}) {
+			o.publishViewLocked()
+		}
 		o.mu.Unlock()
 		return
 	}
 	o.mu.Lock()
-	o.clearSystemAlertAndNotifyLocked("dispatch_preflight_failed")
+	if o.clearHealthAlertAndNotifyLocked("dispatch_preflight_failed") {
+		o.publishViewLocked()
+	}
 	o.mu.Unlock()
 
 	candidates, err := o.tracker.FetchCandidateIssues(ctx)
 	if err != nil {
 		o.logger.Warn("fetch candidate issues failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
+		if o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "tracker_unreachable",
 			Level:   "warn",
 			Message: err.Error(),
-		})
-		o.commitStateLocked(true)
+		}) {
+			o.publishViewLocked()
+		}
 		o.mu.Unlock()
 		return
 	}
 	o.mu.Lock()
 	if !stateRefreshAttempted || stateRefreshSucceeded {
-		o.clearSystemAlertAndNotifyLocked("tracker_unreachable")
+		if o.clearHealthAlertAndNotifyLocked("tracker_unreachable") {
+			o.publishViewLocked()
+		}
 	}
 	o.mu.Unlock()
 	sort.SliceStable(candidates, func(i int, j int) bool {
@@ -1121,12 +1153,13 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	if err != nil {
 		o.logger.Warn("reconcile state refresh failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
+		if o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "tracker_unreachable",
 			Level:   "warn",
 			Message: err.Error(),
-		})
-		o.commitStateLocked(true)
+		}) {
+			o.publishViewLocked()
+		}
 		o.mu.Unlock()
 		return true, false
 	}
@@ -1138,7 +1171,9 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.clearSystemAlertAndNotifyLocked("tracker_unreachable")
+	if o.clearHealthAlertAndNotifyLocked("tracker_unreachable") {
+		o.publishViewLocked()
+	}
 	for issueID, entry := range o.state.Running {
 		issue, ok := byID[issueID]
 		if !ok {
@@ -1332,13 +1367,13 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 		case o.isTerminalState(issue.State, cfg):
 			o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
 		case !o.isActiveState(issue.State, cfg):
-		o.mu.Lock()
-		current := o.state.AwaitingIntervention[issueID]
-		if current != nil {
-			delete(o.state.AwaitingIntervention, issueID)
-			o.commitStateLocked(true)
-		}
-		o.mu.Unlock()
+			o.mu.Lock()
+			current := o.state.AwaitingIntervention[issueID]
+			if current != nil {
+				delete(o.state.AwaitingIntervention, issueID)
+				o.commitStateLocked(true)
+			}
+			o.mu.Unlock()
 		}
 	}
 }
@@ -1405,17 +1440,20 @@ func (o *Orchestrator) startupCleanup(ctx context.Context) {
 	if err != nil {
 		o.logger.Warn("startup cleanup fetch failed", "error", err.Error())
 		o.mu.Lock()
-		o.setSystemAlertAndNotifyLocked(AlertSnapshot{
+		if o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 			Code:    "tracker_terminal_fetch_failed",
 			Level:   "warn",
 			Message: err.Error(),
-		})
-		o.commitStateLocked(true)
+		}) {
+			o.publishViewLocked()
+		}
 		o.mu.Unlock()
 		return
 	}
 	o.mu.Lock()
-	o.clearSystemAlertAndNotifyLocked("tracker_terminal_fetch_failed")
+	if o.clearHealthAlertAndNotifyLocked("tracker_terminal_fetch_failed") {
+		o.publishViewLocked()
+	}
 	o.mu.Unlock()
 	for _, issue := range issues {
 		if err := o.workspace.CleanupWorkspace(ctx, issue.Identifier); err != nil {
@@ -1564,7 +1602,6 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			IssueID:             issueID,
 			IssueIdentifier:     entry.Identifier,
 			WorkspacePath:       entry.WorkspacePath,
-			State:               entry.Issue.State,
 			SessionID:           entry.Session.SessionID,
 			TurnCount:           entry.Session.TurnCount,
 			LastMessage:         entry.Session.LastCodexMessage,
@@ -1574,6 +1611,9 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			TotalTokens:         entry.Session.CodexTotalTokens,
 			CurrentRetryAttempt: entry.RetryAttempt,
 			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
+		}
+		if entry.Issue != nil {
+			row.State = entry.Issue.State
 		}
 		if entry.Dispatch != nil {
 			row.DispatchKind = string(entry.Dispatch.Kind)
@@ -1589,6 +1629,35 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		row.LastEventAt = entry.Session.LastCodexTimestamp
 		running = append(running, row)
 	}
+
+	recovering := make([]RecoveringSnapshot, 0, len(o.state.Recovering))
+	for issueID, entry := range o.state.Recovering {
+		row := RecoveringSnapshot{
+			IssueID:         issueID,
+			IssueIdentifier: entry.Identifier,
+			WorkspacePath:   entry.WorkspacePath,
+			State:           entry.State,
+			Strategy:        string(entry.Strategy),
+			Source:          string(entry.Source),
+			ObservedAt:      entry.ObservedAt,
+			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
+		}
+		if entry.Dispatch != nil {
+			row.DispatchKind = string(entry.Dispatch.Kind)
+			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
+			if entry.Dispatch.Reason != nil {
+				reason := string(*entry.Dispatch.Reason)
+				row.ContinuationReason = &reason
+			}
+		}
+		recovering = append(recovering, row)
+	}
+	sort.SliceStable(recovering, func(i int, j int) bool {
+		if recovering[i].IssueIdentifier != recovering[j].IssueIdentifier {
+			return recovering[i].IssueIdentifier < recovering[j].IssueIdentifier
+		}
+		return recovering[i].IssueID < recovering[j].IssueID
+	})
 
 	awaitingMerge := make([]AwaitingMergeSnapshot, 0, len(o.state.AwaitingMerge))
 	for issueID, entry := range o.state.AwaitingMerge {
@@ -1658,9 +1727,15 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		}
 		retrying = append(retrying, row)
 	}
+	sort.SliceStable(retrying, func(i int, j int) bool {
+		if retrying[i].IssueIdentifier != retrying[j].IssueIdentifier {
+			return retrying[i].IssueIdentifier < retrying[j].IssueIdentifier
+		}
+		return retrying[i].IssueID < retrying[j].IssueID
+	})
 
-	alerts := make([]AlertSnapshot, 0, len(o.systemAlerts)+len(o.state.RetryAttempts))
-	for _, alert := range o.systemAlerts {
+	alerts := make([]AlertSnapshot, 0, len(o.healthAlerts)+len(o.state.RetryAttempts))
+	for _, alert := range o.healthAlerts {
 		alerts = append(alerts, alert)
 	}
 	for issueID, entry := range o.state.RetryAttempts {
@@ -1710,6 +1785,26 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return alerts[i].Message < alerts[j].Message
 	})
 
+	notificationHealth := make([]NotificationChannelHealthSnapshot, 0, len(o.notificationHealth))
+	for _, status := range o.notificationHealth {
+		if status == nil {
+			continue
+		}
+		copyStatus := *status
+		copyStatus.LastAttemptAt = cloneTimePtr(status.LastAttemptAt)
+		copyStatus.LastSuccessAt = cloneTimePtr(status.LastSuccessAt)
+		copyStatus.LastError = optionalError(pointerString(status.LastError))
+		notificationHealth = append(notificationHealth, copyStatus)
+	}
+	sort.SliceStable(notificationHealth, func(i int, j int) bool {
+		return notificationHealth[i].ChannelID < notificationHealth[j].ChannelID
+	})
+
+	persistenceHealth := o.persistenceHealth
+	persistenceHealth.LastAttemptAt = cloneTimePtr(o.persistenceHealth.LastAttemptAt)
+	persistenceHealth.LastSuccessAt = cloneTimePtr(o.persistenceHealth.LastSuccessAt)
+	persistenceHealth.LastError = optionalError(pointerString(o.persistenceHealth.LastError))
+
 	totals := o.state.CodexTotals
 	for _, entry := range o.state.Running {
 		totals.SecondsRunning += now.Sub(entry.StartedAt).Seconds()
@@ -1722,18 +1817,31 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			StartedAt: o.startedAt,
 		},
 		Counts: SnapshotCounts{
+			Recovering:           len(recovering),
 			Running:              len(running),
 			AwaitingMerge:        len(awaitingMerge),
 			AwaitingIntervention: len(awaitingIntervention),
 			Retrying:             len(retrying),
 		},
 		Running:              running,
+		Recovering:           recovering,
 		AwaitingMerge:        awaitingMerge,
 		AwaitingIntervention: awaitingIntervention,
 		Retrying:             retrying,
 		Alerts:               alerts,
-		CodexTotals:          totals,
-		RateLimits:           o.state.CodexRateLimits,
+		Recovery: RecoverySnapshot{
+			Recovering:           recovering,
+			AwaitingMerge:        awaitingMerge,
+			AwaitingIntervention: awaitingIntervention,
+			Retrying:             retrying,
+		},
+		Health: RuntimeHealthSnapshot{
+			Alerts:        alerts,
+			Notifications: notificationHealth,
+			Persistence:   persistenceHealth,
+		},
+		CodexTotals: totals,
+		RateLimits:  o.state.CodexRateLimits,
 	}
 }
 
@@ -1791,6 +1899,9 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	if _, ok := o.state.Running[issue.ID]; ok {
+		return false
+	}
+	if _, ok := o.state.Recovering[issue.ID]; ok {
 		return false
 	}
 	if _, ok := o.state.AwaitingMerge[issue.ID]; ok {
@@ -2179,11 +2290,11 @@ func isStallErrorText(errText string) bool {
 	return strings.Contains(strings.ToLower(errText), "stalled session")
 }
 
-func (o *Orchestrator) setSystemAlertLocked(alert AlertSnapshot) bool {
+func (o *Orchestrator) setHealthAlertLocked(alert AlertSnapshot) bool {
 	if strings.TrimSpace(alert.Code) == "" {
 		return false
 	}
-	if existing, ok := o.systemAlerts[alert.Code]; ok {
+	if existing, ok := o.healthAlerts[alert.Code]; ok {
 		if existing.Level == alert.Level &&
 			existing.Message == alert.Message &&
 			existing.IssueID == alert.IssueID &&
@@ -2191,38 +2302,38 @@ func (o *Orchestrator) setSystemAlertLocked(alert AlertSnapshot) bool {
 			return false
 		}
 	}
-	o.systemAlerts[alert.Code] = alert
+	o.healthAlerts[alert.Code] = alert
 	return true
 }
 
-func (o *Orchestrator) setSystemAlertAndNotifyLocked(alert AlertSnapshot) bool {
-	if !o.setSystemAlertLocked(alert) {
+func (o *Orchestrator) setHealthAlertAndNotifyLocked(alert AlertSnapshot) bool {
+	if !o.setHealthAlertLocked(alert) {
 		return false
 	}
 	o.emitNotificationLocked(o.newSystemAlertEvent(model.NotificationEventSystemAlert, alert))
 	return true
 }
 
-func (o *Orchestrator) clearSystemAlertLocked(code string) bool {
-	_, cleared := o.clearSystemAlertStateLocked(code)
+func (o *Orchestrator) clearHealthAlertLocked(code string) bool {
+	_, cleared := o.clearHealthAlertStateLocked(code)
 	return cleared
 }
 
-func (o *Orchestrator) clearSystemAlertStateLocked(code string) (*AlertSnapshot, bool) {
+func (o *Orchestrator) clearHealthAlertStateLocked(code string) (*AlertSnapshot, bool) {
 	if strings.TrimSpace(code) == "" {
 		return nil, false
 	}
-	existing, ok := o.systemAlerts[code]
+	existing, ok := o.healthAlerts[code]
 	if !ok {
 		return nil, false
 	}
-	delete(o.systemAlerts, code)
+	delete(o.healthAlerts, code)
 	copyAlert := existing
 	return &copyAlert, true
 }
 
-func (o *Orchestrator) clearSystemAlertAndNotifyLocked(code string) bool {
-	alert, cleared := o.clearSystemAlertStateLocked(code)
+func (o *Orchestrator) clearHealthAlertAndNotifyLocked(code string) bool {
+	alert, cleared := o.clearHealthAlertStateLocked(code)
 	if !cleared || alert == nil {
 		return false
 	}

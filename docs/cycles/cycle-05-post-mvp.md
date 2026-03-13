@@ -22,12 +22,15 @@
 
 - 多 agent runner
 - 打包分发
-- 通知系统
+
+### 已落地扩展
+
+- 通知系统（已落地；历史记录见 [Archive RFC](../rfcs/archive/notifications.md)）
+- Session 持久化（已落地；历史记录见 [Archive RFC](../rfcs/archive/session-persistence.md)）
 
 ### 低优先级
 
 - Reactions 系统 — [RFC](../rfcs/reactions-system.md)
-- Session 持久化 — [RFC](../rfcs/session-persistence.md)
 - Skills 系统 — [RFC](../rfcs/skills-system.md)
 
 ## 建议拆法

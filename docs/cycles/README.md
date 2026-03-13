@@ -24,12 +24,9 @@
 
 ## 已归档周期
 
-以下周期文档主要用于保留历史实施边界与阶段性输入输出，已不再作为当前规范源：
+以下周期文档已压缩为统一历史摘要，已不再作为当前规范源：
 
-- `docs/cycles/archive/cycle-01-foundation.md`
-- `docs/cycles/archive/cycle-02-infrastructure.md`
-- `docs/cycles/archive/cycle-03-core-engine.md`
-- `docs/cycles/archive/cycle-04-extension-release.md`
+- `docs/cycles/archive/README.md`
 
 ## 跨周期约束
 
@@ -70,6 +67,6 @@ Cycle 5
 
 ## 建议执行方式
 
-- Cycle 5 作为当前 backlog 管理入口；Cycle 1~4 已归档，仅作历史参考。
+- Cycle 5 作为当前 backlog 管理入口；Cycle 1~4 已压缩为历史摘要，仅作背景参考。
 - 每个周期开始前先 review 上一周期文档，避免把“未决问题”隐性带入下一周期。
 - 周期中途如果需求变更，优先更新本目录文档，再安排实现任务，保证设计与实现一致。

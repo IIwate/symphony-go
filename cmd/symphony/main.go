@@ -223,8 +223,6 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 			return nil, fmt.Errorf("selection.enabled_sources changed: restart required")
 		case strings.TrimSpace(currentRepoDef.Selection.DispatchFlow) != strings.TrimSpace(repoDef.Selection.DispatchFlow):
 			return nil, fmt.Errorf("selection.dispatch_flow changed: restart required")
-		case currentCfg.WorkspaceRoot != newCfg.WorkspaceRoot:
-			return nil, fmt.Errorf("runtime.workspace.root changed: restart required")
 		case currentCfg.TrackerKind != newCfg.TrackerKind:
 			return nil, fmt.Errorf("runtime.tracker.kind changed: restart required")
 		case currentCfg.TrackerRepo != newCfg.TrackerRepo:
@@ -298,22 +296,24 @@ func sessionPersistenceCompatibilityRequired(currentCfg *model.ServiceConfig, ne
 
 func runtimeIdentityForConfig(configDir string, profile string, repoDef *model.AutomationDefinition, cfg *model.ServiceConfig) orchestrator.RuntimeIdentity {
 	identity := orchestrator.RuntimeIdentity{
-		ConfigRoot: configDir,
-		Profile:    strings.TrimSpace(profile),
+		Compatibility: orchestrator.RuntimeCompatibility{
+			Profile: strings.TrimSpace(profile),
+		},
+		Descriptor: orchestrator.RuntimeDescriptor{
+			ConfigRoot: configDir,
+		},
 	}
 	if repoDef != nil {
-		identity.SourceName = strings.Join(nilSafeSources(repoDef), ",")
-		identity.SourceKind = selectedSourceKind(repoDef)
-		identity.FlowName = strings.TrimSpace(repoDef.Selection.DispatchFlow)
+		identity.Compatibility.SourceKind = selectedSourceKind(repoDef)
+		identity.Compatibility.FlowName = strings.TrimSpace(repoDef.Selection.DispatchFlow)
 	}
 	if cfg != nil {
-		identity.TrackerKind = strings.TrimSpace(cfg.TrackerKind)
-		identity.TrackerRepo = strings.TrimSpace(cfg.TrackerRepo)
-		identity.TrackerProjectSlug = strings.TrimSpace(cfg.TrackerProjectSlug)
-		identity.WorkspaceRoot = strings.TrimSpace(cfg.WorkspaceRoot)
-		identity.SessionStatePath = strings.TrimSpace(cfg.SessionPersistence.Path)
-		identity.SessionFlushIntervalMS = cfg.SessionPersistence.FlushIntervalMS
-		identity.SessionFsyncOnCritical = cfg.SessionPersistence.FsyncOnCritical
+		identity.Compatibility.TrackerKind = strings.TrimSpace(cfg.TrackerKind)
+		identity.Compatibility.TrackerRepo = strings.TrimSpace(cfg.TrackerRepo)
+		identity.Compatibility.TrackerProjectSlug = strings.TrimSpace(cfg.TrackerProjectSlug)
+		identity.Descriptor.WorkspaceRoot = strings.TrimSpace(cfg.WorkspaceRoot)
+		identity.Descriptor.SessionPersistenceKind = string(cfg.SessionPersistence.Kind)
+		identity.Descriptor.SessionStatePath = strings.TrimSpace(cfg.SessionPersistence.File.Path)
 	}
 	return identity
 }

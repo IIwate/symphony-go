@@ -1409,15 +1409,19 @@ Provide a JSON REST API under `/api/v1/*` for current runtime state and operatio
 Minimum endpoints:
 
 - `GET /api/v1/state`
-  - Returns a summary view of the current system state (running sessions, retry queue/delays,
-    aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
+  - Returns a summary view of the current system state (running sessions, recovery buckets, health
+    indicators, aggregate token/runtime totals, latest rate limits, and any additional tracked
+    summary fields).
   - Suggested response shape:
 
     ```json
     {
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
+        "recovering": 1,
         "running": 2,
+        "awaiting_merge": 1,
+        "awaiting_intervention": 1,
         "retrying": 1
       },
       "running": [
@@ -1438,15 +1442,43 @@ Minimum endpoints:
           }
         }
       ],
-      "retrying": [
-        {
-          "issue_id": "def456",
-          "issue_identifier": "MT-650",
-          "attempt": 3,
-          "due_at": "2026-02-24T20:16:00Z",
-          "error": "no available orchestrator slots"
+      "recovery": {
+        "recovering": [
+          {
+            "issue_id": "ghi789",
+            "issue_identifier": "MT-651",
+            "strategy": "continuation_retry",
+            "observed_at": "2026-02-24T20:12:00Z"
+          }
+        ],
+        "awaiting_merge": [
+          {
+            "issue_id": "jkl012",
+            "issue_identifier": "MT-652",
+            "pr_number": 41,
+            "pr_state": "open"
+          }
+        ],
+        "awaiting_intervention": [],
+        "retrying": [
+          {
+            "issue_id": "def456",
+            "issue_identifier": "MT-650",
+            "attempt": 3,
+            "due_at": "2026-02-24T20:16:00Z",
+            "error": "no available orchestrator slots"
+          }
+        ]
+      },
+      "health": {
+        "alerts": [],
+        "notifications": [],
+        "persistence": {
+          "enabled": true,
+          "kind": "file",
+          "status": "healthy"
         }
-      ],
+      },
       "codex_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,

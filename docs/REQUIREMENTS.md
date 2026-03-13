@@ -230,6 +230,61 @@ type ServiceConfig struct {
 
     // server（可选扩展）
     ServerPort *int // nullable；正整数绑定该端口，0 用于临时端口
+
+    // session persistence（可选扩展）
+    SessionPersistence SessionPersistenceConfig
+
+    // notifications（可选扩展）
+    Notifications NotificationsConfig
+}
+
+type SessionPersistenceConfig struct {
+    Enabled bool
+    Kind    SessionPersistenceKind
+    File    SessionPersistenceFileConfig
+}
+
+type SessionPersistenceFileConfig struct {
+    Path            string
+    FlushIntervalMS int
+    FsyncOnCritical bool
+}
+
+type NotificationsConfig struct {
+    Channels []NotificationChannelConfig
+    Defaults NotificationDeliveryConfig
+}
+
+type NotificationChannelConfig struct {
+    ID            string
+    DisplayName   string
+    Kind          NotificationChannelKind
+    Subscriptions NotificationSubscriptionConfig
+    Delivery      NotificationDeliveryConfig
+    Webhook       *WebhookNotificationConfig
+    Slack         *SlackNotificationConfig
+}
+
+type NotificationSubscriptionConfig struct {
+    Families []RuntimeEventFamily
+    Types    []NotificationEventType
+}
+
+type NotificationDeliveryConfig struct {
+    TimeoutMS         int
+    RetryCount        int
+    RetryDelayMS      int
+    QueueSize         int
+    CriticalQueueSize int
+}
+
+type WebhookNotificationConfig struct {
+    URL     string
+    Headers map[string]string
+}
+
+type SlackNotificationConfig struct {
+    IncomingWebhookURL string
 }
 ```
 
@@ -306,6 +361,7 @@ type OrchestratorState struct {
     PollIntervalMS      int
     MaxConcurrentAgents int
     Running             map[string]*RunningEntry
+    Recovering          map[string]*RecoveryEntry
     AwaitingMerge       map[string]*AwaitingMergeEntry
     AwaitingIntervention map[string]*AwaitingInterventionEntry
     RetryAttempts       map[string]*RetryEntry
@@ -323,6 +379,18 @@ type RunningEntry struct {
     StallCount    int
     StartedAt     time.Time
     WorkerCancel  context.CancelFunc
+    Dispatch      *DispatchContext
+}
+
+type RecoveryEntry struct {
+    Identifier    string
+    WorkspacePath string
+    State         string
+    RetryAttempt  int
+    StallCount    int
+    ObservedAt    time.Time
+    Strategy      RecoveryStrategy
+    Source        RecoverySource
     Dispatch      *DispatchContext
 }
 
@@ -1016,9 +1084,25 @@ type TokenUsage struct {
 ```json
 {
   "generated_at": "RFC3339 时间戳",
-  "counts": {"running": 2, "retrying": 1},
+  "counts": {
+    "recovering": 1,
+    "running": 2,
+    "awaiting_merge": 1,
+    "awaiting_intervention": 1,
+    "retrying": 1
+  },
   "running": [{"issue_id", "issue_identifier", "state", "session_id", "turn_count", "last_event", "last_message", "started_at", "last_event_at", "tokens": {...}}],
-  "retrying": [{"issue_id", "issue_identifier", "attempt", "due_at", "error"}],
+  "recovery": {
+    "recovering": [{"issue_id", "issue_identifier", "strategy", "source", "observed_at"}],
+    "awaiting_merge": [{"issue_id", "issue_identifier", "pr_number", "pr_state", "awaiting_since"}],
+    "awaiting_intervention": [{"issue_id", "issue_identifier", "reason", "expected_outcome", "observed_at"}],
+    "retrying": [{"issue_id", "issue_identifier", "attempt", "due_at", "error"}]
+  },
+  "health": {
+    "alerts": [{"code", "level", "message"}],
+    "notifications": [{"channel_id", "status", "queue_overflow", "last_error"}],
+    "persistence": {"enabled", "kind", "status", "last_error"}
+  },
   "codex_totals": {"input_tokens", "output_tokens", "total_tokens", "seconds_running"},
   "rate_limits": null
 }
@@ -1026,6 +1110,7 @@ type TokenUsage struct {
 
 **`GET /api/v1/{identifier}` 响应**（SPEC §13.7.2）：
 - 已知 issue → 详细运行时/调试信息
+- 当前实现会根据状态返回 `running` / `recovering` / `awaiting_merge` / `awaiting_intervention` / `retry`
 - 未知 issue → `404` + `{"error":{"code":"issue_not_found","message":"..."}}`
 
 **`POST /api/v1/refresh` 响应**（SPEC §13.7.2）：

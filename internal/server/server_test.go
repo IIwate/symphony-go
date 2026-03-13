@@ -48,15 +48,17 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	if counts["running"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["awaiting_intervention"].(float64) != 1 || counts["retrying"].(float64) != 1 {
 		t.Fatalf("counts = %+v", counts)
 	}
-	awaitingMerge := payload["awaiting_merge"].([]any)
+	recovery := payload["recovery"].(map[string]any)
+	awaitingMerge := recovery["awaiting_merge"].([]any)
 	if len(awaitingMerge) != 1 {
 		t.Fatalf("awaiting_merge = %+v, want 1 entry", awaitingMerge)
 	}
-	awaitingIntervention := payload["awaiting_intervention"].([]any)
+	awaitingIntervention := recovery["awaiting_intervention"].([]any)
 	if len(awaitingIntervention) != 1 {
 		t.Fatalf("awaiting_intervention = %+v, want 1 entry", awaitingIntervention)
 	}
-	alerts := payload["alerts"].([]any)
+	health := payload["health"].(map[string]any)
+	alerts := health["alerts"].([]any)
 	if len(alerts) != 1 {
 		t.Fatalf("alerts = %+v, want 1 alert", alerts)
 	}

@@ -117,7 +117,7 @@
 ### 7.3 可观测性烟测（如 shipped HTTP）
 
 - [x] Dashboard 页面可打开
-- [x] `/api/v1/state` 显示 running / retrying / totals
+- [x] `/api/v1/state` 显示 running / recovery / health / totals
 - [x] `/api/v1/events` 能实时推送状态变化
 - [x] `/api/v1/refresh` 可手动触发轮询
 
@@ -146,6 +146,6 @@
 - 目标环境：Windows 11 / PowerShell / Git Bash / `codex-cli 0.111.0`
 - 是否启用 HTTP server：是
 - 是否启用 `linear_graphql`：是
-- 真实验证结果摘要：2026-03-13 已用 `IIwate/linear-test` + `Symphony Smoke Test (slugId=db0a2d0d6058)` 跑通 `py -3 scripts/live_smoke.py --phase all`；覆盖 `missing_pr -> awaiting_intervention`、`runtime_extensions`（`refresh` 返回、Webhook `details`、session identity 落盘、identity mismatch fail-fast、重启不补发旧通知）、`awaiting_merge -> merged -> issue Done`
+- 真实验证结果摘要：2026-03-13 已用 `IIwate/linear-test` + `Symphony Smoke Test (slugId=db0a2d0d6058)` 跑通 `py -3 scripts/live_smoke.py --phase all`；覆盖 `missing_pr -> awaiting_intervention`、`runtime_extensions`（`refresh` 返回、版本化通知事件 envelope、session compatibility 落盘、compatibility mismatch fail-fast、重启不补发旧通知）、`awaiting_merge -> merged -> issue Done`
 - 已知问题：token totals 在 session 初期可能短暂为 `0`，待绝对 usage 事件到达后更新；不阻塞本轮收口
 - 回滚方案：如需回退本轮配置，回退 `automation/` 中对应配置文件并重新做真实 smoke 验证

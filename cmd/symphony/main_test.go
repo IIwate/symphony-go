@@ -66,9 +66,11 @@ func TestRunCLIDryRunSkipsRuntimeDependencies(t *testing.T) {
     command: codex app-server
   session_persistence:
     enabled: true
-    path: ./local/session-state.json
-    flush_interval_ms: 1000
-    fsync_on_critical: true
+    kind: file
+    file:
+      path: ./local/session-state.json
+      flush_interval_ms: 1000
+      fsync_on_critical: true
 selection:
   dispatch_flow: implement
   enabled_sources:
@@ -539,19 +541,26 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
     command: codex app-server
   session_persistence:
     enabled: true
-    path: %s
-    flush_interval_ms: 1000
-    fsync_on_critical: true
+    kind: file
+    file:
+      path: %s
+      flush_interval_ms: 1000
+      fsync_on_critical: true
   notifications:
     channels:
-      - name: ops
+      - id: ops
+        display_name: Ops
         kind: webhook
-        url: %s
-        events: [system_alert]
+        subscriptions:
+          types: [system_alert]
+        webhook:
+          url: %s
     defaults:
       timeout_ms: 5000
       retry_count: 2
       retry_delay_ms: 1000
+      queue_size: 64
+      critical_queue_size: 16
 selection:
   dispatch_flow: implement
   enabled_sources:
@@ -622,8 +631,8 @@ defaults:
 			if err != nil {
 				t.Fatalf("ApplyReload() error = %v", err)
 			}
-			if got := state.CurrentConfig().Notifications.Channels[0].URL; got != tc.wantURL {
-				t.Fatalf("Notifications.Channels[0].URL = %q, want %q", got, tc.wantURL)
+			if got := state.CurrentConfig().Notifications.Channels[0].Webhook.URL; got != tc.wantURL {
+				t.Fatalf("Notifications.Channels[0].Webhook.URL = %q, want %q", got, tc.wantURL)
 			}
 		})
 	}
@@ -648,9 +657,11 @@ func TestExecuteFailsWhenSessionStateIdentityMismatch(t *testing.T) {
     command: codex app-server
   session_persistence:
     enabled: true
-    path: ./local/session-state.json
-    flush_interval_ms: 1000
-    fsync_on_critical: true
+    kind: file
+    file:
+      path: ./local/session-state.json
+      flush_interval_ms: 1000
+      fsync_on_critical: true
 selection:
   dispatch_flow: implement
   enabled_sources:
@@ -659,19 +670,27 @@ defaults:
   profile: null
 `, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
 	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
-	writeFile(t, statePath, `{
-  "version": 3,
+	writeFile(t, statePath, fmt.Sprintf(`{
+  "version": 4,
   "identity": {
-    "ConfigRoot": "C:/different/root",
-    "Profile": "",
-    "SourceName": "linear-main",
-    "FlowName": "implement",
-    "TrackerKind": "linear",
-    "TrackerRepo": ""
+    "compatibility": {
+      "profile": "",
+      "source_kind": "",
+      "flow_name": "implement",
+      "tracker_kind": "different",
+      "tracker_repo": "",
+      "tracker_project_slug": "demo"
+    },
+    "descriptor": {
+      "config_root": "C:/different/root",
+      "workspace_root": "",
+      "session_persistence_kind": "file",
+      "session_state_path": "%s"
+    }
   },
   "saved_at": "2026-03-12T00:00:00Z"
 }
-`)
+`, filepath.ToSlash(statePath)))
 
 	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
 		return &fakeTrackerClient{}, nil

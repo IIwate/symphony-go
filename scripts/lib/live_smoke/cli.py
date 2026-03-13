@@ -75,7 +75,10 @@ class NotificationRecorder:
             if not isinstance(body, dict):
                 continue
             if path == "/webhook":
-                if body.get("identifier") != identifier or body.get("type") != event_type:
+                subject = body.get("subject")
+                if not isinstance(subject, dict):
+                    continue
+                if subject.get("identifier") != identifier or body.get("type") != event_type:
                     continue
             elif path == "/slack":
                 text = str(body.get("text", ""))
@@ -592,8 +595,10 @@ def _run_runtime_extensions_smoke(
         )
         _assert_notification_details(
             webhook_events[0],
-            reason="missing_pr",
-            expected_outcome="pull_request",
+            **{
+                "dispatch.continuation_reason": "missing_pr",
+                "dispatch.expected_outcome": "pull_request",
+            },
         )
         _wait_for(
             lambda: recorder.find(path="/slack", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
@@ -619,7 +624,7 @@ def _run_runtime_extensions_smoke(
         if "recovered_pending" in persisted:
             raise RuntimeError("session-state.json still exposes legacy recovered_pending key")
         awaiting_intervention = _session_state_entries(persisted, "awaiting_intervention")
-        if not any(item.get("Identifier") == persistence_identifier for item in awaiting_intervention):
+        if not any(str(item.get("identifier", "")).strip() == persistence_identifier for item in awaiting_intervention):
             raise RuntimeError("session-state.json missing awaiting_intervention entry after intervention path")
 
         notification_count_before_restart = recorder.count()
@@ -630,7 +635,15 @@ def _run_runtime_extensions_smoke(
         identity = tampered_state.get("identity")
         if not isinstance(identity, dict):
             raise RuntimeError("session-state.json missing identity object")
-        identity["FlowName"] = "tampered-flow"
+        compatibility = identity.get("compatibility")
+        if not isinstance(compatibility, dict):
+            compatibility = identity.get("Compatibility")
+        if not isinstance(compatibility, dict):
+            raise RuntimeError("session-state.json missing identity.compatibility object")
+        if "flow_name" in compatibility:
+            compatibility["flow_name"] = "tampered-flow"
+        else:
+            compatibility["FlowName"] = "tampered-flow"
         session_state_path.write_text(json.dumps(tampered_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         incompatible_process = start_symphony(resources.binary_path, config.base_dir, echo=echo_output, env=git_env())
         incompatible_tail = _wait_for_process_exit(incompatible_process, timeout_seconds=20)
@@ -705,7 +718,7 @@ def _run_runtime_extensions_smoke(
             )
         persisted = _load_session_state(session_state_path)
         awaiting_merge = _session_state_entries(persisted, "awaiting_merge")
-        if not any(item.get("Identifier") == merge_identifier for item in awaiting_merge):
+        if not any(str(item.get("identifier", "")).strip() == merge_identifier for item in awaiting_merge):
             raise RuntimeError("session-state.json missing awaiting_merge entry after restart")
 
         merge_pull_request(repo, pr.number)
@@ -863,12 +876,14 @@ def _assert_notification_details(event: dict[str, object], **expected_details: s
     body = event.get("body")
     if not isinstance(body, dict):
         raise RuntimeError(f"notification body is not json object: {event}")
-    details = body.get("details")
-    if not isinstance(details, dict):
-        raise RuntimeError(f"notification details missing: {body}")
     for key, expected in expected_details.items():
-        if str(details.get(key, "")).strip() != expected:
-            raise RuntimeError(f"notification details[{key!r}] mismatch: {details.get(key)!r} != {expected!r}")
+        current: object = body
+        for part in key.split("."):
+            if not isinstance(current, dict):
+                raise RuntimeError(f"notification field path {key!r} missing: {body}")
+            current = current.get(part)
+        if str(current or "").strip() != expected:
+            raise RuntimeError(f"notification field {key!r} mismatch: {current!r} != {expected!r}")
 
 
 def _assert_session_identity(
@@ -881,18 +896,37 @@ def _assert_session_identity(
     identity = payload.get("identity")
     if not isinstance(identity, dict):
         raise RuntimeError("session-state.json missing identity object")
-    required = {
-        "FlowName": flow_name,
-        "TrackerProjectSlug": tracker_project_slug,
-    }
-    for key, expected in required.items():
-        if str(identity.get(key, "")).strip() != expected:
-            raise RuntimeError(f"session identity {key} mismatch: {identity.get(key)!r} != {expected!r}")
-    workspace = str(identity.get("WorkspaceRoot", "")).replace("\\", "/").lower()
+    compatibility = identity.get("compatibility")
+    if not isinstance(compatibility, dict):
+        compatibility = identity.get("Compatibility")
+    if not isinstance(compatibility, dict):
+        raise RuntimeError("session-state.json missing identity.compatibility object")
+    descriptor = identity.get("descriptor")
+    if not isinstance(descriptor, dict):
+        descriptor = identity.get("Descriptor")
+    if not isinstance(descriptor, dict):
+        raise RuntimeError("session-state.json missing identity.descriptor object")
+    required = [
+        ("flow_name", "FlowName", flow_name),
+        ("tracker_project_slug", "TrackerProjectSlug", tracker_project_slug),
+    ]
+    for lower_key, upper_key, expected in required:
+        actual = compatibility.get(lower_key)
+        if actual is None:
+            actual = compatibility.get(upper_key)
+        if str(actual or "").strip() != expected:
+            raise RuntimeError(f"session identity compatibility.{lower_key} mismatch: {actual!r} != {expected!r}")
+    workspace = descriptor.get("workspace_root")
+    if workspace is None:
+        workspace = descriptor.get("WorkspaceRoot", "")
+    workspace = str(workspace).replace("\\", "/").lower()
     if workspace != workspace_root.replace("\\", "/").lower():
-        raise RuntimeError(f"session identity WorkspaceRoot mismatch: {identity.get('WorkspaceRoot')!r} != {workspace_root!r}")
-    if not str(identity.get("SessionStatePath", "")).strip():
-        raise RuntimeError("session identity SessionStatePath missing")
+        raise RuntimeError(f"session identity descriptor.workspace_root mismatch: {workspace!r} != {workspace_root!r}")
+    session_state_path = descriptor.get("session_state_path")
+    if session_state_path is None:
+        session_state_path = descriptor.get("SessionStatePath", "")
+    if not str(session_state_path).strip():
+        raise RuntimeError("session identity descriptor.session_state_path missing")
 
 
 def _wait_for_process_exit(process: object, *, timeout_seconds: float) -> str:

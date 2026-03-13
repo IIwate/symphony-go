@@ -165,16 +165,14 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 }
 
 type stateResponse struct {
-	GeneratedAt          string                         `json:"generated_at"`
-	Service              serviceResponse                `json:"service"`
-	Counts               stateCounts                    `json:"counts"`
-	Running              []runningResponse              `json:"running"`
-	AwaitingMerge        []awaitingMergeResponse        `json:"awaiting_merge"`
-	AwaitingIntervention []awaitingInterventionResponse `json:"awaiting_intervention"`
-	Retrying             []retryResponse                `json:"retrying"`
-	Alerts               []alertResponse                `json:"alerts"`
-	CodexTotals          totalsResponse                 `json:"codex_totals"`
-	RateLimits           any                            `json:"rate_limits"`
+	GeneratedAt string            `json:"generated_at"`
+	Service     serviceResponse   `json:"service"`
+	Counts      stateCounts       `json:"counts"`
+	Running     []runningResponse `json:"running"`
+	Recovery    recoveryResponse  `json:"recovery"`
+	Health      healthResponse    `json:"health"`
+	CodexTotals totalsResponse    `json:"codex_totals"`
+	RateLimits  any               `json:"rate_limits"`
 }
 
 type serviceResponse struct {
@@ -184,10 +182,24 @@ type serviceResponse struct {
 }
 
 type stateCounts struct {
+	Recovering           int `json:"recovering"`
 	Running              int `json:"running"`
 	AwaitingMerge        int `json:"awaiting_merge"`
 	AwaitingIntervention int `json:"awaiting_intervention"`
 	Retrying             int `json:"retrying"`
+}
+
+type recoveryResponse struct {
+	Recovering           []recoveringResponse           `json:"recovering"`
+	AwaitingMerge        []awaitingMergeResponse        `json:"awaiting_merge"`
+	AwaitingIntervention []awaitingInterventionResponse `json:"awaiting_intervention"`
+	Retrying             []retryResponse                `json:"retrying"`
+}
+
+type healthResponse struct {
+	Alerts        []alertResponse                     `json:"alerts"`
+	Notifications []notificationChannelHealthResponse `json:"notifications"`
+	Persistence   persistenceHealthResponse           `json:"persistence"`
 }
 
 type runningResponse struct {
@@ -205,6 +217,20 @@ type runningResponse struct {
 	LastEventAt         *string        `json:"last_event_at"`
 	Tokens              totalsResponse `json:"tokens"`
 	CurrentRetryAttempt int            `json:"current_retry_attempt"`
+}
+
+type recoveringResponse struct {
+	IssueID            string  `json:"issue_id"`
+	IssueIdentifier    string  `json:"issue_identifier"`
+	WorkspacePath      string  `json:"workspace_path"`
+	State              string  `json:"state,omitempty"`
+	Strategy           string  `json:"strategy"`
+	Source             string  `json:"source,omitempty"`
+	DispatchKind       string  `json:"dispatch_kind,omitempty"`
+	ExpectedOutcome    string  `json:"expected_outcome,omitempty"`
+	ContinuationReason *string `json:"continuation_reason"`
+	ObservedAt         string  `json:"observed_at"`
+	AttemptCount       int     `json:"attempt_count"`
 }
 
 type retryResponse struct {
@@ -254,6 +280,27 @@ type alertResponse struct {
 	IssueIdentifier string `json:"issue_identifier,omitempty"`
 }
 
+type notificationChannelHealthResponse struct {
+	ChannelID           string  `json:"channel_id"`
+	DisplayName         string  `json:"display_name,omitempty"`
+	Status              string  `json:"status"`
+	QueueOverflow       bool    `json:"queue_overflow"`
+	LastError           *string `json:"last_error"`
+	LastAttemptAt       *string `json:"last_attempt_at"`
+	LastSuccessAt       *string `json:"last_success_at"`
+	ConsecutiveFailures int     `json:"consecutive_failures"`
+}
+
+type persistenceHealthResponse struct {
+	Enabled             bool    `json:"enabled"`
+	Kind                string  `json:"kind,omitempty"`
+	Status              string  `json:"status,omitempty"`
+	LastError           *string `json:"last_error"`
+	LastAttemptAt       *string `json:"last_attempt_at"`
+	LastSuccessAt       *string `json:"last_success_at"`
+	ConsecutiveFailures int     `json:"consecutive_failures"`
+}
+
 type totalsResponse struct {
 	InputTokens    int64   `json:"input_tokens"`
 	OutputTokens   int64   `json:"output_tokens"`
@@ -269,12 +316,31 @@ type issueResponse struct {
 	LastError            *string                       `json:"last_error"`
 	AttemptCount         int                           `json:"attempt_count"`
 	Running              *runningResponse              `json:"running"`
+	Recovering           *recoveringResponse           `json:"recovering"`
 	AwaitingMerge        *awaitingMergeResponse        `json:"awaiting_merge"`
 	AwaitingIntervention *awaitingInterventionResponse `json:"awaiting_intervention"`
 	Retry                *retryResponse                `json:"retry"`
 }
 
 func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
+	recovery := snapshot.Recovery
+	if len(recovery.Recovering) == 0 && len(snapshot.Recovering) > 0 {
+		recovery.Recovering = snapshot.Recovering
+	}
+	if len(recovery.AwaitingMerge) == 0 && len(snapshot.AwaitingMerge) > 0 {
+		recovery.AwaitingMerge = snapshot.AwaitingMerge
+	}
+	if len(recovery.AwaitingIntervention) == 0 && len(snapshot.AwaitingIntervention) > 0 {
+		recovery.AwaitingIntervention = snapshot.AwaitingIntervention
+	}
+	if len(recovery.Retrying) == 0 && len(snapshot.Retrying) > 0 {
+		recovery.Retrying = snapshot.Retrying
+	}
+	health := snapshot.Health
+	if len(health.Alerts) == 0 && len(snapshot.Alerts) > 0 {
+		health.Alerts = snapshot.Alerts
+	}
+
 	serviceStartedAt := ""
 	uptimeSeconds := 0.0
 	if !snapshot.Service.StartedAt.IsZero() {
@@ -314,8 +380,25 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	awaitingMerge := make([]awaitingMergeResponse, 0, len(snapshot.AwaitingMerge))
-	for _, item := range snapshot.AwaitingMerge {
+	recoveringItems := make([]recoveringResponse, 0, len(recovery.Recovering))
+	for _, item := range recovery.Recovering {
+		recoveringItems = append(recoveringItems, recoveringResponse{
+			IssueID:            item.IssueID,
+			IssueIdentifier:    item.IssueIdentifier,
+			WorkspacePath:      item.WorkspacePath,
+			State:              item.State,
+			Strategy:           item.Strategy,
+			Source:             item.Source,
+			DispatchKind:       item.DispatchKind,
+			ExpectedOutcome:    item.ExpectedOutcome,
+			ContinuationReason: item.ContinuationReason,
+			ObservedAt:         item.ObservedAt.UTC().Format(time.RFC3339),
+			AttemptCount:       item.AttemptCount,
+		})
+	}
+
+	awaitingMerge := make([]awaitingMergeResponse, 0, len(recovery.AwaitingMerge))
+	for _, item := range recovery.AwaitingMerge {
 		awaitingMerge = append(awaitingMerge, awaitingMergeResponse{
 			IssueID:         item.IssueID,
 			IssueIdentifier: item.IssueIdentifier,
@@ -330,8 +413,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	awaitingIntervention := make([]awaitingInterventionResponse, 0, len(snapshot.AwaitingIntervention))
-	for _, item := range snapshot.AwaitingIntervention {
+	awaitingIntervention := make([]awaitingInterventionResponse, 0, len(recovery.AwaitingIntervention))
+	for _, item := range recovery.AwaitingIntervention {
 		awaitingIntervention = append(awaitingIntervention, awaitingInterventionResponse{
 			IssueID:             item.IssueID,
 			IssueIdentifier:     item.IssueIdentifier,
@@ -348,8 +431,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	retrying := make([]retryResponse, 0, len(snapshot.Retrying))
-	for _, item := range snapshot.Retrying {
+	retrying := make([]retryResponse, 0, len(recovery.Retrying))
+	for _, item := range recovery.Retrying {
 		retrying = append(retrying, retryResponse{
 			IssueID:            item.IssueID,
 			IssueIdentifier:    item.IssueIdentifier,
@@ -362,8 +445,8 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 		})
 	}
 
-	alerts := make([]alertResponse, 0, len(snapshot.Alerts))
-	for _, item := range snapshot.Alerts {
+	alerts := make([]alertResponse, 0, len(health.Alerts))
+	for _, item := range health.Alerts {
 		alerts = append(alerts, alertResponse{
 			Code:            item.Code,
 			Level:           item.Level,
@@ -371,6 +454,41 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 			IssueID:         item.IssueID,
 			IssueIdentifier: item.IssueIdentifier,
 		})
+	}
+
+	notifications := make([]notificationChannelHealthResponse, 0, len(health.Notifications))
+	for _, item := range health.Notifications {
+		var lastAttemptAt *string
+		if item.LastAttemptAt != nil {
+			text := item.LastAttemptAt.UTC().Format(time.RFC3339)
+			lastAttemptAt = &text
+		}
+		var lastSuccessAt *string
+		if item.LastSuccessAt != nil {
+			text := item.LastSuccessAt.UTC().Format(time.RFC3339)
+			lastSuccessAt = &text
+		}
+		notifications = append(notifications, notificationChannelHealthResponse{
+			ChannelID:           item.ChannelID,
+			DisplayName:         item.DisplayName,
+			Status:              item.Status,
+			QueueOverflow:       item.QueueOverflow,
+			LastError:           item.LastError,
+			LastAttemptAt:       lastAttemptAt,
+			LastSuccessAt:       lastSuccessAt,
+			ConsecutiveFailures: item.ConsecutiveFailures,
+		})
+	}
+
+	var persistenceAttemptAt *string
+	if health.Persistence.LastAttemptAt != nil {
+		text := health.Persistence.LastAttemptAt.UTC().Format(time.RFC3339)
+		persistenceAttemptAt = &text
+	}
+	var persistenceSuccessAt *string
+	if health.Persistence.LastSuccessAt != nil {
+		text := health.Persistence.LastSuccessAt.UTC().Format(time.RFC3339)
+		persistenceSuccessAt = &text
 	}
 
 	return stateResponse{
@@ -381,16 +499,32 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 			UptimeSeconds: uptimeSeconds,
 		},
 		Counts: stateCounts{
+			Recovering:           snapshot.Counts.Recovering,
 			Running:              snapshot.Counts.Running,
 			AwaitingMerge:        snapshot.Counts.AwaitingMerge,
 			AwaitingIntervention: snapshot.Counts.AwaitingIntervention,
 			Retrying:             snapshot.Counts.Retrying,
 		},
-		Running:              running,
-		AwaitingMerge:        awaitingMerge,
-		AwaitingIntervention: awaitingIntervention,
-		Retrying:             retrying,
-		Alerts:               alerts,
+		Running: running,
+		Recovery: recoveryResponse{
+			Recovering:           recoveringItems,
+			AwaitingMerge:        awaitingMerge,
+			AwaitingIntervention: awaitingIntervention,
+			Retrying:             retrying,
+		},
+		Health: healthResponse{
+			Alerts:        alerts,
+			Notifications: notifications,
+			Persistence: persistenceHealthResponse{
+				Enabled:             health.Persistence.Enabled,
+				Kind:                health.Persistence.Kind,
+				Status:              health.Persistence.Status,
+				LastError:           health.Persistence.LastError,
+				LastAttemptAt:       persistenceAttemptAt,
+				LastSuccessAt:       persistenceSuccessAt,
+				ConsecutiveFailures: health.Persistence.ConsecutiveFailures,
+			},
+		},
 		CodexTotals: totalsResponse{
 			InputTokens:    snapshot.CodexTotals.InputTokens,
 			OutputTokens:   snapshot.CodexTotals.OutputTokens,
@@ -402,6 +536,20 @@ func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
 }
 
 func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issueResponse, bool) {
+	recovery := snapshot.Recovery
+	if len(recovery.Recovering) == 0 && len(snapshot.Recovering) > 0 {
+		recovery.Recovering = snapshot.Recovering
+	}
+	if len(recovery.AwaitingMerge) == 0 && len(snapshot.AwaitingMerge) > 0 {
+		recovery.AwaitingMerge = snapshot.AwaitingMerge
+	}
+	if len(recovery.AwaitingIntervention) == 0 && len(snapshot.AwaitingIntervention) > 0 {
+		recovery.AwaitingIntervention = snapshot.AwaitingIntervention
+	}
+	if len(recovery.Retrying) == 0 && len(snapshot.Retrying) > 0 {
+		recovery.Retrying = snapshot.Retrying
+	}
+
 	for _, item := range snapshot.Running {
 		var runningLastEventAt *string
 		if item.LastEventAt != nil {
@@ -439,7 +587,32 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 			}, true
 		}
 	}
-	for _, item := range snapshot.AwaitingMerge {
+	for _, item := range recovery.Recovering {
+		if item.IssueIdentifier == identifier {
+			copyItem := recoveringResponse{
+				IssueID:            item.IssueID,
+				IssueIdentifier:    item.IssueIdentifier,
+				WorkspacePath:      item.WorkspacePath,
+				State:              item.State,
+				Strategy:           item.Strategy,
+				Source:             item.Source,
+				DispatchKind:       item.DispatchKind,
+				ExpectedOutcome:    item.ExpectedOutcome,
+				ContinuationReason: item.ContinuationReason,
+				ObservedAt:         item.ObservedAt.UTC().Format(time.RFC3339),
+				AttemptCount:       item.AttemptCount,
+			}
+			return issueResponse{
+				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),
+				Identifier:    identifier,
+				Status:        "recovering",
+				WorkspacePath: item.WorkspacePath,
+				AttemptCount:  item.AttemptCount,
+				Recovering:    &copyItem,
+			}, true
+		}
+	}
+	for _, item := range recovery.AwaitingMerge {
 		if item.IssueIdentifier == identifier {
 			copyItem := awaitingMergeResponse{
 				IssueID:         item.IssueID,
@@ -464,7 +637,7 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 			}, true
 		}
 	}
-	for _, item := range snapshot.AwaitingIntervention {
+	for _, item := range recovery.AwaitingIntervention {
 		if item.IssueIdentifier == identifier {
 			copyItem := awaitingInterventionResponse{
 				IssueID:             item.IssueID,
@@ -490,7 +663,7 @@ func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issue
 			}, true
 		}
 	}
-	for _, item := range snapshot.Retrying {
+	for _, item := range recovery.Retrying {
 		if item.IssueIdentifier == identifier {
 			copyItem := retryResponse{
 				IssueID:            item.IssueID,

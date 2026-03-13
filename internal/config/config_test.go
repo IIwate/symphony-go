@@ -277,34 +277,48 @@ func TestNewFromWorkflowParsesSessionPersistenceAndNotifications(t *testing.T) {
 	cfg, err := NewFromWorkflow(&model.WorkflowDefinition{
 		Config: map[string]any{
 			"session_persistence": map[string]any{
-				"enabled":           true,
-				"backend":           "file",
-				"path":              "~/session-state.json",
-				"flush_interval_ms": "2500",
-				"fsync_on_critical": "false",
+				"enabled": true,
+				"kind":    "file",
+				"file": map[string]any{
+					"path":              "~/session-state.json",
+					"flush_interval_ms": "2500",
+					"fsync_on_critical": "false",
+				},
 			},
 			"notifications": map[string]any{
 				"channels": []any{
 					map[string]any{
-						"name":   "slack-team",
-						"kind":   "slack",
-						"url":    "$SLACK_WEBHOOK_URL",
-						"events": []any{"issue_completed", "issue_failed"},
+						"id":           "slack-team",
+						"display_name": "Slack Team",
+						"kind":         "slack",
+						"slack": map[string]any{
+							"incoming_webhook_url": "$SLACK_WEBHOOK_URL",
+						},
+						"subscriptions": map[string]any{
+							"types": []any{"issue_completed", "issue_failed"},
+						},
 					},
 					map[string]any{
-						"name": "ops-webhook",
-						"kind": "webhook",
-						"url":  "https://hooks.example.com/symphony",
-						"headers": map[string]any{
-							"Authorization": "$WEBHOOK_AUTH_HEADER",
+						"id":           "ops-webhook",
+						"display_name": "Ops Webhook",
+						"kind":         "webhook",
+						"webhook": map[string]any{
+							"url": "https://hooks.example.com/symphony",
+							"headers": map[string]any{
+								"Authorization": "$WEBHOOK_AUTH_HEADER",
+							},
 						},
-						"events": []any{"system_alert"},
+						"subscriptions": map[string]any{
+							"types": []any{"system_alert"},
+						},
 					},
 				},
 				"defaults": map[string]any{
-					"timeout_ms":     "8000",
-					"retry_count":    "3",
-					"retry_delay_ms": "1500",
+					"timeout_ms":          "8000",
+					"retry_count":         "3",
+					"retry_delay_ms":      "1500",
+					"queue_size":          "64",
+					"critical_queue_size": "16",
 				},
 			},
 		},
@@ -316,22 +330,25 @@ func TestNewFromWorkflowParsesSessionPersistenceAndNotifications(t *testing.T) {
 	if !cfg.SessionPersistence.Enabled {
 		t.Fatal("SessionPersistence.Enabled = false, want true")
 	}
-	if cfg.SessionPersistence.Path != filepath.Join(homeDir, "session-state.json") {
-		t.Fatalf("SessionPersistence.Path = %q, want %q", cfg.SessionPersistence.Path, filepath.Join(homeDir, "session-state.json"))
+	if cfg.SessionPersistence.Kind != model.SessionPersistenceKindFile {
+		t.Fatalf("SessionPersistence.Kind = %q, want file", cfg.SessionPersistence.Kind)
 	}
-	if cfg.SessionPersistence.FlushIntervalMS != 2500 {
-		t.Fatalf("SessionPersistence.FlushIntervalMS = %d, want 2500", cfg.SessionPersistence.FlushIntervalMS)
+	if cfg.SessionPersistence.File.Path != filepath.Join(homeDir, "session-state.json") {
+		t.Fatalf("SessionPersistence.File.Path = %q, want %q", cfg.SessionPersistence.File.Path, filepath.Join(homeDir, "session-state.json"))
 	}
-	if cfg.SessionPersistence.FsyncOnCritical {
-		t.Fatal("SessionPersistence.FsyncOnCritical = true, want false")
+	if cfg.SessionPersistence.File.FlushIntervalMS != 2500 {
+		t.Fatalf("SessionPersistence.File.FlushIntervalMS = %d, want 2500", cfg.SessionPersistence.File.FlushIntervalMS)
+	}
+	if cfg.SessionPersistence.File.FsyncOnCritical {
+		t.Fatal("SessionPersistence.File.FsyncOnCritical = true, want false")
 	}
 	if len(cfg.Notifications.Channels) != 2 {
 		t.Fatalf("Notifications.Channels size = %d, want 2", len(cfg.Notifications.Channels))
 	}
-	if cfg.Notifications.Channels[0].URL != "https://hooks.slack.example/services/test" {
-		t.Fatalf("Notifications.Channels[0].URL = %q", cfg.Notifications.Channels[0].URL)
+	if cfg.Notifications.Channels[0].Slack == nil || cfg.Notifications.Channels[0].Slack.IncomingWebhookURL != "https://hooks.slack.example/services/test" {
+		t.Fatalf("Notifications.Channels[0].Slack = %+v", cfg.Notifications.Channels[0].Slack)
 	}
-	if got := cfg.Notifications.Channels[1].Headers["Authorization"]; got != "Bearer secret" {
+	if got := cfg.Notifications.Channels[1].Webhook.Headers["Authorization"]; got != "Bearer secret" {
 		t.Fatalf("Notifications.Channels[1].Headers[Authorization] = %q, want Bearer secret", got)
 	}
 	if cfg.Notifications.Defaults.TimeoutMS != 8000 {
@@ -342,6 +359,12 @@ func TestNewFromWorkflowParsesSessionPersistenceAndNotifications(t *testing.T) {
 	}
 	if cfg.Notifications.Defaults.RetryDelayMS != 1500 {
 		t.Fatalf("Notifications.Defaults.RetryDelayMS = %d, want 1500", cfg.Notifications.Defaults.RetryDelayMS)
+	}
+	if cfg.Notifications.Defaults.QueueSize != 64 {
+		t.Fatalf("Notifications.Defaults.QueueSize = %d, want 64", cfg.Notifications.Defaults.QueueSize)
+	}
+	if cfg.Notifications.Defaults.CriticalQueueSize != 16 {
+		t.Fatalf("Notifications.Defaults.CriticalQueueSize = %d, want 16", cfg.Notifications.Defaults.CriticalQueueSize)
 	}
 }
 
@@ -360,7 +383,8 @@ func TestValidateForDispatchRejectsInvalidRuntimeExtensions(t *testing.T) {
 			name: "missing session persistence path",
 			mutate: func(cfg *model.ServiceConfig) {
 				cfg.SessionPersistence.Enabled = true
-				cfg.SessionPersistence.Path = ""
+				cfg.SessionPersistence.Kind = model.SessionPersistenceKindFile
+				cfg.SessionPersistence.File.Path = ""
 			},
 		},
 		{
@@ -368,9 +392,12 @@ func TestValidateForDispatchRejectsInvalidRuntimeExtensions(t *testing.T) {
 			mutate: func(cfg *model.ServiceConfig) {
 				cfg.Notifications.Channels = []model.NotificationChannelConfig{
 					{
-						Name:   "ops",
-						Kind:   model.NotificationChannelKindWebhook,
-						Events: []model.NotificationEventType{model.NotificationEventSystemAlert},
+						ID:   "ops",
+						Kind: model.NotificationChannelKindWebhook,
+						Subscriptions: model.NotificationSubscriptionConfig{
+							Types: []model.NotificationEventType{model.NotificationEventSystemAlert},
+						},
+						Delivery: cfg.Notifications.Defaults,
 					},
 				}
 			},
@@ -380,10 +407,15 @@ func TestValidateForDispatchRejectsInvalidRuntimeExtensions(t *testing.T) {
 			mutate: func(cfg *model.ServiceConfig) {
 				cfg.Notifications.Channels = []model.NotificationChannelConfig{
 					{
-						Name:   "ops",
-						Kind:   model.NotificationChannelKindWebhook,
-						URL:    "https://hooks.example.com/symphony",
-						Events: []model.NotificationEventType{"bad_event"},
+						ID:   "ops",
+						Kind: model.NotificationChannelKindWebhook,
+						Subscriptions: model.NotificationSubscriptionConfig{
+							Types: []model.NotificationEventType{"bad_event"},
+						},
+						Delivery: cfg.Notifications.Defaults,
+						Webhook: &model.WebhookNotificationConfig{
+							URL: "https://hooks.example.com/symphony",
+						},
 					},
 				}
 			},

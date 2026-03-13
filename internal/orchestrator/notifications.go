@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,10 +16,10 @@ import (
 )
 
 const (
-	defaultNotificationQueueSize   = 128
-	notificationDrainTimeout       = 5 * time.Second
+	notificationDrainTimeout        = 5 * time.Second
 	notificationQueueOverflowPrefix = "notification_queue_overflow_"
 	notificationDeliveryFailPrefix  = "notification_delivery_failed_"
+	runtimeEventVersion             = 1
 )
 
 type notifier interface {
@@ -29,52 +28,40 @@ type notifier interface {
 }
 
 type asyncNotifier struct {
-	logger         *slog.Logger
-	emitters       []*notificationEmitter
-	enqueueResult  func(channel string, err error)
+	logger        *slog.Logger
+	emitters      []*notificationEmitter
+	enqueueResult func(channelID string, err error)
 }
 
 type notificationEmitter struct {
 	logger         *slog.Logger
 	channel        notificationChannel
-	client         *http.Client
-	queue          chan model.RuntimeEvent
-	deliveryResult func(channel string, err error)
+	normalQueue    chan model.RuntimeEvent
+	criticalQueue  chan model.RuntimeEvent
+	deliveryResult func(channelID string, err error)
 
-	mu     sync.Mutex
-	closed bool
-	wg     sync.WaitGroup
+	mu             sync.Mutex
+	closed         bool
+	overflowActive bool
+	wg             sync.WaitGroup
 }
 
 type notificationChannel struct {
-	name         string
-	kind         model.NotificationChannelKind
-	url          string
-	headers      map[string]string
-	subscribeAll bool
-	events       map[model.NotificationEventType]struct{}
-}
-
-type webhookPayload struct {
-	EventID    string         `json:"event_id"`
-	Type       string         `json:"type"`
-	Level      string         `json:"level"`
-	OccurredAt string         `json:"occurred_at"`
-	IssueID    string         `json:"issue_id,omitempty"`
-	Identifier string         `json:"identifier,omitempty"`
-	Message    string         `json:"message,omitempty"`
-	Details    map[string]any `json:"details,omitempty"`
-}
-
-type slackPayload struct {
-	Text string `json:"text"`
+	id          string
+	displayName string
+	kind        model.NotificationChannelKind
+	families    map[model.RuntimeEventFamily]struct{}
+	types       map[model.NotificationEventType]struct{}
+	delivery    model.NotificationDeliveryConfig
+	webhook     *model.WebhookNotificationConfig
+	slack       *model.SlackNotificationConfig
 }
 
 func newAsyncNotifier(
 	cfg model.NotificationsConfig,
 	logger *slog.Logger,
-	deliveryResult func(channel string, err error),
-	enqueueResult func(channel string, err error),
+	deliveryResult func(channelID string, err error),
+	enqueueResult func(channelID string, err error),
 ) notifier {
 	if len(cfg.Channels) == 0 {
 		return nil
@@ -85,38 +72,34 @@ func newAsyncNotifier(
 
 	emitters := make([]*notificationEmitter, 0, len(cfg.Channels))
 	for _, channelCfg := range cfg.Channels {
-		subscribeAll := false
-		events := make(map[model.NotificationEventType]struct{}, len(channelCfg.Events))
-		for _, eventType := range channelCfg.Events {
-			if eventType == model.NotificationEventAll {
-				subscribeAll = true
-				continue
-			}
-			events[eventType] = struct{}{}
+		families := make(map[model.RuntimeEventFamily]struct{}, len(channelCfg.Subscriptions.Families))
+		for _, family := range channelCfg.Subscriptions.Families {
+			families[family] = struct{}{}
 		}
-		headers := make(map[string]string, len(channelCfg.Headers))
-		for key, value := range channelCfg.Headers {
-			headers[key] = value
+		types := make(map[model.NotificationEventType]struct{}, len(channelCfg.Subscriptions.Types))
+		for _, eventType := range channelCfg.Subscriptions.Types {
+			types[eventType] = struct{}{}
 		}
 
 		emitter := &notificationEmitter{
 			logger: logger,
 			channel: notificationChannel{
-				name:         channelCfg.Name,
-				kind:         channelCfg.Kind,
-				url:          channelCfg.URL,
-				headers:      headers,
-				subscribeAll: subscribeAll,
-				events:       events,
+				id:          channelCfg.ID,
+				displayName: channelCfg.DisplayName,
+				kind:        channelCfg.Kind,
+				families:    families,
+				types:       types,
+				delivery:    channelCfg.Delivery,
+				webhook:     channelCfg.Webhook,
+				slack:       channelCfg.Slack,
 			},
-			client: &http.Client{
-				Timeout: time.Duration(cfg.Defaults.TimeoutMS) * time.Millisecond,
-			},
-			queue:          make(chan model.RuntimeEvent, defaultNotificationQueueSize),
+			normalQueue:    make(chan model.RuntimeEvent, channelCfg.Delivery.QueueSize),
+			criticalQueue:  make(chan model.RuntimeEvent, channelCfg.Delivery.CriticalQueueSize),
 			deliveryResult: deliveryResult,
 		}
-		emitter.wg.Add(1)
-		go emitter.worker(cfg.Defaults)
+		emitter.wg.Add(2)
+		go emitter.worker(emitter.criticalQueue)
+		go emitter.worker(emitter.normalQueue)
 		emitters = append(emitters, emitter)
 	}
 
@@ -132,15 +115,15 @@ func (n *asyncNotifier) Emit(event model.RuntimeEvent) {
 		return
 	}
 	for _, emitter := range n.emitters {
-		if !emitter.subscribed(event.Type) {
+		if !emitter.subscribed(event) {
 			continue
 		}
-		err := emitter.emit(event)
-		if n.enqueueResult != nil {
-			n.enqueueResult(emitter.channel.name, err)
+		err, shouldReport := emitter.emit(event)
+		if shouldReport && n.enqueueResult != nil {
+			go n.enqueueResult(emitter.channel.id, err)
 		}
 		if err != nil {
-			n.logger.Warn("notification queue is full", "channel", emitter.channel.name, "event_type", event.Type, "event_id", event.EventID)
+			n.logger.Warn("notification queue is full", "channel_id", emitter.channel.id, "event_type", event.Type, "event_id", event.EventID)
 		}
 	}
 }
@@ -162,33 +145,48 @@ func (n *asyncNotifier) Close(ctx context.Context) error {
 	return firstErr
 }
 
-func (e *notificationEmitter) subscribed(eventType model.NotificationEventType) bool {
+func (e *notificationEmitter) subscribed(event model.RuntimeEvent) bool {
 	if e == nil {
 		return false
 	}
-	if e.channel.subscribeAll {
-		return true
+	if len(e.channel.types) > 0 {
+		if _, ok := e.channel.types[event.Type]; ok {
+			return true
+		}
 	}
-	_, ok := e.channel.events[eventType]
-	return ok
+	if len(e.channel.families) > 0 {
+		_, ok := e.channel.families[event.Family]
+		return ok
+	}
+	return false
 }
 
-func (e *notificationEmitter) emit(event model.RuntimeEvent) error {
+func (e *notificationEmitter) emit(event model.RuntimeEvent) (error, bool) {
 	if e == nil {
-		return nil
+		return nil, false
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
-		return fmt.Errorf("notification notifier is closed")
+		return fmt.Errorf("notification notifier is closed"), true
+	}
+
+	queue := e.normalQueue
+	if event.Priority == model.RuntimeEventPriorityCritical {
+		queue = e.criticalQueue
 	}
 
 	select {
-	case e.queue <- event:
-		return nil
+	case queue <- event:
+		if !e.overflowActive {
+			return nil, false
+		}
+		e.overflowActive = false
+		return nil, true
 	default:
-		return fmt.Errorf("notification queue is full")
+		e.overflowActive = true
+		return fmt.Errorf("notification queue is full"), true
 	}
 }
 
@@ -203,7 +201,8 @@ func (e *notificationEmitter) Close(ctx context.Context) error {
 	e.mu.Lock()
 	if !e.closed {
 		e.closed = true
-		close(e.queue)
+		close(e.normalQueue)
+		close(e.criticalQueue)
 	}
 	e.mu.Unlock()
 
@@ -221,34 +220,53 @@ func (e *notificationEmitter) Close(ctx context.Context) error {
 	}
 }
 
-func (e *notificationEmitter) worker(defaults model.NotificationDefaultsConfig) {
+func (e *notificationEmitter) worker(queue <-chan model.RuntimeEvent) {
 	defer e.wg.Done()
-	for event := range e.queue {
-		err := e.deliver(defaults, event)
+	for event := range queue {
+		err := e.deliver(event)
 		if e.deliveryResult != nil {
-			e.deliveryResult(e.channel.name, err)
+			e.deliveryResult(e.channel.id, err)
 		}
 	}
 }
 
-func (e *notificationEmitter) deliver(defaults model.NotificationDefaultsConfig, event model.RuntimeEvent) error {
+func (e *notificationEmitter) deliver(event model.RuntimeEvent) error {
 	payload, contentType, err := encodeNotificationEvent(e.channel.kind, event)
 	if err != nil {
 		return err
 	}
 
-	var lastErr error
-	for attempt := 0; attempt <= defaults.RetryCount; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, e.channel.url, bytes.NewReader(payload))
+	var (
+		lastErr error
+		urlText string
+		headers map[string]string
+	)
+	switch e.channel.kind {
+	case model.NotificationChannelKindWebhook:
+		if e.channel.webhook != nil {
+			urlText = e.channel.webhook.URL
+			headers = e.channel.webhook.Headers
+		}
+	case model.NotificationChannelKindSlack:
+		if e.channel.slack != nil {
+			urlText = e.channel.slack.IncomingWebhookURL
+		}
+	default:
+		return fmt.Errorf("unsupported notification channel kind %q", e.channel.kind)
+	}
+
+	client := &http.Client{Timeout: time.Duration(e.channel.delivery.TimeoutMS) * time.Millisecond}
+	for attempt := 0; attempt <= e.channel.delivery.RetryCount; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, urlText, bytes.NewReader(payload))
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Content-Type", contentType)
-		for key, value := range e.channel.headers {
+		for key, value := range headers {
 			req.Header.Set(key, value)
 		}
 
-		resp, err := e.client.Do(req)
+		resp, err := client.Do(req)
 		if err == nil && resp != nil {
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				_ = resp.Body.Close()
@@ -260,10 +278,10 @@ func (e *notificationEmitter) deliver(defaults model.NotificationDefaultsConfig,
 			lastErr = err
 		}
 
-		if attempt >= defaults.RetryCount {
+		if attempt >= e.channel.delivery.RetryCount {
 			break
 		}
-		time.Sleep(time.Duration(defaults.RetryDelayMS) * time.Millisecond)
+		time.Sleep(time.Duration(e.channel.delivery.RetryDelayMS) * time.Millisecond)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("notification delivery failed")
@@ -274,19 +292,10 @@ func (e *notificationEmitter) deliver(defaults model.NotificationDefaultsConfig,
 func encodeNotificationEvent(kind model.NotificationChannelKind, event model.RuntimeEvent) ([]byte, string, error) {
 	switch kind {
 	case model.NotificationChannelKindSlack:
-		raw, err := json.Marshal(slackPayload{Text: renderSlackText(event)})
+		raw, err := json.Marshal(map[string]string{"text": renderSlackText(event)})
 		return raw, "application/json", err
 	case model.NotificationChannelKindWebhook:
-		raw, err := json.Marshal(webhookPayload{
-			EventID:    event.EventID,
-			Type:       string(event.Type),
-			Level:      event.Level,
-			OccurredAt: event.OccurredAt.UTC().Format(time.RFC3339),
-			IssueID:    event.IssueID,
-			Identifier: event.Identifier,
-			Message:    event.Message,
-			Details:    cloneDetails(event.Details),
-		})
+		raw, err := json.Marshal(event)
 		return raw, "application/json", err
 	default:
 		return nil, "", fmt.Errorf("unsupported notification channel kind %q", kind)
@@ -303,6 +312,31 @@ func (o *Orchestrator) reloadNotifierLocked() notifier {
 	previous := o.notifier
 	o.notifier = next
 	return previous
+}
+
+func (o *Orchestrator) reconcileNotificationHealthLocked() {
+	active := make(map[string]model.NotificationChannelConfig, len(o.currentConfig().Notifications.Channels))
+	for _, channel := range o.currentConfig().Notifications.Channels {
+		active[channel.ID] = channel
+		entry := o.notificationHealth[channel.ID]
+		if entry == nil {
+			entry = &NotificationChannelHealthSnapshot{
+				ChannelID:   channel.ID,
+				DisplayName: channel.DisplayName,
+				Status:      "healthy",
+			}
+			o.notificationHealth[channel.ID] = entry
+			continue
+		}
+		entry.DisplayName = channel.DisplayName
+	}
+	for channelID := range o.notificationHealth {
+		if _, ok := active[channelID]; !ok {
+			delete(o.notificationHealth, channelID)
+			o.clearHealthAlertLocked(notificationQueueOverflowCode(channelID))
+			o.clearHealthAlertLocked(notificationDeliveryFailedCode(channelID))
+		}
+	}
 }
 
 func (o *Orchestrator) closeNotifier(active notifier) {
@@ -323,290 +357,296 @@ func (o *Orchestrator) emitNotificationLocked(event model.RuntimeEvent) {
 	o.notifier.Emit(event)
 }
 
-func notificationQueueOverflowCode(channel string) string {
-	return notificationQueueOverflowPrefix + model.SanitizeWorkspaceKey(channel)
+func notificationQueueOverflowCode(channelID string) string {
+	return notificationQueueOverflowPrefix + model.SanitizeWorkspaceKey(channelID)
 }
 
-func notificationDeliveryFailedCode(channel string) string {
-	return notificationDeliveryFailPrefix + model.SanitizeWorkspaceKey(channel)
+func notificationDeliveryFailedCode(channelID string) string {
+	return notificationDeliveryFailPrefix + model.SanitizeWorkspaceKey(channelID)
 }
 
-func (o *Orchestrator) reportNotificationEnqueueResult(channel string, err error) {
-	o.postRuntimeExtensionEvent(runtimeExtensionEvent{
-		Kind:    runtimeExtensionEventNotificationEnqueue,
-		Channel: channel,
-		Err:     err,
-	})
+func (o *Orchestrator) reportNotificationEnqueueResult(channelID string, err error) {
+	o.handleNotificationEnqueueResult(channelID, err)
 }
 
-func (o *Orchestrator) reportNotificationDeliveryResult(channel string, err error) {
-	o.postRuntimeExtensionEvent(runtimeExtensionEvent{
-		Kind:    runtimeExtensionEventNotificationDeliver,
-		Channel: channel,
-		Err:     err,
-	})
+func (o *Orchestrator) reportNotificationDeliveryResult(channelID string, err error) {
+	o.handleNotificationDeliveryResult(channelID, err)
 }
 
-func (o *Orchestrator) handleNotificationEnqueueResult(channel string, err error) {
-	code := notificationQueueOverflowCode(channel)
+func (o *Orchestrator) ensureNotificationChannelHealthLocked(channelID string) *NotificationChannelHealthSnapshot {
+	if entry := o.notificationHealth[channelID]; entry != nil {
+		return entry
+	}
+	entry := &NotificationChannelHealthSnapshot{
+		ChannelID: channelID,
+		Status:    "healthy",
+	}
+	for _, channel := range o.currentConfig().Notifications.Channels {
+		if channel.ID == channelID {
+			entry.DisplayName = channel.DisplayName
+			break
+		}
+	}
+	o.notificationHealth[channelID] = entry
+	return entry
+}
+
+func (o *Orchestrator) handleNotificationEnqueueResult(channelID string, err error) {
+	code := notificationQueueOverflowCode(channelID)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	entry := o.ensureNotificationChannelHealthLocked(channelID)
+	now := o.now().UTC()
+	entry.LastAttemptAt = cloneTimePtr(&now)
+
 	if err == nil {
-		if o.clearSystemAlertLocked(code) {
-			o.commitStateLocked(false)
+		entry.QueueOverflow = false
+		if entry.ConsecutiveFailures == 0 {
+			entry.Status = "healthy"
+			entry.LastError = nil
 		}
+		o.clearHealthAlertAndNotifyLocked(code)
+		o.publishViewLocked()
 		return
 	}
 
-	if !o.setSystemAlertLocked(AlertSnapshot{
+	errorText := err.Error()
+	entry.QueueOverflow = true
+	entry.Status = "degraded"
+	entry.LastError = optionalError(errorText)
+	o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 		Code:    code,
 		Level:   "warn",
-		Message: err.Error(),
-	}) {
-		return
-	}
-	o.commitStateLocked(false)
+		Message: errorText,
+	})
+	o.publishViewLocked()
 }
 
-func (o *Orchestrator) handleNotificationDeliveryResult(channel string, err error) {
-	code := notificationDeliveryFailedCode(channel)
+func (o *Orchestrator) handleNotificationDeliveryResult(channelID string, err error) {
+	code := notificationDeliveryFailedCode(channelID)
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	entry := o.ensureNotificationChannelHealthLocked(channelID)
+	now := o.now().UTC()
+	entry.LastAttemptAt = cloneTimePtr(&now)
+
 	if err == nil {
-		if o.clearSystemAlertLocked(code) {
-			o.commitStateLocked(false)
+		entry.Status = "healthy"
+		entry.LastSuccessAt = cloneTimePtr(&now)
+		entry.ConsecutiveFailures = 0
+		if !entry.QueueOverflow {
+			entry.LastError = nil
 		}
+		o.clearHealthAlertAndNotifyLocked(code)
+		o.publishViewLocked()
 		return
 	}
 
-	o.logger.Warn("notification delivery failed", "channel", channel, "error", err.Error())
-	if !o.setSystemAlertLocked(AlertSnapshot{
+	errorText := err.Error()
+	entry.Status = "degraded"
+	entry.LastError = optionalError(errorText)
+	entry.ConsecutiveFailures++
+	o.logger.Warn("notification delivery failed", "channel_id", channelID, "error", errorText)
+	o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 		Code:    code,
 		Level:   "warn",
-		Message: fmt.Sprintf("notification channel %s failed: %s", channel, err.Error()),
-	}) {
-		return
-	}
-	o.commitStateLocked(false)
+		Message: fmt.Sprintf("notification channel %s failed: %s", channelID, errorText),
+	})
+	o.publishViewLocked()
 }
 
 func renderSlackText(event model.RuntimeEvent) string {
 	lines := []string{
 		fmt.Sprintf("[%s] %s", strings.ToUpper(strings.TrimSpace(event.Level)), string(event.Type)),
 	}
-	if strings.TrimSpace(event.Message) != "" {
-		lines = append(lines, event.Message)
+	if strings.TrimSpace(event.Summary) != "" {
+		lines = append(lines, event.Summary)
 	}
-	if strings.TrimSpace(event.Identifier) != "" {
-		lines = append(lines, fmt.Sprintf("Issue: %s", event.Identifier))
-	} else if strings.TrimSpace(event.IssueID) != "" {
-		lines = append(lines, fmt.Sprintf("IssueID: %s", event.IssueID))
-	}
-
-	if len(event.Details) == 0 {
-		return strings.Join(lines, "\n")
-	}
-
-	keys := make([]string, 0, len(event.Details))
-	for key := range event.Details {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		value := detailString(event.Details[key])
-		if strings.TrimSpace(value) == "" {
-			continue
+	if event.Subject != nil {
+		if strings.TrimSpace(event.Subject.Identifier) != "" {
+			lines = append(lines, fmt.Sprintf("Issue: %s", event.Subject.Identifier))
+		} else if strings.TrimSpace(event.Subject.IssueID) != "" {
+			lines = append(lines, fmt.Sprintf("IssueID: %s", event.Subject.IssueID))
 		}
-		lines = append(lines, fmt.Sprintf("%s: %s", key, value))
+		if strings.TrimSpace(event.Subject.WorkspacePath) != "" {
+			lines = append(lines, fmt.Sprintf("Workspace: %s", event.Subject.WorkspacePath))
+		}
+	}
+	if event.Dispatch != nil {
+		if strings.TrimSpace(event.Dispatch.Kind) != "" {
+			lines = append(lines, fmt.Sprintf("Dispatch: %s", event.Dispatch.Kind))
+		}
+		if strings.TrimSpace(event.Dispatch.ExpectedOutcome) != "" {
+			lines = append(lines, fmt.Sprintf("Expected: %s", event.Dispatch.ExpectedOutcome))
+		}
+		if event.Dispatch.ContinuationReason != nil && strings.TrimSpace(*event.Dispatch.ContinuationReason) != "" {
+			lines = append(lines, fmt.Sprintf("Reason: %s", *event.Dispatch.ContinuationReason))
+		}
+	}
+	if event.Failure != nil {
+		if strings.TrimSpace(event.Failure.Phase) != "" {
+			lines = append(lines, fmt.Sprintf("Phase: %s", event.Failure.Phase))
+		}
+		if strings.TrimSpace(event.Failure.Error) != "" {
+			lines = append(lines, fmt.Sprintf("Error: %s", event.Failure.Error))
+		}
+	}
+	if event.PullRequest != nil {
+		if event.PullRequest.Number > 0 {
+			lines = append(lines, fmt.Sprintf("PR: #%d", event.PullRequest.Number))
+		}
+		if strings.TrimSpace(event.PullRequest.State) != "" {
+			lines = append(lines, fmt.Sprintf("PR State: %s", event.PullRequest.State))
+		}
+		if strings.TrimSpace(event.PullRequest.URL) != "" {
+			lines = append(lines, fmt.Sprintf("PR URL: %s", event.PullRequest.URL))
+		}
+	}
+	if event.Alert != nil {
+		if strings.TrimSpace(event.Alert.Code) != "" {
+			lines = append(lines, fmt.Sprintf("Alert: %s", event.Alert.Code))
+		}
+		if strings.TrimSpace(event.Alert.Status) != "" {
+			lines = append(lines, fmt.Sprintf("Alert Status: %s", event.Alert.Status))
+		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-func cloneDetails(details map[string]any) map[string]any {
-	if len(details) == 0 {
+func eventSubject(issueID string, identifier string, workspacePath string) *model.RuntimeEventSubject {
+	if strings.TrimSpace(issueID) == "" && strings.TrimSpace(identifier) == "" && strings.TrimSpace(workspacePath) == "" {
 		return nil
 	}
-	copyDetails := make(map[string]any, len(details))
-	for key, value := range details {
-		copyDetails[key] = value
-	}
-	return copyDetails
-}
-
-func detailString(value any) string {
-	switch typed := value.(type) {
-	case nil:
-		return ""
-	case string:
-		return typed
-	case *string:
-		if typed == nil {
-			return ""
-		}
-		return *typed
-	default:
-		return fmt.Sprint(value)
+	return &model.RuntimeEventSubject{
+		IssueID:       issueID,
+		Identifier:    identifier,
+		WorkspacePath: workspacePath,
 	}
 }
 
-func eventDetails(pairs ...any) map[string]any {
-	if len(pairs) == 0 {
+func eventDispatch(dispatch *model.DispatchContext, attempt int) *model.RuntimeEventDispatch {
+	if dispatch == nil && attempt <= 0 {
 		return nil
 	}
-	details := make(map[string]any, len(pairs)/2)
-	for index := 0; index+1 < len(pairs); index += 2 {
-		key, ok := pairs[index].(string)
-		if !ok || strings.TrimSpace(key) == "" {
-			continue
-		}
-		value := pairs[index+1]
-		switch typed := value.(type) {
-		case nil:
-			continue
-		case string:
-			if strings.TrimSpace(typed) == "" {
-				continue
-			}
-		case *string:
-			if typed == nil || strings.TrimSpace(*typed) == "" {
-				continue
-			}
-			value = *typed
-		case int:
-			if typed == 0 {
-				continue
-			}
-		}
-		details[key] = value
+	result := &model.RuntimeEventDispatch{
+		AttemptCount: attemptCountFromRetry(attempt),
 	}
-	if len(details) == 0 {
+	if dispatch != nil {
+		result.Kind = string(dispatch.Kind)
+		result.ExpectedOutcome = string(dispatch.ExpectedOutcome)
+		result.ContinuationReason = cloneContinuationReason(dispatch)
+	}
+	return result
+}
+
+func eventPullRequest(pr *PullRequestInfo, branch string) *model.RuntimeEventPullRequest {
+	if pr == nil && strings.TrimSpace(branch) == "" {
 		return nil
 	}
-	return details
+	result := &model.RuntimeEventPullRequest{Branch: branch}
+	if pr != nil {
+		result.Number = pr.Number
+		result.URL = pr.URL
+		result.State = string(pr.State)
+		if strings.TrimSpace(result.Branch) == "" {
+			result.Branch = pr.HeadBranch
+		}
+	}
+	return result
 }
 
 func (o *Orchestrator) newIssueDispatchedEvent(issue model.Issue, attempt int, dispatch *model.DispatchContext) model.RuntimeEvent {
-	details := eventDetails(
-		"state", issue.State,
-		"attempt_count", attemptCountFromRetry(attempt),
-	)
-	if dispatch != nil {
-		maps := eventDetails(
-			"dispatch_kind", string(dispatch.Kind),
-			"expected_outcome", string(dispatch.ExpectedOutcome),
-			"continuation_reason", cloneContinuationReason(dispatch),
-		)
-		for key, value := range maps {
-			if details == nil {
-				details = map[string]any{}
-			}
-			details[key] = value
-		}
-	}
 	return model.RuntimeEvent{
+		Version:    runtimeEventVersion,
 		EventID:    o.nextEventID(),
 		Type:       model.NotificationEventIssueDispatched,
+		Family:     model.RuntimeEventFamilyIssue,
+		Priority:   model.RuntimeEventPriorityNormal,
 		Level:      "info",
 		OccurredAt: o.now().UTC(),
-		IssueID:    issue.ID,
-		Identifier: issue.Identifier,
-		Message:    fmt.Sprintf("issue %s dispatched", issue.Identifier),
-		Details:    details,
+		Summary:    fmt.Sprintf("issue %s dispatched", issue.Identifier),
+		Subject:    eventSubject(issue.ID, issue.Identifier, ""),
+		Dispatch:   eventDispatch(dispatch, attempt),
 	}
 }
 
 func (o *Orchestrator) newIssueFailedEvent(issueID string, identifier string, workspacePath string, phase model.RunPhase, attempt int, err error, dispatch *model.DispatchContext) model.RuntimeEvent {
-	details := eventDetails(
-		"run_phase", phase.String(),
-		"attempt_count", attemptCountFromRetry(attempt),
-		"workspace_path", workspacePath,
-		"error", errorString(err),
-	)
-	if dispatch != nil {
-		maps := eventDetails(
-			"dispatch_kind", string(dispatch.Kind),
-			"expected_outcome", string(dispatch.ExpectedOutcome),
-			"continuation_reason", cloneContinuationReason(dispatch),
-		)
-		for key, value := range maps {
-			if details == nil {
-				details = map[string]any{}
-			}
-			details[key] = value
-		}
-	}
 	return model.RuntimeEvent{
+		Version:    runtimeEventVersion,
 		EventID:    o.nextEventID(),
 		Type:       model.NotificationEventIssueFailed,
+		Family:     model.RuntimeEventFamilyIssue,
+		Priority:   model.RuntimeEventPriorityNormal,
 		Level:      "warn",
 		OccurredAt: o.now().UTC(),
-		IssueID:    issueID,
-		Identifier: identifier,
-		Message:    fmt.Sprintf("issue %s failed", identifier),
-		Details:    details,
+		Summary:    fmt.Sprintf("issue %s failed", identifier),
+		Subject:    eventSubject(issueID, identifier, workspacePath),
+		Dispatch:   eventDispatch(dispatch, attempt),
+		Failure: &model.RuntimeEventFailure{
+			Phase: phase.String(),
+			Error: errorString(err),
+		},
 	}
 }
 
 func (o *Orchestrator) newIssueCompletedEvent(issueID string, identifier string) model.RuntimeEvent {
 	return model.RuntimeEvent{
+		Version:    runtimeEventVersion,
 		EventID:    o.nextEventID(),
 		Type:       model.NotificationEventIssueCompleted,
+		Family:     model.RuntimeEventFamilyIssue,
+		Priority:   model.RuntimeEventPriorityNormal,
 		Level:      "info",
 		OccurredAt: o.now().UTC(),
-		IssueID:    issueID,
-		Identifier: identifier,
-		Message:    fmt.Sprintf("issue %s completed", identifier),
+		Summary:    fmt.Sprintf("issue %s completed", identifier),
+		Subject:    eventSubject(issueID, identifier, ""),
 	}
 }
 
 func (o *Orchestrator) newIssueInterventionRequiredEvent(issueID string, identifier string, branch string, reason string, expectedOutcome model.CompletionMode, pr *PullRequestInfo) model.RuntimeEvent {
-	details := eventDetails(
-		"branch", branch,
-		"reason", reason,
-		"expected_outcome", string(expectedOutcome),
-	)
-	if pr != nil {
-		maps := eventDetails(
-			"pr_number", pr.Number,
-			"pr_url", pr.URL,
-			"pr_state", string(pr.State),
-		)
-		for key, value := range maps {
-			if details == nil {
-				details = map[string]any{}
-			}
-			details[key] = value
-		}
-	}
 	return model.RuntimeEvent{
+		Version:    runtimeEventVersion,
 		EventID:    o.nextEventID(),
 		Type:       model.NotificationEventIssueInterventionRequired,
+		Family:     model.RuntimeEventFamilyIssue,
+		Priority:   model.RuntimeEventPriorityCritical,
 		Level:      "warn",
 		OccurredAt: o.now().UTC(),
-		IssueID:    issueID,
-		Identifier: identifier,
-		Message:    fmt.Sprintf("issue %s requires manual intervention", identifier),
-		Details:    details,
+		Summary:    fmt.Sprintf("issue %s requires manual intervention", identifier),
+		Subject:    eventSubject(issueID, identifier, ""),
+		Dispatch: &model.RuntimeEventDispatch{
+			ExpectedOutcome:    string(expectedOutcome),
+			ContinuationReason: optionalError(reason),
+		},
+		PullRequest: eventPullRequest(pr, branch),
 	}
 }
 
 func (o *Orchestrator) newSystemAlertEvent(eventType model.NotificationEventType, alert AlertSnapshot) model.RuntimeEvent {
+	status := "active"
+	if eventType == model.NotificationEventSystemAlertCleared {
+		status = "cleared"
+	}
 	return model.RuntimeEvent{
+		Version:    runtimeEventVersion,
 		EventID:    o.nextEventID(),
 		Type:       eventType,
+		Family:     model.RuntimeEventFamilyHealth,
+		Priority:   model.RuntimeEventPriorityCritical,
 		Level:      alert.Level,
 		OccurredAt: o.now().UTC(),
-		IssueID:    alert.IssueID,
-		Identifier: alert.IssueIdentifier,
-		Message:    alert.Message,
-		Details: eventDetails(
-			"alert_code", alert.Code,
-			"alert_level", alert.Level,
-		),
+		Summary:    alert.Message,
+		Subject:    eventSubject(alert.IssueID, alert.IssueIdentifier, ""),
+		Alert: &model.RuntimeEventAlert{
+			Code:    alert.Code,
+			Status:  status,
+			Level:   alert.Level,
+			Message: alert.Message,
+		},
 	}
 }
 
