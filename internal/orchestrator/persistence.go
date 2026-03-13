@@ -142,7 +142,7 @@ type fileStateStore struct {
 	logger    *slog.Logger
 	config    model.SessionPersistenceConfig
 	identity  RuntimeIdentity
-	onSuccess func(uint64)
+	onSuccess func(uint64, durableRuntimeState)
 	onFailure func(error)
 
 	mu          sync.Mutex
@@ -153,7 +153,7 @@ type fileStateStore struct {
 	closeCh     chan closeRequest
 }
 
-func newFileStateStore(cfg model.SessionPersistenceConfig, identity RuntimeIdentity, logger *slog.Logger, onSuccess func(uint64), onFailure func(error)) stateStore {
+func newFileStateStore(cfg model.SessionPersistenceConfig, identity RuntimeIdentity, logger *slog.Logger, onSuccess func(uint64, durableRuntimeState), onFailure func(error)) stateStore {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -411,7 +411,7 @@ func (s *fileStateStore) flushPending(pending *scheduledDurableState, force bool
 
 	hasMore, nextForce := s.markFlushed(pending.version)
 	if s.onSuccess != nil {
-		s.onSuccess(pending.version)
+		s.onSuccess(pending.version, cloneDurableRuntimeState(pending.state))
 	}
 	return hasMore, nextForce, nil
 }
@@ -559,7 +559,12 @@ func (o *Orchestrator) ensureRuntimeExtensions() error {
 	o.persistenceHealth.Enabled = cfg.SessionPersistence.Enabled
 	o.persistenceHealth.Kind = string(cfg.SessionPersistence.Kind)
 	if restoredState != nil {
+		copyState := cloneDurableRuntimeState(*restoredState)
+		o.lastPersistedState = &copyState
 		o.restorePersistedStateLocked(restoredState)
+	} else {
+		emptyState := o.buildPersistedStateLocked()
+		o.lastPersistedState = &emptyState
 	}
 	o.extensionsReady = true
 	o.refreshSnapshotLocked()
@@ -1029,15 +1034,15 @@ func (o *Orchestrator) newRetryTimer(issueID string, dueAt time.Time) *time.Time
 	})
 }
 
-func (o *Orchestrator) reportSessionPersistenceWriteSuccess(version uint64) {
-	o.handleSessionPersistenceWriteSuccess(version)
+func (o *Orchestrator) reportSessionPersistenceWriteSuccess(version uint64, state durableRuntimeState) {
+	o.handleSessionPersistenceWriteSuccess(version, state)
 }
 
 func (o *Orchestrator) reportSessionPersistenceWriteFailure(err error) {
 	o.handleSessionPersistenceWriteFailure(err)
 }
 
-func (o *Orchestrator) handleSessionPersistenceWriteSuccess(version uint64) {
+func (o *Orchestrator) handleSessionPersistenceWriteSuccess(version uint64, state durableRuntimeState) {
 	o.mu.Lock()
 	if o.isProtectedLocked() {
 		o.mu.Unlock()
@@ -1048,6 +1053,8 @@ func (o *Orchestrator) handleSessionPersistenceWriteSuccess(version uint64) {
 	if version > o.lastPersistedStateVersion {
 		o.lastPersistedStateVersion = version
 	}
+	copyState := cloneDurableRuntimeState(state)
+	o.lastPersistedState = &copyState
 	o.persistenceHealth.Status = "healthy"
 	o.persistenceHealth.LastAttemptAt = cloneTimePtr(&now)
 	o.persistenceHealth.LastSuccessAt = cloneTimePtr(&now)
@@ -1056,13 +1063,24 @@ func (o *Orchestrator) handleSessionPersistenceWriteSuccess(version uint64) {
 	o.clearHealthAlertAndNotifyLocked(sessionPersistenceWriteFailCode)
 	o.publishViewLocked()
 	shouldResume := false
+	actions := make([]func(), 0)
 	for issueID, requiredVersion := range o.pendingResume {
 		if requiredVersion <= version {
 			delete(o.pendingResume, issueID)
 			shouldResume = true
 		}
 	}
+	for actionVersion, versionActions := range o.pendingActions {
+		if actionVersion > version || len(versionActions) == 0 {
+			continue
+		}
+		actions = append(actions, versionActions...)
+		delete(o.pendingActions, actionVersion)
+	}
 	o.mu.Unlock()
+	for _, action := range actions {
+		action()
+	}
 	if shouldResume {
 		o.reconcileRecovering(o.runtimeContext())
 	}
@@ -1080,6 +1098,11 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.persistenceHealth.LastError = optionalError(errorText)
 	o.persistenceHealth.ConsecutiveFailures++
 	clear(o.pendingResume)
+	clear(o.pendingActions)
+	for issueID := range o.pendingLaunch {
+		delete(o.state.Running, issueID)
+	}
+	clear(o.pendingLaunch)
 	if o.stateStore != nil {
 		o.stateStore.Disable()
 	}

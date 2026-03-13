@@ -385,6 +385,33 @@ func TestNewFromWorkflowRejectsLegacyRuntimeExtensionKeys(t *testing.T) {
 			wantErr: "runtime.session_persistence.backend",
 		},
 		{
+			name: "session persistence path alias",
+			config: map[string]any{
+				"session_persistence": map[string]any{
+					"path": "./state.json",
+				},
+			},
+			wantErr: "runtime.session_persistence.path",
+		},
+		{
+			name: "session persistence flush alias",
+			config: map[string]any{
+				"session_persistence": map[string]any{
+					"flush_interval_ms": 1000,
+				},
+			},
+			wantErr: "runtime.session_persistence.flush_interval_ms",
+		},
+		{
+			name: "session persistence fsync alias",
+			config: map[string]any{
+				"session_persistence": map[string]any{
+					"fsync_on_critical": true,
+				},
+			},
+			wantErr: "runtime.session_persistence.fsync_on_critical",
+		},
+		{
 			name: "notification legacy channel fields",
 			config: map[string]any{
 				"notifications": map[string]any{
@@ -398,6 +425,51 @@ func TestNewFromWorkflowRejectsLegacyRuntimeExtensionKeys(t *testing.T) {
 				},
 			},
 			wantErr: "runtime.notifications.channels[0].name",
+		},
+		{
+			name: "notification events alias",
+			config: map[string]any{
+				"notifications": map[string]any{
+					"channels": []any{
+						map[string]any{
+							"id":     "ops",
+							"kind":   "webhook",
+							"events": []any{"system_alert"},
+						},
+					},
+				},
+			},
+			wantErr: "runtime.notifications.channels[0].events",
+		},
+		{
+			name: "notification url alias",
+			config: map[string]any{
+				"notifications": map[string]any{
+					"channels": []any{
+						map[string]any{
+							"id":   "ops",
+							"kind": "webhook",
+							"url":  "https://hooks.example.com/symphony",
+						},
+					},
+				},
+			},
+			wantErr: "runtime.notifications.channels[0].url",
+		},
+		{
+			name: "notification headers alias",
+			config: map[string]any{
+				"notifications": map[string]any{
+					"channels": []any{
+						map[string]any{
+							"id":      "ops",
+							"kind":    "webhook",
+							"headers": map[string]any{"Authorization": "Bearer test"},
+						},
+					},
+				},
+			},
+			wantErr: "runtime.notifications.channels[0].headers",
 		},
 	}
 

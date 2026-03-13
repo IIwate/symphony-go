@@ -330,6 +330,8 @@ type Orchestrator struct {
 	pendingCleanup            map[string]string
 	recoveredPending          map[string]*model.RecoveryEntry
 	pendingResume             map[string]uint64
+	pendingLaunch             map[string]uint64
+	pendingActions            map[uint64][]func()
 	completedOrder            []string
 	maxCompleted              int
 	startedAt                 time.Time
@@ -338,6 +340,7 @@ type Orchestrator struct {
 	eventSeq                  uint64
 	notifierGeneration        uint64
 	lastPersistedStateVersion uint64
+	lastPersistedState        *durableRuntimeState
 }
 
 var BuildVersion = "dev"
@@ -386,6 +389,8 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		pendingCleanup:     map[string]string{},
 		recoveredPending:   recovering,
 		pendingResume:      map[string]uint64{},
+		pendingLaunch:      map[string]uint64{},
+		pendingActions:     map[uint64][]func(){},
 		maxCompleted:       defaultMaxCompletedEntries,
 		startedAt:          time.Now().UTC(),
 		serviceVersion:     BuildVersion,
@@ -462,6 +467,19 @@ func (o *Orchestrator) Stop() {
 
 func (o *Orchestrator) Wait() {
 	<-o.doneCh
+}
+
+func (o *Orchestrator) schedulePersistedActionLocked(version uint64, action func()) {
+	if version == 0 || action == nil {
+		return
+	}
+	o.pendingActions[version] = append(o.pendingActions[version], action)
+}
+
+func (o *Orchestrator) emitNotification(event model.RuntimeEvent) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.emitNotificationLocked(event)
 }
 
 func (o *Orchestrator) serviceModeLocked() model.ServiceMode {
@@ -760,10 +778,27 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		"attempt", attemptCountFromRetry(normalizedAttempt),
 		"run_phase", model.PhasePreparingWorkspace.String(),
 	)
-	o.emitNotificationLocked(o.newIssueDispatchedEvent(issue, normalizedAttempt, dispatch))
-	o.commitStateLocked(true)
+	version := o.commitStateLocked(true)
+	issueCopy := issue
+	dispatchCopy := model.CloneDispatchContext(dispatch)
+	action := func() {
+		o.mu.Lock()
+		delete(o.pendingLaunch, issueCopy.ID)
+		o.mu.Unlock()
+		o.emitNotification(o.newIssueDispatchedEvent(issueCopy, normalizedAttempt, dispatchCopy))
+		o.launchWorker(workerCtx, issueCopy, attempt, dispatchCopy)
+	}
+	if version > 0 {
+		o.pendingLaunch[issue.ID] = version
+		o.schedulePersistedActionLocked(version, action)
+	}
 	o.mu.Unlock()
+	if version == 0 {
+		action()
+	}
+}
 
+func (o *Orchestrator) launchWorker(workerCtx context.Context, issue model.Issue, attempt *int, dispatch *model.DispatchContext) {
 	o.workerWG.Add(1)
 	go func() {
 		defer o.workerWG.Done()
@@ -1160,9 +1195,17 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		}
 		errorText := result.Err.Error()
 		o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, &errorText, false, stallCount, dispatch)
-		o.emitNotificationLocked(o.newIssueFailedEvent(result.IssueID, identifier, workspacePath, result.Phase, retryAttempt, result.Err, dispatch))
-		o.commitStateLocked(true)
+		version := o.commitStateLocked(true)
+		event := o.newIssueFailedEvent(result.IssueID, identifier, workspacePath, result.Phase, retryAttempt, result.Err, dispatch)
+		if version > 0 {
+			o.schedulePersistedActionLocked(version, func() {
+				o.emitNotification(event)
+			})
+		}
 		o.mu.Unlock()
+		if version == 0 {
+			o.emitNotification(event)
+		}
 		return
 	}
 
@@ -1837,6 +1880,9 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	now := o.now().UTC()
 	running := make([]RunningSnapshot, 0, len(o.state.Running))
 	for issueID, entry := range o.state.Running {
+		if _, pendingLaunch := o.pendingLaunch[issueID]; pendingLaunch {
+			continue
+		}
 		row := RunningSnapshot{
 			IssueID:             issueID,
 			IssueIdentifier:     entry.Identifier,
@@ -1973,6 +2019,90 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return retrying[i].IssueID < retrying[j].IssueID
 	})
 
+	var protectedPersistedState *durableRuntimeState
+	if o.isProtectedLocked() && o.lastPersistedState != nil {
+		persisted := cloneDurableRuntimeState(*o.lastPersistedState)
+		protectedPersistedState = &persisted
+		recovering = make([]RecoveringSnapshot, 0, len(persisted.Recovering))
+		for _, item := range persisted.Recovering {
+			row := RecoveringSnapshot{
+				IssueID:         item.IssueID,
+				IssueIdentifier: item.Identifier,
+				WorkspacePath:   item.WorkspacePath,
+				State:           item.State,
+				Strategy:        item.Strategy,
+				Source:          item.Source,
+				ObservedAt:      item.ObservedAt,
+				AttemptCount:    attemptCountFromRetry(item.RetryAttempt),
+			}
+			dispatch := durableDispatchToModel(item.Dispatch)
+			if dispatch != nil {
+				row.DispatchKind = string(dispatch.Kind)
+				row.ExpectedOutcome = string(dispatch.ExpectedOutcome)
+				if dispatch.Reason != nil {
+					reason := string(*dispatch.Reason)
+					row.ContinuationReason = &reason
+				}
+			}
+			recovering = append(recovering, row)
+		}
+		awaitingMerge = make([]AwaitingMergeSnapshot, 0, len(persisted.AwaitingMerge))
+		for _, item := range persisted.AwaitingMerge {
+			awaitingMerge = append(awaitingMerge, AwaitingMergeSnapshot{
+				IssueID:         item.IssueID,
+				IssueIdentifier: item.Identifier,
+				WorkspacePath:   item.WorkspacePath,
+				State:           item.State,
+				Branch:          item.Branch,
+				PRNumber:        item.PRNumber,
+				PRURL:           item.PRURL,
+				PRState:         item.PRState,
+				AwaitingSince:   item.AwaitingSince,
+				LastError:       optionalError(pointerString(item.LastError)),
+				AttemptCount:    attemptCountFromRetry(item.RetryAttempt),
+			})
+		}
+		awaitingIntervention = make([]AwaitingInterventionSnapshot, 0, len(persisted.AwaitingIntervention))
+		for _, item := range persisted.AwaitingIntervention {
+			awaitingIntervention = append(awaitingIntervention, AwaitingInterventionSnapshot{
+				IssueID:             item.IssueID,
+				IssueIdentifier:     item.Identifier,
+				WorkspacePath:       item.WorkspacePath,
+				Branch:              item.Branch,
+				PRNumber:            item.PRNumber,
+				PRURL:               item.PRURL,
+				PRState:             item.PRState,
+				Reason:              item.Reason,
+				ExpectedOutcome:     item.ExpectedOutcome,
+				PreviousBranch:      item.PreviousBranch,
+				LastKnownIssueState: item.LastKnownIssueState,
+				ObservedAt:          item.ObservedAt,
+				AttemptCount:        attemptCountFromRetry(item.RetryAttempt),
+			})
+		}
+		retrying = make([]RetrySnapshot, 0, len(persisted.Retrying))
+		for _, item := range persisted.Retrying {
+			row := RetrySnapshot{
+				IssueID:         item.IssueID,
+				IssueIdentifier: item.Identifier,
+				WorkspacePath:   item.WorkspacePath,
+				Attempt:         item.Attempt,
+				DueAt:           item.DueAt,
+				Error:           optionalError(pointerString(item.Error)),
+			}
+			dispatch := durableDispatchToModel(item.Dispatch)
+			if dispatch != nil {
+				row.DispatchKind = string(dispatch.Kind)
+				row.ExpectedOutcome = string(dispatch.ExpectedOutcome)
+				if dispatch.Reason != nil {
+					reason := string(*dispatch.Reason)
+					row.ContinuationReason = &reason
+				}
+			}
+			retrying = append(retrying, row)
+		}
+	}
+
 	alerts := make([]AlertSnapshot, 0, len(o.healthAlerts))
 	for _, alert := range o.healthAlerts {
 		alerts = append(alerts, alert)
@@ -1988,42 +2118,82 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	})
 
 	derived := make([]ObservationSnapshot, 0, len(o.state.RetryAttempts)+len(o.state.AwaitingMerge))
-	for issueID, entry := range o.state.RetryAttempts {
-		if entry.Error == nil {
-			continue
+	if protectedPersistedState != nil {
+		for _, entry := range protectedPersistedState.Retrying {
+			if entry.Error == nil {
+				continue
+			}
+			errorText := pointerString(entry.Error)
+			lowerError := strings.ToLower(errorText)
+			switch {
+			case isStallErrorText(errorText) && entry.StallCount > 1:
+				derived = append(derived, ObservationSnapshot{
+					Code:            "repeated_stall",
+					Level:           "warn",
+					Message:         errorText,
+					IssueID:         entry.IssueID,
+					IssueIdentifier: entry.Identifier,
+				})
+			case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
+				derived = append(derived, ObservationSnapshot{
+					Code:            "workspace_hook_failure",
+					Level:           "warn",
+					Message:         errorText,
+					IssueID:         entry.IssueID,
+					IssueIdentifier: entry.Identifier,
+				})
+			}
 		}
-		errorText := *entry.Error
-		lowerError := strings.ToLower(errorText)
-		switch {
-		case isStallErrorText(errorText) && entry.StallCount > 1:
+		for _, entry := range protectedPersistedState.AwaitingMerge {
+			if entry.LastError == nil {
+				continue
+			}
 			derived = append(derived, ObservationSnapshot{
-				Code:            "repeated_stall",
+				Code:            "merge_status_unknown",
 				Level:           "warn",
-				Message:         errorText,
+				Message:         pointerString(entry.LastError),
+				IssueID:         entry.IssueID,
+				IssueIdentifier: entry.Identifier,
+			})
+		}
+	} else {
+		for issueID, entry := range o.state.RetryAttempts {
+			if entry.Error == nil {
+				continue
+			}
+			errorText := *entry.Error
+			lowerError := strings.ToLower(errorText)
+			switch {
+			case isStallErrorText(errorText) && entry.StallCount > 1:
+				derived = append(derived, ObservationSnapshot{
+					Code:            "repeated_stall",
+					Level:           "warn",
+					Message:         errorText,
+					IssueID:         issueID,
+					IssueIdentifier: entry.Identifier,
+				})
+			case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
+				derived = append(derived, ObservationSnapshot{
+					Code:            "workspace_hook_failure",
+					Level:           "warn",
+					Message:         errorText,
+					IssueID:         issueID,
+					IssueIdentifier: entry.Identifier,
+				})
+			}
+		}
+		for issueID, entry := range o.state.AwaitingMerge {
+			if entry.LastError == nil {
+				continue
+			}
+			derived = append(derived, ObservationSnapshot{
+				Code:            "merge_status_unknown",
+				Level:           "warn",
+				Message:         *entry.LastError,
 				IssueID:         issueID,
 				IssueIdentifier: entry.Identifier,
 			})
-		case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
-			derived = append(derived, ObservationSnapshot{
-				Code:            "workspace_hook_failure",
-				Level:           "warn",
-				Message:         errorText,
-				IssueID:         issueID,
-				IssueIdentifier: entry.Identifier,
-			})
 		}
-	}
-	for issueID, entry := range o.state.AwaitingMerge {
-		if entry.LastError == nil {
-			continue
-		}
-		derived = append(derived, ObservationSnapshot{
-			Code:            "merge_status_unknown",
-			Level:           "warn",
-			Message:         *entry.LastError,
-			IssueID:         issueID,
-			IssueIdentifier: entry.Identifier,
-		})
 	}
 	sort.SliceStable(derived, func(i int, j int) bool {
 		if derived[i].Code != derived[j].Code {
@@ -2100,8 +2270,12 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	}
 
 	totals := o.state.CodexTotals
-	for _, entry := range o.state.Running {
-		totals.SecondsRunning += now.Sub(entry.StartedAt).Seconds()
+	if protectedPersistedState != nil {
+		totals = protectedPersistedState.TokenTotal
+	} else {
+		for _, entry := range o.state.Running {
+			totals.SecondsRunning += now.Sub(entry.StartedAt).Seconds()
+		}
 	}
 
 	o.snapshot = Snapshot{
@@ -2354,9 +2528,17 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	delete(o.state.Recovering, issueID)
 	delete(o.state.AwaitingMerge, issueID)
 	o.state.AwaitingIntervention[issueID] = entry
-	o.emitNotificationLocked(o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, pr))
-	o.commitStateLocked(true)
+	version := o.commitStateLocked(true)
+	event := o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, pr)
+	if version > 0 {
+		o.schedulePersistedActionLocked(version, func() {
+			o.emitNotification(event)
+		})
+	}
 	o.mu.Unlock()
+	if version == 0 {
+		o.emitNotification(event)
+	}
 }
 
 func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo, errorText string, retryable bool) bool {
@@ -2512,12 +2694,22 @@ func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID stri
 	delete(o.state.AwaitingMerge, issueID)
 	delete(o.state.AwaitingIntervention, issueID)
 	o.rememberCompletedLocked(issueID)
-	o.emitNotificationLocked(o.newIssueCompletedEvent(issueID, identifier))
-	o.commitStateLocked(true)
+	version := o.commitStateLocked(true)
+	event := o.newIssueCompletedEvent(issueID, identifier)
+	if version > 0 {
+		o.schedulePersistedActionLocked(version, func() {
+			o.emitNotification(event)
+			if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
+				o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
+			}
+		})
+	}
 	o.mu.Unlock()
-
-	if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
-		o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
+	if version == 0 {
+		o.emitNotification(event)
+		if err := o.workspace.CleanupWorkspace(ctx, identifier); err != nil {
+			o.logger.Warn("workspace cleanup failed", "issue_id", issueID, "identifier", identifier, "error", err.Error())
+		}
 	}
 }
 

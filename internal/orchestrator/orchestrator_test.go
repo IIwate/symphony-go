@@ -243,7 +243,7 @@ func TestHandleWorkerExitSuccessWaitsForPersistenceBeforeResume(t *testing.T) {
 		t.Fatalf("awaiting merge = %+v, want empty before persistence ack", o.state.AwaitingMerge)
 	}
 
-	o.handleSessionPersistenceWriteSuccess(1)
+	o.handleSessionPersistenceWriteSuccess(1, store.lastState)
 
 	if _, ok := o.pendingResume["1"]; ok {
 		t.Fatalf("pending resume should be cleared: %+v", o.pendingResume)
@@ -296,6 +296,37 @@ func TestProtectedModeBlocksRefreshDispatchAndRetry(t *testing.T) {
 		t.Fatalf("unexpected dispatch in protected mode: %s", identifier)
 	default:
 	}
+}
+
+func TestDispatchIssueWaitsForPersistenceBeforeStartingWorker(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	runner := &fakeRunner{runCh: make(chan string, 1), block: make(chan struct{})}
+	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, runner, now)
+	store := &fakeStateStore{}
+	o.stateStore = store
+
+	o.dispatchIssue(context.Background(), model.Issue{ID: "1", Identifier: "ABC-1", Title: "Test", State: "Todo"}, nil)
+
+	select {
+	case identifier := <-runner.runCh:
+		t.Fatalf("worker started before persistence ack: %s", identifier)
+	default:
+	}
+	if len(o.Snapshot().Running) != 0 {
+		t.Fatalf("running snapshot = %+v, want hidden pending launch", o.Snapshot().Running)
+	}
+
+	o.handleSessionPersistenceWriteSuccess(1, store.lastState)
+
+	select {
+	case identifier := <-runner.runCh:
+		if identifier != "ABC-1" {
+			t.Fatalf("runner identifier = %q, want ABC-1", identifier)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start after persistence ack")
+	}
+	close(runner.block)
 }
 
 func TestHandleWorkerExitInProtectedModeRecordsObservationOnly(t *testing.T) {
@@ -2733,15 +2764,17 @@ type fakeStateStore struct {
 	disableCalls  int
 	scheduleCalls int
 	nextVersion   uint64
+	lastState     durableRuntimeState
 }
 
 func (f *fakeStateStore) Load() (*durableRuntimeState, error) {
 	return nil, nil
 }
 
-func (f *fakeStateStore) Schedule(_ durableRuntimeState, _ bool) uint64 {
+func (f *fakeStateStore) Schedule(state durableRuntimeState, _ bool) uint64 {
 	f.scheduleCalls++
 	f.nextVersion++
+	f.lastState = cloneDurableRuntimeState(state)
 	return f.nextVersion
 }
 
