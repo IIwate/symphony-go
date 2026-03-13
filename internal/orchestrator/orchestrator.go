@@ -717,6 +717,11 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 	completion := normalizeCompletionContract(o.currentWorkflow().Completion)
 
 	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.mu.Unlock()
+		cancel()
+		return
+	}
 	stallCount := 0
 	var dispatch *model.DispatchContext
 	if existing := o.state.RetryAttempts[issue.ID]; existing != nil {
@@ -1118,8 +1123,6 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		o.mu.Unlock()
 		return
 	}
-	o.addRuntimeLocked(entry)
-	delete(o.state.Running, result.IssueID)
 	identifier := entry.Identifier
 	workspacePath := entry.WorkspacePath
 	retryAttempt := entry.RetryAttempt
@@ -1140,11 +1143,15 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	)
 
 	if o.isProtectedLocked() {
+		delete(o.state.Running, result.IssueID)
 		o.rememberProtectedResultLocked(result.IssueID, entry, result)
 		o.publishViewLocked()
 		o.mu.Unlock()
 		return
 	}
+
+	o.addRuntimeLocked(entry)
+	delete(o.state.Running, result.IssueID)
 
 	if result.Err != nil {
 		nextAttempt := retryAttempt + 1
@@ -1573,6 +1580,10 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 	now := o.now().UTC()
 
 	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.mu.Unlock()
+		return
+	}
 	retryEntry := o.state.RetryAttempts[issueID]
 	if retryEntry == nil || retryEntry.DueAt.After(now) {
 		o.mu.Unlock()
@@ -1591,6 +1602,10 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 	if err != nil {
 		errorText := "retry poll failed"
 		o.mu.Lock()
+		if o.isProtectedLocked() {
+			o.mu.Unlock()
+			return
+		}
 		current := o.state.RetryAttempts[issueID]
 		if current != nil && !current.DueAt.After(o.now().UTC()) {
 			o.scheduleRetryLocked(issueID, current.Identifier, current.Attempt+1, &errorText, false, current.StallCount, current.Dispatch)
@@ -1610,6 +1625,10 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 	}
 	if issue == nil {
 		o.mu.Lock()
+		if o.isProtectedLocked() {
+			o.mu.Unlock()
+			return
+		}
 		current := o.state.RetryAttempts[issueID]
 		if current != nil && !current.DueAt.After(o.now().UTC()) {
 			delete(o.state.RetryAttempts, issueID)
@@ -1622,6 +1641,10 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 	cfg := o.currentConfig()
 	if !o.isDispatchEligible(*issue, cfg, true) {
 		o.mu.Lock()
+		if o.isProtectedLocked() {
+			o.mu.Unlock()
+			return
+		}
 		current := o.state.RetryAttempts[issueID]
 		if current != nil && !current.DueAt.After(o.now().UTC()) {
 			delete(o.state.RetryAttempts, issueID)
@@ -1633,6 +1656,10 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 	if !o.hasAvailableSlots(*issue, cfg) {
 		errorText := "no available orchestrator slots"
 		o.mu.Lock()
+		if o.isProtectedLocked() {
+			o.mu.Unlock()
+			return
+		}
 		current := o.state.RetryAttempts[issueID]
 		if current != nil && !current.DueAt.After(o.now().UTC()) {
 			o.scheduleRetryLocked(issueID, issue.Identifier, current.Attempt+1, &errorText, false, current.StallCount, current.Dispatch)

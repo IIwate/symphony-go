@@ -238,6 +238,10 @@ func TestHandleWorkerExitSuccessWaitsForPersistenceBeforeResume(t *testing.T) {
 	if got := o.pendingResume["1"]; got != 1 {
 		t.Fatalf("pending resume version = %d, want 1", got)
 	}
+	o.reconcileRecovering(context.Background())
+	if _, ok := o.state.AwaitingMerge["1"]; ok {
+		t.Fatalf("awaiting merge = %+v, want empty before persistence ack", o.state.AwaitingMerge)
+	}
 
 	o.handleSessionPersistenceWriteSuccess(1)
 
@@ -297,6 +301,7 @@ func TestProtectedModeBlocksRefreshDispatchAndRetry(t *testing.T) {
 func TestHandleWorkerExitInProtectedModeRecordsObservationOnly(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.state.CodexTotals.SecondsRunning = 12
 	o.state.Running["1"] = &model.RunningEntry{
 		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "In Progress"},
 		Identifier:    "ABC-1",
@@ -336,6 +341,9 @@ func TestHandleWorkerExitInProtectedModeRecordsObservationOnly(t *testing.T) {
 	}
 	if protected.FinalBranch != "feature/abc-1" {
 		t.Fatalf("protected final branch = %q, want feature/abc-1", protected.FinalBranch)
+	}
+	if o.state.CodexTotals.SecondsRunning != 12 {
+		t.Fatalf("seconds_running = %v, want unchanged 12", o.state.CodexTotals.SecondsRunning)
 	}
 	snapshot := o.Snapshot()
 	if len(snapshot.Observations.ProtectedResults) != 1 {

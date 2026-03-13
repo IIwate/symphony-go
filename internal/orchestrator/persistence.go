@@ -856,6 +856,9 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 		if entry == nil {
 			continue
 		}
+		if _, waitingForDurable := o.pendingResume[issueID]; waitingForDurable {
+			continue
+		}
 		copyEntry := *entry
 		copyEntry.Dispatch = model.CloneDispatchContext(entry.Dispatch)
 		pending[issueID] = copyEntry

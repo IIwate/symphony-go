@@ -494,6 +494,7 @@ func Watch(ctx context.Context, dir string, profile string, onChange func(*model
 - 失败的 reload 保持上次有效配置，发出 operator-visible 错误日志
 - 不崩溃服务
 - `automation/local/env.local` 与 `automation/local/session-state.json` 不参与热重载
+- 热重载采用白名单：`runtime.notifications` 与纯节奏类配置（如 `polling.interval_ms`、并发上限）可热更；`workspace.*`、`runtime.session_persistence.*`、source / enabled_sources / dispatch_flow / profile、tracker 身份与状态语义、completion/恢复语义相关项一律 `restart required`
 
 #### 5.1.3 错误类型
 
@@ -544,6 +545,8 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error
 - `active_states`/`terminal_states`：支持 `[]string` 和逗号分隔字符串两种形式
 - 状态归一化：`strings.TrimSpace` + `strings.ToLower`（用于 `max_concurrent_agents_by_state` 的 key）
 - `max_concurrent_agents_by_state` 中非正整数或非数值条目忽略
+- `runtime.session_persistence` 只接受正式 schema：`kind` + `file.path/flush_interval_ms/fsync_on_critical`，拒绝 `backend`、顶层 `path` 等旧入口
+- `runtime.notifications.channels[]` 只接受正式 schema：`id`、`display_name`、`subscriptions.types/families`、`webhook.*` / `slack.*`，拒绝 `name`、`events`、`url`、`headers` 等旧入口
 
 **默认值**（SPEC §6.4）：
 
@@ -1084,6 +1087,15 @@ type TokenUsage struct {
 ```json
 {
   "generated_at": "RFC3339 时间戳",
+  "service": {
+    "version": "build version",
+    "started_at": "RFC3339 时间戳",
+    "uptime_seconds": 123.4,
+    "mode": "normal|protected",
+    "protection_reason": "",
+    "protected_at": null,
+    "restart_required": false
+  },
   "counts": {
     "recovering": 1,
     "running": 2,
@@ -1103,6 +1115,10 @@ type TokenUsage struct {
     "notifications": [{"channel_id", "status", "queue_overflow", "last_error"}],
     "persistence": {"enabled", "kind", "status", "last_error"}
   },
+  "observations": {
+    "derived": [{"code", "level", "message"}],
+    "protected_results": [{"issue_id", "issue_identifier", "outcome", "phase", "observed_at"}]
+  },
   "codex_totals": {"input_tokens", "output_tokens", "total_tokens", "seconds_running"},
   "rate_limits": null
 }
@@ -1110,12 +1126,13 @@ type TokenUsage struct {
 
 **`GET /api/v1/{identifier}` 响应**（SPEC §13.7.2）：
 - 已知 issue → 详细运行时/调试信息
-- 当前实现会根据状态返回 `running` / `recovering` / `awaiting_merge` / `awaiting_intervention` / `retry`
+- 当前实现会根据状态返回 `running` / `recovering` / `awaiting_merge` / `awaiting_intervention` / `retrying` / `protected_result`
 - 未知 issue → `404` + `{"error":{"code":"issue_not_found","message":"..."}}`
 
 **`POST /api/v1/refresh` 响应**（SPEC §13.7.2）：
 - `202 Accepted` + `{"accepted":true,"coalesced":false,"requested_at":"...","operations":["poll","reconcile"]}`
 - 可合并重复请求
+- 若服务处于 protected mode，则返回 `409 Conflict` + `{"error":{"code":"service_protected_mode","message":"..."}}`
 
 **`GET /api/v1/events` SSE 端点**（竞品 contrabass 同款功能）：
 - Content-Type: `text/event-stream`
