@@ -258,6 +258,7 @@ py -3 scripts/live_smoke.py --phase all
 - heavy 阶段默认使用显式 branch namespace `live-smoke`，便于识别和清理测试分支
 - summary 末尾会明确打印 `artifacts cleaned from ...` 或 `artifacts kept at ...`
 - `--purge-history` 会归档旧的 terminal smoke issue；默认关闭，以保留审计痕迹
+- smoke 为测试仓库创建的 marker 文件会统一写入目标仓库的 `live-smoke-artifacts/` 目录，而不是直接落在仓库根目录
 
 ### 6.5 本地开发与 CI 使用建议
 

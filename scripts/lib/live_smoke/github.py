@@ -10,6 +10,8 @@ import time
 
 from live_smoke.shell import run
 
+SMOKE_ARTIFACT_DIR = "live-smoke-artifacts"
+
 
 @dataclass
 class PullRequest:
@@ -47,9 +49,11 @@ def prepare_pull_request(
     clone_dir = work_root / "repo"
     git_clone(repo_url, clone_dir)
     run(["git", "checkout", "-b", branch], cwd=clone_dir, env=git_env())
-    marker = clone_dir / f"{branch.replace('/', '-')}.txt"
+    marker_dir = clone_dir / SMOKE_ARTIFACT_DIR
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / f"{branch.replace('/', '-')}.txt"
     marker.write_text(f"live smoke {int(time.time())}\n", encoding="utf-8")
-    run(["git", "add", marker.name], cwd=clone_dir, env=git_env())
+    run(["git", "add", marker.relative_to(clone_dir).as_posix()], cwd=clone_dir, env=git_env())
     run(["git", "commit", "-m", f"test: live smoke {branch}"], cwd=clone_dir, env=git_env())
     run(["git", "push", "-u", "origin", branch], cwd=clone_dir, env=git_env())
     result = run(
