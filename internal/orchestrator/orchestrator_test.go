@@ -382,10 +382,67 @@ func TestHandleWorkerExitInProtectedModeRecordsObservationOnly(t *testing.T) {
 	}
 }
 
+func TestProtectedSnapshotUsesLastPersistedLedgerOnly(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
+	o.lastPersistedState = &durableRuntimeState{
+		Version: durableStateVersion,
+		SavedAt: now.Add(-time.Minute),
+		Recovering: []durableRecoveryEntry{
+			{
+				IssueID:       "1",
+				Identifier:    "ABC-1",
+				WorkspacePath: "C:/work/ABC-1",
+				State:         "In Progress",
+				RetryAttempt:  1,
+				ObservedAt:    now.Add(-time.Minute),
+				Strategy:      string(model.RecoveryStrategyContinuationRetry),
+				Source:        string(model.RecoverySourceRunning),
+			},
+		},
+		TokenTotal: model.TokenTotals{
+			InputTokens:    10,
+			OutputTokens:   20,
+			TotalTokens:    30,
+			SecondsRunning: 12,
+		},
+	}
+	o.state.Running["live"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "live", Identifier: "LIVE-1", State: "In Progress"},
+		Identifier:    "LIVE-1",
+		WorkspacePath: "C:/work/LIVE-1",
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
+		Session: model.LiveSession{
+			SessionID:        "session-live",
+			CodexTotalTokens: 999,
+		},
+	}
+	o.state.CodexRateLimits = map[string]any{"remaining": 1}
+	o.mu.Lock()
+	o.enterProtectedModeLocked("disk full")
+	o.mu.Unlock()
+
+	snapshot := o.Snapshot()
+	if len(snapshot.Running) != 0 || snapshot.Counts.Running != 0 {
+		t.Fatalf("running snapshot = %+v counts = %+v, want persisted protected view without live running rows", snapshot.Running, snapshot.Counts)
+	}
+	if len(snapshot.Recovery.Recovering) != 1 || snapshot.Recovery.Recovering[0].IssueIdentifier != "ABC-1" {
+		t.Fatalf("recovering snapshot = %+v, want persisted recovery entry only", snapshot.Recovery.Recovering)
+	}
+	if snapshot.CodexTotals.TotalTokens != 30 || snapshot.CodexTotals.SecondsRunning != 12 {
+		t.Fatalf("codex totals = %+v, want persisted totals", snapshot.CodexTotals)
+	}
+	if snapshot.RateLimits != nil {
+		t.Fatalf("rate limits = %+v, want nil in protected persisted view", snapshot.RateLimits)
+	}
+}
+
 func TestHandleCodexUpdateInProtectedModeDoesNotAdvanceDurableTotals(t *testing.T) {
 	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
 	o := newTestOrchestrator(testServiceConfig(), &fakeTracker{}, &fakeWorkspaceManager{}, &fakeRunner{}, now)
 	o.state.CodexTotals = model.TokenTotals{InputTokens: 10, OutputTokens: 20, TotalTokens: 30}
+	o.state.CodexRateLimits = map[string]any{"remaining": 9}
 	o.state.Running["1"] = &model.RunningEntry{
 		Issue:        &model.Issue{ID: "1", Identifier: "ABC-1", State: "In Progress"},
 		Identifier:   "ABC-1",
@@ -407,6 +464,7 @@ func TestHandleCodexUpdateInProtectedModeDoesNotAdvanceDurableTotals(t *testing.
 				OutputTokens: 50,
 				TotalTokens:  150,
 			},
+			RateLimits: map[string]any{"remaining": 1},
 		},
 	})
 
@@ -416,6 +474,9 @@ func TestHandleCodexUpdateInProtectedModeDoesNotAdvanceDurableTotals(t *testing.
 	entry := o.state.Running["1"]
 	if entry == nil || entry.Session.CodexTotalTokens != 150 {
 		t.Fatalf("running session tokens = %+v, want observed totals only", entry)
+	}
+	if remaining := o.state.CodexRateLimits.(map[string]any)["remaining"]; remaining != 9 {
+		t.Fatalf("rate limits = %+v, want protected mode to keep pre-failure value", o.state.CodexRateLimits)
 	}
 }
 
@@ -1123,6 +1184,93 @@ func TestHandleWorkerExitHasNewOpenPRMergedTransitionsToDone(t *testing.T) {
 	}
 	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
 		t.Fatalf("cleanup calls = %+v, want [ABC-1]", workspace.cleaned)
+	}
+}
+
+func TestHandleWorkerExitMergedPRTransitionWaitsForLocalDurableAck(t *testing.T) {
+	now := time.Date(2026, 3, 7, 10, 0, 0, 0, time.UTC)
+	cfg := &model.ServiceConfig{
+		ActiveStates:              []string{"Todo", "In Progress"},
+		TerminalStates:            []string{"Done"},
+		MaxConcurrentAgents:       1,
+		MaxRetryBackoffMS:         300000,
+		OrchestratorAutoCloseOnPR: true,
+	}
+	tracker := &fakeTracker{
+		stateByID: map[string]model.Issue{
+			"1": {ID: "1", Identifier: "ABC-1", State: "In Progress"},
+		},
+	}
+	tracker.onTransition = func(issueID string, targetState string) {
+		trackerIssue := tracker.stateByID[issueID]
+		trackerIssue.State = "Done"
+		tracker.stateByID[issueID] = trackerIssue
+	}
+	workspace := &fakeWorkspaceManager{}
+	store := &fakeStateStore{}
+	o := newTestOrchestrator(cfg, tracker, workspace, &fakeRunner{}, now)
+	o.stateStore = store
+	branch := "iiwate4268/iiwate-33-test"
+	o.prLookup = &fakePRLookup{
+		byBranch: map[string]*PullRequestInfo{
+			branch: {Number: 42, URL: "https://example.test/pr/42", HeadBranch: branch, State: PullRequestStateMerged},
+		},
+	}
+	o.state.Running["1"] = &model.RunningEntry{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", State: "Todo"},
+		Identifier:    "ABC-1",
+		WorkspacePath: "C:/work/ABC-1",
+		RetryAttempt:  0,
+		StartedAt:     now.Add(-time.Second),
+		WorkerCancel:  func() {},
+		Dispatch:      pullRequestDispatch(),
+	}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:      "1",
+		Identifier:   "ABC-1",
+		StartedAt:    now,
+		Phase:        model.PhaseSucceeded,
+		HasNewOpenPR: true,
+		FinalBranch:  branch,
+	})
+
+	if tracker.transitionCalls != 0 {
+		t.Fatalf("transition calls = %d, want 0 before persistence ack", tracker.transitionCalls)
+	}
+	if len(workspace.cleaned) != 0 {
+		t.Fatalf("cleanup calls = %+v, want none before persistence ack", workspace.cleaned)
+	}
+
+	o.handleSessionPersistenceWriteSuccess(1, store.lastState)
+
+	if tracker.transitionCalls != 0 {
+		t.Fatalf("transition calls = %d, want 0 before merged state durable ack", tracker.transitionCalls)
+	}
+	awaiting := o.state.AwaitingMerge["1"]
+	if awaiting == nil {
+		t.Fatal("awaiting merge entry missing after first persistence ack")
+	}
+	if awaiting.PRState != string(PullRequestStateMerged) {
+		t.Fatalf("awaiting merge entry = %+v, want merged PR state", awaiting)
+	}
+	if len(workspace.cleaned) != 0 {
+		t.Fatalf("cleanup calls = %+v, want none before tracker transition ack", workspace.cleaned)
+	}
+
+	o.handleSessionPersistenceWriteSuccess(2, store.lastState)
+
+	if tracker.transitionCalls != 1 || tracker.transitionIssueID != "1" {
+		t.Fatalf("transition calls = %d issue = %q, want 1/1 after merged ack", tracker.transitionCalls, tracker.transitionIssueID)
+	}
+	if len(workspace.cleaned) != 0 {
+		t.Fatalf("cleanup calls = %+v, want none before terminal removal ack", workspace.cleaned)
+	}
+
+	o.handleSessionPersistenceWriteSuccess(3, store.lastState)
+
+	if len(workspace.cleaned) != 1 || workspace.cleaned[0] != "ABC-1" {
+		t.Fatalf("cleanup calls = %+v, want [ABC-1] after terminal removal ack", workspace.cleaned)
 	}
 }
 

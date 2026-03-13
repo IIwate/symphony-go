@@ -319,28 +319,29 @@ type Orchestrator struct {
 
 	state model.OrchestratorState
 
-	mu                        sync.RWMutex
-	snapshot                  Snapshot
-	started                   bool
-	subscribers               map[int]chan Snapshot
-	nextSubscriberID          int
-	healthAlerts              map[string]AlertSnapshot
-	notificationHealth        map[string]*NotificationChannelHealthSnapshot
-	persistenceHealth         PersistenceHealthSnapshot
-	pendingCleanup            map[string]string
-	recoveredPending          map[string]*model.RecoveryEntry
-	pendingResume             map[string]uint64
-	pendingLaunch             map[string]uint64
-	pendingActions            map[uint64][]func()
-	completedOrder            []string
-	maxCompleted              int
-	startedAt                 time.Time
-	serviceVersion            string
-	extensionsReady           bool
-	eventSeq                  uint64
-	notifierGeneration        uint64
-	lastPersistedStateVersion uint64
-	lastPersistedState        *durableRuntimeState
+	mu                          sync.RWMutex
+	snapshot                    Snapshot
+	started                     bool
+	subscribers                 map[int]chan Snapshot
+	nextSubscriberID            int
+	healthAlerts                map[string]AlertSnapshot
+	notificationHealth          map[string]*NotificationChannelHealthSnapshot
+	persistenceHealth           PersistenceHealthSnapshot
+	pendingCleanup              map[string]string
+	recoveredPending            map[string]*model.RecoveryEntry
+	pendingResume               map[string]uint64
+	pendingLaunch               map[string]uint64
+	pendingPostMergeTransitions map[string]uint64
+	pendingActions              map[uint64][]func()
+	completedOrder              []string
+	maxCompleted                int
+	startedAt                   time.Time
+	serviceVersion              string
+	extensionsReady             bool
+	eventSeq                    uint64
+	notifierGeneration          uint64
+	lastPersistedStateVersion   uint64
+	lastPersistedState          *durableRuntimeState
 }
 
 var BuildVersion = "dev"
@@ -383,17 +384,18 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 			ProtectedResults:     map[string]*model.ProtectedResultEntry{},
 			Completed:            map[string]struct{}{},
 		},
-		subscribers:        map[int]chan Snapshot{},
-		healthAlerts:       healthAlerts,
-		notificationHealth: map[string]*NotificationChannelHealthSnapshot{},
-		pendingCleanup:     map[string]string{},
-		recoveredPending:   recovering,
-		pendingResume:      map[string]uint64{},
-		pendingLaunch:      map[string]uint64{},
-		pendingActions:     map[uint64][]func(){},
-		maxCompleted:       defaultMaxCompletedEntries,
-		startedAt:          time.Now().UTC(),
-		serviceVersion:     BuildVersion,
+		subscribers:                 map[int]chan Snapshot{},
+		healthAlerts:                healthAlerts,
+		notificationHealth:          map[string]*NotificationChannelHealthSnapshot{},
+		pendingCleanup:              map[string]string{},
+		recoveredPending:            recovering,
+		pendingResume:               map[string]uint64{},
+		pendingLaunch:               map[string]uint64{},
+		pendingPostMergeTransitions: map[string]uint64{},
+		pendingActions:              map[uint64][]func(){},
+		maxCompleted:                defaultMaxCompletedEntries,
+		startedAt:                   time.Now().UTC(),
+		serviceVersion:              BuildVersion,
 	}
 	o.prLookup = newGitHubPRLookup()
 	o.applyCurrentConfigLocked()
@@ -1242,6 +1244,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 		return
 	}
 	event := update.Event
+	protected := o.isProtectedLocked()
 	entry.Session.LastCodexMessage = event.Message
 	lastEvent := event.Event
 	entry.Session.LastCodexEvent = &lastEvent
@@ -1261,7 +1264,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 		entry.Session.TurnCount++
 	}
 	if event.Usage != nil {
-		if o.isProtectedLocked() {
+		if protected {
 			entry.Session.CodexInputTokens = event.Usage.InputTokens
 			entry.Session.CodexOutputTokens = event.Usage.OutputTokens
 			entry.Session.CodexTotalTokens = event.Usage.TotalTokens
@@ -1272,7 +1275,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 			o.applyUsageLocked(&entry.Session, event.Usage)
 		}
 	}
-	if event.RateLimits != nil {
+	if event.RateLimits != nil && !protected {
 		o.state.CodexRateLimits = event.RateLimits
 	}
 	o.commitStateLocked(false)
@@ -1368,6 +1371,9 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 	pending := make(map[string]model.AwaitingMergeEntry, len(o.state.AwaitingMerge))
 	for issueID, entry := range o.state.AwaitingMerge {
 		if entry == nil {
+			continue
+		}
+		if _, waitingForAck := o.pendingPostMergeTransitions[issueID]; waitingForAck {
 			continue
 		}
 		pending[issueID] = *entry
@@ -2023,6 +2029,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	if o.isProtectedLocked() && o.lastPersistedState != nil {
 		persisted := cloneDurableRuntimeState(*o.lastPersistedState)
 		protectedPersistedState = &persisted
+		running = make([]RunningSnapshot, 0)
 		recovering = make([]RecoveringSnapshot, 0, len(persisted.Recovering))
 		for _, item := range persisted.Recovering {
 			row := RecoveringSnapshot{
@@ -2270,8 +2277,10 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 	}
 
 	totals := o.state.CodexTotals
+	rateLimits := o.state.CodexRateLimits
 	if protectedPersistedState != nil {
 		totals = protectedPersistedState.TokenTotal
+		rateLimits = nil
 	} else {
 		for _, entry := range o.state.Running {
 			totals.SecondsRunning += now.Sub(entry.StartedAt).Seconds()
@@ -2312,7 +2321,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			ProtectedResults: protectedResults,
 		},
 		CodexTotals: totals,
-		RateLimits:  o.state.CodexRateLimits,
+		RateLimits:  rateLimits,
 	}
 }
 
@@ -2621,7 +2630,58 @@ func isRetryablePostMergeError(err error) bool {
 	}
 }
 
-func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo) bool {
+func (o *Orchestrator) stageMergedPullRequestCompletion(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo, action func()) (uint64, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.isProtectedLocked() {
+		return 0, false
+	}
+	if _, waitingForAck := o.pendingPostMergeTransitions[issueID]; waitingForAck {
+		return 0, true
+	}
+
+	current := o.state.AwaitingMerge[issueID]
+	awaitingSince := o.now().UTC()
+	postMergeRetryCount := 0
+	if current == nil {
+		current = &model.AwaitingMergeEntry{}
+		o.state.AwaitingMerge[issueID] = current
+	} else {
+		if !current.AwaitingSince.IsZero() {
+			awaitingSince = current.AwaitingSince
+		}
+		postMergeRetryCount = current.PostMergeRetryCount
+	}
+	current.Identifier = identifier
+	current.State = issueState
+	current.WorkspacePath = workspacePath
+	current.Branch = branch
+	current.RetryAttempt = retryAttempt
+	current.StallCount = stallCount
+	current.AwaitingSince = awaitingSince
+	current.LastError = nil
+	current.PostMergeRetryCount = postMergeRetryCount
+	current.NextPostMergeRetryAt = nil
+	if pr != nil {
+		current.PRNumber = pr.Number
+		current.PRURL = pr.URL
+		current.PRState = string(pr.State)
+		current.PRBaseOwner = pr.BaseOwner
+		current.PRBaseRepo = pr.BaseRepo
+		current.PRHeadOwner = pr.HeadOwner
+	}
+	delete(o.pendingResume, issueID)
+	delete(o.state.Recovering, issueID)
+	delete(o.state.AwaitingIntervention, issueID)
+	version := o.commitStateLocked(true)
+	if version > 0 && action != nil {
+		o.pendingPostMergeTransitions[issueID] = version
+		o.schedulePersistedActionLocked(version, action)
+	}
+	return version, false
+}
+
+func (o *Orchestrator) finishMergedPullRequestCompletion(ctx context.Context, issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo) bool {
 	completer, ok := o.tracker.(tracker.IssueCompleter)
 	if !ok {
 		o.logger.Warn("tracker does not support issue completion", "issue_id", issueID, "issue_identifier", identifier, "branch", branch)
@@ -2648,6 +2708,30 @@ func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID
 		return o.handleFailedPostMergeTransition(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, pr, errorText, isRetryablePostMergeError(err))
 	}
 	return o.handleFailedPostMergeTransition(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, pr, "post-merge transition did not reach terminal state", true)
+}
+
+func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo) bool {
+	var version uint64
+	copyPR := clonePullRequestInfo(pr)
+	action := func() {
+		defer func() {
+			o.mu.Lock()
+			if pendingVersion, ok := o.pendingPostMergeTransitions[issueID]; ok && pendingVersion == version {
+				delete(o.pendingPostMergeTransitions, issueID)
+			}
+			o.mu.Unlock()
+		}()
+		o.finishMergedPullRequestCompletion(o.runtimeContext(), issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, copyPR)
+	}
+	var waitingForAck bool
+	version, waitingForAck = o.stageMergedPullRequestCompletion(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, copyPR, action)
+	if waitingForAck {
+		return true
+	}
+	if version > 0 {
+		return true
+	}
+	return o.finishMergedPullRequestCompletion(ctx, issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, copyPR)
 }
 
 func (o *Orchestrator) lookupPullRequestByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error) {

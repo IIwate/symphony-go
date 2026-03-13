@@ -24,7 +24,7 @@ jobs:
   live-smoke:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     concurrency:
-      group: live-smoke-shared-linear-project
+      group: live-smoke-ci-gate
       cancel-in-progress: false
     runs-on: windows-latest
     permissions:
@@ -74,4 +74,9 @@ jobs:
           if (-not $env:LINEAR_PROJECT_SLUG) { throw "Missing secret LIVE_SMOKE_LINEAR_PROJECT_SLUG" }
           $phase = "${{ github.event_name == 'workflow_dispatch' && inputs.phase || 'all' }}"
           $repo = "${{ github.event_name == 'workflow_dispatch' && inputs.repo || 'IIwate/linear-test' }}"
-          py -3 scripts/live_smoke.py --phase $phase --repo $repo
+          if ("${{ github.event_name }}" -eq "pull_request") {
+            $namespace = "live-smoke-pr-${{ github.event.pull_request.number }}-$env:GITHUB_RUN_ATTEMPT"
+          } else {
+            $namespace = "live-smoke-dispatch-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          }
+          py -3 scripts/live_smoke.py --phase $phase --repo $repo --branch-namespace $namespace

@@ -155,7 +155,7 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 		}
 		identifier := strings.TrimPrefix(r.URL.Path, "/api/v1/")
 		if identifier == "" || strings.Contains(identifier, "/") {
-			http.NotFound(w, r)
+			writeError(w, http.StatusNotFound, "invalid_issue_identifier", "issue identifier is invalid", logger)
 			return
 		}
 		response, ok := findIssueResponse(runtime.Snapshot(), identifier)
@@ -186,7 +186,7 @@ type serviceResponse struct {
 	StartedAt        string  `json:"started_at"`
 	UptimeSeconds    float64 `json:"uptime_seconds"`
 	Mode             string  `json:"mode"`
-	ProtectionReason string  `json:"protection_reason,omitempty"`
+	ProtectionReason string  `json:"protection_reason"`
 	ProtectedAt      *string `json:"protected_at"`
 	RestartRequired  bool    `json:"restart_required"`
 }

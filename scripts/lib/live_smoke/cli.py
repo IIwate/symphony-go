@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 from threading import Lock, Thread
 import time
@@ -163,8 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--branch-namespace",
-        default="live-smoke",
-        help="Explicit workspace branch namespace used in generated smoke config",
+        default="",
+        help="Explicit workspace branch namespace used in generated smoke config; defaults to a run-scoped namespace",
     )
     parser.add_argument(
         "--echo-process-output",
@@ -181,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     repo_url = f"https://github.com/{repo}"
     linear_api_key = args.linear_api_key or _env_required("LINEAR_API_KEY")
     linear_project_slug = args.linear_project_slug or _env_required("LINEAR_PROJECT_SLUG")
+    branch_namespace = _resolve_branch_namespace(args.branch_namespace)
+    issue_prefix = _smoke_issue_prefix(branch_namespace)
 
     temp_dir = temp_root() / time.strftime("%Y%m%d-%H%M%S")
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -193,7 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _run_step(results, "preflight", lambda: _preflight(repo))
         _run_step(results, "build_binary", lambda: _build_binary(resources))
-        _run_step(results, "cleanup_active_smoke_issues", lambda: _cleanup_stale_smoke_issues(linear, context, linear_project_slug))
+        _run_step(
+            results,
+            "cleanup_active_smoke_issues",
+            lambda: _cleanup_stale_smoke_issues(linear, context, linear_project_slug, issue_prefix),
+        )
         if args.purge_history:
             _run_step(results, "purge_history", lambda: _purge_terminal_smoke_issues(linear, project_slug=linear_project_slug))
 
@@ -221,7 +228,8 @@ def main(argv: list[str] | None = None) -> int:
                     linear_project_slug,
                     repo_url,
                     args.linear_branch_scope,
-                    args.branch_namespace,
+                    branch_namespace,
+                    issue_prefix,
                     args.echo_process_output,
                 ),
             )
@@ -236,7 +244,8 @@ def main(argv: list[str] | None = None) -> int:
                     repo,
                     repo_url,
                     args.linear_branch_scope,
-                    args.branch_namespace,
+                    branch_namespace,
+                    issue_prefix,
                     args.echo_process_output,
                 ),
             )
@@ -251,7 +260,8 @@ def main(argv: list[str] | None = None) -> int:
                     repo,
                     repo_url,
                     args.linear_branch_scope,
-                    args.branch_namespace,
+                    branch_namespace,
+                    issue_prefix,
                     args.echo_process_output,
                 ),
             )
@@ -285,6 +295,34 @@ def _env_required(name: str) -> str:
     return value
 
 
+def _slug_component(value: str, *, fallback: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    if not normalized:
+        return fallback
+    return normalized[:48].rstrip("-") or fallback
+
+
+def _resolve_branch_namespace(explicit: str) -> str:
+    override = _slug_component(explicit, fallback="") if explicit.strip() else ""
+    if override:
+        return override
+    run_id = os.getenv("GITHUB_RUN_ID", "").strip()
+    run_attempt = _slug_component(os.getenv("GITHUB_RUN_ATTEMPT", "").strip(), fallback="1")
+    if run_id:
+        event_name = _slug_component(os.getenv("GITHUB_EVENT_NAME", "").strip(), fallback="ci")
+        return f"live-smoke-{event_name}-{run_id}-{run_attempt}"
+    local_stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"live-smoke-local-{local_stamp}-{os.getpid()}"
+
+
+def _smoke_issue_prefix(namespace: str) -> str:
+    return f"[live-smoke:{namespace}]"
+
+
+def _is_any_live_smoke_title(title: str) -> bool:
+    return title.startswith(LIVE_SMOKE_PREFIX) or title.startswith("[live-smoke:")
+
+
 def _preflight(repo: str) -> str:
     require_command("go")
     require_command("git")
@@ -305,29 +343,32 @@ def _build_binary(resources: Resources) -> str:
     return str(binary_path)
 
 
-def _cleanup_stale_smoke_issues(linear: LinearClient, context: TeamContext, project_slug: str) -> str:
+def _cleanup_stale_smoke_issues(linear: LinearClient, context: TeamContext, project_slug: str, issue_prefix: str) -> str:
     stale = []
+    foreign = []
     for issue in linear.fetch_active_issues(project_slug):
         title = str(issue.get("title", ""))
-        if title.startswith(LIVE_SMOKE_PREFIX):
+        if title.startswith(issue_prefix):
             stale.append(issue)
+            continue
+        foreign.append(issue)
     for issue in stale:
         linear.update_issue_state(str(issue["id"]), context.canceled_state_id)
-    remaining = [
-        issue
-        for issue in linear.fetch_active_issues(project_slug)
-        if not str(issue.get("title", "")).startswith(LIVE_SMOKE_PREFIX)
-    ]
-    if remaining:
-        identifiers = ", ".join(str(item["identifier"]) for item in remaining)
-        raise RuntimeError(f"target project still has active non-smoke issues: {identifiers}")
-    return f"cleaned={len(stale)}"
+    if foreign:
+        identifiers = ", ".join(str(item["identifier"]) for item in foreign)
+        raise RuntimeError(
+            f"target project has active issues outside current namespace {issue_prefix}: {identifiers}"
+        )
+    return f"cleaned={len(stale)} namespace={issue_prefix}"
 
 
 def _purge_terminal_smoke_issues(linear: LinearClient, *, project_slug: str) -> str:
     purged = 0
-    for issue in linear.fetch_smoke_issues(project_slug, LIVE_SMOKE_PREFIX):
+    for issue in linear.fetch_smoke_issues(project_slug, "[live-smoke"):
         state_name = str(issue.get("state", {}).get("name", "")).strip()
+        title = str(issue.get("title", ""))
+        if not _is_any_live_smoke_title(title):
+            continue
         if state_name in {"Todo", "In Progress"}:
             continue
         linear.archive_issue(str(issue["id"]), trash=True)
@@ -413,11 +454,12 @@ def _run_missing_pr_smoke(
     repo_url: str,
     branch_scope: str,
     branch_namespace: str,
+    issue_prefix: str,
     echo_output: bool,
 ) -> str:
     if resources.binary_path is None:
         raise RuntimeError("symphony binary is not built")
-    issue = linear.create_issue(f"{LIVE_SMOKE_PREFIX} missing_pr {int(time.time())}", context)
+    issue = linear.create_issue(f"{issue_prefix} missing_pr {int(time.time())}", context)
     resources.issue_ids.append(str(issue["id"]))
     port = allocate_port()
     config = SmokeConfig(
@@ -462,11 +504,12 @@ def _run_merge_path_smoke(
     repo_url: str,
     branch_scope: str,
     branch_namespace: str,
+    issue_prefix: str,
     echo_output: bool,
 ) -> str:
     if resources.binary_path is None:
         raise RuntimeError("symphony binary is not built")
-    issue = linear.create_issue(f"{LIVE_SMOKE_PREFIX} merge_path {int(time.time())}", context)
+    issue = linear.create_issue(f"{issue_prefix} merge_path {int(time.time())}", context)
     resources.issue_ids.append(str(issue["id"]))
     branch = _linear_branch_name(branch_namespace, branch_scope, str(issue["identifier"]))
     pr = prepare_pull_request(
@@ -535,6 +578,7 @@ def _run_runtime_extensions_smoke(
     repo_url: str,
     branch_scope: str,
     branch_namespace: str,
+    issue_prefix: str,
     echo_output: bool,
 ) -> str:
     if resources.binary_path is None:
@@ -576,7 +620,7 @@ def _run_runtime_extensions_smoke(
         _assert_public_state_surface(state_payload)
         _assert_refresh_contract(base_url)
 
-        persistence_issue = linear.create_issue(f"{LIVE_SMOKE_PREFIX} runtime_extensions persistence {int(time.time())}", context)
+        persistence_issue = linear.create_issue(f"{issue_prefix} runtime_extensions persistence {int(time.time())}", context)
         resources.issue_ids.append(str(persistence_issue["id"]))
         persistence_identifier = str(persistence_issue["identifier"])
         persistence_payload = _wait_for(
@@ -686,7 +730,7 @@ def _run_runtime_extensions_smoke(
                 f"unexpected notification replay after restart: before={notification_count_before_restart}, after={notification_count_after_restart}"
             )
 
-        merge_issue = linear.create_issue(f"{LIVE_SMOKE_PREFIX} runtime_extensions merge {int(time.time())}", context)
+        merge_issue = linear.create_issue(f"{issue_prefix} runtime_extensions merge {int(time.time())}", context)
         resources.issue_ids.append(str(merge_issue["id"]))
         merge_identifier = str(merge_issue["identifier"])
         branch = _linear_branch_name(f"{branch_namespace}-feature", branch_scope, merge_identifier)

@@ -535,14 +535,19 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
 	writeFile(t, filepath.Join(configDir, "flows", "other-flow.yaml"), "prompt: prompts/other.md.liquid\n")
 	writeFile(t, filepath.Join(configDir, "prompts", "other.md.liquid"), "other flow\n")
 
-	writeProject := func(workspaceValue string, branchNamespace string, sessionPath string, notificationURL string, pollInterval int, dispatchFlow string, codexCommand string) {
+	writeProject := func(workspaceValue string, branchNamespace string, sessionPath string, notificationURL string, pollInterval int, dispatchFlow string, codexCommand string, maxConcurrentAgents int, agentExtras string) {
+		agentBlock := fmt.Sprintf("    max_concurrent_agents: %d\n    max_turns: 20\n", maxConcurrentAgents)
+		if agentExtras != "" {
+			agentBlock += agentExtras
+		}
 		projectYAML := fmt.Sprintf(`runtime:
   workspace:
     root: %s
     branch_namespace: %s
   polling:
     interval_ms: %d
-  codex:
+  agent:
+%s  codex:
     command: %s
   session_persistence:
     enabled: true
@@ -572,11 +577,11 @@ selection:
     - linear-main
 defaults:
   profile: null
-`, workspaceValue, branchNamespace, pollInterval, codexCommand, sessionPath, notificationURL, dispatchFlow)
+`, workspaceValue, branchNamespace, pollInterval, agentBlock, codexCommand, sessionPath, notificationURL, dispatchFlow)
 		writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	}
 
-	writeProject(workspaceRoot, "runner-a", "./automation/local/session-state.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server")
+	writeProject(workspaceRoot, "runner-a", "./automation/local/session-state.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server", 10, "")
 
 	repoDef, err := loader.Load(configDir, "")
 	if err != nil {
@@ -599,17 +604,21 @@ defaults:
 	}
 
 	tests := []struct {
-		name            string
-		workspace       string
-		branchNamespace string
-		sessionPath     string
-		url             string
-		pollInterval    int
-		dispatchFlow    string
-		codexCommand    string
-		wantErr         string
-		wantURL         string
-		wantPoll        int
+		name              string
+		workspace         string
+		branchNamespace   string
+		sessionPath       string
+		url               string
+		pollInterval      int
+		dispatchFlow      string
+		codexCommand      string
+		maxConcurrent     int
+		agentExtras       string
+		wantErr           string
+		wantURL           string
+		wantPoll          int
+		wantMaxConcurrent int
+		wantStateLimit    int
 	}{
 		{
 			name:            "session persistence",
@@ -620,6 +629,7 @@ defaults:
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
 			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
 			wantErr:         "runtime.session_persistence changed: restart required",
 		},
 		{
@@ -631,6 +641,7 @@ defaults:
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
 			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
 			wantErr:         "runtime.workspace.root changed: restart required",
 		},
 		{
@@ -642,6 +653,7 @@ defaults:
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
 			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
 			wantErr:         "runtime.workspace.branch_namespace changed: restart required",
 		},
 		{
@@ -653,6 +665,7 @@ defaults:
 			pollInterval:    30000,
 			dispatchFlow:    "other-flow",
 			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
 			wantErr:         "selection.dispatch_flow changed: restart required",
 		},
 		{
@@ -664,6 +677,7 @@ defaults:
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
 			codexCommand:    "codex next-server",
+			maxConcurrent:   10,
 			wantErr:         "runtime.codex.command changed: restart required",
 		},
 		{
@@ -675,6 +689,7 @@ defaults:
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
 			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
 			wantURL:         "https://hooks.example.com/b",
 		},
 		{
@@ -686,13 +701,40 @@ defaults:
 			pollInterval:    45000,
 			dispatchFlow:    "implement",
 			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
 			wantPoll:        45000,
+		},
+		{
+			name:              "max concurrent agents",
+			workspace:         workspaceRoot,
+			branchNamespace:   "runner-a",
+			sessionPath:       "./automation/local/session-state.json",
+			url:               "https://hooks.example.com/a",
+			pollInterval:      30000,
+			dispatchFlow:      "implement",
+			codexCommand:      "codex app-server",
+			maxConcurrent:     3,
+			wantMaxConcurrent: 3,
+		},
+		{
+			name:            "max concurrent agents by state",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/session-state.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			agentExtras: "    max_concurrent_agents_by_state:\n" +
+				"      todo: 2\n",
+			wantStateLimit: 2,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			writeProject(tc.workspace, tc.branchNamespace, tc.sessionPath, tc.url, tc.pollInterval, tc.dispatchFlow, tc.codexCommand)
+			writeProject(tc.workspace, tc.branchNamespace, tc.sessionPath, tc.url, tc.pollInterval, tc.dispatchFlow, tc.codexCommand, tc.maxConcurrent, tc.agentExtras)
 			reloaded, err := loader.Load(configDir, "")
 			if err != nil {
 				t.Fatalf("loader.Load() reload error = %v", err)
@@ -714,6 +756,12 @@ defaults:
 			}
 			if tc.wantPoll != 0 && state.CurrentConfig().PollIntervalMS != tc.wantPoll {
 				t.Fatalf("PollIntervalMS = %d, want %d", state.CurrentConfig().PollIntervalMS, tc.wantPoll)
+			}
+			if tc.wantMaxConcurrent != 0 && state.CurrentConfig().MaxConcurrentAgents != tc.wantMaxConcurrent {
+				t.Fatalf("MaxConcurrentAgents = %d, want %d", state.CurrentConfig().MaxConcurrentAgents, tc.wantMaxConcurrent)
+			}
+			if tc.wantStateLimit != 0 && state.CurrentConfig().MaxConcurrentAgentsByState["todo"] != tc.wantStateLimit {
+				t.Fatalf("MaxConcurrentAgentsByState[todo] = %d, want %d", state.CurrentConfig().MaxConcurrentAgentsByState["todo"], tc.wantStateLimit)
 			}
 		})
 	}

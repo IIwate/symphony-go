@@ -214,6 +214,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 入口：`scripts/live_smoke.py`
 - 目标：把 dry-run、`config doctor/set`、inline hook、symlink 逃逸、`missing_pr`、`awaiting_merge -> merged -> Done` 这些链路做成可重复执行的 smoke
 - 默认会在 `.codex-tmp/live-smoke/` 下生成临时配置、工作区和临时 binary；脚本结束后默认自动清理
+- 默认会为每次运行生成独立的 branch namespace / issue title 前缀；CI 会绑定到当前 GitHub run，本地则回退到时间戳 + PID
 - 若需要保留现场排障，传 `--keep-artifacts`
 - 若需要清理历史已终态 smoke issue，显式传 `--purge-history`
 
@@ -224,6 +225,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/refresh
 - 已设置 `LINEAR_API_KEY`
 - 已设置 `LINEAR_PROJECT_SLUG`
 - 默认测试仓库为 `IIwate/linear-test`
+- 本地手动 smoke 不要复用 CI gate 专用的 Linear project；若项目里已有其他 active issue，脚本会 fail-fast，而不会替你清理别的运行
 
 推荐命令：
 
@@ -233,10 +235,13 @@ $env:LINEAR_API_KEY="..."
 $env:LINEAR_PROJECT_SLUG="..."
 py -3 scripts/live_smoke.py --phase light
 
-# 完整 smoke：包含真实 issue / PR / merge 路径
+# 本地排障用完整 smoke：包含真实 issue / PR / merge 路径
 $env:LINEAR_API_KEY="..."
 $env:LINEAR_PROJECT_SLUG="..."
 py -3 scripts/live_smoke.py --phase all
+
+# 若要手动复用一个固定 namespace 做定点排障，再显式指定
+py -3 scripts/live_smoke.py --phase heavy --branch-namespace debug-yourname-20260313
 ```
 
 脚本阶段说明：
@@ -258,7 +263,9 @@ py -3 scripts/live_smoke.py --phase all
 
 补充说明：
 
-- heavy 阶段默认使用显式 branch namespace `live-smoke`，便于识别和清理测试分支
+- `cleanup_active_smoke_issues` 只会取消当前 namespace 遗留的 active smoke issue，不会再清理共享 Linear 项目中的其他 smoke 运行
+- 若目标 project 里还存在其他 active issue（无论是不是 smoke），脚本会直接 fail-fast；这是为了避免当前进程误处理别的运行
+- heavy 阶段默认使用 run-scoped branch namespace；只有显式传 `--branch-namespace` 时才会复用固定 namespace
 - summary 末尾会明确打印 `artifacts cleaned from ...` 或 `artifacts kept at ...`
 - `--purge-history` 会归档旧的 terminal smoke issue；默认关闭，以保留审计痕迹
 - smoke 为测试仓库创建的 marker 文件会统一写入目标仓库的 `live-smoke-artifacts/` 目录，而不是直接落在仓库根目录
@@ -275,7 +282,9 @@ py -3 scripts/live_smoke.py --phase all
 - 推荐节奏：
   - 本地开发：先跑 `go test`
   - PR 提交后：等待普通 CI 复验
-  - 需要验收真实外部链路时：本地手动跑 `py -3 scripts/live_smoke.py --phase heavy`，或在 GitHub Actions 手动触发 `Live Smoke`
+  - 需要本地排障时：手动跑 `py -3 scripts/live_smoke.py --phase heavy`
+  - 需要正式验收真实外部链路时：以 GitHub Actions `Live Smoke` workflow 为准；本地手动 smoke 只用于调试，不作为 PR gate 的 canonical 结果
+- 若本地需要反复复现 live-smoke，优先准备独立的 debug project slug；不要和 CI gate 共享同一个 active project
 
 ### 6.6 GitHub Actions 工作流
 

@@ -246,10 +246,12 @@ for {
 | 方法 | 路径 | 功能 |
 |---|---|---|
 | GET | `/` | Dashboard HTML |
-| GET | `/api/v1/state` | 全局状态快照 JSON |
-| GET | `/api/v1/{identifier}` | 单 issue 详情 (200/404) |
-| POST | `/api/v1/refresh` | 触发立即轮询 (202) |
+| GET | `/api/v1/state` | 全局状态快照 JSON（`service.protection_reason` 固定返回） |
+| GET | `/api/v1/{identifier}` | 单 issue 详情（200/404；unknown/malformed 都返回 JSON error envelope） |
+| POST | `/api/v1/refresh` | 触发立即轮询（202；protected mode 为 409） |
 | GET | `/api/v1/events` | SSE 实时事件流 |
+
+补充：`GET /api/v1/{identifier}` 以 issue identifier 为 key 返回单 issue 状态摘要；若路径 malformed 或当前快照中不存在该 issue，都会返回统一 JSON error envelope。`POST /api/v1/refresh` 成功返回 `202 Accepted`，服务处于 protected mode 时返回 `409 Conflict` + 统一错误 envelope。
 
 ---
 

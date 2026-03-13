@@ -41,6 +41,9 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	if service["mode"] != "normal" {
 		t.Fatalf("service.mode = %v, want normal", service["mode"])
 	}
+	if got, ok := service["protection_reason"]; !ok || got != "" {
+		t.Fatalf("service.protection_reason = %v (present=%v), want empty string", got, ok)
+	}
 	if service["started_at"] == nil {
 		t.Fatalf("service.started_at missing: %+v", service)
 	}
@@ -203,6 +206,31 @@ func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	var missingPayload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &missingPayload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	missingErr := missingPayload["error"].(map[string]any)
+	if missingErr["code"] != "issue_not_found" {
+		t.Fatalf("error.code = %v, want issue_not_found", missingErr["code"])
+	}
+
+	for _, path := range []string{"/api/v1/", "/api/v1/ABC-1/extra"} {
+		req = httptest.NewRequest(http.MethodGet, path, nil)
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("path %q status = %d, want 404", path, rec.Code)
+		}
+		var malformedPayload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &malformedPayload); err != nil {
+			t.Fatalf("path %q Unmarshal() error = %v", path, err)
+		}
+		malformedErr := malformedPayload["error"].(map[string]any)
+		if malformedErr["code"] != "invalid_issue_identifier" {
+			t.Fatalf("path %q error.code = %v, want invalid_issue_identifier", path, malformedErr["code"])
+		}
 	}
 }
 

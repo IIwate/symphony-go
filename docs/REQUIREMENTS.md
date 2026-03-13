@@ -1058,7 +1058,7 @@ type TokenUsage struct {
 | GET | `/` | Dashboard HTML | 200 |
 | GET | `/api/v1/state` | 全局状态快照 JSON | 200 |
 | GET | `/api/v1/{identifier}` | 单 issue 详情 JSON | 200 / 404 |
-| POST | `/api/v1/refresh` | 触发立即轮询 + 对账 | 202 |
+| POST | `/api/v1/refresh` | 触发立即轮询 + 对账 | 202 / 409 |
 | GET | `/api/v1/events` | SSE 实时事件流 | 200 (text/event-stream) |
 
 不支持的方法返回 `405 Method Not Allowed`。
@@ -1124,10 +1124,13 @@ type TokenUsage struct {
 }
 ```
 
+补充约束：`service.protection_reason` 是稳定字符串字段；normal 模式固定返回空字符串，protected 模式返回进入 protected mode 的原因。
+
 **`GET /api/v1/{identifier}` 响应**（SPEC §13.7.2）：
 - 已知 issue → 详细运行时/调试信息
 - 当前实现会根据状态返回 `running` / `recovering` / `awaiting_merge` / `awaiting_intervention` / `retrying` / `protected_result`
 - 未知 issue → `404` + `{"error":{"code":"issue_not_found","message":"..."}}`
+- malformed path（空 identifier 或包含额外 `/`）→ `404` + `{"error":{"code":"invalid_issue_identifier","message":"..."}}`
 
 **`POST /api/v1/refresh` 响应**（SPEC §13.7.2）：
 - `202 Accepted` + `{"accepted":true,"coalesced":false,"requested_at":"...","operations":["poll","reconcile"]}`

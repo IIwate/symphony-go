@@ -1099,6 +1099,7 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.persistenceHealth.ConsecutiveFailures++
 	clear(o.pendingResume)
 	clear(o.pendingActions)
+	clear(o.pendingPostMergeTransitions)
 	for issueID := range o.pendingLaunch {
 		delete(o.state.Running, issueID)
 	}
