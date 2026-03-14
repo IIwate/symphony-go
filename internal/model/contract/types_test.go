@@ -64,9 +64,10 @@ func TestReasonAndErrorDescriptorsAreStructured(t *testing.T) {
 
 func TestDiscoveryStateAndControlContractsMarshalStableFields(t *testing.T) {
 	record := IssueRuntimeRecord{
-		RecordID: "rec_linear_123",
+		RecordID: "rec_linear_linear-main_linear-123",
 		SourceRef: SourceRef{
 			SourceKind:       SourceKindLinear,
+			SourceName:       "linear-main",
 			SourceID:         "linear-123",
 			SourceIdentifier: "ENG-123",
 			URL:              "https://linear.app/example/issue/ENG-123",
@@ -138,9 +139,10 @@ func TestDiscoveryStateAndControlContractsMarshalStableFields(t *testing.T) {
 func TestLedgerAndEventContractsMarshalStableFields(t *testing.T) {
 	retryDueAt := "2026-03-14T00:10:00Z"
 	ledger := IssueLedgerRecord{
-		RecordID: "rec_linear_123",
+		RecordID: "rec_linear_linear-main_linear-123",
 		SourceRef: SourceRef{
 			SourceKind:       SourceKindLinear,
+			SourceName:       "linear-main",
 			SourceID:         "linear-123",
 			SourceIdentifier: "ENG-123",
 			URL:              "https://linear.app/example/issue/ENG-123",
@@ -157,12 +159,13 @@ func TestLedgerAndEventContractsMarshalStableFields(t *testing.T) {
 		EventType:   EventTypeStateChanged,
 		Timestamp:   "2026-03-14T00:00:02Z",
 		ServiceMode: ServiceModeServing,
-		RecordIDs:   []RecordID{"rec_linear_123"},
-		Reason:      ptrReason(MustReason(ReasonRecordBlockedAwaitingMerge, map[string]any{"record_id": "rec_linear_123"})),
+		RecordIDs:   []RecordID{"rec_linear_linear-main_linear-123"},
+		Reason:      ptrReason(MustReason(ReasonRecordBlockedAwaitingMerge, map[string]any{"record_id": "rec_linear_linear-main_linear-123"})),
 	}
 
 	assertJSONHasKeys(t, ledger, []string{"record_id", "source_ref", "status", "reason", "retry_due_at", "durable_refs", "result", "updated_at"})
 	assertJSONHasKeys(t, event, []string{"event_id", "event_type", "timestamp", "service_mode", "record_ids", "reason"})
+	assertJSONHasKeys(t, ledger.SourceRef, []string{"source_kind", "source_name", "source_id", "source_identifier", "url"})
 }
 
 func assertJSONHasKeys(t *testing.T, value any, keys []string) {

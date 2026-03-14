@@ -336,24 +336,34 @@ func cloneServiceReasons(reasons []contract.Reason) []contract.Reason {
 	return cloned
 }
 
-func recordIDForSource(sourceKind contract.SourceKind, sourceID string) contract.RecordID {
-	token := strings.TrimSpace(string(sourceKind))
+func sanitizeRecordIDToken(value string, fallback string) string {
+	token := model.SanitizeWorkspaceKey(strings.TrimSpace(value))
+	token = strings.Trim(token, "._-")
 	if token == "" {
-		token = "source"
+		return fallback
 	}
-	return contract.RecordID(fmt.Sprintf("rec_%s_%s", token, strings.TrimSpace(sourceID)))
+	return token
 }
 
-func recordIDForIssue(sourceKind contract.SourceKind, issue *model.Issue) contract.RecordID {
+func recordIDForSource(sourceKind contract.SourceKind, sourceName string, sourceID string) contract.RecordID {
+	return contract.RecordID(fmt.Sprintf(
+		"rec_%s_%s_%s",
+		sanitizeRecordIDToken(string(sourceKind), "source"),
+		sanitizeRecordIDToken(sourceName, "source"),
+		sanitizeRecordIDToken(sourceID, "id"),
+	))
+}
+
+func recordIDForIssue(sourceKind contract.SourceKind, sourceName string, issue *model.Issue) contract.RecordID {
 	if issue == nil {
 		return ""
 	}
-	return recordIDForSource(sourceKind, issue.ID)
+	return recordIDForSource(sourceKind, sourceName, issue.ID)
 }
 
-func sourceRefForIssue(sourceKind contract.SourceKind, issue *model.Issue) contract.SourceRef {
+func sourceRefForIssue(sourceKind contract.SourceKind, sourceName string, issue *model.Issue) contract.SourceRef {
 	if issue == nil {
-		return contract.SourceRef{SourceKind: sourceKind}
+		return contract.SourceRef{SourceKind: sourceKind, SourceName: strings.TrimSpace(sourceName)}
 	}
 	url := ""
 	if issue.URL != nil {
@@ -361,6 +371,7 @@ func sourceRefForIssue(sourceKind contract.SourceKind, issue *model.Issue) contr
 	}
 	return contract.SourceRef{
 		SourceKind:       sourceKind,
+		SourceName:       strings.TrimSpace(sourceName),
 		SourceID:         strings.TrimSpace(issue.ID),
 		SourceIdentifier: strings.TrimSpace(issue.Identifier),
 		URL:              url,
@@ -386,13 +397,19 @@ func (o *Orchestrator) currentSourceKind() contract.SourceKind {
 	return discoverySourceKind(o.currentRuntimeIdentity())
 }
 
+func (o *Orchestrator) currentSourceName() string {
+	return discoverySourceName(o.currentRuntimeIdentity())
+}
+
 func (o *Orchestrator) ensureRecordIdentityLocked(record *model.IssueRecord, issueID string, identifier string) {
 	if record == nil {
 		return
 	}
 	sourceKind := o.currentSourceKind()
-	record.Runtime.RecordID = recordIDForSource(sourceKind, issueID)
+	sourceName := o.currentSourceName()
+	record.Runtime.RecordID = recordIDForSource(sourceKind, sourceName, issueID)
 	record.Runtime.SourceRef.SourceKind = sourceKind
+	record.Runtime.SourceRef.SourceName = strings.TrimSpace(sourceName)
 	record.Runtime.SourceRef.SourceID = strings.TrimSpace(issueID)
 	record.Runtime.SourceRef.SourceIdentifier = strings.TrimSpace(identifier)
 }
@@ -475,10 +492,11 @@ func isAwaitingIntervention(record *model.IssueRecord) bool {
 
 func (o *Orchestrator) issueRecordFromIssue(issue model.Issue, ledgerPath string) *model.IssueRecord {
 	sourceKind := o.currentSourceKind()
+	sourceName := o.currentSourceName()
 	record := &model.IssueRecord{
 		Runtime: contract.IssueRuntimeRecord{
-			RecordID:  recordIDForIssue(sourceKind, &issue),
-			SourceRef: sourceRefForIssue(sourceKind, &issue),
+			RecordID:  recordIDForIssue(sourceKind, sourceName, &issue),
+			SourceRef: sourceRefForIssue(sourceKind, sourceName, &issue),
 			Status:    contract.IssueStatusActive,
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 			DurableRefs: contract.DurableRefs{
@@ -500,8 +518,9 @@ func (o *Orchestrator) ensureRecordLocked(issue model.Issue) *model.IssueRecord 
 	record.LastKnownIssue = model.CloneIssue(&issue)
 	record.LastKnownIssueState = strings.TrimSpace(issue.State)
 	sourceKind := o.currentSourceKind()
-	record.Runtime.SourceRef = sourceRefForIssue(sourceKind, &issue)
-	record.Runtime.RecordID = recordIDForIssue(sourceKind, &issue)
+	sourceName := o.currentSourceName()
+	record.Runtime.SourceRef = sourceRefForIssue(sourceKind, sourceName, &issue)
+	record.Runtime.RecordID = recordIDForIssue(sourceKind, sourceName, &issue)
 	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
 	return record
 }
@@ -673,10 +692,7 @@ func (o *Orchestrator) enterProtectedModeLocked(reason string) bool {
 	}
 	o.state.Service.Mode = model.ServiceModeUnavailable
 	o.state.Service.Reasons = []contract.Reason{
-		contract.MustReason(contract.ReasonServiceUnavailableCoreDependency, map[string]any{
-			"component": "ledger_store",
-			"detail":    strings.TrimSpace(reason),
-		}),
+		serviceUnavailableReason("ledger_store", reason, o.currentSourceKind(), o.currentSourceName()),
 	}
 	o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 		Code:    serviceProtectedModeCode,
@@ -684,6 +700,37 @@ func (o *Orchestrator) enterProtectedModeLocked(reason string) bool {
 		Message: fmt.Sprintf("service became unavailable: %s", reason),
 	})
 	return true
+}
+
+func serviceUnavailableReason(component string, detail string, sourceKind contract.SourceKind, sourceName string) contract.Reason {
+	return contract.MustReason(contract.ReasonServiceUnavailableCoreDependency, map[string]any{
+		"component":   strings.TrimSpace(component),
+		"source_kind": sourceKind,
+		"source_name": strings.TrimSpace(sourceName),
+		"detail":      strings.TrimSpace(detail),
+	})
+}
+
+func (o *Orchestrator) coreDependencyReasonsLocked() []contract.Reason {
+	identity := o.currentRuntimeIdentity()
+	sourceKind := discoverySourceKind(identity)
+	sourceName := discoverySourceName(identity)
+	mappings := []struct {
+		alertCode string
+		component string
+	}{
+		{alertCode: "dispatch_preflight_failed", component: "dispatch_preflight"},
+		{alertCode: "tracker_unreachable", component: "task_source"},
+	}
+	reasons := make([]contract.Reason, 0, len(mappings))
+	for _, mapping := range mappings {
+		alert, ok := o.healthAlerts[mapping.alertCode]
+		if !ok {
+			continue
+		}
+		reasons = append(reasons, serviceUnavailableReason(mapping.component, alert.Message, sourceKind, sourceName))
+	}
+	return reasons
 }
 
 func (o *Orchestrator) rememberProtectedResultLocked(issueID string, entry *model.IssueRecord, result WorkerResult) {
@@ -770,7 +817,7 @@ func (o *Orchestrator) Discovery() DiscoveryDocument {
 	snapshot := o.snapshot
 	identity := o.currentRuntimeIdentity()
 	sourceKind := discoverySourceKind(identity)
-	sourceName := strings.TrimSpace(identity.Compatibility.ActiveSource)
+	sourceName := discoverySourceName(identity)
 
 	return contract.DiscoveryDocument{
 		APIVersion: contract.APIVersionV1,
@@ -1614,8 +1661,10 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 		if o.isActiveState(issue.State, cfg) {
 			entry.LastKnownIssue = model.CloneIssue(&issue)
 			entry.LastKnownIssueState = strings.TrimSpace(issue.State)
-			entry.Runtime.SourceRef = sourceRefForIssue(o.currentSourceKind(), &issue)
-			entry.Runtime.RecordID = recordIDForIssue(o.currentSourceKind(), &issue)
+			sourceKind := o.currentSourceKind()
+			sourceName := o.currentSourceName()
+			entry.Runtime.SourceRef = sourceRefForIssue(sourceKind, sourceName, &issue)
+			entry.Runtime.RecordID = recordIDForIssue(sourceKind, sourceName, &issue)
 			continue
 		}
 		o.terminateRunningLocked(ctx, issueID, false, false, "")
@@ -1678,8 +1727,10 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				if current != nil && current.LastKnownIssueState != issue.State {
 					current.LastKnownIssue = model.CloneIssue(&issue)
 					current.LastKnownIssueState = issue.State
-					current.Runtime.SourceRef = sourceRefForIssue(o.currentSourceKind(), &issue)
-					current.Runtime.RecordID = recordIDForIssue(o.currentSourceKind(), &issue)
+					sourceKind := o.currentSourceKind()
+					sourceName := o.currentSourceName()
+					current.Runtime.SourceRef = sourceRefForIssue(sourceKind, sourceName, &issue)
+					current.Runtime.RecordID = recordIDForIssue(sourceKind, sourceName, &issue)
 					o.commitStateLocked(true)
 				}
 				o.mu.Unlock()
@@ -2281,10 +2332,14 @@ func (o *Orchestrator) publicServiceStateLocked() (contract.ServiceMode, bool, [
 		}))
 	}
 
-	switch o.serviceModeLocked() {
-	case contract.ServiceModeUnavailable:
+	if o.serviceModeLocked() == contract.ServiceModeUnavailable {
 		return contract.ServiceModeUnavailable, recoveryInProgress, reasons
-	case contract.ServiceModeDegraded:
+	}
+	if coreReasons := o.coreDependencyReasonsLocked(); len(coreReasons) > 0 {
+		reasons = append(reasons, coreReasons...)
+		return contract.ServiceModeUnavailable, recoveryInProgress, reasons
+	}
+	if o.serviceModeLocked() == contract.ServiceModeDegraded {
 		return contract.ServiceModeDegraded, recoveryInProgress, reasons
 	}
 
@@ -2315,6 +2370,10 @@ func discoverySourceKind(identity RuntimeIdentity) contract.SourceKind {
 		return kind
 	}
 	return ""
+}
+
+func discoverySourceName(identity RuntimeIdentity) string {
+	return strings.TrimSpace(identity.Compatibility.ActiveSource)
 }
 
 func discoveryInstanceID(identity RuntimeIdentity) string {

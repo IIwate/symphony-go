@@ -22,9 +22,11 @@ type fakeTracker struct {
 	candidates []model.Issue
 	issuesByID map[string]model.Issue
 	fetchErr   error
+	fetchCalls int
 }
 
 func (f *fakeTracker) FetchCandidateIssues(context.Context) ([]model.Issue, error) {
+	f.fetchCalls++
 	if f.fetchErr != nil {
 		return nil, f.fetchErr
 	}
@@ -104,16 +106,19 @@ func newTestConfig(t *testing.T) *model.ServiceConfig {
 	t.Helper()
 	root := t.TempDir()
 	return &model.ServiceConfig{
-		TrackerKind:         "linear",
-		TrackerProjectSlug:  "demo",
-		ActiveStates:        []string{"Todo", "In Progress"},
-		TerminalStates:      []string{"Done", "Closed"},
-		PollIntervalMS:      10,
-		AutomationRootDir:   root,
-		WorkspaceRoot:       filepath.Join(root, "workspaces"),
-		MaxConcurrentAgents: 2,
-		MaxTurns:            1,
-		MaxRetryBackoffMS:   100,
+		TrackerKind:                "linear",
+		TrackerAPIKey:              "secret-key",
+		TrackerProjectSlug:         "demo",
+		ActiveStates:               []string{"Todo", "In Progress"},
+		TerminalStates:             []string{"Done", "Closed"},
+		PollIntervalMS:             10,
+		AutomationRootDir:          root,
+		WorkspaceRoot:              filepath.Join(root, "workspaces"),
+		WorkspaceLinearBranchScope: "demo-scope",
+		MaxConcurrentAgents:        2,
+		MaxTurns:                   1,
+		MaxRetryBackoffMS:          100,
+		CodexCommand:               "codex app-server",
 		SessionPersistence: model.SessionPersistenceConfig{
 			Enabled: true,
 			Kind:    model.SessionPersistenceKindFile,
@@ -168,6 +173,44 @@ func ptrString(value string) *string {
 	return &value
 }
 
+func assertUnavailableServiceSurface(
+	t *testing.T,
+	discovery contract.DiscoveryDocument,
+	snapshot contract.ServiceStateSnapshot,
+	wantComponent string,
+) {
+	t.Helper()
+	if discovery.ServiceMode != contract.ServiceModeUnavailable {
+		t.Fatalf("discovery service_mode = %q, want %q", discovery.ServiceMode, contract.ServiceModeUnavailable)
+	}
+	if snapshot.ServiceMode != contract.ServiceModeUnavailable {
+		t.Fatalf("snapshot service_mode = %q, want %q", snapshot.ServiceMode, contract.ServiceModeUnavailable)
+	}
+	if !reflect.DeepEqual(discovery.Reasons, snapshot.Reasons) {
+		t.Fatalf("discovery/state reasons mismatch: discovery=%#v state=%#v", discovery.Reasons, snapshot.Reasons)
+	}
+	if len(snapshot.Reasons) != 1 {
+		t.Fatalf("snapshot reasons = %#v, want 1 reason", snapshot.Reasons)
+	}
+	reason := snapshot.Reasons[0]
+	if reason.ReasonCode != contract.ReasonServiceUnavailableCoreDependency {
+		t.Fatalf("reason_code = %q, want %q", reason.ReasonCode, contract.ReasonServiceUnavailableCoreDependency)
+	}
+	if got := reason.Details["component"]; got != wantComponent {
+		t.Fatalf("reason component = %v, want %q", got, wantComponent)
+	}
+	if got := reason.Details["source_kind"]; got != contract.SourceKindLinear {
+		t.Fatalf("reason source_kind = %v, want %q", got, contract.SourceKindLinear)
+	}
+	if got := reason.Details["source_name"]; got != "linear-main" {
+		t.Fatalf("reason source_name = %v, want linear-main", got)
+	}
+	detail, ok := reason.Details["detail"].(string)
+	if !ok || strings.TrimSpace(detail) == "" {
+		t.Fatalf("reason detail = %#v, want non-empty string", reason.Details)
+	}
+}
+
 func TestEnsureRecordLockedUsesRuntimeSourceIdentity(t *testing.T) {
 	o, _, _ := newTestOrchestrator(t)
 	o.runtimeIdentityFn = func() RuntimeIdentity {
@@ -185,11 +228,14 @@ func TestEnsureRecordLockedUsesRuntimeSourceIdentity(t *testing.T) {
 	record := o.ensureRecordLocked(issue)
 	o.mu.Unlock()
 
-	if record.Runtime.RecordID != "rec_github_issues_42" {
-		t.Fatalf("record_id = %q, want rec_github_issues_42", record.Runtime.RecordID)
+	if record.Runtime.RecordID != "rec_github_issues_github-main_42" {
+		t.Fatalf("record_id = %q, want rec_github_issues_github-main_42", record.Runtime.RecordID)
 	}
 	if record.Runtime.SourceRef.SourceKind != contract.SourceKindGitHubIssues {
 		t.Fatalf("source_kind = %q, want %q", record.Runtime.SourceRef.SourceKind, contract.SourceKindGitHubIssues)
+	}
+	if record.Runtime.SourceRef.SourceName != "github-main" {
+		t.Fatalf("source_name = %q, want github-main", record.Runtime.SourceRef.SourceName)
 	}
 	if record.Runtime.SourceRef.SourceIdentifier != "GH-42" {
 		t.Fatalf("source_identifier = %q, want GH-42", record.Runtime.SourceRef.SourceIdentifier)
@@ -216,6 +262,42 @@ func TestDiscoveryUsesRuntimeSourceIdentity(t *testing.T) {
 	}
 	if len(discovery.Capabilities.Sources) != 1 || discovery.Capabilities.Sources[0] != contract.SourceKindGitHubIssues {
 		t.Fatalf("discovery capabilities.sources = %#v, want [%q]", discovery.Capabilities.Sources, contract.SourceKindGitHubIssues)
+	}
+}
+
+func TestRunOnceDispatchPreflightFailureExposesUnavailableServiceSurface(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	cfg := o.currentConfig()
+	cfg.SessionPersistence.Enabled = false
+	cfg.CodexCommand = ""
+
+	o.RunOnce(context.Background(), false)
+
+	if trackerClient.fetchCalls != 0 {
+		t.Fatalf("tracker fetch calls = %d, want 0 when dispatch preflight fails", trackerClient.fetchCalls)
+	}
+	assertUnavailableServiceSurface(t, o.Discovery(), o.Snapshot(), "dispatch_preflight")
+	refresh := o.RequestRefresh()
+	if refresh.Status != contract.ControlStatusRejected {
+		t.Fatalf("refresh status = %q, want %q", refresh.Status, contract.ControlStatusRejected)
+	}
+}
+
+func TestRunOnceTrackerUnreachableExposesUnavailableServiceSurface(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	cfg := o.currentConfig()
+	cfg.SessionPersistence.Enabled = false
+	trackerClient.fetchErr = assertErr("tracker down")
+
+	o.RunOnce(context.Background(), false)
+
+	if trackerClient.fetchCalls == 0 {
+		t.Fatal("tracker fetch calls = 0, want candidate fetch attempt")
+	}
+	assertUnavailableServiceSurface(t, o.Discovery(), o.Snapshot(), "task_source")
+	refresh := o.RequestRefresh()
+	if refresh.Status != contract.ControlStatusRejected {
+		t.Fatalf("refresh status = %q, want %q", refresh.Status, contract.ControlStatusRejected)
 	}
 }
 
@@ -313,8 +395,8 @@ func TestBuildPersistedStateUsesLedgerRecordsAndNoLegacyDumpKeys(t *testing.T) {
 	record := o.ensureRecordLocked(issue)
 	o.scheduleRetryLocked(issue.ID, issue.Identifier, 2, ptrString("runner failed"), false, 1, freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion)))
 	o.rememberCompletedLocked(contract.IssueRuntimeRecord{
-		RecordID:  contract.RecordID("rec_linear_done"),
-		SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "done", SourceIdentifier: "DONE-1"},
+		RecordID:  contract.RecordID("rec_linear_linear-main_done"),
+		SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "done", SourceIdentifier: "DONE-1"},
 		Status:    contract.IssueStatusCompleted,
 		UpdatedAt: o.now().UTC().Format(time.RFC3339Nano),
 		Result:    &contract.Result{Outcome: contract.ResultOutcomeSucceeded, Summary: "done", CompletedAt: o.now().UTC().Format(time.RFC3339Nano)},
@@ -354,14 +436,14 @@ func TestRestorePersistedStateRebuildsRecordIndexesAndCompletedWindow(t *testing
 		Service: durableServiceMetadata{
 			TokenTotal: model.TokenTotals{InputTokens: 11},
 			RecordMetadata: map[string]durableRecordMetadata{
-				"rec_linear_1": {RetryAttempt: 2, StallCount: 1},
-				"rec_linear_2": {RetryAttempt: 1, StallCount: 0},
+				"rec_linear_linear-main_1": {RetryAttempt: 2, StallCount: 1},
+				"rec_linear_linear-main_2": {RetryAttempt: 1, StallCount: 0},
 			},
 		},
 		Records: []contract.IssueLedgerRecord{
 			{
-				RecordID:   "rec_linear_1",
-				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1"},
+				RecordID:   "rec_linear_linear-main_1",
+				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
 				Status:     contract.IssueStatusRetryScheduled,
 				Reason:     ptrReason(contract.MustReason(contract.ReasonRecordBlockedRetryScheduled, map[string]any{"attempt": 3})),
 				RetryDueAt: &retryDue,
@@ -371,8 +453,8 @@ func TestRestorePersistedStateRebuildsRecordIndexesAndCompletedWindow(t *testing
 				UpdatedAt: o.now().UTC().Format(time.RFC3339Nano),
 			},
 			{
-				RecordID:  "rec_linear_2",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "2", SourceIdentifier: "ABC-2"},
+				RecordID:  "rec_linear_linear-main_2",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "2", SourceIdentifier: "ABC-2"},
 				Status:    contract.IssueStatusAwaitingMerge,
 				Reason:    ptrReason(contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{"pr_number": 42})),
 				DurableRefs: contract.DurableRefs{
@@ -382,8 +464,8 @@ func TestRestorePersistedStateRebuildsRecordIndexesAndCompletedWindow(t *testing
 				UpdatedAt: o.now().UTC().Format(time.RFC3339Nano),
 			},
 			{
-				RecordID:  "rec_linear_done",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "done", SourceIdentifier: "DONE-1"},
+				RecordID:  "rec_linear_linear-main_done",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "done", SourceIdentifier: "DONE-1"},
 				Status:    contract.IssueStatusCompleted,
 				Result:    &contract.Result{Outcome: contract.ResultOutcomeSucceeded, Summary: "done", CompletedAt: o.now().UTC().Format(time.RFC3339Nano)},
 				DurableRefs: contract.DurableRefs{
@@ -631,8 +713,8 @@ func TestFileLedgerStoreRoundTrip(t *testing.T) {
 		Service:  durableServiceMetadata{},
 		Records: []contract.IssueLedgerRecord{
 			{
-				RecordID:  "rec_linear_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1"},
+				RecordID:  "rec_linear_linear-main_1",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
 				Status:    contract.IssueStatusAwaitingMerge,
 				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 				DurableRefs: contract.DurableRefs{
@@ -666,8 +748,8 @@ func TestWriteDurableRuntimeStateRoundTripJSON(t *testing.T) {
 		SavedAt: time.Now().UTC(),
 		Records: []contract.IssueLedgerRecord{
 			{
-				RecordID:  "rec_linear_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1"},
+				RecordID:  "rec_linear_linear-main_1",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
 				Status:    contract.IssueStatusCompleted,
 				Result:    &contract.Result{Outcome: contract.ResultOutcomeSucceeded, Summary: "done", CompletedAt: time.Now().UTC().Format(time.RFC3339Nano)},
 				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -693,8 +775,8 @@ func TestWriteDurableRuntimeStateOverwritesExistingFile(t *testing.T) {
 		SavedAt: time.Now().UTC(),
 		Records: []contract.IssueLedgerRecord{
 			{
-				RecordID:  "rec_linear_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1"},
+				RecordID:  "rec_linear_linear-main_1",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
 				Status:    contract.IssueStatusAwaitingIntervention,
 				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 			},
@@ -705,8 +787,8 @@ func TestWriteDurableRuntimeStateOverwritesExistingFile(t *testing.T) {
 		SavedAt: time.Now().UTC(),
 		Records: []contract.IssueLedgerRecord{
 			{
-				RecordID:  "rec_linear_2",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "2", SourceIdentifier: "ABC-2"},
+				RecordID:  "rec_linear_linear-main_2",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "2", SourceIdentifier: "ABC-2"},
 				Status:    contract.IssueStatusAwaitingMerge,
 				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 			},
@@ -728,8 +810,8 @@ func TestWriteDurableRuntimeStateOverwritesExistingFile(t *testing.T) {
 	if err := json.Unmarshal(raw, &loaded); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if len(loaded.Records) != 1 || loaded.Records[0].RecordID != "rec_linear_2" {
-		t.Fatalf("loaded records = %#v, want overwritten rec_linear_2", loaded.Records)
+	if len(loaded.Records) != 1 || loaded.Records[0].RecordID != "rec_linear_linear-main_2" {
+		t.Fatalf("loaded records = %#v, want overwritten rec_linear_linear-main_2", loaded.Records)
 	}
 }
 

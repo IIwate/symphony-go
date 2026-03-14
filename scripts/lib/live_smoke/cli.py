@@ -777,6 +777,7 @@ def _run_recovery_ledger_smoke(
             timeout_seconds=30,
             description="runtime_ledger startup",
         )
+        _assert_discovery_source(fetch_json(f"{base_url}/api/v1/discovery"), kind="linear", name="linear-main")
         events = open_events_stream(f"{base_url}/api/v1/events")
         _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_ledger snapshot")
 
@@ -798,6 +799,14 @@ def _run_recovery_ledger_smoke(
             description="runtime_ledger awaiting_intervention via SSE",
         )
         record = _require_runtime_record(persistence_state, persistence_identifier, status="awaiting_intervention")
+        _assert_source_anchor(
+            record,
+            "runtime_ledger.record",
+            source_kind="linear",
+            source_name="linear-main",
+            source_id=str(persistence_issue["id"]),
+            source_identifier=persistence_identifier,
+        )
         reason = _require_reason(record, "record.blocked.awaiting_intervention")
         if reason["category"] != "record":
             raise RuntimeError(f"awaiting_intervention reason category mismatch: {reason}")
@@ -838,6 +847,17 @@ def _run_recovery_ledger_smoke(
             workspace_root=str((resources.temp_dir.parent / f"workspaces-{namespace}").resolve()).replace("\\", "/"),
             ledger_path=str(ledger_path.resolve()).replace("\\", "/"),
         )
+        ledger_record = _find_ledger_record(ledger_payload, persistence_identifier, status="awaiting_intervention")
+        if ledger_record is None:
+            raise RuntimeError(f"runtime_ledger persisted record missing: {ledger_payload}")
+        _assert_source_anchor(
+            ledger_record,
+            "runtime_ledger.ledger_record",
+            source_kind="linear",
+            source_name="linear-main",
+            source_id=str(persistence_issue["id"]),
+            source_identifier=persistence_identifier,
+        )
         notification_count_before_restart = recorder.count()
 
         events.close()
@@ -860,7 +880,15 @@ def _run_recovery_ledger_smoke(
             timeout_seconds=60,
             description="runtime_ledger restored awaiting_intervention",
         )
-        _require_runtime_record(restored_state, persistence_identifier, status="awaiting_intervention")
+        restored_record = _require_runtime_record(restored_state, persistence_identifier, status="awaiting_intervention")
+        _assert_source_anchor(
+            restored_record,
+            "runtime_ledger.restored_record",
+            source_kind="linear",
+            source_name="linear-main",
+            source_id=str(persistence_issue["id"]),
+            source_identifier=persistence_identifier,
+        )
         time.sleep(5)
         if recorder.count() != notification_count_before_restart:
             raise RuntimeError(
@@ -1109,6 +1137,7 @@ def _run_notification_degraded_smoke(
         )
         discovery_payload = fetch_json(f"{base_url}/api/v1/discovery")
         _assert_discovery_surface(discovery_payload)
+        _assert_service_surface_consistency(discovery_payload, degraded_state)
         if discovery_payload["service_mode"] != "degraded":
             raise RuntimeError(f"notification_degraded discovery mode mismatch: {discovery_payload}")
         service_reason = _require_reason_from_list(degraded_state.get("reasons"), "service.degraded.notification_delivery")
@@ -1196,6 +1225,7 @@ def _run_unavailable_ledger_smoke(
         )
         discovery_payload = fetch_json(f"{base_url}/api/v1/discovery")
         _assert_discovery_surface(discovery_payload)
+        _assert_service_surface_consistency(discovery_payload, unavailable_state)
         if discovery_payload["service_mode"] != "unavailable":
             raise RuntimeError(f"ledger_unavailable discovery mode mismatch: {discovery_payload}")
         rejected_control = _post_refresh(base_url)
@@ -1266,6 +1296,7 @@ def _await_formal_startup(base_url: str) -> tuple[dict[str, object], dict[str, o
     state_payload = fetch_json(f"{base_url}/api/v1/state")
     _assert_discovery_surface(discovery_payload)
     _assert_state_surface(state_payload)
+    _assert_service_surface_consistency(discovery_payload, state_payload)
     return discovery_payload, state_payload
 
 
@@ -1395,6 +1426,12 @@ def _assert_discovery_surface(payload: dict[str, object]) -> None:
     _assert_reason_list(payload["reasons"], "discovery.reasons")
 
 
+def _assert_discovery_source(payload: dict[str, object], *, kind: str, name: str) -> None:
+    source = _require_mapping(payload.get("source"), "discovery.source")
+    if source.get("kind") != kind or source.get("name") != name:
+        raise RuntimeError(f"discovery source mismatch: {source} != kind={kind} name={name}")
+
+
 def _assert_state_surface(payload: dict[str, object]) -> None:
     _require_keys(payload, ["generated_at", "service_mode", "recovery_in_progress", "reasons", "counts", "records", "completed_window"], "state")
     for legacy_key in ["recovered_pending", "recovering", "retrying", "alerts", "service", "health", "observations"]:
@@ -1465,12 +1502,24 @@ def _assert_event_envelope(payload: dict[str, object], expected_event: str) -> N
         _assert_reason_surface(_require_mapping(reason, "events.reason"), "events.reason")
 
 
+def _assert_service_surface_consistency(discovery_payload: dict[str, object], state_payload: dict[str, object]) -> None:
+    if discovery_payload.get("service_mode") != state_payload.get("service_mode"):
+        raise RuntimeError(
+            f"discovery/state service_mode mismatch: discovery={discovery_payload.get('service_mode')} state={state_payload.get('service_mode')}"
+        )
+    if discovery_payload.get("reasons") != state_payload.get("reasons"):
+        raise RuntimeError(
+            f"discovery/state reasons mismatch: discovery={discovery_payload.get('reasons')} state={state_payload.get('reasons')}"
+        )
+
+
 def _assert_record_surface(record: object, label: str) -> None:
     current = _require_mapping(record, label)
     _require_keys(current, ["record_id", "source_ref", "status", "updated_at", "reason", "observation", "durable_refs", "result"], label)
     if current["status"] not in {"active", "retry_scheduled", "awaiting_merge", "awaiting_intervention", "completed"}:
         raise RuntimeError(f"{label} status mismatch: {current}")
     _assert_source_ref_surface(current["source_ref"], f"{label}.source_ref")
+    _assert_record_identity_anchor(current, label)
     reason = current["reason"]
     if reason is not None:
         _assert_reason_surface(_require_mapping(reason, f"{label}.reason"), f"{label}.reason")
@@ -1489,6 +1538,7 @@ def _assert_ledger_record_surface(record: object, label: str) -> None:
     if current["status"] not in {"active", "retry_scheduled", "awaiting_merge", "awaiting_intervention", "completed"}:
         raise RuntimeError(f"{label} status mismatch: {current}")
     _assert_source_ref_surface(current["source_ref"], f"{label}.source_ref")
+    _assert_record_identity_anchor(current, label)
     reason = current["reason"]
     if reason is not None:
         _assert_reason_surface(_require_mapping(reason, f"{label}.reason"), f"{label}.reason")
@@ -1500,7 +1550,54 @@ def _assert_ledger_record_surface(record: object, label: str) -> None:
 
 def _assert_source_ref_surface(value: object, label: str) -> None:
     payload = _require_mapping(value, label)
-    _require_keys(payload, ["source_kind", "source_id", "source_identifier", "url"], label)
+    _require_keys(payload, ["source_kind", "source_name", "source_id", "source_identifier", "url"], label)
+
+
+def _sanitize_record_id_token(value: object, *, fallback: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]", "_", str(value).strip()).strip("._-")
+    return token or fallback
+
+
+def _expected_record_id(source_ref: object, label: str) -> str:
+    payload = _require_mapping(source_ref, label)
+    return "_".join(
+        [
+            "rec",
+            _sanitize_record_id_token(payload.get("source_kind", ""), fallback="source"),
+            _sanitize_record_id_token(payload.get("source_name", ""), fallback="source"),
+            _sanitize_record_id_token(payload.get("source_id", ""), fallback="id"),
+        ]
+    )
+
+
+def _assert_record_identity_anchor(record: dict[str, object], label: str) -> None:
+    record_id = str(record.get("record_id", "")).strip()
+    if not record_id:
+        raise RuntimeError(f"{label}.record_id missing: {record}")
+    expected = _expected_record_id(record.get("source_ref"), f"{label}.source_ref")
+    if record_id != expected:
+        raise RuntimeError(f"{label}.record_id mismatch: {record_id} != {expected}")
+
+
+def _assert_source_anchor(
+    record: dict[str, object],
+    label: str,
+    *,
+    source_kind: str,
+    source_name: str,
+    source_id: str,
+    source_identifier: str,
+) -> None:
+    source_ref = _require_mapping(record.get("source_ref"), f"{label}.source_ref")
+    if source_ref.get("source_kind") != source_kind:
+        raise RuntimeError(f"{label}.source_kind mismatch: {source_ref}")
+    if source_ref.get("source_name") != source_name:
+        raise RuntimeError(f"{label}.source_name mismatch: {source_ref}")
+    if source_ref.get("source_id") != source_id:
+        raise RuntimeError(f"{label}.source_id mismatch: {source_ref}")
+    if source_ref.get("source_identifier") != source_identifier:
+        raise RuntimeError(f"{label}.source_identifier mismatch: {source_ref}")
+    _assert_record_identity_anchor(record, label)
 
 
 def _assert_reason_surface(value: object, label: str) -> None:

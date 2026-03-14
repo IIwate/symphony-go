@@ -73,6 +73,7 @@ func (k SourceKind) IsValid() bool {
 
 type SourceRef struct {
 	SourceKind       SourceKind `json:"source_kind"`
+	SourceName       string     `json:"source_name"`
 	SourceID         string     `json:"source_id"`
 	SourceIdentifier string     `json:"source_identifier"`
 	URL              string     `json:"url"`
