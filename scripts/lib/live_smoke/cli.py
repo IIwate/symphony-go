@@ -466,13 +466,13 @@ def _run_missing_pr_smoke(
         description="missing_pr intervention",
     )
     reason = payload["awaiting_intervention"]["reason"]
-    if reason != "missing_pr":
+    if reason != "record.blocked.awaiting_intervention":
         raise RuntimeError(f"unexpected intervention reason: {reason}")
     process.stop()
     resources.processes.remove(process)
     linear.update_issue_state(str(issue["id"]), context.canceled_state_id)
     resources.issue_ids.remove(str(issue["id"]))
-    return f"{issue['identifier']} -> awaiting_intervention(missing_pr)"
+    return f"{issue['identifier']} -> awaiting_intervention(record.blocked.awaiting_intervention)"
 
 
 def _run_merge_path_smoke(
@@ -880,7 +880,26 @@ def _session_state_entries(payload: dict[str, object], key: str) -> list[dict[st
         legacy_key = "".join(part.capitalize() for part in key.split("_"))
         values = payload.get(legacy_key)
     if not isinstance(values, list):
-        return []
+        status_by_key = {
+            "recovering": "active",
+            "awaiting_merge": "awaiting_merge",
+            "awaiting_intervention": "awaiting_intervention",
+            "retrying": "retry_scheduled",
+        }
+        target_status = status_by_key.get(key)
+        records = payload.get("records")
+        if target_status is None or not isinstance(records, list):
+            return []
+        normalized: list[dict[str, object]] = []
+        for item in records:
+            if not isinstance(item, dict) or str(item.get("status", "")).strip() != target_status:
+                continue
+            row = dict(item)
+            source_ref = row.get("source_ref")
+            if isinstance(source_ref, dict) and "identifier" not in row:
+                row["identifier"] = str(source_ref.get("source_identifier", "")).strip()
+            normalized.append(row)
+        return normalized
     return [item for item in values if isinstance(item, dict)]
 
 
