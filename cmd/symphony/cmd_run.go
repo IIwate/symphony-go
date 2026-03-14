@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -15,15 +14,34 @@ import (
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
 	"symphony-go/internal/orchestrator"
-	"symphony-go/internal/secret"
+	"symphony-go/internal/runtimepolicy"
 )
 
+func newRunCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "run",
+		Short: "运行 Symphony 编排服务",
+		Args:  cobra.NoArgs,
+		RunE:  runRunCmd,
+	}
+	addSharedFlags(cmd)
+	cmd.Flags().Int("port", -1, "HTTP server port")
+	cmd.Flags().Bool("dry-run", false, "run a single validation cycle and exit")
+	return cmd
+}
+
+func addSharedFlags(cmd *cobra.Command) {
+	cmd.Flags().String("config-dir", "automation", "path to automation config directory")
+	cmd.Flags().String("profile", "", "runtime profile name")
+	cmd.Flags().String("log-level", "info", "debug/info/warn/error")
+	cmd.Flags().String("log-file", "", "path to log file")
+}
+
 type sharedOptions struct {
-	configDir      string
-	profile        string
-	logLevel       string
-	logFile        string
-	nonInteractive bool
+	configDir string
+	profile   string
+	logLevel  string
+	logFile   string
 }
 
 func runRunCmd(cmd *cobra.Command, args []string) error {
@@ -43,27 +61,16 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	store := secret.New()
 	repoDef, definition, cfg, err := loadCommandConfig(opts.configDir, opts.profile)
 	if err != nil {
 		return err
 	}
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		diagnosis := config.DiagnoseConfig(cfg, repoDef)
-		if diagnosis.HasMissingSecrets() && len(diagnosis.OtherErrors) == 0 && isInteractive() && !opts.nonInteractive {
-			if err := runWizardFunc(diagnosis, envLocalPath(opts.configDir), store, cmd.ErrOrStderr()); err != nil {
-				return err
-			}
-			repoDef, definition, cfg, err = loadCommandConfig(opts.configDir, opts.profile)
-			if err != nil {
-				return err
-			}
-			if err := config.ValidateForDispatch(cfg); err != nil {
-				return err
-			}
-		} else {
-			return err
+		if !diagnosis.IsReady() {
+			return diagnosis
 		}
+		return err
 	}
 
 	portOverride := applyPortOverride(cfg, port)
@@ -115,8 +122,8 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 		logger.Info("automation reloaded", slog.String("config_dir", newRepoDef.RootDir))
 		return nil
 	}, func(watchErr error) {
-		if strings.Contains(strings.ToLower(watchErr.Error()), "restart required") {
-			logger.Warn("automation reload rejected", "error", watchErr.Error())
+		if restartErr, ok := runtimepolicy.IsRestartRequired(watchErr); ok {
+			logger.Warn("automation reload rejected", "field_path", restartErr.Decision.FieldPath, "error", watchErr.Error())
 			return
 		}
 		logger.Warn("automation reload failed", "error", watchErr.Error())
@@ -171,17 +178,12 @@ func readSharedOptions(cmd *cobra.Command) (*sharedOptions, error) {
 	if err != nil {
 		return nil, err
 	}
-	nonInteractive, err := cmd.Flags().GetBool("non-interactive")
-	if err != nil {
-		return nil, err
-	}
 
 	return &sharedOptions{
-		configDir:      configDir,
-		profile:        profile,
-		logLevel:       logLevel,
-		logFile:        logFile,
-		nonInteractive: nonInteractive,
+		configDir: configDir,
+		profile:   profile,
+		logLevel:  logLevel,
+		logFile:   logFile,
 	}, nil
 }
 
