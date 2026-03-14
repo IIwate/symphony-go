@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"symphony-go/internal/loader"
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
+	"symphony-go/internal/model/contract"
 	"symphony-go/internal/orchestrator"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workspace"
@@ -102,7 +104,7 @@ defaults:
 		orchestratorCalls++
 		return &fakeOrchestrator{}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		serverCalls++
 		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
 	}
@@ -621,7 +623,7 @@ defaults:
 	newOrchestratorFactory = func(tc tracker.Client, wm workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, identityFn func() orchestrator.RuntimeIdentity, logger *slog.Logger) orchestratorService {
 		return orchestrator.NewOrchestrator(tc, wm, runner, configFn, workflowFn, identityFn, logger)
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
 	}
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
@@ -711,7 +713,7 @@ func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
 			},
 		}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		return &fakeHTTPServer{
 			addr: "127.0.0.1:8080",
 			shutdown: func(context.Context) error {
@@ -782,7 +784,7 @@ func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
 			},
 		}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		return &fakeHTTPServer{
 			addr: "127.0.0.1:8081",
 			shutdown: func(context.Context) error {
@@ -861,7 +863,7 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 			},
 		}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		gotPort = port
 		return &fakeHTTPServer{
 			addr: "127.0.0.1:9090",
@@ -909,6 +911,81 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 	}
 }
 
+func TestExecutePassesListenHostConfigurationToHTTPServer(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+
+	tests := []struct {
+		name     string
+		host     string
+		expected string
+	}{
+		{name: "default localhost", expected: "127.0.0.1"},
+		{name: "explicit remote host", host: "0.0.0.0", expected: "0.0.0.0"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := stubDependencies(t)
+			defer restore()
+
+			configDir := filepath.Join(t.TempDir(), "automation")
+			writeAutomationConfig(t, configDir, automationFixtureOptions{})
+			writeRunProjectConfig(t, configDir, tc.host, 0)
+
+			signalCtx, signalCancel := context.WithCancel(context.Background())
+			started := make(chan struct{})
+			gotHost := ""
+			gotPort := -1
+
+			newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
+				return &fakeOrchestrator{
+					start: func(context.Context) error {
+						close(started)
+						return nil
+					},
+					wait: func() {
+						<-signalCtx.Done()
+					},
+				}
+			}
+			newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
+				gotHost = host
+				gotPort = port
+				return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
+			}
+			watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition) error, func(error)) error {
+				return nil
+			}
+			notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+				return signalCtx, func() {}
+			}
+
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- execute([]string{"run", "--config-dir", configDir}, io.Discard, io.Discard)
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("orchestrator did not start")
+			}
+
+			signalCancel()
+
+			if err := <-errCh; err != nil {
+				t.Fatalf("execute() error = %v", err)
+			}
+			if gotHost != tc.expected {
+				t.Fatalf("http host = %q, want %q", gotHost, tc.expected)
+			}
+			if gotPort != 0 {
+				t.Fatalf("http port = %d, want 0", gotPort)
+			}
+		})
+	}
+}
+
 func stubDependencies(t *testing.T) func() {
 	t.Helper()
 	origLoadEnv := loadEnvFile
@@ -944,7 +1021,7 @@ func stubDependencies(t *testing.T) func() {
 	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
 	}
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
@@ -990,11 +1067,16 @@ type fakeAgentRunner struct{}
 func (fakeAgentRunner) Run(context.Context, agent.RunParams) error { return nil }
 
 type fakeOrchestrator struct {
-	runOnce      func(context.Context, bool)
-	notifyReload func(*model.WorkflowDefinition)
-	start        func(context.Context) error
-	wait         func()
-	snapshot     orchestrator.Snapshot
+	mu             sync.Mutex
+	runOnce        func(context.Context, bool)
+	notifyReload   func(*model.WorkflowDefinition)
+	requestRefresh func() orchestrator.RefreshRequestResult
+	start          func(context.Context) error
+	wait           func()
+	discovery      orchestrator.DiscoveryDocument
+	snapshot       orchestrator.Snapshot
+	nextID         int
+	subscribers    map[int]chan orchestrator.Snapshot
 }
 
 func (f *fakeOrchestrator) Start(ctx context.Context) error {
@@ -1022,14 +1104,65 @@ func (f *fakeOrchestrator) NotifyWorkflowReload(def *model.WorkflowDefinition) {
 	}
 }
 
-func (f *fakeOrchestrator) RequestRefresh() orchestrator.RefreshRequestResult {
-	return orchestrator.RefreshRequestResult{Accepted: true}
+func (f *fakeOrchestrator) Discovery() orchestrator.DiscoveryDocument {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.discovery
 }
-func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot { return f.snapshot }
+
+func (f *fakeOrchestrator) RequestRefresh() orchestrator.RefreshRequestResult {
+	if f.requestRefresh != nil {
+		return f.requestRefresh()
+	}
+	reason := contract.MustReason(contract.ReasonControlRefreshAccepted, map[string]any{
+		"service_mode": contract.ServiceModeServing,
+	})
+	return contract.ControlResult{
+		Action:              contract.ControlActionRefresh,
+		Status:              contract.ControlStatusAccepted,
+		Reason:              &reason,
+		RecommendedNextStep: "等待 SSE 通知后回读 /api/v1/state",
+		Timestamp:           "2026-03-14T00:00:00Z",
+	}
+}
+func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapshot
+}
 func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func()) {
+	f.mu.Lock()
+	if f.subscribers == nil {
+		f.subscribers = map[int]chan orchestrator.Snapshot{}
+	}
 	ch := make(chan orchestrator.Snapshot, max(1, buffer))
-	ch <- f.snapshot
-	return ch, func() { close(ch) }
+	id := f.nextID
+	f.nextID++
+	f.subscribers[id] = ch
+	snapshot := f.snapshot
+	f.mu.Unlock()
+	ch <- snapshot
+	return ch, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if existing, ok := f.subscribers[id]; ok {
+			delete(f.subscribers, id)
+			close(existing)
+		}
+	}
+}
+
+func (f *fakeOrchestrator) publish(snapshot orchestrator.Snapshot) {
+	f.mu.Lock()
+	f.snapshot = snapshot
+	subscribers := make([]chan orchestrator.Snapshot, 0, len(f.subscribers))
+	for _, ch := range f.subscribers {
+		subscribers = append(subscribers, ch)
+	}
+	f.mu.Unlock()
+	for _, ch := range subscribers {
+		ch <- snapshot
+	}
 }
 
 type fakeHTTPServer struct {
@@ -1102,6 +1235,31 @@ terminal_states: ["Closed", "Done"]
 	writeFile(t, filepath.Join(root, "flows", "implement.yaml"), `prompt: prompts/implement.md.liquid
 `)
 	writeFile(t, filepath.Join(root, "prompts", "implement.md.liquid"), opts.PromptTemplate+"\n")
+}
+
+func writeRunProjectConfig(t *testing.T, root string, host string, port int) {
+	t.Helper()
+
+	workspaceRoot := filepath.ToSlash(filepath.Join(filepath.Dir(root), "workspaces"))
+	hostBlock := ""
+	if strings.TrimSpace(host) != "" {
+		hostBlock = fmt.Sprintf("    host: %s\n", host)
+	}
+	projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+  codex:
+    command: codex app-server
+  server:
+%s    port: %d
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, workspaceRoot, hostBlock, port)
+	writeFile(t, filepath.Join(root, "project.yaml"), projectYAML)
 }
 
 func writeFile(t *testing.T, path string, content string) {

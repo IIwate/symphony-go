@@ -206,6 +206,7 @@ type ServiceConfig struct {
 	CodexTurnTimeoutMS               int
 	CodexReadTimeoutMS               int
 	CodexStallTimeoutMS              int
+	ServerHost                       string
 	ServerPort                       *int
 	SessionPersistence               SessionPersistenceConfig
 	Notifications                    NotificationsConfig

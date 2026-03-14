@@ -70,8 +70,8 @@ var (
 	newOrchestratorFactory = func(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, identityFn func() orchestrator.RuntimeIdentity, logger *slog.Logger) orchestratorService {
 		return orchestrator.NewOrchestrator(trackerClient, workspaceManager, runner, configFn, workflowFn, identityFn, logger)
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
-		return server.Start(runtime, logger, port)
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
+		return server.Start(runtime, logger, host, port)
 	}
 	notifySignalContext = func(parent context.Context, signals ...os.Signal) (context.Context, context.CancelFunc) {
 		return signal.NotifyContext(parent, signals...)

@@ -102,6 +102,20 @@ func TestEvaluateReloadReturnsRestartRequiredForProtectedChanges(t *testing.T) {
 	}
 }
 
+func TestEvaluateReloadTreatsListenHostAsRestartBoundary(t *testing.T) {
+	currentRepoDef, currentCfg := fixtureConfig()
+	nextRepoDef, nextCfg := fixtureConfig()
+	nextCfg.ServerHost = "0.0.0.0"
+
+	decision := EvaluateReload(currentRepoDef, nextRepoDef, currentCfg, nextCfg)
+	if decision.Outcome != ReloadOutcomeRestartRequired {
+		t.Fatalf("decision.Outcome = %q, want %q", decision.Outcome, ReloadOutcomeRestartRequired)
+	}
+	if decision.FieldPath != "runtime.server.host" {
+		t.Fatalf("decision.FieldPath = %q, want runtime.server.host", decision.FieldPath)
+	}
+}
+
 func TestEvaluateReloadUsesDefinitionBoundaries(t *testing.T) {
 	currentRepoDef, currentCfg := fixtureConfig()
 	nextRepoDef, nextCfg := fixtureConfig()
@@ -162,6 +176,7 @@ func fixtureConfig() (*model.AutomationDefinition, *model.ServiceConfig) {
 			WorkspaceRoot:              "H:/workspaces",
 			WorkspaceLinearBranchScope: "scope",
 			WorkspaceBranchNamespace:   "runner-a",
+			ServerHost:                 "127.0.0.1",
 			MaxConcurrentAgents:        4,
 			MaxRetryBackoffMS:          60000,
 			CodexCommand:               "codex app-server",

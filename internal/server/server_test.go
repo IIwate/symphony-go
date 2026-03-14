@@ -1,23 +1,56 @@
 package server
 
 import (
-	"bytes"
-	"context"
+	"bufio"
 	"encoding/json"
-	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
+	"symphony-go/internal/model/contract"
 	"symphony-go/internal/orchestrator"
 )
 
-func TestStateEndpointReturnsSnapshot(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
+func TestDiscoveryEndpointReturnsFormalContract(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+	handler := NewHandler(runtime, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var payload contract.DiscoveryDocument
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if payload.APIVersion != contract.APIVersionV1 {
+		t.Fatalf("api_version = %q, want %q", payload.APIVersion, contract.APIVersionV1)
+	}
+	if payload.Instance.Name != "symphony" {
+		t.Fatalf("instance.name = %q, want symphony", payload.Instance.Name)
+	}
+	if payload.Source.Kind != contract.SourceKindLinear {
+		t.Fatalf("source.kind = %q, want %q", payload.Source.Kind, contract.SourceKindLinear)
+	}
+	if payload.Capabilities.EventProtocol != "sse" {
+		t.Fatalf("event_protocol = %q, want sse", payload.Capabilities.EventProtocol)
+	}
+	if len(payload.Capabilities.ControlActions) != 1 || payload.Capabilities.ControlActions[0] != contract.ControlActionRefresh {
+		t.Fatalf("control_actions = %#v, want [refresh]", payload.Capabilities.ControlActions)
+	}
+	if payload.Limits.CompletedWindowSize != 100 {
+		t.Fatalf("completed_window_size = %d, want 100", payload.Limits.CompletedWindowSize)
+	}
+}
+
+func TestStateEndpointReturnsFormalSnapshot(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
 	handler := NewHandler(runtime, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
@@ -25,437 +58,212 @@ func TestStateEndpointReturnsSnapshot(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	var payload map[string]any
+
+	var payload contract.ServiceStateSnapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if payload["generated_at"] == nil {
-		t.Fatalf("generated_at missing: %+v", payload)
+	if payload.ServiceMode != contract.ServiceModeServing {
+		t.Fatalf("service_mode = %q, want %q", payload.ServiceMode, contract.ServiceModeServing)
 	}
-	service := payload["service"].(map[string]any)
-	if service["version"] != "test-build" {
-		t.Fatalf("service.version = %v, want test-build", service["version"])
+	if payload.Counts.Total != 1 || payload.Counts.Active != 1 || payload.Counts.Completed != 1 {
+		t.Fatalf("counts = %#v, want total=1 active=1 completed=1", payload.Counts)
 	}
-	if service["mode"] != "normal" {
-		t.Fatalf("service.mode = %v, want normal", service["mode"])
+	if len(payload.Records) != 1 || payload.Records[0].RecordID != "rec_linear_1" {
+		t.Fatalf("records = %#v, want rec_linear_1", payload.Records)
 	}
-	if got, ok := service["protection_reason"]; !ok || got != "" {
-		t.Fatalf("service.protection_reason = %v (present=%v), want empty string", got, ok)
-	}
-	if service["started_at"] == nil {
-		t.Fatalf("service.started_at missing: %+v", service)
-	}
-	if service["uptime_seconds"].(float64) <= 0 {
-		t.Fatalf("service.uptime_seconds = %v, want positive", service["uptime_seconds"])
-	}
-	counts := payload["counts"].(map[string]any)
-	if counts["running"].(float64) != 1 || counts["recovering"].(float64) != 1 || counts["awaiting_merge"].(float64) != 1 || counts["awaiting_intervention"].(float64) != 1 || counts["retrying"].(float64) != 1 {
-		t.Fatalf("counts = %+v", counts)
-	}
-	recovery := payload["recovery"].(map[string]any)
-	recovering := recovery["recovering"].([]any)
-	if len(recovering) != 1 {
-		t.Fatalf("recovering = %+v, want 1 entry", recovering)
-	}
-	awaitingMerge := recovery["awaiting_merge"].([]any)
-	if len(awaitingMerge) != 1 {
-		t.Fatalf("awaiting_merge = %+v, want 1 entry", awaitingMerge)
-	}
-	awaitingIntervention := recovery["awaiting_intervention"].([]any)
-	if len(awaitingIntervention) != 1 {
-		t.Fatalf("awaiting_intervention = %+v, want 1 entry", awaitingIntervention)
-	}
-	health := payload["health"].(map[string]any)
-	alerts := health["alerts"].([]any)
-	if len(alerts) != 1 {
-		t.Fatalf("alerts = %+v, want 1 alert", alerts)
-	}
-	notifications := health["notifications"].([]any)
-	if len(notifications) != 1 {
-		t.Fatalf("notifications = %+v, want 1 channel", notifications)
-	}
-	persistence := health["persistence"].(map[string]any)
-	if persistence["status"] != "healthy" {
-		t.Fatalf("persistence.status = %v, want healthy", persistence["status"])
-	}
-	observations := payload["observations"].(map[string]any)
-	if len(observations["derived"].([]any)) != 1 {
-		t.Fatalf("observations.derived = %+v, want 1 entry", observations["derived"])
-	}
-	if len(observations["protected_results"].([]any)) != 1 {
-		t.Fatalf("observations.protected_results = %+v, want 1 entry", observations["protected_results"])
-	}
-	rateLimits := payload["rate_limits"].(map[string]any)
-	if rateLimits["remaining"] != float64(9) {
-		t.Fatalf("rate_limits = %+v, want remaining=9", rateLimits)
+	if len(payload.CompletedWindow.Records) != 1 || payload.CompletedWindow.Records[0].RecordID != "rec_linear_done" {
+		t.Fatalf("completed_window = %#v, want rec_linear_done", payload.CompletedWindow)
 	}
 }
 
-func TestIssueEndpointReturnsKnownIssueAnd404ForUnknown(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
-	handler := NewHandler(runtime, nil)
+func TestRefreshEndpointReturnsControlResult(t *testing.T) {
+	t.Run("accepted", func(t *testing.T) {
+		runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+		handler := NewHandler(runtime, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/ABC-1", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var runningPayload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &runningPayload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	if runningPayload["workspace_path"] != "C:/work/ABC-1" {
-		t.Fatalf("workspace_path = %v, want C:/work/ABC-1", runningPayload["workspace_path"])
-	}
-	if runningPayload["attempt_count"].(float64) != 2 {
-		t.Fatalf("attempt_count = %v, want 2", runningPayload["attempt_count"])
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-2", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var retryPayload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &retryPayload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	if retryPayload["last_error"] != "workspace_hook_failed: before_run failed" {
-		t.Fatalf("last_error = %v", retryPayload["last_error"])
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-3", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var awaitingPayload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &awaitingPayload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	if awaitingPayload["status"] != "awaiting_merge" {
-		t.Fatalf("status = %v, want awaiting_merge", awaitingPayload["status"])
-	}
-	if awaitingPayload["attempt_count"].(float64) != 1 {
-		t.Fatalf("attempt_count = %v, want 1", awaitingPayload["attempt_count"])
-	}
-	awaitingEntry := awaitingPayload["awaiting_merge"].(map[string]any)
-	if awaitingEntry["pr_state"] != "open" {
-		t.Fatalf("awaiting_merge.pr_state = %v, want open", awaitingEntry["pr_state"])
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-4", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var interventionPayload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &interventionPayload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	if interventionPayload["status"] != "awaiting_intervention" {
-		t.Fatalf("status = %v, want awaiting_intervention", interventionPayload["status"])
-	}
-	if interventionPayload["attempt_count"].(float64) != 2 {
-		t.Fatalf("attempt_count = %v, want 2", interventionPayload["attempt_count"])
-	}
-	interventionEntry := interventionPayload["awaiting_intervention"].(map[string]any)
-	if interventionEntry["pr_state"] != "closed" {
-		t.Fatalf("awaiting_intervention.pr_state = %v, want closed", interventionEntry["pr_state"])
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-5", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var recoveringPayload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &recoveringPayload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	if recoveringPayload["status"] != "recovering" {
-		t.Fatalf("status = %v, want recovering", recoveringPayload["status"])
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/ABC-6", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var protectedPayload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &protectedPayload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	if protectedPayload["status"] != "protected_result" {
-		t.Fatalf("status = %v, want protected_result", protectedPayload["status"])
-	}
-	if protectedPayload["protected_result"] == nil {
-		t.Fatalf("protected_result missing: %+v", protectedPayload)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/MISSING", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
-	}
-	var missingPayload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &missingPayload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	missingErr := missingPayload["error"].(map[string]any)
-	if missingErr["code"] != "issue_not_found" {
-		t.Fatalf("error.code = %v, want issue_not_found", missingErr["code"])
-	}
-
-	for _, path := range []string{"/api/v1/", "/api/v1/ABC-1/extra"} {
-		req = httptest.NewRequest(http.MethodGet, path, nil)
-		rec = httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/control/refresh", nil)
+		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("path %q status = %d, want 404", path, rec.Code)
-		}
-		var malformedPayload map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &malformedPayload); err != nil {
-			t.Fatalf("path %q Unmarshal() error = %v", path, err)
-		}
-		malformedErr := malformedPayload["error"].(map[string]any)
-		if malformedErr["code"] != "invalid_issue_identifier" {
-			t.Fatalf("path %q error.code = %v, want invalid_issue_identifier", path, malformedErr["code"])
-		}
-	}
-}
 
-func TestRefreshEndpointAndMethodNotAllowed(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
-	handler := NewHandler(runtime, nil)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
+		}
+		var payload contract.ControlResult
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		if payload.Status != contract.ControlStatusAccepted {
+			t.Fatalf("status = %q, want %q", payload.Status, contract.ControlStatusAccepted)
+		}
+		if payload.Reason == nil || payload.Reason.ReasonCode != contract.ReasonControlRefreshAccepted {
+			t.Fatalf("reason = %#v, want %q", payload.Reason, contract.ReasonControlRefreshAccepted)
+		}
+	})
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/refresh", nil)
+	t.Run("rejected", func(t *testing.T) {
+		reason := contract.MustReason(contract.ReasonControlRefreshRejectedServiceMode, map[string]any{
+			"service_mode": contract.ServiceModeUnavailable,
+		})
+		runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+		runtime.refreshResult = contract.ControlResult{
+			Action:              contract.ControlActionRefresh,
+			Status:              contract.ControlStatusRejected,
+			Reason:              &reason,
+			RecommendedNextStep: "检查核心依赖后重试",
+			Timestamp:           "2026-03-14T00:00:03Z",
+		}
+		handler := NewHandler(runtime, nil)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/control/refresh", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		var payload contract.ControlResult
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		if payload.Status != contract.ControlStatusRejected {
+			t.Fatalf("status = %q, want %q", payload.Status, contract.ControlStatusRejected)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/control/refresh", nil)
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202", rec.Code)
-	}
-	if runtime.refreshCount != 1 {
-		t.Fatalf("refreshCount = %d, want 1", runtime.refreshCount)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/refresh", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	NewHandler(newFakeRuntime(sampleDiscovery(), sampleSnapshot()), nil).ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
+		t.Fatalf("GET status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
 	}
 }
 
-func TestRefreshEndpointRejectsProtectedMode(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
-	runtime.refreshResult = &orchestrator.RefreshRequestResult{
-		Accepted:        false,
-		RequestedAt:     time.Date(2026, 3, 7, 12, 2, 0, 0, time.UTC),
-		RejectedCode:    "service_protected_mode",
-		RejectedMessage: "service is in protected mode",
-	}
-	handler := NewHandler(runtime, nil)
+func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+	srv := httptest.NewServer(NewHandler(runtime, nil))
+	defer srv.Close()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/refresh", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", rec.Code)
+	resp, err := http.Get(srv.URL + "/api/v1/events")
+	if err != nil {
+		t.Fatalf("GET /api/v1/events error = %v", err)
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
+	defer resp.Body.Close()
+
+	reader := bufio.NewReader(resp.Body)
+	first := readSSEEvent(t, reader)
+	if first.Event != string(contract.EventTypeSnapshot) {
+		t.Fatalf("first event = %q, want %q", first.Event, contract.EventTypeSnapshot)
 	}
-	if _, ok := payload["accepted"]; ok {
-		t.Fatalf("payload = %+v, want canonical error envelope only", payload)
+	var firstEnvelope contract.EventEnvelope
+	if err := json.Unmarshal([]byte(first.Data), &firstEnvelope); err != nil {
+		t.Fatalf("Unmarshal(first) error = %v", err)
 	}
-	errPayload := payload["error"].(map[string]any)
-	if errPayload["code"] != "service_protected_mode" {
-		t.Fatalf("error.code = %v, want service_protected_mode", errPayload["code"])
+	if firstEnvelope.EventType != contract.EventTypeSnapshot {
+		t.Fatalf("first payload event_type = %q, want %q", firstEnvelope.EventType, contract.EventTypeSnapshot)
 	}
-}
-
-func TestEventsEndpointSendsSnapshotAndUpdate(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
-	handler := NewHandler(runtime, nil)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
-	writer := newStreamingResponseWriter()
-
-	done := make(chan struct{})
-	go func() {
-		handler.ServeHTTP(writer, req)
-		close(done)
-	}()
-
-	writer.waitForBody(t, "event: snapshot")
-	runtime.publish(sampleSnapshot())
-	writer.waitForBody(t, "event: update")
-
-	body := writer.bodyString()
-	if !strings.Contains(body, "event: snapshot") {
-		t.Fatalf("body missing snapshot event: %s", body)
-	}
-	if !strings.Contains(body, "event: update") {
-		t.Fatalf("body missing update event: %s", body)
+	if len(firstEnvelope.RecordIDs) != 2 {
+		t.Fatalf("first record_ids = %#v, want 2 ids", firstEnvelope.RecordIDs)
 	}
 
-	cancel()
-	<-done
-}
+	next := sampleSnapshot()
+	next.ServiceMode = contract.ServiceModeDegraded
+	next.Reasons = []contract.Reason{contract.MustReason(contract.ReasonServiceDegradedNotificationDelivery, map[string]any{
+		"channel_ids": []string{"ops"},
+	})}
+	next.Records[0].Status = contract.IssueStatusAwaitingMerge
+	next.Records[0].Reason = ptrReason(contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{
+		"record_id": "rec_linear_1",
+	}))
+	next.Records[0].UpdatedAt = "2026-03-14T00:00:05Z"
+	runtime.publish(next)
 
-func TestEventsEndpointClientDisconnect(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
-	handler := NewHandler(runtime, nil)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	writer := newStreamingResponseWriter()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
-
-	done := make(chan struct{})
-	go func() {
-		handler.ServeHTTP(writer, req)
-		close(done)
-	}()
-
-	writer.waitForBody(t, "event: snapshot")
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("SSE handler did not exit after client disconnect")
+	second := readSSEEvent(t, reader)
+	if second.Event != string(contract.EventTypeStateChanged) {
+		t.Fatalf("second event = %q, want %q", second.Event, contract.EventTypeStateChanged)
+	}
+	var secondEnvelope contract.EventEnvelope
+	if err := json.Unmarshal([]byte(second.Data), &secondEnvelope); err != nil {
+		t.Fatalf("Unmarshal(second) error = %v", err)
+	}
+	if secondEnvelope.ServiceMode != contract.ServiceModeDegraded {
+		t.Fatalf("service_mode = %q, want %q", secondEnvelope.ServiceMode, contract.ServiceModeDegraded)
+	}
+	if len(secondEnvelope.RecordIDs) == 0 || secondEnvelope.RecordIDs[0] != "rec_linear_1" {
+		t.Fatalf("record_ids = %#v, want rec_linear_1", secondEnvelope.RecordIDs)
+	}
+	if secondEnvelope.Reason == nil || secondEnvelope.Reason.ReasonCode != contract.ReasonServiceDegradedNotificationDelivery {
+		t.Fatalf("reason = %#v, want %q", secondEnvelope.Reason, contract.ReasonServiceDegradedNotificationDelivery)
 	}
 }
 
-func TestEventsEndpointNoFlusherReturns500(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
+func TestEventsEndpointWithoutFlusherReturnsServiceUnavailable(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
 	handler := NewHandler(runtime, nil)
-	writer := &failingResponseWriter{header: make(http.Header)}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	recorder := httptest.NewRecorder()
+	writer := &nonFlusherResponseWriter{ResponseWriter: recorder}
 	handler.ServeHTTP(writer, req)
 
-	if writer.status != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", writer.status)
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(writer.buf.Bytes(), &payload); err != nil {
-		t.Fatalf("Unmarshal() error = %v, body = %q", err, writer.buf.String())
-	}
-	errPayload := payload["error"].(map[string]any)
-	if errPayload["code"] != "stream_not_supported" {
-		t.Fatalf("error.code = %v, want stream_not_supported", errPayload["code"])
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
 }
 
-func TestEventsEndpointConcurrentClients(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
-	handler := NewHandler(runtime, nil)
-
-	type client struct {
-		cancel func()
-		writer *streamingResponseWriter
-		done   chan struct{}
-	}
-
-	clients := make([]client, 0, 2)
-	for range 2 {
-		ctx, cancel := context.WithCancel(context.Background())
-		writer := newStreamingResponseWriter()
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
-		done := make(chan struct{})
-		go func() {
-			handler.ServeHTTP(writer, req)
-			close(done)
-		}()
-		clients = append(clients, client{cancel: cancel, writer: writer, done: done})
-	}
-
-	for _, client := range clients {
-		client.writer.waitForBody(t, "event: snapshot")
-	}
-
-	runtime.publish(sampleSnapshot())
-
-	for _, client := range clients {
-		client.writer.waitForBody(t, "event: update")
-		client.cancel()
-	}
-
-	for _, client := range clients {
-		select {
-		case <-client.done:
-		case <-time.After(time.Second):
-			t.Fatal("concurrent SSE client did not exit")
-		}
-	}
-}
-
-func TestDashboardAndMethodNotAllowed(t *testing.T) {
-	runtime := newFakeRuntime(sampleSnapshot())
+func TestUnknownRouteReturnsStructuredNotFound(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
 	handler := NewHandler(runtime, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "Symphony-Go") {
-		t.Fatalf("dashboard body = %q", rec.Body.String())
-	}
 
-	req = httptest.NewRequest(http.MethodPost, "/", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
-}
-
-func TestWriteJSONLogsEncodeFailure(t *testing.T) {
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	writer := &failingResponseWriter{header: make(http.Header), writeErr: errors.New("boom")}
-
-	writeJSON(writer, http.StatusOK, map[string]any{"ok": true}, logger)
-
-	if writer.status != http.StatusOK {
-		t.Fatalf("status = %d, want 200", writer.status)
+	var payload contract.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	if !strings.Contains(logs.String(), "http response encode failed") {
-		t.Fatalf("warn log missing: %s", logs.String())
+	if payload.ErrorCode != contract.ErrorAPINotFound {
+		t.Fatalf("error_code = %q, want %q", payload.ErrorCode, contract.ErrorAPINotFound)
 	}
 }
 
 type fakeRuntime struct {
 	mu            sync.Mutex
+	discovery     orchestrator.DiscoveryDocument
 	snapshot      orchestrator.Snapshot
-	refreshCount  int
-	refreshResult *orchestrator.RefreshRequestResult
+	refreshResult contract.ControlResult
 	nextID        int
 	subscribers   map[int]chan orchestrator.Snapshot
 }
 
-func newFakeRuntime(snapshot orchestrator.Snapshot) *fakeRuntime {
+func newFakeRuntime(discovery orchestrator.DiscoveryDocument, snapshot orchestrator.Snapshot) *fakeRuntime {
+	reason := contract.MustReason(contract.ReasonControlRefreshAccepted, map[string]any{
+		"service_mode": contract.ServiceModeServing,
+	})
 	return &fakeRuntime{
-		snapshot:    snapshot,
-		subscribers: make(map[int]chan orchestrator.Snapshot),
+		discovery: discovery,
+		snapshot:  snapshot,
+		refreshResult: contract.ControlResult{
+			Action:              contract.ControlActionRefresh,
+			Status:              contract.ControlStatusAccepted,
+			Reason:              &reason,
+			RecommendedNextStep: "等待 SSE 通知后回读 /api/v1/state",
+			Timestamp:           "2026-03-14T00:00:02Z",
+		},
+		subscribers: map[int]chan orchestrator.Snapshot{},
 	}
+}
+
+func (f *fakeRuntime) Discovery() orchestrator.DiscoveryDocument {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.discovery
 }
 
 func (f *fakeRuntime) Snapshot() orchestrator.Snapshot {
@@ -467,15 +275,7 @@ func (f *fakeRuntime) Snapshot() orchestrator.Snapshot {
 func (f *fakeRuntime) RequestRefresh() orchestrator.RefreshRequestResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.refreshCount++
-	if f.refreshResult != nil {
-		return *f.refreshResult
-	}
-	return orchestrator.RefreshRequestResult{
-		Accepted:    true,
-		RequestedAt: time.Date(2026, 3, 7, 12, 1, 0, 0, time.UTC),
-		Operations:  []string{"poll", "reconcile"},
-	}
+	return f.refreshResult
 }
 
 func (f *fakeRuntime) SubscribeSnapshots(_ int) (<-chan orchestrator.Snapshot, func()) {
@@ -486,18 +286,14 @@ func (f *fakeRuntime) SubscribeSnapshots(_ int) (<-chan orchestrator.Snapshot, f
 	f.subscribers[id] = ch
 	snapshot := f.snapshot
 	f.mu.Unlock()
-
 	ch <- snapshot
-
 	return ch, func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		subscriber, ok := f.subscribers[id]
-		if !ok {
-			return
+		if existing, ok := f.subscribers[id]; ok {
+			delete(f.subscribers, id)
+			close(existing)
 		}
-		delete(f.subscribers, id)
-		close(subscriber)
 	}
 }
 
@@ -509,232 +305,124 @@ func (f *fakeRuntime) publish(snapshot orchestrator.Snapshot) {
 		subscribers = append(subscribers, ch)
 	}
 	f.mu.Unlock()
-
 	for _, ch := range subscribers {
 		ch <- snapshot
 	}
 }
 
-func sampleSnapshot() orchestrator.Snapshot {
-	now := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
-	return orchestrator.Snapshot{
-		GeneratedAt: now,
-		Service: orchestrator.ServiceSnapshot{
-			Version:   "test-build",
-			StartedAt: now.Add(-5 * time.Minute),
-			Mode:      "normal",
-		},
-		Counts: orchestrator.SnapshotCounts{
-			Recovering:           1,
-			Running:              1,
-			AwaitingMerge:        1,
-			AwaitingIntervention: 1,
-			Retrying:             1,
-		},
-		Running: []orchestrator.RunningSnapshot{
-			{
-				IssueID:             "1",
-				IssueIdentifier:     "ABC-1",
-				WorkspacePath:       "C:/work/ABC-1",
-				State:               "In Progress",
-				SessionID:           "thread-turn",
-				TurnCount:           2,
-				LastEvent:           "turn_completed",
-				LastMessage:         "done",
-				StartedAt:           now.Add(-time.Minute),
-				InputTokens:         10,
-				OutputTokens:        5,
-				TotalTokens:         15,
-				CurrentRetryAttempt: 1,
-				AttemptCount:        2,
-			},
-		},
-		Recovery: orchestrator.RecoverySnapshot{
-			Recovering: []orchestrator.RecoveringSnapshot{
-				{
-					IssueID:         "5",
-					IssueIdentifier: "ABC-5",
-					WorkspacePath:   "C:/work/ABC-5",
-					State:           "In Progress",
-					Strategy:        "post_run_resume",
-					Source:          "succeeded",
-					ObservedAt:      now.Add(-90 * time.Second),
-					AttemptCount:    1,
-				},
-			},
-			AwaitingMerge: []orchestrator.AwaitingMergeSnapshot{
-				{
-					IssueID:         "3",
-					IssueIdentifier: "ABC-3",
-					WorkspacePath:   "C:/work/ABC-3",
-					State:           "In Progress",
-					Branch:          "testuser/linear-demo-scope-abc-3",
-					PRNumber:        99,
-					PRURL:           "https://example.test/pr/99",
-					PRState:         "open",
-					AwaitingSince:   now.Add(-2 * time.Minute),
-					AttemptCount:    1,
-				},
-			},
-			AwaitingIntervention: []orchestrator.AwaitingInterventionSnapshot{
-				{
-					IssueID:         "4",
-					IssueIdentifier: "ABC-4",
-					WorkspacePath:   "C:/work/ABC-4",
-					Branch:          "testuser/linear-demo-scope-abc-4",
-					PRNumber:        100,
-					PRURL:           "https://example.test/pr/100",
-					PRState:         "closed",
-					ObservedAt:      now.Add(-3 * time.Minute),
-					AttemptCount:    2,
-				},
-			},
-			Retrying: []orchestrator.RetrySnapshot{
-				{
-					IssueID:         "2",
-					IssueIdentifier: "ABC-2",
-					WorkspacePath:   "C:/work/ABC-2",
-					Attempt:         3,
-					DueAt:           now.Add(time.Minute),
-					Error:           stringPtr("workspace_hook_failed: before_run failed"),
-				},
-			},
-		},
-		Health: orchestrator.RuntimeHealthSnapshot{
-			Alerts: []orchestrator.AlertSnapshot{
-				{
-					Code:    "tracker_unreachable",
-					Level:   "warn",
-					Message: "tracker down",
-				},
-			},
-			Notifications: []orchestrator.NotificationChannelHealthSnapshot{
-				{
-					ChannelID:           "ops",
-					DisplayName:         "Ops",
-					Status:              "healthy",
-					ConsecutiveFailures: 0,
-				},
-			},
-			Persistence: orchestrator.PersistenceHealthSnapshot{
-				Enabled:             true,
-				Kind:                "file",
-				Status:              "healthy",
-				ConsecutiveFailures: 0,
-			},
-		},
-		Observations: orchestrator.RuntimeObservationsSnapshot{
-			Derived: []orchestrator.ObservationSnapshot{
-				{
-					Code:            "merge_status_unknown",
-					Level:           "warn",
-					Message:         "gh unavailable",
-					IssueID:         "3",
-					IssueIdentifier: "ABC-3",
-				},
-			},
-			ProtectedResults: []orchestrator.ProtectedResultSnapshot{
-				{
-					IssueID:         "6",
-					IssueIdentifier: "ABC-6",
-					WorkspacePath:   "C:/work/ABC-6",
-					Outcome:         "succeeded",
-					Phase:           "succeeded",
-					FinalBranch:     "feature/abc-6",
-					ObservedAt:      now.Add(-30 * time.Second),
-					AttemptCount:    2,
-				},
-			},
-		},
-		CodexTotals: orchestrator.Snapshot{}.CodexTotals,
-		RateLimits:  map[string]any{"remaining": 9, "resetAt": "2026-03-07T12:05:00Z"},
-	}
+type sseMessage struct {
+	Event string
+	Data  string
 }
 
-func stringPtr(value string) *string {
-	copyValue := value
-	return &copyValue
-}
-
-type failingResponseWriter struct {
-	header   http.Header
-	status   int
-	writeErr error
-	buf      bytes.Buffer
-}
-
-func (w *failingResponseWriter) Header() http.Header {
-	if w.header == nil {
-		w.header = make(http.Header)
-	}
-	return w.header
-}
-
-func (w *failingResponseWriter) WriteHeader(status int) {
-	w.status = status
-}
-
-func (w *failingResponseWriter) Write(p []byte) (int, error) {
-	if w.writeErr == nil {
-		return w.buf.Write(p)
-	}
-	return 0, w.writeErr
-}
-
-type streamingResponseWriter struct {
-	header  http.Header
-	status  int
-	buf     bytes.Buffer
-	mu      sync.Mutex
-	flushCh chan struct{}
-}
-
-func newStreamingResponseWriter() *streamingResponseWriter {
-	return &streamingResponseWriter{
-		header:  make(http.Header),
-		flushCh: make(chan struct{}, 16),
-	}
-}
-
-func (w *streamingResponseWriter) Header() http.Header { return w.header }
-
-func (w *streamingResponseWriter) WriteHeader(status int) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.status = status
-}
-
-func (w *streamingResponseWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.Write(p)
-}
-
-func (w *streamingResponseWriter) Flush() {
-	select {
-	case w.flushCh <- struct{}{}:
-	default:
-	}
-}
-
-func (w *streamingResponseWriter) bodyString() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.String()
-}
-
-func (w *streamingResponseWriter) waitForBody(t *testing.T, needle string) {
+func readSSEEvent(t *testing.T, reader *bufio.Reader) sseMessage {
 	t.Helper()
-	deadline := time.After(time.Second)
+
+	message := sseMessage{}
 	for {
-		if strings.Contains(w.bodyString(), needle) {
-			return
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("ReadString() error = %v", err)
 		}
-		select {
-		case <-w.flushCh:
-		case <-time.After(10 * time.Millisecond):
-		case <-deadline:
-			t.Fatalf("body %q missing %q", w.bodyString(), needle)
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if message.Event != "" || message.Data != "" {
+				return message
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			message.Event = strings.TrimSpace(strings.TrimPrefix(line, "event: "))
+		case strings.HasPrefix(line, "data: "):
+			message.Data = strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 		}
 	}
+}
+
+type nonFlusherResponseWriter struct {
+	http.ResponseWriter
+}
+
+func sampleDiscovery() orchestrator.DiscoveryDocument {
+	return contract.DiscoveryDocument{
+		APIVersion: contract.APIVersionV1,
+		Instance: contract.InstanceDocument{
+			ID:      "automation",
+			Name:    "symphony",
+			Version: "dev",
+		},
+		Source: contract.SourceDocument{
+			Kind: contract.SourceKindLinear,
+			Name: "linear-main",
+		},
+		ServiceMode:        contract.ServiceModeServing,
+		RecoveryInProgress: false,
+		Capabilities: contract.CapabilityDocument{
+			EventProtocol:  "sse",
+			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
+			Notifications:  []string{"slack", "webhook"},
+			Sources:        []contract.SourceKind{contract.SourceKindLinear},
+		},
+		Reasons: []contract.Reason{},
+		Limits: contract.LimitDocument{
+			CompletedWindowSize: 100,
+		},
+	}
+}
+
+func sampleSnapshot() orchestrator.Snapshot {
+	return contract.ServiceStateSnapshot{
+		GeneratedAt:        "2026-03-14T00:00:00Z",
+		ServiceMode:        contract.ServiceModeServing,
+		RecoveryInProgress: false,
+		Reasons:            []contract.Reason{},
+		Counts: contract.StateCounts{
+			Total:     1,
+			Active:    1,
+			Completed: 1,
+		},
+		Records: []contract.IssueRuntimeRecord{
+			{
+				RecordID:  "rec_linear_1",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1", URL: "https://linear.app/issue/ABC-1"},
+				Status:    contract.IssueStatusActive,
+				UpdatedAt: "2026-03-14T00:00:00Z",
+				Observation: &contract.Observation{
+					Running: true,
+					Summary: "agent run in progress",
+					Details: map[string]any{"runner": "codex"},
+				},
+				DurableRefs: contract.DurableRefs{
+					Workspace:  &contract.WorkspaceRef{Path: "/tmp/abc-1"},
+					Branch:     &contract.BranchRef{Name: "feature/abc-1"},
+					LedgerPath: "automation/local/runtime-ledger.json",
+				},
+			},
+		},
+		CompletedWindow: contract.CompletedWindow{
+			Limit: 100,
+			Records: []contract.IssueRuntimeRecord{
+				{
+					RecordID:  "rec_linear_done",
+					SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "done", SourceIdentifier: "DONE-1"},
+					Status:    contract.IssueStatusCompleted,
+					UpdatedAt: "2026-03-14T00:00:01Z",
+					DurableRefs: contract.DurableRefs{
+						LedgerPath: "automation/local/runtime-ledger.json",
+					},
+					Result: &contract.Result{
+						Outcome:     contract.ResultOutcomeSucceeded,
+						Summary:     "completed",
+						CompletedAt: "2026-03-14T00:00:01Z",
+						Details:     map[string]any{"record_id": "rec_linear_done"},
+					},
+				},
+			},
+		},
+	}
+}
+
+func ptrReason(reason contract.Reason) *contract.Reason {
+	return &reason
 }

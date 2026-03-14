@@ -128,6 +128,9 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	}
 
 	server := getMap(configMap, "server")
+	if host := strings.TrimSpace(getString(server, "host", "")); host != "" {
+		cfg.ServerHost = host
+	}
 	if port, ok := getInt(server, "port"); ok && port >= 0 {
 		cfg.ServerPort = &port
 	}
@@ -334,6 +337,7 @@ func defaultServiceConfig() *model.ServiceConfig {
 		CodexTurnTimeoutMS:               3600000,
 		CodexReadTimeoutMS:               5000,
 		CodexStallTimeoutMS:              300000,
+		ServerHost:                       "127.0.0.1",
 		SessionPersistence: model.SessionPersistenceConfig{
 			Kind: model.SessionPersistenceKindFile,
 			File: model.SessionPersistenceFileConfig{

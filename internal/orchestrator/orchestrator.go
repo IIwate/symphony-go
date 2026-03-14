@@ -39,129 +39,9 @@ type CodexUpdate struct {
 	Event   agent.AgentEvent
 }
 
-type Snapshot struct {
-	GeneratedAt  time.Time
-	Service      ServiceSnapshot
-	Counts       SnapshotCounts
-	Running      []RunningSnapshot
-	Recovery     RecoverySnapshot
-	Health       RuntimeHealthSnapshot
-	Observations RuntimeObservationsSnapshot
-	CodexTotals  model.TokenTotals
-	RateLimits   any
-}
-
-type ServiceSnapshot struct {
-	Version          string
-	StartedAt        time.Time
-	Mode             model.ServiceMode
-	ProtectionReason string
-	ProtectedAt      *time.Time
-	RestartRequired  bool
-}
-
-type SnapshotCounts struct {
-	Recovering           int
-	Running              int
-	AwaitingMerge        int
-	AwaitingIntervention int
-	Retrying             int
-}
-
-type RecoverySnapshot struct {
-	Recovering           []RecoveringSnapshot
-	AwaitingMerge        []AwaitingMergeSnapshot
-	AwaitingIntervention []AwaitingInterventionSnapshot
-	Retrying             []RetrySnapshot
-}
-
-type RuntimeHealthSnapshot struct {
-	Alerts        []AlertSnapshot
-	Notifications []NotificationChannelHealthSnapshot
-	Persistence   PersistenceHealthSnapshot
-}
-
-type RuntimeObservationsSnapshot struct {
-	Derived          []ObservationSnapshot
-	ProtectedResults []ProtectedResultSnapshot
-}
-
-type RunningSnapshot struct {
-	IssueID             string
-	IssueIdentifier     string
-	WorkspacePath       string
-	State               string
-	DispatchKind        string
-	ExpectedOutcome     string
-	ContinuationReason  *string
-	SessionID           string
-	TurnCount           int
-	LastEvent           string
-	LastMessage         string
-	StartedAt           time.Time
-	LastEventAt         *time.Time
-	InputTokens         int64
-	OutputTokens        int64
-	TotalTokens         int64
-	CurrentRetryAttempt int
-	AttemptCount        int
-}
-
-type RecoveringSnapshot struct {
-	IssueID            string
-	IssueIdentifier    string
-	WorkspacePath      string
-	State              string
-	Strategy           string
-	Source             string
-	DispatchKind       string
-	ExpectedOutcome    string
-	ContinuationReason *string
-	ObservedAt         time.Time
-	AttemptCount       int
-}
-
-type RetrySnapshot struct {
-	IssueID            string
-	IssueIdentifier    string
-	WorkspacePath      string
-	DispatchKind       string
-	ExpectedOutcome    string
-	ContinuationReason *string
-	Attempt            int
-	DueAt              time.Time
-	Error              *string
-}
-
-type AwaitingMergeSnapshot struct {
-	IssueID         string
-	IssueIdentifier string
-	WorkspacePath   string
-	State           string
-	Branch          string
-	PRNumber        int
-	PRURL           string
-	PRState         string
-	AwaitingSince   time.Time
-	LastError       *string
-	AttemptCount    int
-}
-
-type AwaitingInterventionSnapshot struct {
-	IssueID             string
-	IssueIdentifier     string
-	WorkspacePath       string
-	Branch              string
-	PRNumber            int
-	PRURL               string
-	PRState             string
-	Reason              string
-	ExpectedOutcome     string
-	PreviousBranch      string
-	LastKnownIssueState string
-	ObservedAt          time.Time
-	AttemptCount        int
-}
+type Snapshot = contract.ServiceStateSnapshot
+type DiscoveryDocument = contract.DiscoveryDocument
+type RefreshRequestResult = contract.ControlResult
 
 type AlertSnapshot struct {
 	Code            string
@@ -169,30 +49,6 @@ type AlertSnapshot struct {
 	Message         string
 	IssueID         string
 	IssueIdentifier string
-}
-
-type ObservationSnapshot struct {
-	Code            string
-	Level           string
-	Message         string
-	IssueID         string
-	IssueIdentifier string
-}
-
-type ProtectedResultSnapshot struct {
-	IssueID             string
-	IssueIdentifier     string
-	WorkspacePath       string
-	Outcome             string
-	Phase               string
-	Error               *string
-	FinalBranch         string
-	ObservedAt          time.Time
-	DispatchKind        string
-	ExpectedOutcome     string
-	ContinuationReason  *string
-	CurrentRetryAttempt int
-	AttemptCount        int
 }
 
 type NotificationChannelHealthSnapshot struct {
@@ -281,15 +137,6 @@ type RuntimeIdentity struct {
 	Descriptor    RuntimeDescriptor
 }
 
-type RefreshRequestResult struct {
-	Accepted        bool
-	Coalesced       bool
-	RequestedAt     time.Time
-	Operations      []string
-	RejectedCode    string
-	RejectedMessage string
-}
-
 type Orchestrator struct {
 	tracker           tracker.Client
 	workspace         workspace.Manager
@@ -349,7 +196,7 @@ type Orchestrator struct {
 
 var BuildVersion = "dev"
 
-const defaultMaxCompletedEntries = 4096
+const defaultMaxCompletedEntries = 100
 const serviceProtectedModeCode = "service_protected_mode"
 
 func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, runtimeIdentityFn func() RuntimeIdentity, logger *slog.Logger) *Orchestrator {
@@ -846,28 +693,38 @@ func (o *Orchestrator) rememberProtectedResultLocked(issueID string, entry *mode
 
 func (o *Orchestrator) RequestRefresh() RefreshRequestResult {
 	o.mu.RLock()
-	protected := o.isProtectedLocked()
-	serviceReasons := cloneServiceReasons(o.state.Service.Reasons)
+	serviceMode, _, _ := o.publicServiceStateLocked()
 	o.mu.RUnlock()
 
-	result := RefreshRequestResult{RequestedAt: o.now().UTC()}
-	if protected {
-		result.RejectedCode = serviceProtectedModeCode
-		result.RejectedMessage = "service is unavailable; fix the core dependency before retrying refresh"
-		if len(serviceReasons) > 0 {
-			result.RejectedMessage = fmt.Sprintf("%s: %s", result.RejectedMessage, serviceReasons[0].ReasonCode)
+	timestamp := o.now().UTC().Format(time.RFC3339Nano)
+	if serviceMode == contract.ServiceModeUnavailable {
+		reason := contract.MustReason(contract.ReasonControlRefreshRejectedServiceMode, map[string]any{
+			"service_mode": serviceMode,
+		})
+		return contract.ControlResult{
+			Action:              contract.ControlActionRefresh,
+			Status:              contract.ControlStatusRejected,
+			Reason:              &reason,
+			RecommendedNextStep: "检查核心依赖后重试",
+			Timestamp:           timestamp,
 		}
-		return result
 	}
 
-	result.Accepted = true
-	result.Operations = []string{"poll", "reconcile"}
+	reasonDetails := map[string]any{
+		"service_mode": serviceMode,
+	}
 	select {
 	case o.refreshCh <- struct{}{}:
-		return result
 	default:
-		result.Coalesced = true
-		return result
+		reasonDetails["coalesced"] = true
+	}
+	reason := contract.MustReason(contract.ReasonControlRefreshAccepted, reasonDetails)
+	return contract.ControlResult{
+		Action:              contract.ControlActionRefresh,
+		Status:              contract.ControlStatusAccepted,
+		Reason:              &reason,
+		RecommendedNextStep: "等待 SSE 通知后回读 /api/v1/state",
+		Timestamp:           timestamp,
 	}
 }
 
@@ -883,6 +740,45 @@ func (o *Orchestrator) Snapshot() Snapshot {
 	defer o.mu.Unlock()
 	o.refreshSnapshotLocked()
 	return o.snapshot
+}
+
+func (o *Orchestrator) Discovery() DiscoveryDocument {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.refreshSnapshotLocked()
+	snapshot := o.snapshot
+	identity := o.currentRuntimeIdentity()
+	sourceKind := discoverySourceKind(identity)
+	sourceName := strings.TrimSpace(identity.Compatibility.ActiveSource)
+	if sourceName == "" {
+		sourceName = "linear-main"
+	}
+
+	return contract.DiscoveryDocument{
+		APIVersion: contract.APIVersionV1,
+		Instance: contract.InstanceDocument{
+			ID:      discoveryInstanceID(identity),
+			Name:    "symphony",
+			Version: o.serviceVersion,
+		},
+		Source: contract.SourceDocument{
+			Kind: sourceKind,
+			Name: sourceName,
+		},
+		ServiceMode:        snapshot.ServiceMode,
+		RecoveryInProgress: snapshot.RecoveryInProgress,
+		Capabilities: contract.CapabilityDocument{
+			EventProtocol:  "sse",
+			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
+			Notifications:  notificationCapabilityKinds(o.currentConfig()),
+			Sources:        []contract.SourceKind{sourceKind},
+		},
+		Reasons: cloneServiceReasons(snapshot.Reasons),
+		Limits: contract.LimitDocument{
+			CompletedWindowSize: o.maxCompleted,
+		},
+	}
 }
 
 func (o *Orchestrator) SubscribeSnapshots(buffer int) (<-chan Snapshot, func()) {
@@ -2306,354 +2202,134 @@ func (o *Orchestrator) applyCurrentConfigLocked() {
 
 func (o *Orchestrator) refreshSnapshotLocked() {
 	now := o.now().UTC()
-	running := make([]RunningSnapshot, 0, len(o.runningRecords))
-	for issueID, entry := range o.runningRecords {
-		if _, pendingLaunch := o.pendingLaunch[issueID]; pendingLaunch {
-			continue
-		}
-		row := RunningSnapshot{
-			IssueID:             issueID,
-			IssueIdentifier:     recordIdentifier(entry),
-			WorkspacePath:       recordWorkspacePath(entry),
-			SessionID:           entry.Session.SessionID,
-			TurnCount:           entry.Session.TurnCount,
-			LastMessage:         entry.Session.LastCodexMessage,
-			StartedAt:           recordUpdatedAt(entry, now),
-			InputTokens:         entry.Session.CodexInputTokens,
-			OutputTokens:        entry.Session.CodexOutputTokens,
-			TotalTokens:         entry.Session.CodexTotalTokens,
-			CurrentRetryAttempt: entry.RetryAttempt,
-			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
-		}
-		row.State = entry.LastKnownIssueState
-		if entry.Dispatch != nil {
-			row.DispatchKind = string(entry.Dispatch.Kind)
-			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
-			if entry.Dispatch.Reason != nil {
-				reason := string(*entry.Dispatch.Reason)
-				row.ContinuationReason = &reason
-			}
-		}
-		if entry.Session.LastCodexEvent != nil {
-			row.LastEvent = *entry.Session.LastCodexEvent
-		}
-		row.LastEventAt = entry.Session.LastCodexTimestamp
-		running = append(running, row)
-	}
-	sort.SliceStable(running, func(i int, j int) bool {
-		if running[i].IssueIdentifier != running[j].IssueIdentifier {
-			return running[i].IssueIdentifier < running[j].IssueIdentifier
-		}
-		return running[i].IssueID < running[j].IssueID
-	})
-
-	recovering := make([]RecoveringSnapshot, 0, len(o.state.Records))
-	for issueID, entry := range o.state.Records {
-		if entry == nil || entry.Runtime.Status != contract.IssueStatusActive || !entry.NeedsRecovery || isRecordRunning(entry) {
-			continue
-		}
-		row := RecoveringSnapshot{
-			IssueID:         issueID,
-			IssueIdentifier: recordIdentifier(entry),
-			WorkspacePath:   recordWorkspacePath(entry),
-			State:           entry.LastKnownIssueState,
-			Strategy:        "conservative_recovery",
-			Source:          "ledger",
-			ObservedAt:      recordUpdatedAt(entry, now),
-			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
-		}
-		if entry.Dispatch != nil {
-			row.DispatchKind = string(entry.Dispatch.Kind)
-			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
-			if entry.Dispatch.Reason != nil {
-				reason := string(*entry.Dispatch.Reason)
-				row.ContinuationReason = &reason
-			}
-		}
-		recovering = append(recovering, row)
-	}
-	sort.SliceStable(recovering, func(i int, j int) bool {
-		if recovering[i].IssueIdentifier != recovering[j].IssueIdentifier {
-			return recovering[i].IssueIdentifier < recovering[j].IssueIdentifier
-		}
-		return recovering[i].IssueID < recovering[j].IssueID
-	})
-
-	awaitingMerge := make([]AwaitingMergeSnapshot, 0, len(o.awaitingMergeRecords))
-	for issueID, entry := range o.awaitingMergeRecords {
-		pr := entry.Runtime.DurableRefs.PullRequest
-		lastError := (*string)(nil)
-		if entry.Runtime.Reason != nil {
-			if value, ok := entry.Runtime.Reason.Details["last_error"].(string); ok {
-				lastError = optionalError(value)
-			}
-		}
-		awaitingMerge = append(awaitingMerge, AwaitingMergeSnapshot{
-			IssueID:         issueID,
-			IssueIdentifier: recordIdentifier(entry),
-			WorkspacePath:   recordWorkspacePath(entry),
-			State:           entry.LastKnownIssueState,
-			Branch:          recordBranch(entry),
-			AwaitingSince:   recordUpdatedAt(entry, now),
-			LastError:       lastError,
-			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
-		})
-		item := &awaitingMerge[len(awaitingMerge)-1]
-		if pr != nil {
-			item.PRNumber = pr.Number
-			item.PRURL = pr.URL
-			item.PRState = pr.State
-		}
-	}
-	sort.SliceStable(awaitingMerge, func(i int, j int) bool {
-		if awaitingMerge[i].IssueIdentifier != awaitingMerge[j].IssueIdentifier {
-			return awaitingMerge[i].IssueIdentifier < awaitingMerge[j].IssueIdentifier
-		}
-		return awaitingMerge[i].IssueID < awaitingMerge[j].IssueID
-	})
-
-	awaitingIntervention := make([]AwaitingInterventionSnapshot, 0, len(o.awaitingInterventionRecords))
-	for issueID, entry := range o.awaitingInterventionRecords {
-		pr := entry.Runtime.DurableRefs.PullRequest
-		reasonCode := ""
-		if entry.Runtime.Reason != nil {
-			reasonCode = string(entry.Runtime.Reason.ReasonCode)
-		}
-		awaitingIntervention = append(awaitingIntervention, AwaitingInterventionSnapshot{
-			IssueID:             issueID,
-			IssueIdentifier:     recordIdentifier(entry),
-			WorkspacePath:       recordWorkspacePath(entry),
-			Branch:              recordBranch(entry),
-			Reason:              reasonCode,
-			ExpectedOutcome:     string(o.currentWorkflow().Completion.Mode),
-			PreviousBranch:      recordBranch(entry),
-			LastKnownIssueState: entry.LastKnownIssueState,
-			ObservedAt:          recordUpdatedAt(entry, now),
-			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
-		})
-		item := &awaitingIntervention[len(awaitingIntervention)-1]
-		if pr != nil {
-			item.PRNumber = pr.Number
-			item.PRURL = pr.URL
-			item.PRState = pr.State
-		}
-	}
-	sort.SliceStable(awaitingIntervention, func(i int, j int) bool {
-		if awaitingIntervention[i].IssueIdentifier != awaitingIntervention[j].IssueIdentifier {
-			return awaitingIntervention[i].IssueIdentifier < awaitingIntervention[j].IssueIdentifier
-		}
-		return awaitingIntervention[i].IssueID < awaitingIntervention[j].IssueID
-	})
-
-	retrying := make([]RetrySnapshot, 0, len(o.retryRecords))
-	for issueID, entry := range o.retryRecords {
-		lastError := (*string)(nil)
-		if entry.Runtime.Reason != nil {
-			if value, ok := entry.Runtime.Reason.Details["last_error"].(string); ok {
-				lastError = optionalError(value)
-			}
-		}
-		row := RetrySnapshot{
-			IssueID:         issueID,
-			IssueIdentifier: recordIdentifier(entry),
-			WorkspacePath:   recordWorkspacePath(entry),
-			Attempt:         entry.RetryAttempt,
-			Error:           lastError,
-		}
-		if entry.RetryDueAt != nil {
-			row.DueAt = *entry.RetryDueAt
-		}
-		if entry.Dispatch != nil {
-			row.DispatchKind = string(entry.Dispatch.Kind)
-			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
-			if entry.Dispatch.Reason != nil {
-				reason := string(*entry.Dispatch.Reason)
-				row.ContinuationReason = &reason
-			}
-		}
-		retrying = append(retrying, row)
-	}
-	sort.SliceStable(retrying, func(i int, j int) bool {
-		if retrying[i].IssueIdentifier != retrying[j].IssueIdentifier {
-			return retrying[i].IssueIdentifier < retrying[j].IssueIdentifier
-		}
-		return retrying[i].IssueID < retrying[j].IssueID
-	})
-
-	alerts := make([]AlertSnapshot, 0, len(o.healthAlerts))
-	for _, alert := range o.healthAlerts {
-		alerts = append(alerts, alert)
-	}
-	sort.SliceStable(alerts, func(i int, j int) bool {
-		if alerts[i].Code != alerts[j].Code {
-			return alerts[i].Code < alerts[j].Code
-		}
-		if alerts[i].IssueIdentifier != alerts[j].IssueIdentifier {
-			return alerts[i].IssueIdentifier < alerts[j].IssueIdentifier
-		}
-		return alerts[i].Message < alerts[j].Message
-	})
-
-	derived := make([]ObservationSnapshot, 0, len(o.retryRecords)+len(o.awaitingMergeRecords))
-	for issueID, entry := range o.retryRecords {
-		if entry.Runtime.Reason == nil {
-			continue
-		}
-		errorText, _ := entry.Runtime.Reason.Details["last_error"].(string)
-		if strings.TrimSpace(errorText) == "" {
-			continue
-		}
-		lowerError := strings.ToLower(errorText)
-		switch {
-		case isStallErrorText(errorText) && entry.StallCount > 1:
-			derived = append(derived, ObservationSnapshot{
-				Code:            "repeated_stall",
-				Level:           "warn",
-				Message:         errorText,
-				IssueID:         issueID,
-				IssueIdentifier: recordIdentifier(entry),
-			})
-		case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
-			derived = append(derived, ObservationSnapshot{
-				Code:            "workspace_hook_failure",
-				Level:           "warn",
-				Message:         errorText,
-				IssueID:         issueID,
-				IssueIdentifier: recordIdentifier(entry),
-			})
-		}
-	}
-	for issueID, entry := range o.awaitingMergeRecords {
-		if entry.Runtime.Reason == nil {
-			continue
-		}
-		errorText, _ := entry.Runtime.Reason.Details["last_error"].(string)
-		if strings.TrimSpace(errorText) == "" {
-			continue
-		}
-		derived = append(derived, ObservationSnapshot{
-			Code:            "merge_status_unknown",
-			Level:           "warn",
-			Message:         errorText,
-			IssueID:         issueID,
-			IssueIdentifier: recordIdentifier(entry),
-		})
-	}
-	sort.SliceStable(derived, func(i int, j int) bool {
-		if derived[i].Code != derived[j].Code {
-			return derived[i].Code < derived[j].Code
-		}
-		if derived[i].IssueIdentifier != derived[j].IssueIdentifier {
-			return derived[i].IssueIdentifier < derived[j].IssueIdentifier
-		}
-		return derived[i].Message < derived[j].Message
-	})
-
-	protectedResults := make([]ProtectedResultSnapshot, 0, len(o.state.ProtectedResults))
-	for issueID, entry := range o.state.ProtectedResults {
+	records := make([]contract.IssueRuntimeRecord, 0, len(o.state.Records))
+	for _, entry := range o.state.Records {
 		if entry == nil {
 			continue
 		}
-		row := ProtectedResultSnapshot{
-			IssueID:             issueID,
-			IssueIdentifier:     entry.Identifier,
-			WorkspacePath:       entry.WorkspacePath,
-			Outcome:             string(entry.Outcome),
-			Phase:               entry.Phase.String(),
-			Error:               optionalError(pointerString(entry.Error)),
-			FinalBranch:         entry.FinalBranch,
-			ObservedAt:          entry.ObservedAt,
-			CurrentRetryAttempt: entry.RetryAttempt,
-			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
-		}
-		if entry.Dispatch != nil {
-			row.DispatchKind = string(entry.Dispatch.Kind)
-			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
-			if entry.Dispatch.Reason != nil {
-				reason := string(*entry.Dispatch.Reason)
-				row.ContinuationReason = &reason
-			}
-		}
-		protectedResults = append(protectedResults, row)
+		records = append(records, cloneRuntimeRecord(entry.Runtime))
 	}
-	sort.SliceStable(protectedResults, func(i int, j int) bool {
-		if protectedResults[i].IssueIdentifier != protectedResults[j].IssueIdentifier {
-			return protectedResults[i].IssueIdentifier < protectedResults[j].IssueIdentifier
+	sort.SliceStable(records, func(i int, j int) bool {
+		if records[i].SourceRef.SourceIdentifier != records[j].SourceRef.SourceIdentifier {
+			return records[i].SourceRef.SourceIdentifier < records[j].SourceRef.SourceIdentifier
 		}
-		return protectedResults[i].IssueID < protectedResults[j].IssueID
+		return records[i].RecordID < records[j].RecordID
 	})
 
-	notificationHealth := make([]NotificationChannelHealthSnapshot, 0, len(o.notificationHealth))
-	for _, status := range o.notificationHealth {
+	completed := cloneCompletedWindow(o.state.CompletedWindow)
+	if completed == nil {
+		completed = []contract.IssueRuntimeRecord{}
+	}
+
+	counts := contract.StateCounts{
+		Total:     len(records),
+		Completed: len(completed),
+	}
+	for _, record := range records {
+		switch record.Status {
+		case contract.IssueStatusActive:
+			counts.Active++
+		case contract.IssueStatusRetryScheduled:
+			counts.RetryScheduled++
+		case contract.IssueStatusAwaitingMerge:
+			counts.AwaitingMerge++
+		case contract.IssueStatusAwaitingIntervention:
+			counts.AwaitingIntervention++
+		case contract.IssueStatusCompleted:
+			counts.Completed++
+		}
+	}
+
+	serviceMode, recoveryInProgress, reasons := o.publicServiceStateLocked()
+	if reasons == nil {
+		reasons = []contract.Reason{}
+	}
+
+	o.snapshot = contract.ServiceStateSnapshot{
+		GeneratedAt:        now.Format(time.RFC3339Nano),
+		ServiceMode:        serviceMode,
+		RecoveryInProgress: recoveryInProgress,
+		Reasons:            reasons,
+		Counts:             counts,
+		Records:            records,
+		CompletedWindow: contract.CompletedWindow{
+			Limit:   o.maxCompleted,
+			Records: completed,
+		},
+	}
+}
+
+func (o *Orchestrator) publicServiceStateLocked() (contract.ServiceMode, bool, []contract.Reason) {
+	recoveryInProgress := o.state.Service.RecoveryInProgress
+	reasons := cloneServiceReasons(o.state.Service.Reasons)
+	if recoveryInProgress {
+		reasons = append(reasons, contract.MustReason(contract.ReasonServiceRecoveryInProgress, map[string]any{
+			"phase": "restore",
+		}))
+	}
+
+	switch o.serviceModeLocked() {
+	case contract.ServiceModeUnavailable:
+		return contract.ServiceModeUnavailable, recoveryInProgress, reasons
+	case contract.ServiceModeDegraded:
+		return contract.ServiceModeDegraded, recoveryInProgress, reasons
+	}
+
+	channelIDs := make([]string, 0, len(o.notificationHealth))
+	for channelID, status := range o.notificationHealth {
 		if status == nil {
 			continue
 		}
-		copyStatus := *status
-		copyStatus.LastAttemptAt = cloneTimePtr(status.LastAttemptAt)
-		copyStatus.LastSuccessAt = cloneTimePtr(status.LastSuccessAt)
-		copyStatus.LastError = optionalError(pointerString(status.LastError))
-		notificationHealth = append(notificationHealth, copyStatus)
-	}
-	sort.SliceStable(notificationHealth, func(i int, j int) bool {
-		return notificationHealth[i].ChannelID < notificationHealth[j].ChannelID
-	})
-
-	persistenceHealth := o.persistenceHealth
-	persistenceHealth.LastAttemptAt = cloneTimePtr(o.persistenceHealth.LastAttemptAt)
-	persistenceHealth.LastSuccessAt = cloneTimePtr(o.persistenceHealth.LastSuccessAt)
-	persistenceHealth.LastError = optionalError(pointerString(o.persistenceHealth.LastError))
-
-	mode := o.serviceModeLocked()
-	protectionReason := ""
-	restartRequired := mode == model.ServiceModeUnavailable
-	if len(o.state.Service.Reasons) > 0 {
-		protectionReason = string(o.state.Service.Reasons[0].ReasonCode)
-	}
-
-	totals := o.state.CodexTotals
-	rateLimits := o.state.CodexRateLimits
-	for _, entry := range o.runningRecords {
-		if entry.StartedAt != nil {
-			totals.SecondsRunning += now.Sub(*entry.StartedAt).Seconds()
+		if strings.EqualFold(strings.TrimSpace(status.Status), "degraded") {
+			channelIDs = append(channelIDs, channelID)
 		}
 	}
-
-	o.snapshot = Snapshot{
-		GeneratedAt: now,
-		Service: ServiceSnapshot{
-			Version:          o.serviceVersion,
-			StartedAt:        o.startedAt,
-			Mode:             mode,
-			ProtectionReason: protectionReason,
-			ProtectedAt:      nil,
-			RestartRequired:  restartRequired,
-		},
-		Counts: SnapshotCounts{
-			Recovering:           len(recovering),
-			Running:              len(running),
-			AwaitingMerge:        len(awaitingMerge),
-			AwaitingIntervention: len(awaitingIntervention),
-			Retrying:             len(retrying),
-		},
-		Running: running,
-		Recovery: RecoverySnapshot{
-			Recovering:           recovering,
-			AwaitingMerge:        awaitingMerge,
-			AwaitingIntervention: awaitingIntervention,
-			Retrying:             retrying,
-		},
-		Health: RuntimeHealthSnapshot{
-			Alerts:        alerts,
-			Notifications: notificationHealth,
-			Persistence:   persistenceHealth,
-		},
-		Observations: RuntimeObservationsSnapshot{
-			Derived:          derived,
-			ProtectedResults: protectedResults,
-		},
-		CodexTotals: totals,
-		RateLimits:  rateLimits,
+	if len(channelIDs) > 0 {
+		sort.Strings(channelIDs)
+		reasons = append(reasons, contract.MustReason(contract.ReasonServiceDegradedNotificationDelivery, map[string]any{
+			"channel_ids": channelIDs,
+		}))
+		return contract.ServiceModeDegraded, recoveryInProgress, reasons
 	}
+	return contract.ServiceModeServing, recoveryInProgress, reasons
+}
+
+func discoverySourceKind(identity RuntimeIdentity) contract.SourceKind {
+	kind := contract.SourceKind(model.NormalizeState(identity.Compatibility.SourceKind))
+	if kind.IsValid() {
+		return kind
+	}
+	return contract.SourceKindLinear
+}
+
+func discoveryInstanceID(identity RuntimeIdentity) string {
+	if value := strings.TrimSpace(identity.Descriptor.ConfigRoot); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(identity.Compatibility.ActiveSource); value != "" {
+		return value
+	}
+	return "symphony"
+}
+
+func notificationCapabilityKinds(cfg *model.ServiceConfig) []string {
+	if cfg == nil || len(cfg.Notifications.Channels) == 0 {
+		return []string{}
+	}
+	values := map[string]struct{}{}
+	for _, channel := range cfg.Notifications.Channels {
+		kind := strings.TrimSpace(string(channel.Kind))
+		if kind == "" {
+			continue
+		}
+		values[kind] = struct{}{}
+	}
+	result := make([]string, 0, len(values))
+	for kind := range values {
+		result = append(result, kind)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func (o *Orchestrator) publishSnapshotLocked() {

@@ -133,7 +133,7 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 
 	var httpSrv httpServer
 	if cfg.ServerPort != nil {
-		httpSrv, err = newHTTPServerFactory(orch, logger, *cfg.ServerPort)
+		httpSrv, err = newHTTPServerFactory(orch, logger, cfg.ServerHost, *cfg.ServerPort)
 		if err != nil {
 			return err
 		}

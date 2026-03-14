@@ -60,7 +60,7 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 				"thread_sandbox":      "workspace-write",
 				"turn_sandbox_policy": map[string]any{"type": "workspaceWrite"},
 			},
-			"server": map[string]any{"port": "0"},
+			"server": map[string]any{"host": "0.0.0.0", "port": "0"},
 		},
 	}
 
@@ -116,6 +116,9 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	}
 	if cfg.ServerPort == nil || *cfg.ServerPort != 0 {
 		t.Fatalf("ServerPort = %v, want 0", cfg.ServerPort)
+	}
+	if cfg.ServerHost != "0.0.0.0" {
+		t.Fatalf("ServerHost = %q, want 0.0.0.0", cfg.ServerHost)
 	}
 	if cfg.CodexCommand != "codex app-server" {
 		t.Fatalf("CodexCommand = %q, want default", cfg.CodexCommand)

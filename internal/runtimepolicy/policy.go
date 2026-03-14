@@ -128,6 +128,8 @@ func firstRestartRequiredDefinitionChange(currentRepoDef *model.AutomationDefini
 
 func firstRestartRequiredConfigChange(currentCfg *model.ServiceConfig, newCfg *model.ServiceConfig) string {
 	switch {
+	case currentCfg.ServerHost != newCfg.ServerHost:
+		return "runtime.server.host"
 	case !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort):
 		return "runtime.server.port"
 	case currentCfg.TrackerKind != newCfg.TrackerKind:
