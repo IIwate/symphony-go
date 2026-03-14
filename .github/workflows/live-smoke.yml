@@ -73,22 +73,23 @@ jobs:
           if (-not $env:OPENAI_API_KEY) { throw "Missing secret LIVE_SMOKE_OPENAI_API_KEY" }
           $codexDir = Join-Path $env:USERPROFILE ".codex"
           New-Item -ItemType Directory -Force $codexDir | Out-Null
-          @"
-model_provider = "custom"
-model = "gpt-5.4"
-model_reasoning_effort = "xhigh"
-plan_mode_reasoning_effort = "xhigh"
-disable_response_storage = true
-sandbox_mode = "workspace-write"
-approval_policy = "never"
-network_access = true
-
-[model_providers.custom]
-name = "custom"
-wire_api = "responses"
-requires_openai_auth = true
-base_url = "$env:OPENAI_BASE_URL"
-"@ | Set-Content -Path (Join-Path $codexDir "config.toml") -Encoding utf8
+          $configPath = Join-Path $codexDir "config.toml"
+          @(
+            'model_provider = "custom"'
+            'model = "gpt-5.4"'
+            'model_reasoning_effort = "xhigh"'
+            'plan_mode_reasoning_effort = "xhigh"'
+            'disable_response_storage = true'
+            'sandbox_mode = "workspace-write"'
+            'approval_policy = "never"'
+            'network_access = true'
+            ''
+            '[model_providers.custom]'
+            'name = "custom"'
+            'wire_api = "responses"'
+            'requires_openai_auth = true'
+            "base_url = `"$env:OPENAI_BASE_URL`""
+          ) | Set-Content -Path $configPath -Encoding utf8
           $env:OPENAI_API_KEY | codex login --with-api-key
           codex login status
 
