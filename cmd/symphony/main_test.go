@@ -58,7 +58,7 @@ func TestRunCLIDryRunSkipsRuntimeDependencies(t *testing.T) {
 
 	configDir := filepath.Join(t.TempDir(), "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	statePath := filepath.Join(configDir, "local", "session-state.json")
+	statePath := filepath.Join(configDir, "local", "runtime-ledger.json")
 	writeFile(t, statePath, "not-json\n")
 	projectYAML := fmt.Sprintf(`runtime:
   workspace:
@@ -69,7 +69,7 @@ func TestRunCLIDryRunSkipsRuntimeDependencies(t *testing.T) {
     enabled: true
     kind: file
     file:
-      path: ./local/session-state.json
+      path: ./local/runtime-ledger.json
       flush_interval_ms: 1000
       fsync_on_critical: true
 selection:
@@ -133,7 +133,7 @@ defaults:
 		t.Fatalf("ReadFile(%q) error = %v", statePath, err)
 	}
 	if string(content) != "not-json\n" {
-		t.Fatalf("session state content changed during dry-run: %q", string(content))
+		t.Fatalf("runtime ledger content changed during dry-run: %q", string(content))
 	}
 }
 
@@ -370,7 +370,7 @@ defaults:
 		writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	}
 
-	writeProject(workspaceRoot, "runner-a", "./automation/local/session-state.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server", 10, "")
+	writeProject(workspaceRoot, "runner-a", "./automation/local/runtime-ledger.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server", 10, "")
 
 	repoDef, err := loader.Load(configDir, "")
 	if err != nil {
@@ -413,7 +413,7 @@ defaults:
 			name:            "session persistence",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/other-session-state.json",
+			sessionPath:     "./automation/local/other-runtime-ledger.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -425,7 +425,7 @@ defaults:
 			name:            "workspace root",
 			workspace:       filepath.ToSlash(filepath.Join(tmpDir, "other-workspaces")),
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/session-state.json",
+			sessionPath:     "./automation/local/runtime-ledger.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -437,7 +437,7 @@ defaults:
 			name:            "workspace branch namespace",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-b",
-			sessionPath:     "./automation/local/session-state.json",
+			sessionPath:     "./automation/local/runtime-ledger.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -449,7 +449,7 @@ defaults:
 			name:            "dispatch flow",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/session-state.json",
+			sessionPath:     "./automation/local/runtime-ledger.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "other-flow",
@@ -461,7 +461,7 @@ defaults:
 			name:            "codex command",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/session-state.json",
+			sessionPath:     "./automation/local/runtime-ledger.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -473,7 +473,7 @@ defaults:
 			name:            "notifications",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/session-state.json",
+			sessionPath:     "./automation/local/runtime-ledger.json",
 			url:             "https://hooks.example.com/b",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -485,7 +485,7 @@ defaults:
 			name:            "poll interval",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/session-state.json",
+			sessionPath:     "./automation/local/runtime-ledger.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    45000,
 			dispatchFlow:    "implement",
@@ -497,7 +497,7 @@ defaults:
 			name:              "max concurrent agents",
 			workspace:         workspaceRoot,
 			branchNamespace:   "runner-a",
-			sessionPath:       "./automation/local/session-state.json",
+			sessionPath:       "./automation/local/runtime-ledger.json",
 			url:               "https://hooks.example.com/a",
 			pollInterval:      30000,
 			dispatchFlow:      "implement",
@@ -509,7 +509,7 @@ defaults:
 			name:            "max concurrent agents by state",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/session-state.json",
+			sessionPath:     "./automation/local/runtime-ledger.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -564,7 +564,7 @@ func TestExecuteFailsWhenSessionStateIdentityMismatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	configDir := filepath.Join(tmpDir, "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	statePath := filepath.Join(configDir, "local", "session-state.json")
+	statePath := filepath.Join(configDir, "local", "runtime-ledger.json")
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
 		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(statePath), err)
 	}
@@ -577,7 +577,7 @@ func TestExecuteFailsWhenSessionStateIdentityMismatch(t *testing.T) {
     enabled: true
     kind: file
     file:
-      path: ./local/session-state.json
+      path: ./local/runtime-ledger.json
       flush_interval_ms: 1000
       fsync_on_critical: true
 selection:

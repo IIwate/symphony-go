@@ -212,7 +212,10 @@ func matchesWatchedPath(rootDir string, activeProfile string, eventPath string) 
 	switch relativePath {
 	case "project.yaml", "local/overrides.yaml":
 		return true
-	case "local/env.local", "local/session-state.json":
+	case "local/env.local":
+		return false
+	}
+	if strings.HasPrefix(relativePath, "local/") {
 		return false
 	}
 

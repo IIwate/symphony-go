@@ -592,6 +592,9 @@ def _run_merge_path_smoke(
             timeout_seconds=15,
             description="awaiting_merge snapshot event",
         )
+        control_payload = _assert_refresh_contract(base_url)
+        if control_payload["status"] != "accepted":
+            raise RuntimeError(f"awaiting_merge refresh status mismatch: {control_payload}")
         waiting_state = _wait_for(
             lambda: _await_state_after_sse(
                 base_url,
@@ -614,11 +617,36 @@ def _run_merge_path_smoke(
 
         merge_pull_request(repo, pr.number)
         resources.pull_request_numbers.remove(pr.number)
+        control_payload = _assert_refresh_contract(base_url)
+        if control_payload["status"] != "accepted":
+            raise RuntimeError(f"merged_pr_source_not_terminal refresh status mismatch: {control_payload}")
+        intervention_state = _wait_for(
+            lambda: _await_state_after_sse(
+                base_url,
+                events,
+                expected_service_mode="serving",
+                predicate=lambda payload: (
+                    _find_runtime_record(payload, str(issue["identifier"]), status="awaiting_intervention") is not None
+                ),
+            ),
+            process,
+            timeout_seconds=120,
+            description="merged_pr_source_not_terminal SSE -> state",
+        )
+        record = _require_runtime_record(intervention_state, str(issue["identifier"]), status="awaiting_intervention")
+        reason = _require_reason(record, "record.blocked.awaiting_intervention")
+        if reason.get("details", {}).get("cause") != "merged_pr_source_not_terminal":
+            raise RuntimeError(f"unexpected merged intervention reason: {reason}")
+
+        linear.update_issue_state(str(issue["id"]), context.done_state_id)
+        control_payload = _assert_refresh_contract(base_url)
+        if control_payload["status"] != "accepted":
+            raise RuntimeError(f"completed refresh status mismatch: {control_payload}")
         _wait_for(
             lambda: _await_linear_done(linear, str(issue["id"])),
             process,
             timeout_seconds=120,
-            description="issue done after merge",
+            description="issue done after external source close",
         )
         completed_state = _wait_for(
             lambda: _await_state_after_sse(
@@ -642,7 +670,7 @@ def _run_merge_path_smoke(
         process.stop()
         resources.processes.remove(process)
         resources.issue_ids.remove(str(issue["id"]))
-    return f"{issue['identifier']} -> awaiting_merge -> completed_window.succeeded"
+    return f"{issue['identifier']} -> awaiting_intervention(merged_pr_source_not_terminal) -> completed_window.succeeded"
 
 
 def _run_runtime_extensions_smoke(
@@ -905,11 +933,51 @@ def _run_recovery_ledger_smoke(
 
         merge_pull_request(repo, pr.number)
         resources.pull_request_numbers.remove(pr.number)
+        intervention_state = _wait_for(
+            lambda: _await_state_after_sse(
+                base_url,
+                events,
+                expected_service_mode="serving",
+                predicate=lambda payload: (
+                    _find_runtime_record(payload, merge_identifier, status="awaiting_intervention") is not None
+                ),
+            ),
+            process,
+            timeout_seconds=180,
+            description="runtime_ledger merged_pr_source_not_terminal via SSE",
+        )
+        intervention_record = _require_runtime_record(intervention_state, merge_identifier, status="awaiting_intervention")
+        intervention_reason = _require_reason(intervention_record, "record.blocked.awaiting_intervention")
+        if intervention_reason.get("details", {}).get("cause") != "merged_pr_source_not_terminal":
+            raise RuntimeError(f"unexpected runtime_ledger merge intervention reason: {intervention_reason}")
+        _wait_for(
+            lambda: _await_ledger_record(ledger_path, merge_identifier, status="awaiting_intervention"),
+            process,
+            timeout_seconds=15,
+            description="runtime_ledger awaiting_intervention persisted after merge",
+            interval_seconds=0.2,
+        )
+        _wait_for(
+            lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_intervention_required") or None,
+            process,
+            timeout_seconds=60,
+            description="runtime_ledger webhook intervention notification after merge",
+            interval_seconds=0.5,
+        )
+        _wait_for(
+            lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_intervention_required") or None,
+            process,
+            timeout_seconds=60,
+            description="runtime_ledger slack intervention notification after merge",
+            interval_seconds=0.5,
+        )
+
+        linear.update_issue_state(str(merge_issue["id"]), context.done_state_id)
         _wait_for(
             lambda: _await_linear_done(linear, str(merge_issue["id"])),
             process,
             timeout_seconds=180,
-            description="runtime_ledger issue done after merge",
+            description="runtime_ledger issue done after external source close",
         )
         completed_state = _wait_for(
             lambda: _await_state_after_sse(
@@ -951,7 +1019,7 @@ def _run_recovery_ledger_smoke(
         linear.update_issue_state(str(persistence_issue["id"]), context.canceled_state_id)
         resources.issue_ids.remove(str(persistence_issue["id"]))
         resources.issue_ids.remove(str(merge_issue["id"]))
-        return f"{persistence_identifier}/awaiting_intervention + {merge_identifier}/completed recovered from ledger"
+        return f"{persistence_identifier}/awaiting_intervention + {merge_identifier}/awaiting_intervention_after_merge -> completed recovered from ledger"
     finally:
         if events is not None:
             events.close()
@@ -1015,10 +1083,13 @@ def _run_notification_degraded_smoke(
         issue = linear.create_issue(f"{issue_prefix} notification_degraded {int(time.time())}", context)
         resources.issue_ids.append(str(issue["id"]))
         identifier = str(issue["identifier"])
+        control_payload = _assert_refresh_contract(base_url)
+        if control_payload["status"] != "accepted":
+            raise RuntimeError(f"notification_degraded refresh status mismatch: {control_payload}")
         _wait_for(
             lambda: recorder.find(path="/webhook", identifier=identifier, event_type="issue_intervention_required") or None,
             process,
-            timeout_seconds=30,
+            timeout_seconds=90,
             description="notification_degraded webhook delivery",
             interval_seconds=0.5,
         )
@@ -1270,7 +1341,18 @@ def _await_service_mode(base_url: str, *, expected_mode: str, reason_code: str) 
 
 
 def _post_refresh(base_url: str) -> dict[str, object]:
-    return post_json(f"{base_url}/api/v1/control/refresh")
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            return post_json(f"{base_url}/api/v1/control/refresh")
+        except OSError as exc:
+            last_error = exc
+            if attempt == 2:
+                break
+            time.sleep(0.5)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("refresh request failed without error detail")
 
 
 def _load_ledger(path: Path) -> dict[str, object]:

@@ -19,11 +19,9 @@ import (
 )
 
 type fakeTracker struct {
-	candidates  []model.Issue
-	issuesByID  map[string]model.Issue
-	fetchErr    error
-	completeErr error
-	completed   []string
+	candidates []model.Issue
+	issuesByID map[string]model.Issue
+	fetchErr   error
 }
 
 func (f *fakeTracker) FetchCandidateIssues(context.Context) ([]model.Issue, error) {
@@ -61,14 +59,6 @@ func (f *fakeTracker) FetchIssueStatesByIDs(_ context.Context, ids []string) ([]
 		}
 	}
 	return result, nil
-}
-
-func (f *fakeTracker) CompleteIssue(_ context.Context, issueID string) error {
-	if f.completeErr != nil {
-		return f.completeErr
-	}
-	f.completed = append(f.completed, issueID)
-	return nil
 }
 
 type fakeWorkspace struct {
@@ -114,17 +104,16 @@ func newTestConfig(t *testing.T) *model.ServiceConfig {
 	t.Helper()
 	root := t.TempDir()
 	return &model.ServiceConfig{
-		TrackerKind:               "linear",
-		TrackerProjectSlug:        "demo",
-		ActiveStates:              []string{"Todo", "In Progress"},
-		TerminalStates:            []string{"Done", "Closed"},
-		PollIntervalMS:            10,
-		AutomationRootDir:         root,
-		WorkspaceRoot:             filepath.Join(root, "workspaces"),
-		MaxConcurrentAgents:       2,
-		MaxTurns:                  1,
-		MaxRetryBackoffMS:         100,
-		OrchestratorAutoCloseOnPR: true,
+		TrackerKind:         "linear",
+		TrackerProjectSlug:  "demo",
+		ActiveStates:        []string{"Todo", "In Progress"},
+		TerminalStates:      []string{"Done", "Closed"},
+		PollIntervalMS:      10,
+		AutomationRootDir:   root,
+		WorkspaceRoot:       filepath.Join(root, "workspaces"),
+		MaxConcurrentAgents: 2,
+		MaxTurns:            1,
+		MaxRetryBackoffMS:   100,
 		SessionPersistence: model.SessionPersistenceConfig{
 			Enabled: true,
 			Kind:    model.SessionPersistenceKindFile,
@@ -153,7 +142,13 @@ func newTestOrchestrator(t *testing.T) (*Orchestrator, *fakeTracker, *fakeWorksp
 	trackerClient := &fakeTracker{issuesByID: map[string]model.Issue{}}
 	workspaceManager := &fakeWorkspace{root: cfg.WorkspaceRoot}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	o := NewOrchestrator(trackerClient, workspaceManager, fakeRunner{}, func() *model.ServiceConfig { return cfg }, newTestWorkflow, nil, logger)
+	identity := RuntimeIdentity{
+		Compatibility: RuntimeCompatibility{
+			ActiveSource: "linear-main",
+			SourceKind:   "linear",
+		},
+	}
+	o := NewOrchestrator(trackerClient, workspaceManager, fakeRunner{}, func() *model.ServiceConfig { return cfg }, newTestWorkflow, func() RuntimeIdentity { return identity }, logger)
 	o.now = func() time.Time { return time.Date(2026, 3, 14, 10, 0, 0, 0, time.UTC) }
 	return o, trackerClient, workspaceManager
 }
@@ -171,6 +166,128 @@ func newIssue(id string, identifier string, state string) model.Issue {
 
 func ptrString(value string) *string {
 	return &value
+}
+
+func TestEnsureRecordLockedUsesRuntimeSourceIdentity(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	o.runtimeIdentityFn = func() RuntimeIdentity {
+		return RuntimeIdentity{
+			Compatibility: RuntimeCompatibility{
+				ActiveSource: "github-main",
+				SourceKind:   string(contract.SourceKindGitHubIssues),
+			},
+		}
+	}
+
+	issue := newIssue("42", "GH-42", "Todo")
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	o.mu.Unlock()
+
+	if record.Runtime.RecordID != "rec_github_issues_42" {
+		t.Fatalf("record_id = %q, want rec_github_issues_42", record.Runtime.RecordID)
+	}
+	if record.Runtime.SourceRef.SourceKind != contract.SourceKindGitHubIssues {
+		t.Fatalf("source_kind = %q, want %q", record.Runtime.SourceRef.SourceKind, contract.SourceKindGitHubIssues)
+	}
+	if record.Runtime.SourceRef.SourceIdentifier != "GH-42" {
+		t.Fatalf("source_identifier = %q, want GH-42", record.Runtime.SourceRef.SourceIdentifier)
+	}
+}
+
+func TestDiscoveryUsesRuntimeSourceIdentity(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	o.runtimeIdentityFn = func() RuntimeIdentity {
+		return RuntimeIdentity{
+			Compatibility: RuntimeCompatibility{
+				ActiveSource: "github-main",
+				SourceKind:   string(contract.SourceKindGitHubIssues),
+			},
+		}
+	}
+
+	discovery := o.Discovery()
+	if discovery.Source.Kind != contract.SourceKindGitHubIssues {
+		t.Fatalf("discovery source.kind = %q, want %q", discovery.Source.Kind, contract.SourceKindGitHubIssues)
+	}
+	if discovery.Source.Name != "github-main" {
+		t.Fatalf("discovery source.name = %q, want github-main", discovery.Source.Name)
+	}
+	if len(discovery.Capabilities.Sources) != 1 || discovery.Capabilities.Sources[0] != contract.SourceKindGitHubIssues {
+		t.Fatalf("discovery capabilities.sources = %#v, want [%q]", discovery.Capabilities.Sources, contract.SourceKindGitHubIssues)
+	}
+}
+
+func TestReconcileAwaitingMergeMovesMergedPRWithoutTerminalSourceToAwaitingIntervention(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "Todo")
+	trackerClient.issuesByID[issue.ID] = issue
+	o.prLookup = fakePRLookup{
+		refresh: func(context.Context, string, *PullRequestInfo) (*PullRequestInfo, error) {
+			return &PullRequestInfo{
+				Number:     7,
+				URL:        "https://example.invalid/pr/7",
+				State:      PullRequestStateMerged,
+				HeadBranch: "feature/abc-1",
+				BaseOwner:  "acme",
+				BaseRepo:   "repo",
+				HeadOwner:  "acme",
+			}, nil
+		},
+	}
+
+	o.moveToAwaitingMerge(issue.ID, issue.Identifier, issue.State, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier), "feature/abc-1", 0, 0, &PullRequestInfo{
+		Number:     7,
+		URL:        "https://example.invalid/pr/7",
+		State:      PullRequestStateOpen,
+		HeadBranch: "feature/abc-1",
+	}, nil)
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	snapshot := o.Snapshot()
+	if len(snapshot.Records) != 1 {
+		t.Fatalf("records = %#v, want 1 record", snapshot.Records)
+	}
+	record := snapshot.Records[0]
+	if record.Status != contract.IssueStatusAwaitingIntervention {
+		t.Fatalf("status = %q, want %q", record.Status, contract.IssueStatusAwaitingIntervention)
+	}
+	if record.Reason == nil || record.Reason.ReasonCode != contract.ReasonRecordBlockedAwaitingIntervention {
+		t.Fatalf("reason = %#v, want %q", record.Reason, contract.ReasonRecordBlockedAwaitingIntervention)
+	}
+	if got := record.Reason.Details["cause"]; got != string(model.ContinuationReasonMergedPRNotTerminal) {
+		t.Fatalf("reason.details[cause] = %v, want %q", got, model.ContinuationReasonMergedPRNotTerminal)
+	}
+	if got := record.Reason.Details["source_state"]; got != "Todo" {
+		t.Fatalf("reason.details[source_state] = %v, want Todo", got)
+	}
+	if record.DurableRefs.PullRequest == nil || record.DurableRefs.PullRequest.State != string(PullRequestStateMerged) {
+		t.Fatalf("pull_request = %#v, want merged ref", record.DurableRefs.PullRequest)
+	}
+}
+
+func TestClassifySuccessfulRunReturnsCompletedForMergedTerminalSource(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	o.prLookup = fakePRLookup{
+		find: func(context.Context, string, string) (*PullRequestInfo, error) {
+			return &PullRequestInfo{
+				Number:     9,
+				URL:        "https://example.invalid/pr/9",
+				State:      PullRequestStateMerged,
+				HeadBranch: "feature/abc-9",
+			}, nil
+		},
+	}
+
+	decision, err := o.classifySuccessfulRun(context.Background(), filepath.Join(o.currentConfig().WorkspaceRoot, "ABC-9"), "feature/abc-9", freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion)), "Done")
+	if err != nil {
+		t.Fatalf("classifySuccessfulRun() error = %v", err)
+	}
+	if decision.Disposition != DispositionCompleted {
+		t.Fatalf("decision.Disposition = %q, want %q", decision.Disposition, DispositionCompleted)
+	}
 }
 
 func TestOrchestratorStateDoesNotExposeLegacyBucketFields(t *testing.T) {
@@ -566,6 +683,53 @@ func TestWriteDurableRuntimeStateRoundTripJSON(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "\"recovering\"") || strings.Contains(string(raw), "\"retrying\"") {
 		t.Fatalf("runtime-ledger.json still contains legacy bucket keys: %s", string(raw))
+	}
+}
+
+func TestWriteDurableRuntimeStateOverwritesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime-ledger.json")
+	initial := durableRuntimeState{
+		Version: durableStateVersion,
+		SavedAt: time.Now().UTC(),
+		Records: []contract.IssueLedgerRecord{
+			{
+				RecordID:  "rec_linear_1",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1"},
+				Status:    contract.IssueStatusAwaitingIntervention,
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			},
+		},
+	}
+	updated := durableRuntimeState{
+		Version: durableStateVersion,
+		SavedAt: time.Now().UTC(),
+		Records: []contract.IssueLedgerRecord{
+			{
+				RecordID:  "rec_linear_2",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "2", SourceIdentifier: "ABC-2"},
+				Status:    contract.IssueStatusAwaitingMerge,
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			},
+		},
+	}
+
+	if err := writeDurableRuntimeState(path, initial, true); err != nil {
+		t.Fatalf("writeDurableRuntimeState(initial) error = %v", err)
+	}
+	if err := writeDurableRuntimeState(path, updated, true); err != nil {
+		t.Fatalf("writeDurableRuntimeState(updated) error = %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var loaded durableRuntimeState
+	if err := json.Unmarshal(raw, &loaded); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(loaded.Records) != 1 || loaded.Records[0].RecordID != "rec_linear_2" {
+		t.Fatalf("loaded records = %#v, want overwritten rec_linear_2", loaded.Records)
 	}
 }
 

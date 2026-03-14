@@ -43,8 +43,8 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 		},
 		Records: []contract.IssueRuntimeRecord{
 			{
-				RecordID:  "rec_linear_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1"},
+				RecordID:  "rec_github_issues_1",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceID: "1", SourceIdentifier: "GH-1"},
 				Status:    contract.IssueStatusActive,
 				UpdatedAt: "2026-03-14T00:00:00Z",
 				Observation: &contract.Observation{
@@ -74,13 +74,13 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 	}
 	updated.Records = []contract.IssueRuntimeRecord{
 		{
-			RecordID:  "rec_linear_1",
-			SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1"},
+			RecordID:  "rec_github_issues_1",
+			SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceID: "1", SourceIdentifier: "GH-1"},
 			Status:    contract.IssueStatusAwaitingMerge,
 			UpdatedAt: "2026-03-14T00:00:01Z",
 			Reason: func() *contract.Reason {
 				reason := contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{
-					"record_id": "rec_linear_1",
+					"record_id": "rec_github_issues_1",
 				})
 				return &reason
 			}(),
@@ -104,8 +104,8 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 			Version: "dev",
 		},
 		Source: contract.SourceDocument{
-			Kind: contract.SourceKindLinear,
-			Name: "linear-main",
+			Kind: contract.SourceKindGitHubIssues,
+			Name: "github-main",
 		},
 		ServiceMode:        contract.ServiceModeServing,
 		RecoveryInProgress: false,
@@ -113,7 +113,7 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 			EventProtocol:  "sse",
 			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
 			Notifications:  []string{"webhook"},
-			Sources:        []contract.SourceKind{contract.SourceKindLinear},
+			Sources:        []contract.SourceKind{contract.SourceKindGitHubIssues},
 		},
 		Reasons: []contract.Reason{},
 		Limits: contract.LimitDocument{
@@ -259,8 +259,8 @@ func TestMainIntegration_RunCommandExposesUnavailableServiceMode(t *testing.T) {
 			Version: "dev",
 		},
 		Source: contract.SourceDocument{
-			Kind: contract.SourceKindLinear,
-			Name: "linear-main",
+			Kind: contract.SourceKindGitHubIssues,
+			Name: "github-main",
 		},
 		ServiceMode:        contract.ServiceModeUnavailable,
 		RecoveryInProgress: false,
@@ -268,7 +268,7 @@ func TestMainIntegration_RunCommandExposesUnavailableServiceMode(t *testing.T) {
 			EventProtocol:  "sse",
 			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
 			Notifications:  []string{"webhook"},
-			Sources:        []contract.SourceKind{contract.SourceKindLinear},
+			Sources:        []contract.SourceKind{contract.SourceKindGitHubIssues},
 		},
 		Reasons: []contract.Reason{serviceReason},
 		Limits: contract.LimitDocument{

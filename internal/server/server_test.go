@@ -35,8 +35,8 @@ func TestDiscoveryEndpointReturnsFormalContract(t *testing.T) {
 	if payload.Instance.Name != "symphony" {
 		t.Fatalf("instance.name = %q, want symphony", payload.Instance.Name)
 	}
-	if payload.Source.Kind != contract.SourceKindLinear {
-		t.Fatalf("source.kind = %q, want %q", payload.Source.Kind, contract.SourceKindLinear)
+	if payload.Source.Kind != contract.SourceKindGitHubIssues {
+		t.Fatalf("source.kind = %q, want %q", payload.Source.Kind, contract.SourceKindGitHubIssues)
 	}
 	if payload.Capabilities.EventProtocol != "sse" {
 		t.Fatalf("event_protocol = %q, want sse", payload.Capabilities.EventProtocol)
@@ -96,11 +96,11 @@ func TestStateEndpointReturnsFormalSnapshot(t *testing.T) {
 	if payload.Counts.Total != 1 || payload.Counts.Active != 1 || payload.Counts.Completed != 1 {
 		t.Fatalf("counts = %#v, want total=1 active=1 completed=1", payload.Counts)
 	}
-	if len(payload.Records) != 1 || payload.Records[0].RecordID != "rec_linear_1" {
-		t.Fatalf("records = %#v, want rec_linear_1", payload.Records)
+	if len(payload.Records) != 1 || payload.Records[0].RecordID != "rec_github_issues_1" {
+		t.Fatalf("records = %#v, want rec_github_issues_1", payload.Records)
 	}
-	if len(payload.CompletedWindow.Records) != 1 || payload.CompletedWindow.Records[0].RecordID != "rec_linear_done" {
-		t.Fatalf("completed_window = %#v, want rec_linear_done", payload.CompletedWindow)
+	if len(payload.CompletedWindow.Records) != 1 || payload.CompletedWindow.Records[0].RecordID != "rec_github_issues_done" {
+		t.Fatalf("completed_window = %#v, want rec_github_issues_done", payload.CompletedWindow)
 	}
 }
 
@@ -200,7 +200,7 @@ func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
 	})}
 	next.Records[0].Status = contract.IssueStatusAwaitingMerge
 	next.Records[0].Reason = ptrReason(contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{
-		"record_id": "rec_linear_1",
+		"record_id": "rec_github_issues_1",
 	}))
 	next.Records[0].UpdatedAt = "2026-03-14T00:00:05Z"
 	runtime.publish(next)
@@ -216,8 +216,8 @@ func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
 	if secondEnvelope.ServiceMode != contract.ServiceModeDegraded {
 		t.Fatalf("service_mode = %q, want %q", secondEnvelope.ServiceMode, contract.ServiceModeDegraded)
 	}
-	if len(secondEnvelope.RecordIDs) == 0 || secondEnvelope.RecordIDs[0] != "rec_linear_1" {
-		t.Fatalf("record_ids = %#v, want rec_linear_1", secondEnvelope.RecordIDs)
+	if len(secondEnvelope.RecordIDs) == 0 || secondEnvelope.RecordIDs[0] != "rec_github_issues_1" {
+		t.Fatalf("record_ids = %#v, want rec_github_issues_1", secondEnvelope.RecordIDs)
 	}
 	if secondEnvelope.Reason == nil || secondEnvelope.Reason.ReasonCode != contract.ReasonServiceDegradedNotificationDelivery {
 		t.Fatalf("reason = %#v, want %q", secondEnvelope.Reason, contract.ReasonServiceDegradedNotificationDelivery)
@@ -378,8 +378,8 @@ func sampleDiscovery() orchestrator.DiscoveryDocument {
 			Version: "dev",
 		},
 		Source: contract.SourceDocument{
-			Kind: contract.SourceKindLinear,
-			Name: "linear-main",
+			Kind: contract.SourceKindGitHubIssues,
+			Name: "github-main",
 		},
 		ServiceMode:        contract.ServiceModeServing,
 		RecoveryInProgress: false,
@@ -387,7 +387,7 @@ func sampleDiscovery() orchestrator.DiscoveryDocument {
 			EventProtocol:  "sse",
 			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
 			Notifications:  []string{"slack", "webhook"},
-			Sources:        []contract.SourceKind{contract.SourceKindLinear},
+			Sources:        []contract.SourceKind{contract.SourceKindGitHubIssues},
 		},
 		Reasons: []contract.Reason{},
 		Limits: contract.LimitDocument{
@@ -409,8 +409,8 @@ func sampleSnapshot() orchestrator.Snapshot {
 		},
 		Records: []contract.IssueRuntimeRecord{
 			{
-				RecordID:  "rec_linear_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "1", SourceIdentifier: "ABC-1", URL: "https://linear.app/issue/ABC-1"},
+				RecordID:  "rec_github_issues_1",
+				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceID: "1", SourceIdentifier: "GH-1", URL: "https://github.example/issues/1"},
 				Status:    contract.IssueStatusActive,
 				UpdatedAt: "2026-03-14T00:00:00Z",
 				Observation: &contract.Observation{
@@ -429,8 +429,8 @@ func sampleSnapshot() orchestrator.Snapshot {
 			Limit: 100,
 			Records: []contract.IssueRuntimeRecord{
 				{
-					RecordID:  "rec_linear_done",
-					SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceID: "done", SourceIdentifier: "DONE-1"},
+					RecordID:  "rec_github_issues_done",
+					SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceID: "done", SourceIdentifier: "GH-2"},
 					Status:    contract.IssueStatusCompleted,
 					UpdatedAt: "2026-03-14T00:00:01Z",
 					DurableRefs: contract.DurableRefs{
@@ -440,7 +440,7 @@ func sampleSnapshot() orchestrator.Snapshot {
 						Outcome:     contract.ResultOutcomeSucceeded,
 						Summary:     "completed",
 						CompletedAt: "2026-03-14T00:00:01Z",
-						Details:     map[string]any{"record_id": "rec_linear_done"},
+						Details:     map[string]any{"record_id": "rec_github_issues_done"},
 					},
 				},
 			},

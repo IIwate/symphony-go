@@ -161,8 +161,6 @@ func TestResolveActiveWorkflowMappingTable(t *testing.T) {
     command: codex app-server
   server:
     port: 8080
-  orchestrator:
-    auto_close_on_pr: false
 selection:
   dispatch_flow: implement
   enabled_sources:
@@ -583,7 +581,7 @@ func TestWatchIgnoresEnvLocalChange(t *testing.T) {
 	}
 }
 
-func TestWatchIgnoresSessionStateChange(t *testing.T) {
+func TestWatchIgnoresRuntimeLedgerChange(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -596,11 +594,33 @@ func TestWatchIgnoresSessionStateChange(t *testing.T) {
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	writeLoaderFile(t, filepath.Join(root, "local", "session-state.json"), "{\"version\":1}\n")
+	writeLoaderFile(t, filepath.Join(root, "local", "runtime-ledger.json"), "{\"version\":1}\n")
 
 	select {
 	case definition := <-updates:
-		t.Fatalf("unexpected update received for session-state.json change: %+v", definition)
+		t.Fatalf("unexpected update received for runtime-ledger.json change: %+v", definition)
+	case <-time.After(750 * time.Millisecond):
+	}
+}
+
+func TestWatchIgnoresLocalRuntimeScratchFileChange(t *testing.T) {
+	root := writeLoaderFixture(t, loaderFixtureOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	updates := make(chan *model.AutomationDefinition, 1)
+	if err := Watch(ctx, root, "", func(def *model.AutomationDefinition) {
+		updates <- def
+	}); err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	writeLoaderFile(t, filepath.Join(root, "local", "worker-runtime.json"), "{\"running\":true}\n")
+
+	select {
+	case definition := <-updates:
+		t.Fatalf("unexpected update received for local runtime scratch file: %+v", definition)
 	case <-time.After(750 * time.Millisecond):
 	}
 }

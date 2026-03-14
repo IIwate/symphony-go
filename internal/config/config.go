@@ -99,11 +99,6 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 		cfg.MaxConcurrentAgentsByState = normalizePositiveIntMap(byState)
 	}
 
-	orchestrator := getMap(configMap, "orchestrator")
-	if autoClose, ok := getBool(orchestrator, "auto_close_on_pr"); ok {
-		cfg.OrchestratorAutoCloseOnPR = autoClose
-	}
-
 	codex := getMap(configMap, "codex")
 	if command := strings.TrimSpace(getString(codex, "command", "")); command != "" {
 		cfg.CodexCommand = command
@@ -329,7 +324,6 @@ func defaultServiceConfig() *model.ServiceConfig {
 		MaxTurns:                         20,
 		MaxRetryBackoffMS:                300000,
 		MaxConcurrentAgentsByState:       map[string]int{},
-		OrchestratorAutoCloseOnPR:        true,
 		CodexCommand:                     "codex app-server",
 		CodexApprovalPolicy:              "never",
 		CodexThreadSandbox:               "workspace-write",
@@ -341,7 +335,7 @@ func defaultServiceConfig() *model.ServiceConfig {
 		SessionPersistence: model.SessionPersistenceConfig{
 			Kind: model.SessionPersistenceKindFile,
 			File: model.SessionPersistenceFileConfig{
-				Path:            filepath.Join(".", "local", "session-state.json"),
+				Path:            filepath.Join(".", "local", "runtime-ledger.json"),
 				FlushIntervalMS: 1000,
 				FsyncOnCritical: true,
 			},

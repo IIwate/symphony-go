@@ -90,34 +90,10 @@ const issueStatesByIDsQuery = `query IssueStatesByIDs($ids: [ID!]!, $after: Stri
   }
 }`
 
-const issueTeamStatesQuery = `query IssueTeamStates($id: String!) {
-  issue(id: $id) {
-    team {
-      states {
-        nodes {
-          id
-          name
-          type
-        }
-      }
-    }
-  }
-}`
-
-const issueUpdateStateMutation = `mutation MoveIssueToState($id: String!, $stateId: String!) {
-  issueUpdate(id: $id, input: { stateId: $stateId }) {
-    success
-  }
-}`
-
 type Client interface {
 	FetchCandidateIssues(ctx context.Context) ([]model.Issue, error)
 	FetchIssuesByStates(ctx context.Context, states []string) ([]model.Issue, error)
 	FetchIssueStatesByIDs(ctx context.Context, ids []string) ([]model.Issue, error)
-}
-
-type IssueCompleter interface {
-	CompleteIssue(ctx context.Context, issueID string) error
 }
 
 type LinearClient struct {
@@ -196,69 +172,6 @@ func (c *LinearClient) FetchIssueStatesByIDs(ctx context.Context, ids []string) 
 	return c.fetchIssues(ctx, issueStatesByIDsQuery, map[string]any{
 		"ids": ids,
 	})
-}
-
-func (c *LinearClient) CompleteIssue(ctx context.Context, issueID string) error {
-	rawPayload, err := c.executeGraphQL(ctx, issueTeamStatesQuery, map[string]any{
-		"id": issueID,
-	})
-	if err != nil {
-		return err
-	}
-
-	var statePayload issueTeamStatesPayload
-	if err := json.Unmarshal(rawPayload, &statePayload); err != nil {
-		return model.NewTrackerError(model.ErrLinearUnknownPayload, "decode issue team states payload", err)
-	}
-	if statePayload.Issue == nil || statePayload.Issue.Team == nil || statePayload.Issue.Team.States == nil {
-		return model.NewTrackerError(model.ErrLinearUnknownPayload, "issue team states payload is missing", nil)
-	}
-
-	stateID := ""
-	for _, state := range statePayload.Issue.Team.States.Nodes {
-		if strings.TrimSpace(state.ID) == "" {
-			continue
-		}
-		if model.NormalizeState(state.Type) == "completed" {
-			stateID = state.ID
-			break
-		}
-	}
-	if stateID == "" {
-		for _, state := range statePayload.Issue.Team.States.Nodes {
-			if strings.TrimSpace(state.ID) == "" {
-				continue
-			}
-			if model.NormalizeState(state.Name) == "done" {
-				stateID = state.ID
-				break
-			}
-		}
-	}
-	if stateID == "" {
-		return model.NewTrackerError(model.ErrLinearStateNotFound, "no Linear completed workflow state found", nil)
-	}
-
-	rawPayload, err = c.executeGraphQL(ctx, issueUpdateStateMutation, map[string]any{
-		"id":      issueID,
-		"stateId": stateID,
-	})
-	if err != nil {
-		return err
-	}
-
-	var updatePayload issueUpdatePayload
-	if err := json.Unmarshal(rawPayload, &updatePayload); err != nil {
-		return model.NewTrackerError(model.ErrLinearUnknownPayload, "decode issue update payload", err)
-	}
-	if updatePayload.IssueUpdate == nil {
-		return model.NewTrackerError(model.ErrLinearUnknownPayload, "issueUpdate payload is missing", nil)
-	}
-	if !updatePayload.IssueUpdate.Success {
-		return model.NewTrackerError(model.ErrLinearTransitionFailed, "Linear issue transition returned success=false", nil)
-	}
-
-	return nil
 }
 
 func (c *LinearClient) fetchIssues(ctx context.Context, query string, baseVariables map[string]any) ([]model.Issue, error) {
@@ -531,36 +444,6 @@ type graphQLResponse struct {
 
 type graphQLError struct {
 	Message string `json:"message"`
-}
-
-type issueTeamStatesPayload struct {
-	Issue *issueTeamStatesNode `json:"issue"`
-}
-
-type issueTeamStatesNode struct {
-	Team *teamStatesNode `json:"team"`
-}
-
-type teamStatesNode struct {
-	States *workflowStateConnection `json:"states"`
-}
-
-type workflowStateConnection struct {
-	Nodes []workflowStateNode `json:"nodes"`
-}
-
-type workflowStateNode struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Type string `json:"type"`
-}
-
-type issueUpdatePayload struct {
-	IssueUpdate *issueUpdateResult `json:"issueUpdate"`
-}
-
-type issueUpdateResult struct {
-	Success bool `json:"success"`
 }
 
 type issuesPayload struct {

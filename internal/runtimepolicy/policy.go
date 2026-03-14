@@ -174,8 +174,6 @@ func firstRestartRequiredConfigChange(currentCfg *model.ServiceConfig, newCfg *m
 		return "runtime.hooks.timeout_ms"
 	case currentCfg.MaxTurns != newCfg.MaxTurns:
 		return "runtime.agent.max_turns"
-	case currentCfg.OrchestratorAutoCloseOnPR != newCfg.OrchestratorAutoCloseOnPR:
-		return "runtime.orchestrator.auto_close_on_pr"
 	case currentCfg.CodexCommand != newCfg.CodexCommand:
 		return "runtime.codex.command"
 	case currentCfg.CodexApprovalPolicy != newCfg.CodexApprovalPolicy:

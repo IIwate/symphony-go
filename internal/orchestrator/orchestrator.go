@@ -94,13 +94,10 @@ type SuccessfulRunDisposition string
 
 const (
 	DispositionCompleted            SuccessfulRunDisposition = "completed"
-	DispositionTryCompleteMergedPR  SuccessfulRunDisposition = "try_complete_merged_pr"
 	DispositionAwaitingMerge        SuccessfulRunDisposition = "awaiting_merge"
 	DispositionAwaitingIntervention SuccessfulRunDisposition = "awaiting_intervention"
 	DispositionContinuation         SuccessfulRunDisposition = "continuation"
 )
-
-const maxPostMergeCloseRetries = 3
 
 type SuccessfulRunDecision struct {
 	Disposition     SuccessfulRunDisposition
@@ -182,7 +179,6 @@ type Orchestrator struct {
 	pendingCleanup              map[string]string
 	pendingRecovery             map[string]uint64
 	pendingLaunch               map[string]uint64
-	pendingPostMergeTransitions map[string]uint64
 	pendingActions              map[uint64][]func()
 	maxCompleted                int
 	startedAt                   time.Time
@@ -240,7 +236,6 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		pendingCleanup:              map[string]string{},
 		pendingRecovery:             map[string]uint64{},
 		pendingLaunch:               map[string]uint64{},
-		pendingPostMergeTransitions: map[string]uint64{},
 		pendingActions:              map[uint64][]func(){},
 		maxCompleted:                defaultMaxCompletedEntries,
 		startedAt:                   time.Now().UTC(),
@@ -341,23 +336,31 @@ func cloneServiceReasons(reasons []contract.Reason) []contract.Reason {
 	return cloned
 }
 
-func recordIDForIssue(issue *model.Issue) contract.RecordID {
+func recordIDForSource(sourceKind contract.SourceKind, sourceID string) contract.RecordID {
+	token := strings.TrimSpace(string(sourceKind))
+	if token == "" {
+		token = "source"
+	}
+	return contract.RecordID(fmt.Sprintf("rec_%s_%s", token, strings.TrimSpace(sourceID)))
+}
+
+func recordIDForIssue(sourceKind contract.SourceKind, issue *model.Issue) contract.RecordID {
 	if issue == nil {
 		return ""
 	}
-	return contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issue.ID)))
+	return recordIDForSource(sourceKind, issue.ID)
 }
 
-func sourceRefForIssue(issue *model.Issue) contract.SourceRef {
+func sourceRefForIssue(sourceKind contract.SourceKind, issue *model.Issue) contract.SourceRef {
 	if issue == nil {
-		return contract.SourceRef{SourceKind: contract.SourceKindLinear}
+		return contract.SourceRef{SourceKind: sourceKind}
 	}
 	url := ""
 	if issue.URL != nil {
 		url = strings.TrimSpace(*issue.URL)
 	}
 	return contract.SourceRef{
-		SourceKind:       contract.SourceKindLinear,
+		SourceKind:       sourceKind,
 		SourceID:         strings.TrimSpace(issue.ID),
 		SourceIdentifier: strings.TrimSpace(issue.Identifier),
 		URL:              url,
@@ -377,6 +380,21 @@ func cloneIssueRecord(record *model.IssueRecord) *model.IssueRecord {
 	copyValue.RetryTimer = nil
 	copyValue.WorkerCancel = nil
 	return &copyValue
+}
+
+func (o *Orchestrator) currentSourceKind() contract.SourceKind {
+	return discoverySourceKind(o.currentRuntimeIdentity())
+}
+
+func (o *Orchestrator) ensureRecordIdentityLocked(record *model.IssueRecord, issueID string, identifier string) {
+	if record == nil {
+		return
+	}
+	sourceKind := o.currentSourceKind()
+	record.Runtime.RecordID = recordIDForSource(sourceKind, issueID)
+	record.Runtime.SourceRef.SourceKind = sourceKind
+	record.Runtime.SourceRef.SourceID = strings.TrimSpace(issueID)
+	record.Runtime.SourceRef.SourceIdentifier = strings.TrimSpace(identifier)
 }
 
 func currentAttempt(record *model.IssueRecord) int {
@@ -455,11 +473,12 @@ func isAwaitingIntervention(record *model.IssueRecord) bool {
 	return record != nil && record.Runtime.Status == contract.IssueStatusAwaitingIntervention
 }
 
-func issueRecordFromIssue(issue model.Issue, ledgerPath string) *model.IssueRecord {
+func (o *Orchestrator) issueRecordFromIssue(issue model.Issue, ledgerPath string) *model.IssueRecord {
+	sourceKind := o.currentSourceKind()
 	record := &model.IssueRecord{
 		Runtime: contract.IssueRuntimeRecord{
-			RecordID:  recordIDForIssue(&issue),
-			SourceRef: sourceRefForIssue(&issue),
+			RecordID:  recordIDForIssue(sourceKind, &issue),
+			SourceRef: sourceRefForIssue(sourceKind, &issue),
 			Status:    contract.IssueStatusActive,
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 			DurableRefs: contract.DurableRefs{
@@ -475,13 +494,14 @@ func issueRecordFromIssue(issue model.Issue, ledgerPath string) *model.IssueReco
 func (o *Orchestrator) ensureRecordLocked(issue model.Issue) *model.IssueRecord {
 	record := o.state.Records[issue.ID]
 	if record == nil {
-		record = issueRecordFromIssue(issue, ledgerPathForConfig(o.currentConfig()))
+		record = o.issueRecordFromIssue(issue, ledgerPathForConfig(o.currentConfig()))
 		o.state.Records[issue.ID] = record
 	}
 	record.LastKnownIssue = model.CloneIssue(&issue)
 	record.LastKnownIssueState = strings.TrimSpace(issue.State)
-	record.Runtime.SourceRef = sourceRefForIssue(&issue)
-	record.Runtime.RecordID = recordIDForIssue(&issue)
+	sourceKind := o.currentSourceKind()
+	record.Runtime.SourceRef = sourceRefForIssue(sourceKind, &issue)
+	record.Runtime.RecordID = recordIDForIssue(sourceKind, &issue)
 	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
 	return record
 }
@@ -751,9 +771,6 @@ func (o *Orchestrator) Discovery() DiscoveryDocument {
 	identity := o.currentRuntimeIdentity()
 	sourceKind := discoverySourceKind(identity)
 	sourceName := strings.TrimSpace(identity.Compatibility.ActiveSource)
-	if sourceName == "" {
-		sourceName = "linear-main"
-	}
 
 	return contract.DiscoveryDocument{
 		APIVersion: contract.APIVersionV1,
@@ -772,7 +789,7 @@ func (o *Orchestrator) Discovery() DiscoveryDocument {
 			EventProtocol:  "sse",
 			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
 			Notifications:  notificationCapabilityKinds(o.currentConfig()),
-			Sources:        []contract.SourceKind{sourceKind},
+			Sources:        discoveryCapabilitySources(sourceKind),
 		},
 		Reasons: cloneServiceReasons(snapshot.Reasons),
 		Limits: contract.LimitDocument{
@@ -1253,7 +1270,7 @@ func (o *Orchestrator) currentBranch(ctx context.Context, workspacePath string) 
 	return trimmed, nil
 }
 
-func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath string, finalBranch string, dispatch *model.DispatchContext, autoCloseOnPR bool, issueState string) (*SuccessfulRunDecision, error) {
+func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath string, finalBranch string, dispatch *model.DispatchContext, issueState string) (*SuccessfulRunDecision, error) {
 	contract := normalizeCompletionContract(model.CompletionContract{
 		Mode:        model.CompletionModeNone,
 		OnMissingPR: dispatchCompletionAction(dispatch, "missing"),
@@ -1299,15 +1316,15 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 			FinalBranch:     branch,
 		}, nil
 	case PullRequestStateMerged:
-		if autoCloseOnPR {
+		if o.isTerminalState(issueState, o.currentConfig()) {
 			return &SuccessfulRunDecision{
-				Disposition:     DispositionTryCompleteMergedPR,
+				Disposition:     DispositionCompleted,
 				ExpectedOutcome: contract.Mode,
 				PR:              clonePullRequestInfo(pr),
 				FinalBranch:     branch,
 			}, nil
 		}
-		reason := model.ContinuationReasonMergedPRAutoCloseOff
+		reason := model.ContinuationReasonMergedPRNotTerminal
 		return &SuccessfulRunDecision{
 			Disposition:     DispositionAwaitingIntervention,
 			Reason:          &reason,
@@ -1597,7 +1614,8 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 		if o.isActiveState(issue.State, cfg) {
 			entry.LastKnownIssue = model.CloneIssue(&issue)
 			entry.LastKnownIssueState = strings.TrimSpace(issue.State)
-			entry.Runtime.SourceRef = sourceRefForIssue(&issue)
+			entry.Runtime.SourceRef = sourceRefForIssue(o.currentSourceKind(), &issue)
+			entry.Runtime.RecordID = recordIDForIssue(o.currentSourceKind(), &issue)
 			continue
 		}
 		o.terminateRunningLocked(ctx, issueID, false, false, "")
@@ -1618,9 +1636,6 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 	pending := make(map[string]*model.IssueRecord, len(o.awaitingMergeRecords))
 	for issueID, entry := range o.awaitingMergeRecords {
 		if entry == nil {
-			continue
-		}
-		if _, waitingForAck := o.pendingPostMergeTransitions[issueID]; waitingForAck {
 			continue
 		}
 		pending[issueID] = cloneIssueRecord(entry)
@@ -1663,7 +1678,8 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				if current != nil && current.LastKnownIssueState != issue.State {
 					current.LastKnownIssue = model.CloneIssue(&issue)
 					current.LastKnownIssueState = issue.State
-					current.Runtime.SourceRef = sourceRefForIssue(&issue)
+					current.Runtime.SourceRef = sourceRefForIssue(o.currentSourceKind(), &issue)
+					current.Runtime.RecordID = recordIDForIssue(o.currentSourceKind(), &issue)
 					o.commitStateLocked(true)
 				}
 				o.mu.Unlock()
@@ -1748,10 +1764,11 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 			}
 			o.mu.Unlock()
 		case PullRequestStateMerged:
-			if entry.RetryDueAt != nil && entry.RetryDueAt.After(o.now().UTC()) {
+			issue, ok := byID[issueID]
+			if !ok {
 				continue
 			}
-			o.tryCompleteMergedPullRequest(ctx, issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, entry.LastKnownIssueState, pr)
+			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonMergedPRNotTerminal), issue.State, pr)
 		case PullRequestStateClosed:
 			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonClosedUnmergedPR), entry.LastKnownIssueState, pr)
 		default:
@@ -2098,17 +2115,12 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 	if record == nil {
 		record = &model.IssueRecord{
 			Runtime: contract.IssueRuntimeRecord{
-				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
-				SourceRef: contract.SourceRef{
-					SourceKind:       contract.SourceKindLinear,
-					SourceID:         strings.TrimSpace(issueID),
-					SourceIdentifier: strings.TrimSpace(identifier),
-				},
 				DurableRefs: contract.DurableRefs{
 					LedgerPath: ledgerPathForConfig(o.currentConfig()),
 				},
 			},
 		}
+		o.ensureRecordIdentityLocked(record, issueID, identifier)
 		o.state.Records[issueID] = record
 	}
 	if existing := o.retryRecords[issueID]; existing != nil && existing.RetryTimer != nil {
@@ -2142,6 +2154,7 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 	record.RetryDueAt = &dueAt
 	record.RetryTimer = timer
 	record.Dispatch = retryDispatch
+	o.ensureRecordIdentityLocked(record, issueID, identifier)
 	o.setRecordStatusLocked(record, contract.IssueStatusRetryScheduled, &contract.Reason{
 		ReasonCode: contract.ReasonRecordBlockedRetryScheduled,
 		Category:   contract.CategoryRecord,
@@ -2295,11 +2308,13 @@ func (o *Orchestrator) publicServiceStateLocked() (contract.ServiceMode, bool, [
 }
 
 func discoverySourceKind(identity RuntimeIdentity) contract.SourceKind {
-	kind := contract.SourceKind(model.NormalizeState(identity.Compatibility.SourceKind))
-	if kind.IsValid() {
+	if kind := contract.SourceKind(model.NormalizeState(identity.Compatibility.SourceKind)); kind.IsValid() {
 		return kind
 	}
-	return contract.SourceKindLinear
+	if kind := contract.SourceKind(model.NormalizeState(identity.Compatibility.TrackerKind)); kind.IsValid() {
+		return kind
+	}
+	return ""
 }
 
 func discoveryInstanceID(identity RuntimeIdentity) string {
@@ -2330,6 +2345,13 @@ func notificationCapabilityKinds(cfg *model.ServiceConfig) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func discoveryCapabilitySources(sourceKind contract.SourceKind) []contract.SourceKind {
+	if !sourceKind.IsValid() {
+		return []contract.SourceKind{}
+	}
+	return []contract.SourceKind{sourceKind}
 }
 
 func (o *Orchestrator) publishSnapshotLocked() {
@@ -2485,17 +2507,12 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	if record == nil {
 		record = &model.IssueRecord{
 			Runtime: contract.IssueRuntimeRecord{
-				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
-				SourceRef: contract.SourceRef{
-					SourceKind:       contract.SourceKindLinear,
-					SourceID:         strings.TrimSpace(issueID),
-					SourceIdentifier: strings.TrimSpace(identifier),
-				},
 				DurableRefs: contract.DurableRefs{
 					LedgerPath: ledgerPathForConfig(o.currentConfig()),
 				},
 			},
 		}
+		o.ensureRecordIdentityLocked(record, issueID, identifier)
 		o.state.Records[issueID] = record
 	}
 	record.RetryAttempt = retryAttempt
@@ -2503,7 +2520,7 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	record.LastKnownIssueState = issueState
 	record.NeedsRecovery = false
 	record.RetryDueAt = nil
-	record.Runtime.SourceRef.SourceIdentifier = identifier
+	o.ensureRecordIdentityLocked(record, issueID, identifier)
 	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
 	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
 	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
@@ -2553,17 +2570,12 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	if record == nil {
 		record = &model.IssueRecord{
 			Runtime: contract.IssueRuntimeRecord{
-				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
-				SourceRef: contract.SourceRef{
-					SourceKind:       contract.SourceKindLinear,
-					SourceID:         strings.TrimSpace(issueID),
-					SourceIdentifier: strings.TrimSpace(identifier),
-				},
 				DurableRefs: contract.DurableRefs{
 					LedgerPath: ledgerPathForConfig(o.currentConfig()),
 				},
 			},
 		}
+		o.ensureRecordIdentityLocked(record, issueID, identifier)
 		o.state.Records[issueID] = record
 	}
 	reasonCode := contract.ReasonRecordBlockedAwaitingIntervention
@@ -2574,7 +2586,7 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	record.StallCount = stallCount
 	record.LastKnownIssueState = issueState
 	record.NeedsRecovery = false
-	record.Runtime.SourceRef.SourceIdentifier = identifier
+	o.ensureRecordIdentityLocked(record, issueID, identifier)
 	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
 	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
 	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
@@ -2593,10 +2605,11 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 			"cause":            reason,
 			"expected_outcome": string(expectedOutcome),
 			"previous_branch":  branch,
+			"source_state":     issueState,
 		},
 	}, &contract.Observation{
 		Running: false,
-		Summary: "operator intervention required",
+		Summary: "awaiting external intervention",
 	})
 	o.reindexRecordLocked(issueID, record)
 	delete(o.pendingRecovery, issueID)
@@ -2611,238 +2624,6 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	if version == 0 {
 		o.emitNotification(event)
 	}
-}
-
-func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo, errorText string, retryable bool) bool {
-	if !retryable {
-		o.moveToAwaitingIntervention(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, model.CompletionModePullRequest, "post_merge_transition_failed", issueState, pr)
-		return false
-	}
-
-	o.mu.Lock()
-	if o.isProtectedLocked() {
-		o.mu.Unlock()
-		return false
-	}
-	current := o.state.Records[issueID]
-	if current == nil {
-		current = &model.IssueRecord{
-			Runtime: contract.IssueRuntimeRecord{
-				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
-				SourceRef: contract.SourceRef{
-					SourceKind:       contract.SourceKindLinear,
-					SourceID:         strings.TrimSpace(issueID),
-					SourceIdentifier: strings.TrimSpace(identifier),
-				},
-				DurableRefs: contract.DurableRefs{
-					LedgerPath: ledgerPathForConfig(o.currentConfig()),
-				},
-			},
-		}
-		o.state.Records[issueID] = current
-	}
-	postMergeRetryCount := 1
-	if current.Runtime.Reason != nil {
-		if value, ok := current.Runtime.Reason.Details["post_merge_retry_count"].(int); ok {
-			postMergeRetryCount = value + 1
-		}
-		if value, ok := current.Runtime.Reason.Details["post_merge_retry_count"].(float64); ok {
-			postMergeRetryCount = int(value) + 1
-		}
-	}
-	if postMergeRetryCount > maxPostMergeCloseRetries {
-		o.mu.Unlock()
-		o.moveToAwaitingIntervention(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, model.CompletionModePullRequest, "post_merge_transition_failed", issueState, pr)
-		return false
-	}
-
-	nextRetryAt := o.now().UTC().Add(postMergeRetryDelay(postMergeRetryCount, o.currentConfig().MaxRetryBackoffMS))
-	current.RetryAttempt = retryAttempt
-	current.StallCount = stallCount
-	current.LastKnownIssueState = issueState
-	current.Runtime.SourceRef.SourceIdentifier = identifier
-	current.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
-	current.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
-	current.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
-	current.RetryDueAt = &nextRetryAt
-	if pr != nil {
-		current.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
-			Number: pr.Number,
-			URL:    pr.URL,
-			State:  string(pr.State),
-		}
-	}
-	o.setRecordStatusLocked(current, contract.IssueStatusAwaitingMerge, &contract.Reason{
-		ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
-		Category:   contract.CategoryRecord,
-		Details: map[string]any{
-			"record_id":                current.Runtime.RecordID,
-			"last_error":               errorText,
-			"post_merge_retry_count":   postMergeRetryCount,
-			"next_post_merge_retry_at": nextRetryAt.Format(time.RFC3339Nano),
-		},
-	}, &contract.Observation{
-		Running: false,
-		Summary: "awaiting post-merge retry",
-	})
-	if pr != nil && current.Runtime.Reason != nil {
-		current.Runtime.Reason.Details["pr_number"] = pr.Number
-		current.Runtime.Reason.Details["pr_state"] = pr.State
-		current.Runtime.Reason.Details["pr_base_owner"] = pr.BaseOwner
-		current.Runtime.Reason.Details["pr_base_repo"] = pr.BaseRepo
-		current.Runtime.Reason.Details["pr_head_owner"] = pr.HeadOwner
-	}
-	o.reindexRecordLocked(issueID, current)
-	delete(o.pendingRecovery, issueID)
-	o.commitStateLocked(true)
-	o.mu.Unlock()
-	return false
-}
-
-func postMergeRetryDelay(attempt int, maxBackoffMS int) time.Duration {
-	maxBackoff := maxInt(maxBackoffMS, 10000)
-	base := math.Min(float64(10000)*math.Pow(2, float64(maxInt(attempt, 1)-1)), float64(maxBackoff))
-	return time.Duration(base) * time.Millisecond
-}
-
-func isRetryablePostMergeError(err error) bool {
-	switch {
-	case err == nil:
-		return false
-	case errors.Is(err, context.Canceled):
-		return false
-	case errors.Is(err, context.DeadlineExceeded):
-		return true
-	case errors.Is(err, model.ErrLinearAPIRequest):
-		return true
-	case errors.Is(err, model.ErrLinearAPIStatus):
-		return true
-	default:
-		return false
-	}
-}
-
-func (o *Orchestrator) stageMergedPullRequestCompletion(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo, action func()) (uint64, bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.isProtectedLocked() {
-		return 0, false
-	}
-	if _, waitingForAck := o.pendingPostMergeTransitions[issueID]; waitingForAck {
-		return 0, true
-	}
-
-	current := o.state.Records[issueID]
-	if current == nil {
-		current = &model.IssueRecord{
-			Runtime: contract.IssueRuntimeRecord{
-				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
-				SourceRef: contract.SourceRef{
-					SourceKind:       contract.SourceKindLinear,
-					SourceID:         strings.TrimSpace(issueID),
-					SourceIdentifier: strings.TrimSpace(identifier),
-				},
-				DurableRefs: contract.DurableRefs{
-					LedgerPath: ledgerPathForConfig(o.currentConfig()),
-				},
-			},
-		}
-		o.state.Records[issueID] = current
-	}
-	current.RetryAttempt = retryAttempt
-	current.StallCount = stallCount
-	current.LastKnownIssueState = issueState
-	current.NeedsRecovery = false
-	current.RetryDueAt = nil
-	current.Runtime.SourceRef.SourceIdentifier = identifier
-	current.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
-	current.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
-	current.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
-	if pr != nil {
-		current.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
-			Number: pr.Number,
-			URL:    pr.URL,
-			State:  string(pr.State),
-		}
-	}
-	o.setRecordStatusLocked(current, contract.IssueStatusAwaitingMerge, &contract.Reason{
-		ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
-		Category:   contract.CategoryRecord,
-		Details: map[string]any{
-			"record_id": current.Runtime.RecordID,
-		},
-	}, &contract.Observation{
-		Running: false,
-		Summary: "awaiting pull request merge",
-	})
-	if pr != nil && current.Runtime.Reason != nil {
-		current.Runtime.Reason.Details["pr_number"] = pr.Number
-		current.Runtime.Reason.Details["pr_state"] = pr.State
-		current.Runtime.Reason.Details["pr_base_owner"] = pr.BaseOwner
-		current.Runtime.Reason.Details["pr_base_repo"] = pr.BaseRepo
-		current.Runtime.Reason.Details["pr_head_owner"] = pr.HeadOwner
-	}
-	o.reindexRecordLocked(issueID, current)
-	delete(o.pendingRecovery, issueID)
-	version := o.commitStateLocked(true)
-	if version > 0 && action != nil {
-		o.pendingPostMergeTransitions[issueID] = version
-		o.schedulePersistedActionLocked(version, action)
-	}
-	return version, false
-}
-
-func (o *Orchestrator) finishMergedPullRequestCompletion(ctx context.Context, issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo) bool {
-	completer, ok := o.tracker.(tracker.IssueCompleter)
-	if !ok {
-		o.logger.Warn("tracker does not support issue completion", "issue_id", issueID, "issue_identifier", identifier, "branch", branch)
-		o.moveToAwaitingIntervention(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, model.CompletionModePullRequest, "post_merge_transition_unsupported", issueState, pr)
-		return false
-	}
-	if err := completer.CompleteIssue(ctx, issueID); err != nil {
-		errorText := fmt.Sprintf("post-merge transition failed: %s", err.Error())
-		o.logger.Warn("post-merge transition failed", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "error", err.Error())
-		return o.handleFailedPostMergeTransition(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, pr, errorText, isRetryablePostMergeError(err))
-	}
-
-	issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{issueID})
-	cfg := o.currentConfig()
-	if err == nil && len(issues) > 0 {
-		issueState = issues[0].State
-		if o.isTerminalState(issues[0].State, cfg) {
-			o.completeSuccessfulIssue(ctx, issueID, identifier)
-			return true
-		}
-	}
-	if err != nil {
-		errorText := fmt.Sprintf("post-merge state refresh failed: %s", err.Error())
-		return o.handleFailedPostMergeTransition(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, pr, errorText, isRetryablePostMergeError(err))
-	}
-	return o.handleFailedPostMergeTransition(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, pr, "post-merge transition did not reach terminal state", true)
-}
-
-func (o *Orchestrator) tryCompleteMergedPullRequest(ctx context.Context, issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, issueState string, pr *PullRequestInfo) bool {
-	var version uint64
-	copyPR := clonePullRequestInfo(pr)
-	action := func() {
-		defer func() {
-			o.mu.Lock()
-			if pendingVersion, ok := o.pendingPostMergeTransitions[issueID]; ok && pendingVersion == version {
-				delete(o.pendingPostMergeTransitions, issueID)
-			}
-			o.mu.Unlock()
-		}()
-		o.finishMergedPullRequestCompletion(o.runtimeContext(), issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, copyPR)
-	}
-	var waitingForAck bool
-	version, waitingForAck = o.stageMergedPullRequestCompletion(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, copyPR, action)
-	if waitingForAck {
-		return true
-	}
-	if version > 0 {
-		return true
-	}
-	return o.finishMergedPullRequestCompletion(ctx, issueID, identifier, workspacePath, branch, retryAttempt, stallCount, issueState, copyPR)
 }
 
 func (o *Orchestrator) lookupPullRequestByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error) {

@@ -389,7 +389,7 @@ func writeDurableRuntimeState(path string, state durableRuntimeState, force bool
 	}
 	raw = append(raw, '\n')
 
-	tempFile, err := os.CreateTemp(dir, "session-state-*.tmp")
+	tempFile, err := os.CreateTemp(dir, "runtime-ledger-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -411,7 +411,7 @@ func writeDurableRuntimeState(path string, state durableRuntimeState, force bool
 	if err := tempFile.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tempPath, path)
+	return replaceDurableStateFileAtomically(tempPath, path)
 }
 
 func normalizeRuntimeIdentity(identity RuntimeIdentity) RuntimeIdentity {
@@ -535,6 +535,7 @@ func (o *Orchestrator) currentRuntimeIdentity() RuntimeIdentity {
 		cfg := o.currentConfig()
 		return normalizeRuntimeIdentity(RuntimeIdentity{
 			Compatibility: RuntimeCompatibility{
+				SourceKind:         cfg.TrackerKind,
 				TrackerKind:        cfg.TrackerKind,
 				TrackerRepo:        cfg.TrackerRepo,
 				TrackerProjectSlug: cfg.TrackerProjectSlug,
@@ -779,7 +780,7 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 	if entry == nil {
 		return nil
 	}
-	decision, err := o.classifySuccessfulRun(ctx, recordWorkspacePath(entry), recordBranch(entry), entry.Dispatch, o.currentConfig().OrchestratorAutoCloseOnPR, issueState)
+	decision, err := o.classifySuccessfulRun(ctx, recordWorkspacePath(entry), recordBranch(entry), entry.Dispatch, issueState)
 	if err != nil {
 		o.logger.Warn("ledger recovery classification failed", "issue_id", issueID, "issue_identifier", recordIdentifier(entry), "branch", recordBranch(entry), "error", err.Error())
 		o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, o.currentWorkflow().Completion.Mode, "recovery_uncertain", issueState, recordPullRequest(entry))
@@ -787,8 +788,8 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 	}
 
 	switch decision.Disposition {
-	case DispositionTryCompleteMergedPR:
-		o.tryCompleteMergedPullRequest(ctx, issueID, recordIdentifier(entry), recordWorkspacePath(entry), decision.FinalBranch, entry.RetryAttempt, entry.StallCount, issueState, decision.PR)
+	case DispositionCompleted:
+		o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
 	case DispositionAwaitingMerge:
 		o.moveToAwaitingMerge(issueID, recordIdentifier(entry), issueState, recordWorkspacePath(entry), decision.FinalBranch, entry.RetryAttempt, entry.StallCount, decision.PR, nil)
 	case DispositionAwaitingIntervention:
@@ -899,7 +900,6 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.persistenceHealth.ConsecutiveFailures++
 	clear(o.pendingRecovery)
 	clear(o.pendingActions)
-	clear(o.pendingPostMergeTransitions)
 	for issueID := range o.pendingLaunch {
 		delete(o.runningRecords, issueID)
 	}

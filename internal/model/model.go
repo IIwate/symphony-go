@@ -79,11 +79,11 @@ const (
 type ContinuationReason string
 
 const (
-	ContinuationReasonUnfinishedIssue      ContinuationReason = "unfinished_issue"
-	ContinuationReasonMissingPR            ContinuationReason = "missing_pr"
-	ContinuationReasonClosedUnmergedPR     ContinuationReason = "pr_closed_unmerged"
-	ContinuationReasonMergedPRAutoCloseOff ContinuationReason = "merged_pr_auto_close_disabled"
-	ContinuationReasonTrackerIssueMissing  ContinuationReason = "tracker_issue_missing_during_recovery"
+	ContinuationReasonUnfinishedIssue     ContinuationReason = "unfinished_issue"
+	ContinuationReasonMissingPR           ContinuationReason = "missing_pr"
+	ContinuationReasonClosedUnmergedPR    ContinuationReason = "pr_closed_unmerged"
+	ContinuationReasonMergedPRNotTerminal ContinuationReason = "merged_pr_source_not_terminal"
+	ContinuationReasonTrackerIssueMissing ContinuationReason = "tracker_issue_missing_during_recovery"
 )
 
 type PRContext struct {
@@ -198,7 +198,6 @@ type ServiceConfig struct {
 	MaxTurns                         int
 	MaxRetryBackoffMS                int
 	MaxConcurrentAgentsByState       map[string]int
-	OrchestratorAutoCloseOnPR        bool
 	CodexCommand                     string
 	CodexApprovalPolicy              string
 	CodexThreadSandbox               string
@@ -646,8 +645,6 @@ var (
 	ErrLinearGraphQLErrors       = &TrackerError{Code: "linear_graphql_errors"}
 	ErrLinearUnknownPayload      = &TrackerError{Code: "linear_unknown_payload"}
 	ErrLinearMissingEndCursor    = &TrackerError{Code: "linear_missing_end_cursor"}
-	ErrLinearStateNotFound       = &TrackerError{Code: "linear_state_not_found"}
-	ErrLinearTransitionFailed    = &TrackerError{Code: "linear_transition_failed"}
 )
 
 var workspaceKeyPattern = regexp.MustCompile(`[^A-Za-z0-9._-]`)

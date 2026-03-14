@@ -53,9 +53,6 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 					"oops":   "x",
 				},
 			},
-			"orchestrator": map[string]any{
-				"auto_close_on_pr": false,
-			},
 			"codex": map[string]any{
 				"thread_sandbox":      "workspace-write",
 				"turn_sandbox_policy": map[string]any{"type": "workspaceWrite"},
@@ -111,9 +108,6 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	if len(cfg.MaxConcurrentAgentsByState) != 1 {
 		t.Fatalf("MaxConcurrentAgentsByState size = %d, want 1", len(cfg.MaxConcurrentAgentsByState))
 	}
-	if cfg.OrchestratorAutoCloseOnPR {
-		t.Fatal("OrchestratorAutoCloseOnPR = true, want false")
-	}
 	if cfg.ServerPort == nil || *cfg.ServerPort != 0 {
 		t.Fatalf("ServerPort = %v, want 0", cfg.ServerPort)
 	}
@@ -122,6 +116,9 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	}
 	if cfg.CodexCommand != "codex app-server" {
 		t.Fatalf("CodexCommand = %q, want default", cfg.CodexCommand)
+	}
+	if cfg.SessionPersistence.File.Path != filepath.Join(".", "local", "runtime-ledger.json") {
+		t.Fatalf("SessionPersistence.File.Path = %q, want %q", cfg.SessionPersistence.File.Path, filepath.Join(".", "local", "runtime-ledger.json"))
 	}
 	if cfg.CodexTurnSandboxPolicy != `{"type":"workspaceWrite"}` {
 		t.Fatalf("CodexTurnSandboxPolicy = %q", cfg.CodexTurnSandboxPolicy)
