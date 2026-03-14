@@ -366,6 +366,45 @@ func TestPullRequestInfoFromAwaitingMergeUsesPersistedReasonDetails(t *testing.T
 	}
 }
 
+func TestReconcileAwaitingMergeKeepsPersistedPRWhenRefreshReturnsNil(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	o.prLookup = fakePRLookup{
+		refresh: func(context.Context, string, *PullRequestInfo) (*PullRequestInfo, error) {
+			return nil, nil
+		},
+	}
+	o.moveToAwaitingMerge(
+		issue.ID,
+		issue.Identifier,
+		issue.State,
+		filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier),
+		"feature/abc-1",
+		1,
+		0,
+		&PullRequestInfo{
+			Number:    42,
+			URL:       "https://github.example/pr/42",
+			State:     PullRequestStateOpen,
+			BaseOwner: "IIwate",
+			BaseRepo:  "symphony-go",
+			HeadOwner: "IIwate",
+		},
+		nil,
+	)
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	current := o.awaitingMergeRecords[issue.ID]
+	if current == nil {
+		t.Fatal("awaitingMerge record missing")
+	}
+	if current.Runtime.Status != contract.IssueStatusAwaitingMerge {
+		t.Fatalf("Status = %q, want %q", current.Runtime.Status, contract.IssueStatusAwaitingMerge)
+	}
+}
+
 func TestHandleSessionPersistenceWriteFailureSetsUnavailableServiceMode(t *testing.T) {
 	o, _, _ := newTestOrchestrator(t)
 

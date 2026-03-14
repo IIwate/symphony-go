@@ -1799,6 +1799,28 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 		}
 		if pr == nil {
 			o.logger.Warn("awaiting-merge PR lookup returned no match", "issue_id", issueID, "issue_identifier", recordIdentifier(entry), "branch", recordBranch(entry))
+			if entry.Runtime.DurableRefs.PullRequest != nil {
+				o.mu.Lock()
+				current := o.awaitingMergeRecords[issueID]
+				if current != nil {
+					o.setRecordReasonLocked(current, &contract.Reason{
+						ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
+						Category:   contract.CategoryRecord,
+						Details: map[string]any{
+							"record_id":     current.Runtime.RecordID,
+							"last_error":    "pull request refresh returned no match",
+							"pr_number":     current.Runtime.DurableRefs.PullRequest.Number,
+							"pr_state":      current.Runtime.DurableRefs.PullRequest.State,
+							"pr_base_owner": recordReasonDetailString(current, "pr_base_owner"),
+							"pr_base_repo":  recordReasonDetailString(current, "pr_base_repo"),
+							"pr_head_owner": recordReasonDetailString(current, "pr_head_owner"),
+						},
+					})
+					o.commitStateLocked(true)
+				}
+				o.mu.Unlock()
+				continue
+			}
 			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonMissingPR), entry.LastKnownIssueState, nil)
 			continue
 		}
