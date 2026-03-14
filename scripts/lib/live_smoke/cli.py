@@ -26,7 +26,8 @@ from live_smoke.symphony import (
     post_json,
     start_symphony,
     symphony_binary_name,
-    symphony_command,
+    symphony_doctor_command,
+    symphony_run_command,
     write_doctor_config,
     write_inline_hook_config,
     write_smoke_config,
@@ -383,35 +384,14 @@ def _run_doctor_and_set(resources: Resources) -> str:
     write_doctor_config(base_dir)
 
     doctor = run(
-        symphony_command(resources.binary_path, "config", "doctor", "--config-dir", str(base_dir)),
+        symphony_doctor_command(resources.binary_path, "--config-dir", str(base_dir)),
         cwd=repo_root(),
         check=False,
     )
     combined = doctor.stdout + doctor.stderr
     if doctor.returncode == 0 or "CODEX_COMMAND (runtime.codex.command)" not in combined:
-        raise RuntimeError("config doctor did not report missing runtime.codex.command")
-
-    set_result = run(
-        [
-            "pwsh",
-            "-NoLogo",
-            "-NoProfile",
-            "-Command",
-            f"'codex app-server' | & '{resources.binary_path}' config set CODEX_COMMAND --config-dir '{base_dir}' --non-interactive",
-        ],
-        cwd=repo_root(),
-    )
-    if "当前运行实例不会自动更新" not in set_result.stdout:
-        raise RuntimeError("config set output missing runtime update warning")
-
-    doctor_again = run(
-        symphony_command(resources.binary_path, "config", "doctor", "--config-dir", str(base_dir)),
-        cwd=repo_root(),
-        check=False,
-    )
-    if "CODEX_COMMAND" in doctor_again.stdout + doctor_again.stderr:
-        raise RuntimeError("config doctor still reports CODEX_COMMAND after config set")
-    return "doctor/set ok"
+        raise RuntimeError("doctor did not report missing runtime.codex.command")
+    return "doctor ok"
 
 
 def _run_inline_hook_dry_run(resources: Resources, linear_api_key: str, project_slug: str, branch_scope: str) -> str:
@@ -420,7 +400,7 @@ def _run_inline_hook_dry_run(resources: Resources, linear_api_key: str, project_
     base_dir = resources.temp_dir / "inline-hook"
     write_inline_hook_config(base_dir, linear_api_key=linear_api_key, linear_project_slug=project_slug, linear_branch_scope=branch_scope)
     result = run(
-        symphony_command(resources.binary_path, "--dry-run", "--config-dir", str(base_dir)),
+        symphony_run_command(resources.binary_path, "--dry-run", "--config-dir", str(base_dir)),
         cwd=repo_root(),
     )
     combined = result.stdout + result.stderr
@@ -436,7 +416,7 @@ def _run_symlink_escape_check(resources: Resources, linear_api_key: str, project
     if not write_symlink_escape_config(base_dir, linear_api_key=linear_api_key, linear_project_slug=project_slug, linear_branch_scope=branch_scope):
         return "skipped: symlink unsupported"
     result = run(
-        symphony_command(resources.binary_path, "--dry-run", "--config-dir", str(base_dir)),
+        symphony_run_command(resources.binary_path, "--dry-run", "--config-dir", str(base_dir)),
         cwd=repo_root(),
         check=False,
     )

@@ -49,6 +49,14 @@ def symphony_command(binary_path: Path, *args: str) -> list[str]:
     return [str(binary_path), *args]
 
 
+def symphony_run_command(binary_path: Path, *args: str) -> list[str]:
+    return symphony_command(binary_path, "run", *args)
+
+
+def symphony_doctor_command(binary_path: Path, *args: str) -> list[str]:
+    return symphony_command(binary_path, "doctor", *args)
+
+
 def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
     for name in ["sources", "flows", "prompts", "hooks", "local"]:
         (config.base_dir / name).mkdir(parents=True, exist_ok=True)
@@ -306,7 +314,7 @@ terminal_states: ["Closed", "Done"]
 
 def start_symphony(binary_path: Path, config_dir: Path, *, echo: bool = True, env: dict[str, str] | None = None) -> ManagedProcess:
     return ManagedProcess(
-        symphony_command(binary_path, "--config-dir", str(config_dir), "--log-level", "debug"),
+        symphony_run_command(binary_path, "--config-dir", str(config_dir), "--log-level", "debug"),
         cwd=repo_root(),
         env=env,
         echo=echo,
