@@ -17,6 +17,7 @@ import (
 	"symphony-go/internal/agent"
 	"symphony-go/internal/config"
 	"symphony-go/internal/model"
+	"symphony-go/internal/model/contract"
 	"symphony-go/internal/shell"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workspace"
@@ -327,13 +328,15 @@ type Orchestrator struct {
 	healthAlerts                map[string]AlertSnapshot
 	notificationHealth          map[string]*NotificationChannelHealthSnapshot
 	persistenceHealth           PersistenceHealthSnapshot
+	runningRecords              map[string]*model.IssueRecord
+	retryRecords                map[string]*model.IssueRecord
+	awaitingMergeRecords        map[string]*model.IssueRecord
+	awaitingInterventionRecords map[string]*model.IssueRecord
 	pendingCleanup              map[string]string
-	recoveredPending            map[string]*model.RecoveryEntry
-	pendingResume               map[string]uint64
+	pendingRecovery             map[string]uint64
 	pendingLaunch               map[string]uint64
 	pendingPostMergeTransitions map[string]uint64
 	pendingActions              map[uint64][]func()
-	completedOrder              []string
 	maxCompleted                int
 	startedAt                   time.Time
 	serviceVersion              string
@@ -353,7 +356,6 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	recovering := map[string]*model.RecoveryEntry{}
 	healthAlerts := map[string]AlertSnapshot{}
 
 	o := &Orchestrator{
@@ -375,21 +377,21 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		shutdownCh:        make(chan struct{}),
 		doneCh:            make(chan struct{}),
 		state: model.OrchestratorState{
-			Mode:                 model.ServiceModeNormal,
-			Running:              map[string]*model.RunningEntry{},
-			Recovering:           recovering,
-			AwaitingMerge:        map[string]*model.AwaitingMergeEntry{},
-			AwaitingIntervention: map[string]*model.AwaitingInterventionEntry{},
-			RetryAttempts:        map[string]*model.RetryEntry{},
-			ProtectedResults:     map[string]*model.ProtectedResultEntry{},
-			Completed:            map[string]struct{}{},
+			Service: model.RuntimeServiceState{
+				Mode: model.ServiceModeServing,
+			},
+			Records:          map[string]*model.IssueRecord{},
+			ProtectedResults: map[string]*model.ProtectedResultEntry{},
 		},
 		subscribers:                 map[int]chan Snapshot{},
 		healthAlerts:                healthAlerts,
 		notificationHealth:          map[string]*NotificationChannelHealthSnapshot{},
+		runningRecords:              map[string]*model.IssueRecord{},
+		retryRecords:                map[string]*model.IssueRecord{},
+		awaitingMergeRecords:        map[string]*model.IssueRecord{},
+		awaitingInterventionRecords: map[string]*model.IssueRecord{},
 		pendingCleanup:              map[string]string{},
-		recoveredPending:            recovering,
-		pendingResume:               map[string]uint64{},
+		pendingRecovery:             map[string]uint64{},
 		pendingLaunch:               map[string]uint64{},
 		pendingPostMergeTransitions: map[string]uint64{},
 		pendingActions:              map[uint64][]func(){},
@@ -401,6 +403,301 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
 	return o
+}
+
+func cloneReason(value *contract.Reason) *contract.Reason {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	if value.Details != nil {
+		copyValue.Details = map[string]any{}
+		for key, item := range value.Details {
+			copyValue.Details[key] = item
+		}
+	}
+	return &copyValue
+}
+
+func cloneObservation(value *contract.Observation) *contract.Observation {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	if value.Details != nil {
+		copyValue.Details = map[string]any{}
+		for key, item := range value.Details {
+			copyValue.Details[key] = item
+		}
+	}
+	return &copyValue
+}
+
+func cloneResult(value *contract.Result) *contract.Result {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	if value.Details != nil {
+		copyValue.Details = map[string]any{}
+		for key, item := range value.Details {
+			copyValue.Details[key] = item
+		}
+	}
+	return &copyValue
+}
+
+func cloneDurableRefs(value contract.DurableRefs) contract.DurableRefs {
+	copyValue := value
+	if value.Workspace != nil {
+		workspaceCopy := *value.Workspace
+		copyValue.Workspace = &workspaceCopy
+	}
+	if value.Branch != nil {
+		branchCopy := *value.Branch
+		copyValue.Branch = &branchCopy
+	}
+	if value.PullRequest != nil {
+		prCopy := *value.PullRequest
+		copyValue.PullRequest = &prCopy
+	}
+	return copyValue
+}
+
+func cloneRuntimeRecord(value contract.IssueRuntimeRecord) contract.IssueRuntimeRecord {
+	value.Reason = cloneReason(value.Reason)
+	value.Observation = cloneObservation(value.Observation)
+	value.DurableRefs = cloneDurableRefs(value.DurableRefs)
+	value.Result = cloneResult(value.Result)
+	return value
+}
+
+func cloneCompletedWindow(records []contract.IssueRuntimeRecord) []contract.IssueRuntimeRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	cloned := make([]contract.IssueRuntimeRecord, 0, len(records))
+	for _, record := range records {
+		cloned = append(cloned, cloneRuntimeRecord(record))
+	}
+	return cloned
+}
+
+func cloneServiceReasons(reasons []contract.Reason) []contract.Reason {
+	if len(reasons) == 0 {
+		return nil
+	}
+	cloned := make([]contract.Reason, 0, len(reasons))
+	for _, reason := range reasons {
+		cloned = append(cloned, *cloneReason(&reason))
+	}
+	return cloned
+}
+
+func recordIDForIssue(issue *model.Issue) contract.RecordID {
+	if issue == nil {
+		return ""
+	}
+	return contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issue.ID)))
+}
+
+func sourceRefForIssue(issue *model.Issue) contract.SourceRef {
+	if issue == nil {
+		return contract.SourceRef{SourceKind: contract.SourceKindLinear}
+	}
+	url := ""
+	if issue.URL != nil {
+		url = strings.TrimSpace(*issue.URL)
+	}
+	return contract.SourceRef{
+		SourceKind:       contract.SourceKindLinear,
+		SourceID:         strings.TrimSpace(issue.ID),
+		SourceIdentifier: strings.TrimSpace(issue.Identifier),
+		URL:              url,
+	}
+}
+
+func cloneIssueRecord(record *model.IssueRecord) *model.IssueRecord {
+	if record == nil {
+		return nil
+	}
+	copyValue := *record
+	copyValue.Runtime = cloneRuntimeRecord(record.Runtime)
+	copyValue.RetryDueAt = cloneTimePtr(record.RetryDueAt)
+	copyValue.LastKnownIssue = model.CloneIssue(record.LastKnownIssue)
+	copyValue.StartedAt = cloneTimePtr(record.StartedAt)
+	copyValue.Dispatch = model.CloneDispatchContext(record.Dispatch)
+	copyValue.RetryTimer = nil
+	copyValue.WorkerCancel = nil
+	return &copyValue
+}
+
+func currentAttempt(record *model.IssueRecord) int {
+	if record == nil {
+		return 0
+	}
+	return record.RetryAttempt
+}
+
+func (o *Orchestrator) reconcileActiveRecovery(ctx context.Context) {
+	o.reconcileRecovering(ctx)
+}
+
+func ledgerPathForConfig(cfg *model.ServiceConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.SessionPersistence.File.Path)
+}
+
+func recordIdentifier(record *model.IssueRecord) string {
+	if record == nil {
+		return ""
+	}
+	return strings.TrimSpace(record.Runtime.SourceRef.SourceIdentifier)
+}
+
+func recordWorkspacePath(record *model.IssueRecord) string {
+	if record == nil || record.Runtime.DurableRefs.Workspace == nil {
+		return ""
+	}
+	return strings.TrimSpace(record.Runtime.DurableRefs.Workspace.Path)
+}
+
+func recordBranch(record *model.IssueRecord) string {
+	if record == nil || record.Runtime.DurableRefs.Branch == nil {
+		return ""
+	}
+	return strings.TrimSpace(record.Runtime.DurableRefs.Branch.Name)
+}
+
+func recordPullRequest(record *model.IssueRecord) *PullRequestInfo {
+	if record == nil || record.Runtime.DurableRefs.PullRequest == nil {
+		return nil
+	}
+	pr := record.Runtime.DurableRefs.PullRequest
+	return &PullRequestInfo{
+		Number:     pr.Number,
+		URL:        pr.URL,
+		State:      PullRequestState(pr.State),
+		HeadBranch: recordBranch(record),
+	}
+}
+
+func isRecordRunning(record *model.IssueRecord) bool {
+	return record != nil && record.Runtime.Status == contract.IssueStatusActive && record.Runtime.Observation != nil && record.Runtime.Observation.Running
+}
+
+func isRetryScheduled(record *model.IssueRecord) bool {
+	return record != nil && record.Runtime.Status == contract.IssueStatusRetryScheduled
+}
+
+func isAwaitingMerge(record *model.IssueRecord) bool {
+	return record != nil && record.Runtime.Status == contract.IssueStatusAwaitingMerge
+}
+
+func isAwaitingIntervention(record *model.IssueRecord) bool {
+	return record != nil && record.Runtime.Status == contract.IssueStatusAwaitingIntervention
+}
+
+func issueRecordFromIssue(issue model.Issue, ledgerPath string) *model.IssueRecord {
+	record := &model.IssueRecord{
+		Runtime: contract.IssueRuntimeRecord{
+			RecordID:  recordIDForIssue(&issue),
+			SourceRef: sourceRefForIssue(&issue),
+			Status:    contract.IssueStatusActive,
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			DurableRefs: contract.DurableRefs{
+				LedgerPath: ledgerPath,
+			},
+		},
+		LastKnownIssue:      model.CloneIssue(&issue),
+		LastKnownIssueState: strings.TrimSpace(issue.State),
+	}
+	return record
+}
+
+func (o *Orchestrator) ensureRecordLocked(issue model.Issue) *model.IssueRecord {
+	record := o.state.Records[issue.ID]
+	if record == nil {
+		record = issueRecordFromIssue(issue, ledgerPathForConfig(o.currentConfig()))
+		o.state.Records[issue.ID] = record
+	}
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = strings.TrimSpace(issue.State)
+	record.Runtime.SourceRef = sourceRefForIssue(&issue)
+	record.Runtime.RecordID = recordIDForIssue(&issue)
+	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
+	return record
+}
+
+func (o *Orchestrator) setRecordObservationLocked(record *model.IssueRecord, observation *contract.Observation) {
+	if record == nil {
+		return
+	}
+	record.Runtime.Observation = cloneObservation(observation)
+	record.Runtime.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
+}
+
+func (o *Orchestrator) setRecordReasonLocked(record *model.IssueRecord, reason *contract.Reason) {
+	if record == nil {
+		return
+	}
+	record.Runtime.Reason = cloneReason(reason)
+	record.Runtime.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
+}
+
+func (o *Orchestrator) setRecordStatusLocked(record *model.IssueRecord, status contract.IssueStatus, reason *contract.Reason, observation *contract.Observation) {
+	if record == nil {
+		return
+	}
+	record.Runtime.Status = status
+	record.Runtime.Reason = cloneReason(reason)
+	record.Runtime.Observation = cloneObservation(observation)
+	record.Runtime.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
+	if status != contract.IssueStatusRetryScheduled {
+		record.RetryDueAt = nil
+	}
+}
+
+func (o *Orchestrator) removeRecordLocked(issueID string) *model.IssueRecord {
+	record := o.state.Records[issueID]
+	delete(o.state.Records, issueID)
+	delete(o.runningRecords, issueID)
+	delete(o.retryRecords, issueID)
+	delete(o.awaitingMergeRecords, issueID)
+	delete(o.awaitingInterventionRecords, issueID)
+	return record
+}
+
+func (o *Orchestrator) reindexRecordLocked(issueID string, record *model.IssueRecord) {
+	delete(o.runningRecords, issueID)
+	delete(o.retryRecords, issueID)
+	delete(o.awaitingMergeRecords, issueID)
+	delete(o.awaitingInterventionRecords, issueID)
+	if record == nil {
+		return
+	}
+	switch {
+	case isRecordRunning(record):
+		o.runningRecords[issueID] = record
+	case isRetryScheduled(record):
+		o.retryRecords[issueID] = record
+	case isAwaitingMerge(record):
+		o.awaitingMergeRecords[issueID] = record
+	case isAwaitingIntervention(record):
+		o.awaitingInterventionRecords[issueID] = record
+	}
+}
+
+func recordUpdatedAt(record *model.IssueRecord, fallback time.Time) time.Time {
+	if record == nil {
+		return fallback
+	}
+	if ts, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(record.Runtime.UpdatedAt)); err == nil {
+		return ts
+	}
+	return fallback
 }
 
 func (o *Orchestrator) Start(ctx context.Context) error {
@@ -485,36 +782,36 @@ func (o *Orchestrator) emitNotification(event model.RuntimeEvent) {
 }
 
 func (o *Orchestrator) serviceModeLocked() model.ServiceMode {
-	if o.state.Mode == "" {
-		return model.ServiceModeNormal
+	if o.state.Service.Mode == "" {
+		return model.ServiceModeServing
 	}
-	return o.state.Mode
+	return o.state.Service.Mode
 }
 
 func (o *Orchestrator) isProtectedLocked() bool {
-	return o.serviceModeLocked() == model.ServiceModeProtected
+	return o.serviceModeLocked() == model.ServiceModeUnavailable
 }
 
 func (o *Orchestrator) enterProtectedModeLocked(reason string) bool {
 	if o.isProtectedLocked() {
 		return false
 	}
-	now := o.now().UTC()
-	o.state.Mode = model.ServiceModeProtected
-	o.state.Protection = &model.ProtectedState{
-		Reason:      reason,
-		EnteredAt:   now,
-		MustRestart: true,
+	o.state.Service.Mode = model.ServiceModeUnavailable
+	o.state.Service.Reasons = []contract.Reason{
+		contract.MustReason(contract.ReasonServiceUnavailableCoreDependency, map[string]any{
+			"component": "ledger_store",
+			"detail":    strings.TrimSpace(reason),
+		}),
 	}
 	o.setHealthAlertAndNotifyLocked(AlertSnapshot{
 		Code:    serviceProtectedModeCode,
 		Level:   "warn",
-		Message: fmt.Sprintf("service entered protected mode: %s", reason),
+		Message: fmt.Sprintf("service became unavailable: %s", reason),
 	})
 	return true
 }
 
-func (o *Orchestrator) rememberProtectedResultLocked(issueID string, entry *model.RunningEntry, result WorkerResult) {
+func (o *Orchestrator) rememberProtectedResultLocked(issueID string, entry *model.IssueRecord, result WorkerResult) {
 	if strings.TrimSpace(issueID) == "" || entry == nil {
 		return
 	}
@@ -526,8 +823,8 @@ func (o *Orchestrator) rememberProtectedResultLocked(issueID string, entry *mode
 		errText = &text
 	}
 	resultEntry := &model.ProtectedResultEntry{
-		Identifier:    entry.Identifier,
-		WorkspacePath: entry.WorkspacePath,
+		Identifier:    entry.Runtime.SourceRef.SourceIdentifier,
+		WorkspacePath: entry.Runtime.DurableRefs.Workspace.Path,
 		Outcome:       outcome,
 		Phase:         result.Phase,
 		Error:         errText,
@@ -542,15 +839,15 @@ func (o *Orchestrator) rememberProtectedResultLocked(issueID string, entry *mode
 func (o *Orchestrator) RequestRefresh() RefreshRequestResult {
 	o.mu.RLock()
 	protected := o.isProtectedLocked()
-	protection := o.state.Protection
+	serviceReasons := cloneServiceReasons(o.state.Service.Reasons)
 	o.mu.RUnlock()
 
 	result := RefreshRequestResult{RequestedAt: o.now().UTC()}
 	if protected {
 		result.RejectedCode = serviceProtectedModeCode
-		result.RejectedMessage = "service is in protected mode; restart is required after fixing session persistence"
-		if protection != nil && strings.TrimSpace(protection.Reason) != "" {
-			result.RejectedMessage = fmt.Sprintf("%s: %s", result.RejectedMessage, protection.Reason)
+		result.RejectedMessage = "service is unavailable; fix the core dependency before retrying refresh"
+		if len(serviceReasons) > 0 {
+			result.RejectedMessage = fmt.Sprintf("%s: %s", result.RejectedMessage, serviceReasons[0].ReasonCode)
 		}
 		return result
 	}
@@ -744,14 +1041,15 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 	}
 	stallCount := 0
 	var dispatch *model.DispatchContext
-	if existing := o.state.RetryAttempts[issue.ID]; existing != nil {
-		stallCount = existing.StallCount
-		if existing.TimerHandle != nil {
-			existing.TimerHandle.Stop()
+	record := o.ensureRecordLocked(issue)
+	if isRetryScheduled(record) {
+		stallCount = record.StallCount
+		if record.RetryTimer != nil {
+			record.RetryTimer.Stop()
+			record.RetryTimer = nil
 		}
-		dispatch = model.CloneDispatchContext(existing.Dispatch)
+		dispatch = model.CloneDispatchContext(record.Dispatch)
 	}
-	delete(o.state.RetryAttempts, issue.ID)
 	normalizedAttempt := 0
 	if attempt != nil {
 		normalizedAttempt = *attempt
@@ -763,16 +1061,27 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 		retryAttempt := normalizedAttempt
 		dispatch.RetryAttempt = &retryAttempt
 	}
-	o.state.Running[issue.ID] = &model.RunningEntry{
-		Issue:         model.CloneIssue(&issue),
-		Identifier:    issue.Identifier,
-		WorkspacePath: "",
-		RetryAttempt:  normalizedAttempt,
-		StallCount:    stallCount,
-		StartedAt:     o.now().UTC(),
-		WorkerCancel:  cancel,
-		Dispatch:      model.CloneDispatchContext(dispatch),
-	}
+	startedAt := o.now().UTC()
+	record.RetryAttempt = normalizedAttempt
+	record.StallCount = stallCount
+	record.StartedAt = &startedAt
+	record.WorkerCancel = cancel
+	record.Dispatch = model.CloneDispatchContext(dispatch)
+	record.Session = model.LiveSession{}
+	record.NeedsRecovery = false
+	record.Runtime.Result = nil
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = strings.TrimSpace(issue.State)
+	o.setRecordStatusLocked(record, contract.IssueStatusActive, nil, &contract.Observation{
+		Running: true,
+		Summary: "agent run in progress",
+		Details: map[string]any{
+			"attempt":   attemptCountFromRetry(normalizedAttempt),
+			"issue_id":  issue.ID,
+			"issue_key": issue.Identifier,
+		},
+	})
+	o.reindexRecordLocked(issue.ID, record)
 	o.logger.Info(
 		"dispatching issue",
 		"issue_id", issue.ID,
@@ -821,8 +1130,8 @@ func (o *Orchestrator) launchWorker(workerCtx context.Context, issue model.Issue
 		}
 		workspaceRef.Dispatch = model.CloneDispatchContext(dispatch)
 		o.mu.Lock()
-		if entry := o.state.Running[issue.ID]; entry != nil {
-			entry.WorkspacePath = workspaceRef.Path
+		if entry := o.state.Records[issue.ID]; isRecordRunning(entry) {
+			entry.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspaceRef.Path}
 			entry.Dispatch = model.CloneDispatchContext(dispatch)
 			o.commitStateLocked(false)
 		}
@@ -1145,8 +1454,8 @@ func decisionForMissingPullRequest(contract model.CompletionContract, branch str
 
 func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	o.mu.Lock()
-	entry := o.state.Running[result.IssueID]
-	if entry == nil {
+	entry := o.state.Records[result.IssueID]
+	if !isRecordRunning(entry) {
 		identifier, pending := o.pendingCleanup[result.IssueID]
 		if pending {
 			delete(o.pendingCleanup, result.IssueID)
@@ -1160,15 +1469,12 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		o.mu.Unlock()
 		return
 	}
-	identifier := entry.Identifier
-	workspacePath := entry.WorkspacePath
+	identifier := recordIdentifier(entry)
+	workspacePath := recordWorkspacePath(entry)
 	retryAttempt := entry.RetryAttempt
 	stallCount := entry.StallCount
 	dispatch := model.CloneDispatchContext(entry.Dispatch)
-	issueState := ""
-	if entry.Issue != nil {
-		issueState = entry.Issue.State
-	}
+	issueState := entry.LastKnownIssueState
 	o.logger.Info(
 		"worker finished",
 		"issue_id", result.IssueID,
@@ -1180,7 +1486,13 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	)
 
 	if o.isProtectedLocked() {
-		delete(o.state.Running, result.IssueID)
+		entry.WorkerCancel = nil
+		entry.StartedAt = nil
+		o.setRecordObservationLocked(entry, &contract.Observation{
+			Running: false,
+			Summary: "service unavailable; run result captured for operator review",
+		})
+		o.reindexRecordLocked(result.IssueID, entry)
 		o.rememberProtectedResultLocked(result.IssueID, entry, result)
 		o.publishViewLocked()
 		o.mu.Unlock()
@@ -1188,7 +1500,8 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	}
 
 	o.addRuntimeLocked(entry)
-	delete(o.state.Running, result.IssueID)
+	entry.WorkerCancel = nil
+	entry.StartedAt = nil
 
 	if result.Err != nil {
 		nextAttempt := retryAttempt + 1
@@ -1211,27 +1524,34 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		return
 	}
 
-	o.state.Recovering[result.IssueID] = &model.RecoveryEntry{
-		Identifier:    identifier,
-		WorkspacePath: workspacePath,
-		FinalBranch:   strings.TrimSpace(result.FinalBranch),
-		State:         issueState,
-		RetryAttempt:  retryAttempt,
-		StallCount:    stallCount,
-		ObservedAt:    o.now().UTC(),
-		Strategy:      model.RecoveryStrategyPostRunResume,
-		Source:        model.RecoverySourceSucceeded,
-		Dispatch:      model.CloneDispatchContext(dispatch),
+	if workspacePath != "" {
+		entry.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
 	}
+	finalBranch := strings.TrimSpace(result.FinalBranch)
+	if finalBranch != "" {
+		entry.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: finalBranch}
+	}
+	entry.NeedsRecovery = true
+	entry.Dispatch = model.CloneDispatchContext(dispatch)
+	entry.LastKnownIssueState = issueState
+	o.setRecordStatusLocked(entry, contract.IssueStatusActive, nil, &contract.Observation{
+		Running: false,
+		Summary: "awaiting conservative recovery evaluation",
+		Details: map[string]any{
+			"final_branch": finalBranch,
+			"issue_state":  issueState,
+		},
+	})
+	o.reindexRecordLocked(result.IssueID, entry)
 	version := o.commitStateLocked(true)
 	if version > 0 {
-		o.pendingResume[result.IssueID] = version
+		o.pendingRecovery[result.IssueID] = version
 	}
 	o.mu.Unlock()
 
 	if version == 0 {
 		ctx := o.runtimeContext()
-		o.reconcileRecovering(ctx)
+		o.reconcileActiveRecovery(ctx)
 	}
 }
 
@@ -1239,8 +1559,8 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	entry := o.state.Running[update.IssueID]
-	if entry == nil {
+	entry := o.state.Records[update.IssueID]
+	if !isRecordRunning(entry) {
 		return
 	}
 	event := update.Event
@@ -1278,6 +1598,16 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 	if event.RateLimits != nil && !protected {
 		o.state.CodexRateLimits = event.RateLimits
 	}
+	observation := &contract.Observation{
+		Running: true,
+		Summary: "agent run in progress",
+		Details: map[string]any{
+			"session_id": entry.Session.SessionID,
+			"turn_count": entry.Session.TurnCount,
+		},
+	}
+	o.setRecordObservationLocked(entry, observation)
+	o.reindexRecordLocked(update.IssueID, entry)
 	o.commitStateLocked(false)
 }
 
@@ -1292,12 +1622,18 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	cfg := o.currentConfig()
 
 	o.mu.Lock()
-	for issueID, entry := range o.state.Running {
+	for issueID, entry := range o.state.Records {
+		if !isRecordRunning(entry) {
+			continue
+		}
 		stallTimeout := cfg.CodexStallTimeoutMS
 		if stallTimeout <= 0 {
 			continue
 		}
-		lastSeen := entry.StartedAt
+		lastSeen := o.now().UTC()
+		if entry.StartedAt != nil {
+			lastSeen = *entry.StartedAt
+		}
 		if entry.Session.LastCodexTimestamp != nil {
 			lastSeen = *entry.Session.LastCodexTimestamp
 		}
@@ -1305,9 +1641,11 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 			o.terminateRunningLocked(ctx, issueID, false, true, "stalled session")
 		}
 	}
-	ids := make([]string, 0, len(o.state.Running))
-	for issueID := range o.state.Running {
-		ids = append(ids, issueID)
+	ids := make([]string, 0, len(o.state.Records))
+	for issueID, entry := range o.state.Records {
+		if isRecordRunning(entry) {
+			ids = append(ids, issueID)
+		}
 	}
 	o.mu.Unlock()
 
@@ -1340,7 +1678,10 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	if o.clearHealthAlertAndNotifyLocked("tracker_unreachable") {
 		o.publishViewLocked()
 	}
-	for issueID, entry := range o.state.Running {
+	for issueID, entry := range o.state.Records {
+		if !isRecordRunning(entry) {
+			continue
+		}
 		issue, ok := byID[issueID]
 		if !ok {
 			continue
@@ -1350,7 +1691,9 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 			continue
 		}
 		if o.isActiveState(issue.State, cfg) {
-			entry.Issue = model.CloneIssue(&issue)
+			entry.LastKnownIssue = model.CloneIssue(&issue)
+			entry.LastKnownIssueState = strings.TrimSpace(issue.State)
+			entry.Runtime.SourceRef = sourceRefForIssue(&issue)
 			continue
 		}
 		o.terminateRunningLocked(ctx, issueID, false, false, "")
@@ -1368,15 +1711,15 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 	}
 
 	o.mu.RLock()
-	pending := make(map[string]model.AwaitingMergeEntry, len(o.state.AwaitingMerge))
-	for issueID, entry := range o.state.AwaitingMerge {
+	pending := make(map[string]*model.IssueRecord, len(o.awaitingMergeRecords))
+	for issueID, entry := range o.awaitingMergeRecords {
 		if entry == nil {
 			continue
 		}
 		if _, waitingForAck := o.pendingPostMergeTransitions[issueID]; waitingForAck {
 			continue
 		}
-		pending[issueID] = *entry
+		pending[issueID] = cloneIssueRecord(entry)
 	}
 	o.mu.RUnlock()
 	if len(pending) == 0 {
@@ -1405,98 +1748,103 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 		if issue, ok := byID[issueID]; ok {
 			switch {
 			case o.isTerminalState(issue.State, cfg):
-				o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
+				o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
 				continue
 			case !o.isActiveState(issue.State, cfg):
-				o.mu.Lock()
-				current := o.state.AwaitingMerge[issueID]
-				if current != nil {
-					delete(o.state.AwaitingMerge, issueID)
-					o.commitStateLocked(true)
-				}
-				o.mu.Unlock()
+				o.completeAbandonedIssue(ctx, issueID, recordIdentifier(entry), "source issue left active states while awaiting merge")
 				continue
 			default:
 				o.mu.Lock()
-				current := o.state.AwaitingMerge[issueID]
-				if current != nil && current.State != issue.State {
-					current.State = issue.State
+				current := o.awaitingMergeRecords[issueID]
+				if current != nil && current.LastKnownIssueState != issue.State {
+					current.LastKnownIssue = model.CloneIssue(&issue)
+					current.LastKnownIssueState = issue.State
+					current.Runtime.SourceRef = sourceRefForIssue(&issue)
 					o.commitStateLocked(true)
 				}
 				o.mu.Unlock()
 			}
 		}
 
-		pr, err := o.lookupAwaitingMergePullRequest(ctx, entry.WorkspacePath, entry)
+		pr, err := o.lookupAwaitingMergePullRequest(ctx, recordWorkspacePath(entry), entry)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			o.logger.Warn("awaiting-merge PR lookup failed", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "error", err.Error())
+			o.logger.Warn("awaiting-merge PR lookup failed", "issue_id", issueID, "issue_identifier", recordIdentifier(entry), "branch", recordBranch(entry), "error", err.Error())
 			errorText := err.Error()
 			o.mu.Lock()
-			current := o.state.AwaitingMerge[issueID]
+			current := o.awaitingMergeRecords[issueID]
 			if current != nil {
-				current.LastError = optionalError(errorText)
+				o.setRecordReasonLocked(current, &contract.Reason{
+					ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
+					Category:   contract.CategoryRecord,
+					Details: map[string]any{
+						"record_id":  current.Runtime.RecordID,
+						"last_error": errorText,
+					},
+				})
 				o.commitStateLocked(true)
 			}
 			o.mu.Unlock()
 			continue
 		}
 		if pr == nil {
-			o.logger.Warn("awaiting-merge PR lookup returned no match", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch)
-			o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonMissingPR), entry.State, nil)
+			o.logger.Warn("awaiting-merge PR lookup returned no match", "issue_id", issueID, "issue_identifier", recordIdentifier(entry), "branch", recordBranch(entry))
+			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonMissingPR), entry.LastKnownIssueState, nil)
 			continue
 		}
 
 		switch pr.State {
 		case PullRequestStateOpen:
 			o.mu.Lock()
-			current := o.state.AwaitingMerge[issueID]
+			current := o.awaitingMergeRecords[issueID]
 			if current != nil {
-				changed := current.PRNumber != pr.Number ||
-					current.PRURL != pr.URL ||
-					current.PRState != string(pr.State) ||
-					current.PRBaseOwner != pr.BaseOwner ||
-					current.PRBaseRepo != pr.BaseRepo ||
-					current.PRHeadOwner != pr.HeadOwner ||
-					current.LastError != nil ||
-					current.PostMergeRetryCount != 0 ||
-					current.NextPostMergeRetryAt != nil
-				current.PRNumber = pr.Number
-				current.PRURL = pr.URL
-				current.PRState = string(pr.State)
-				current.PRBaseOwner = pr.BaseOwner
-				current.PRBaseRepo = pr.BaseRepo
-				current.PRHeadOwner = pr.HeadOwner
-				current.LastError = nil
-				current.PostMergeRetryCount = 0
-				current.NextPostMergeRetryAt = nil
-				if changed {
-					o.commitStateLocked(true)
+				current.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
+					Number: pr.Number,
+					URL:    pr.URL,
+					State:  string(pr.State),
 				}
+				current.RetryDueAt = nil
+				o.setRecordReasonLocked(current, &contract.Reason{
+					ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
+					Category:   contract.CategoryRecord,
+					Details: map[string]any{
+						"record_id": current.Runtime.RecordID,
+						"pr_number": pr.Number,
+						"pr_state":  pr.State,
+					},
+				})
+				o.commitStateLocked(true)
 			}
 			o.mu.Unlock()
 		case PullRequestStateMerged:
-			if entry.NextPostMergeRetryAt != nil && entry.NextPostMergeRetryAt.After(o.now().UTC()) {
+			if entry.RetryDueAt != nil && entry.RetryDueAt.After(o.now().UTC()) {
 				continue
 			}
-			o.tryCompleteMergedPullRequest(ctx, issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, entry.State, pr)
+			o.tryCompleteMergedPullRequest(ctx, issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, entry.LastKnownIssueState, pr)
 		case PullRequestStateClosed:
-			o.moveToAwaitingIntervention(issueID, entry.Identifier, entry.WorkspacePath, entry.Branch, entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonClosedUnmergedPR), entry.State, pr)
+			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonClosedUnmergedPR), entry.LastKnownIssueState, pr)
 		default:
 			errorText := fmt.Sprintf("unsupported pull request state %q", pr.State)
-			o.logger.Warn("awaiting-merge PR state is unsupported", "issue_id", issueID, "issue_identifier", entry.Identifier, "branch", entry.Branch, "state", pr.State)
+			o.logger.Warn("awaiting-merge PR state is unsupported", "issue_id", issueID, "issue_identifier", recordIdentifier(entry), "branch", recordBranch(entry), "state", pr.State)
 			o.mu.Lock()
-			current := o.state.AwaitingMerge[issueID]
+			current := o.awaitingMergeRecords[issueID]
 			if current != nil {
-				current.PRNumber = pr.Number
-				current.PRURL = pr.URL
-				current.PRState = string(pr.State)
-				current.PRBaseOwner = pr.BaseOwner
-				current.PRBaseRepo = pr.BaseRepo
-				current.PRHeadOwner = pr.HeadOwner
-				current.LastError = optionalError(errorText)
+				current.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
+					Number: pr.Number,
+					URL:    pr.URL,
+					State:  string(pr.State),
+				}
+				o.setRecordReasonLocked(current, &contract.Reason{
+					ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
+					Category:   contract.CategoryRecord,
+					Details: map[string]any{
+						"record_id":  current.Runtime.RecordID,
+						"last_error": errorText,
+						"pr_state":   pr.State,
+					},
+				})
 				o.commitStateLocked(true)
 			}
 			o.mu.Unlock()
@@ -1513,12 +1861,12 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 	}
 
 	o.mu.RLock()
-	pending := make(map[string]model.AwaitingInterventionEntry, len(o.state.AwaitingIntervention))
-	for issueID, entry := range o.state.AwaitingIntervention {
+	pending := make(map[string]*model.IssueRecord, len(o.awaitingInterventionRecords))
+	for issueID, entry := range o.awaitingInterventionRecords {
 		if entry == nil {
 			continue
 		}
-		pending[issueID] = *entry
+		pending[issueID] = cloneIssueRecord(entry)
 	}
 	o.mu.RUnlock()
 	if len(pending) == 0 {
@@ -1545,9 +1893,16 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 		issue, ok := byID[issueID]
 		if !ok {
 			o.mu.Lock()
-			current := o.state.AwaitingIntervention[issueID]
-			if current != nil && current.Reason != string(model.ContinuationReasonTrackerIssueMissing) {
-				current.Reason = string(model.ContinuationReasonTrackerIssueMissing)
+			current := o.awaitingInterventionRecords[issueID]
+			if current != nil {
+				o.setRecordReasonLocked(current, &contract.Reason{
+					ReasonCode: contract.ReasonRecordBlockedRecoveryUncertain,
+					Category:   contract.CategoryRecord,
+					Details: map[string]any{
+						"record_id": current.Runtime.RecordID,
+						"cause":     string(model.ContinuationReasonTrackerIssueMissing),
+					},
+				})
 				o.commitStateLocked(true)
 			}
 			o.mu.Unlock()
@@ -1555,15 +1910,9 @@ func (o *Orchestrator) reconcileAwaitingIntervention(ctx context.Context) {
 		}
 		switch {
 		case o.isTerminalState(issue.State, cfg):
-			o.completeSuccessfulIssue(ctx, issueID, entry.Identifier)
+			o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
 		case !o.isActiveState(issue.State, cfg):
-			o.mu.Lock()
-			current := o.state.AwaitingIntervention[issueID]
-			if current != nil {
-				delete(o.state.AwaitingIntervention, issueID)
-				o.commitStateLocked(true)
-			}
-			o.mu.Unlock()
+			o.completeAbandonedIssue(ctx, issueID, recordIdentifier(entry), "source issue left active states while awaiting intervention")
 		}
 	}
 }
@@ -1587,19 +1936,19 @@ func (o *Orchestrator) processDueRetries(ctx context.Context) {
 
 	now := o.now().UTC()
 	o.mu.Lock()
-	due := make([]dueRetry, 0, len(o.state.RetryAttempts))
-	for issueID, entry := range o.state.RetryAttempts {
-		if entry == nil || entry.DueAt.After(now) {
+	due := make([]dueRetry, 0, len(o.retryRecords))
+	for issueID, entry := range o.retryRecords {
+		if entry == nil || entry.RetryDueAt == nil || entry.RetryDueAt.After(now) {
 			continue
 		}
-		if entry.TimerHandle != nil {
-			entry.TimerHandle.Stop()
-			entry.TimerHandle = nil
+		if entry.RetryTimer != nil {
+			entry.RetryTimer.Stop()
+			entry.RetryTimer = nil
 		}
 		due = append(due, dueRetry{
 			IssueID:    issueID,
-			Identifier: entry.Identifier,
-			DueAt:      entry.DueAt,
+			Identifier: recordIdentifier(entry),
+			DueAt:      *entry.RetryDueAt,
 		})
 	}
 	o.mu.Unlock()
@@ -1633,18 +1982,16 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 		o.mu.Unlock()
 		return
 	}
-	retryEntry := o.state.RetryAttempts[issueID]
-	if retryEntry == nil || retryEntry.DueAt.After(now) {
+	retryEntry := o.retryRecords[issueID]
+	if retryEntry == nil || retryEntry.RetryDueAt == nil || retryEntry.RetryDueAt.After(now) {
 		o.mu.Unlock()
 		return
 	}
-	if retryEntry.TimerHandle != nil {
-		retryEntry.TimerHandle.Stop()
-		retryEntry.TimerHandle = nil
+	if retryEntry.RetryTimer != nil {
+		retryEntry.RetryTimer.Stop()
+		retryEntry.RetryTimer = nil
 	}
-	snapshot := *retryEntry
-	snapshot.Error = optionalError(pointerString(retryEntry.Error))
-	snapshot.Dispatch = model.CloneDispatchContext(retryEntry.Dispatch)
+	snapshot := cloneIssueRecord(retryEntry)
 	o.mu.Unlock()
 
 	candidates, err := o.tracker.FetchCandidateIssues(ctx)
@@ -1655,9 +2002,9 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 			o.mu.Unlock()
 			return
 		}
-		current := o.state.RetryAttempts[issueID]
-		if current != nil && !current.DueAt.After(o.now().UTC()) {
-			o.scheduleRetryLocked(issueID, current.Identifier, current.Attempt+1, &errorText, false, current.StallCount, current.Dispatch)
+		current := o.retryRecords[issueID]
+		if current != nil && current.RetryDueAt != nil && !current.RetryDueAt.After(o.now().UTC()) {
+			o.scheduleRetryLocked(issueID, recordIdentifier(current), current.RetryAttempt+1, &errorText, false, current.StallCount, current.Dispatch)
 			o.commitStateLocked(true)
 		}
 		o.mu.Unlock()
@@ -1678,12 +2025,11 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 			o.mu.Unlock()
 			return
 		}
-		current := o.state.RetryAttempts[issueID]
-		if current != nil && !current.DueAt.After(o.now().UTC()) {
-			delete(o.state.RetryAttempts, issueID)
-			o.commitStateLocked(true)
-		}
+		current := o.retryRecords[issueID]
 		o.mu.Unlock()
+		if current != nil {
+			o.completeAbandonedIssue(ctx, issueID, recordIdentifier(current), "record disappeared from candidate issue set")
+		}
 		return
 	}
 
@@ -1694,12 +2040,11 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 			o.mu.Unlock()
 			return
 		}
-		current := o.state.RetryAttempts[issueID]
-		if current != nil && !current.DueAt.After(o.now().UTC()) {
-			delete(o.state.RetryAttempts, issueID)
-			o.commitStateLocked(true)
-		}
+		current := o.retryRecords[issueID]
 		o.mu.Unlock()
+		if current != nil {
+			o.completeAbandonedIssue(ctx, issueID, recordIdentifier(current), "record is no longer dispatch eligible")
+		}
 		return
 	}
 	if !o.hasAvailableSlots(*issue, cfg) {
@@ -1709,16 +2054,16 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 			o.mu.Unlock()
 			return
 		}
-		current := o.state.RetryAttempts[issueID]
-		if current != nil && !current.DueAt.After(o.now().UTC()) {
-			o.scheduleRetryLocked(issueID, issue.Identifier, current.Attempt+1, &errorText, false, current.StallCount, current.Dispatch)
+		current := o.retryRecords[issueID]
+		if current != nil && current.RetryDueAt != nil && !current.RetryDueAt.After(o.now().UTC()) {
+			o.scheduleRetryLocked(issueID, issue.Identifier, current.RetryAttempt+1, &errorText, false, current.StallCount, current.Dispatch)
 			o.commitStateLocked(true)
 		}
 		o.mu.Unlock()
 		return
 	}
 
-	attempt := snapshot.Attempt
+	attempt := snapshot.RetryAttempt
 	o.dispatchIssue(ctx, *issue, &attempt)
 }
 
@@ -1755,12 +2100,12 @@ func (o *Orchestrator) gracefulShutdown() {
 	if o.tickTimer != nil {
 		o.tickTimer.Stop()
 	}
-	for _, retryEntry := range o.state.RetryAttempts {
-		if retryEntry.TimerHandle != nil {
-			retryEntry.TimerHandle.Stop()
+	for _, retryEntry := range o.retryRecords {
+		if retryEntry.RetryTimer != nil {
+			retryEntry.RetryTimer.Stop()
 		}
 	}
-	for _, entry := range o.state.Running {
+	for _, entry := range o.runningRecords {
 		if entry.WorkerCancel != nil {
 			entry.WorkerCancel()
 		}
@@ -1781,7 +2126,7 @@ func (o *Orchestrator) gracefulShutdown() {
 }
 
 func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID string, cleanup bool, scheduleRetry bool, errText string) {
-	entry := o.state.Running[issueID]
+	entry := o.runningRecords[issueID]
 	if entry == nil {
 		return
 	}
@@ -1789,10 +2134,11 @@ func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID strin
 	if entry.WorkerCancel != nil {
 		entry.WorkerCancel()
 	}
-	delete(o.state.Running, issueID)
+	entry.WorkerCancel = nil
+	entry.StartedAt = nil
 
 	if cleanup {
-		o.pendingCleanup[issueID] = entry.Identifier
+		o.pendingCleanup[issueID] = recordIdentifier(entry)
 	}
 
 	if scheduleRetry {
@@ -1805,13 +2151,36 @@ func (o *Orchestrator) terminateRunningLocked(ctx context.Context, issueID strin
 			stallCount++
 		}
 		errorPtr := optionalError(errText)
-		o.scheduleRetryLocked(issueID, entry.Identifier, nextAttempt, errorPtr, false, stallCount, entry.Dispatch)
+		o.scheduleRetryLocked(issueID, recordIdentifier(entry), nextAttempt, errorPtr, false, stallCount, entry.Dispatch)
+		return
 	}
+	o.setRecordStatusLocked(entry, contract.IssueStatusActive, nil, &contract.Observation{
+		Running: false,
+		Summary: "run terminated by orchestrator",
+	})
+	o.reindexRecordLocked(issueID, entry)
 }
 
 func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, attempt int, errText *string, continuation bool, stallCount int, dispatch *model.DispatchContext) {
-	if existing := o.state.RetryAttempts[issueID]; existing != nil && existing.TimerHandle != nil {
-		existing.TimerHandle.Stop()
+	record := o.state.Records[issueID]
+	if record == nil {
+		record = &model.IssueRecord{
+			Runtime: contract.IssueRuntimeRecord{
+				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
+				SourceRef: contract.SourceRef{
+					SourceKind:       contract.SourceKindLinear,
+					SourceID:         strings.TrimSpace(issueID),
+					SourceIdentifier: strings.TrimSpace(identifier),
+				},
+				DurableRefs: contract.DurableRefs{
+					LedgerPath: ledgerPathForConfig(o.currentConfig()),
+				},
+			},
+		}
+		o.state.Records[issueID] = record
+	}
+	if existing := o.retryRecords[issueID]; existing != nil && existing.RetryTimer != nil {
+		existing.RetryTimer.Stop()
 	}
 
 	delay := time.Second
@@ -1833,17 +2202,32 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 		retryAttempt := attempt
 		retryDispatch.RetryAttempt = &retryAttempt
 	}
-	o.state.RetryAttempts[issueID] = &model.RetryEntry{
-		IssueID:       issueID,
-		Identifier:    identifier,
-		WorkspacePath: workspacePathForIdentifier(o.currentConfig().WorkspaceRoot, identifier),
-		Attempt:       attempt,
-		StallCount:    stallCount,
-		DueAt:         dueAt,
-		TimerHandle:   timer,
-		Error:         errText,
-		Dispatch:      retryDispatch,
+	if record.Runtime.DurableRefs.Workspace == nil {
+		record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePathForIdentifier(o.currentConfig().WorkspaceRoot, identifier)}
 	}
+	record.RetryAttempt = attempt
+	record.StallCount = stallCount
+	record.RetryDueAt = &dueAt
+	record.RetryTimer = timer
+	record.Dispatch = retryDispatch
+	o.setRecordStatusLocked(record, contract.IssueStatusRetryScheduled, &contract.Reason{
+		ReasonCode: contract.ReasonRecordBlockedRetryScheduled,
+		Category:   contract.CategoryRecord,
+		Details: map[string]any{
+			"record_id": record.Runtime.RecordID,
+			"attempt":   attemptCountFromRetry(attempt),
+		},
+	}, &contract.Observation{
+		Running: false,
+		Summary: "retry scheduled",
+	})
+	if errText != nil {
+		record.Runtime.Reason.Details["last_error"] = *errText
+	}
+	record.Runtime.SourceRef.SourceIdentifier = strings.TrimSpace(identifier)
+	record.Runtime.SourceRef.SourceID = strings.TrimSpace(issueID)
+	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
+	o.reindexRecordLocked(issueID, record)
 }
 
 func (o *Orchestrator) applyUsageLocked(session *model.LiveSession, usage *agent.TokenUsage) {
@@ -1869,11 +2253,13 @@ func (o *Orchestrator) applyUsageLocked(session *model.LiveSession, usage *agent
 	session.LastReportedTotalTokens = usage.TotalTokens
 }
 
-func (o *Orchestrator) addRuntimeLocked(entry *model.RunningEntry) {
+func (o *Orchestrator) addRuntimeLocked(entry *model.IssueRecord) {
 	if entry == nil {
 		return
 	}
-	o.state.CodexTotals.SecondsRunning += o.now().Sub(entry.StartedAt).Seconds()
+	if entry.StartedAt != nil {
+		o.state.CodexTotals.SecondsRunning += o.now().Sub(*entry.StartedAt).Seconds()
+	}
 }
 
 func (o *Orchestrator) applyCurrentConfigLocked() {
@@ -1884,28 +2270,26 @@ func (o *Orchestrator) applyCurrentConfigLocked() {
 
 func (o *Orchestrator) refreshSnapshotLocked() {
 	now := o.now().UTC()
-	running := make([]RunningSnapshot, 0, len(o.state.Running))
-	for issueID, entry := range o.state.Running {
+	running := make([]RunningSnapshot, 0, len(o.runningRecords))
+	for issueID, entry := range o.runningRecords {
 		if _, pendingLaunch := o.pendingLaunch[issueID]; pendingLaunch {
 			continue
 		}
 		row := RunningSnapshot{
 			IssueID:             issueID,
-			IssueIdentifier:     entry.Identifier,
-			WorkspacePath:       entry.WorkspacePath,
+			IssueIdentifier:     recordIdentifier(entry),
+			WorkspacePath:       recordWorkspacePath(entry),
 			SessionID:           entry.Session.SessionID,
 			TurnCount:           entry.Session.TurnCount,
 			LastMessage:         entry.Session.LastCodexMessage,
-			StartedAt:           entry.StartedAt,
+			StartedAt:           recordUpdatedAt(entry, now),
 			InputTokens:         entry.Session.CodexInputTokens,
 			OutputTokens:        entry.Session.CodexOutputTokens,
 			TotalTokens:         entry.Session.CodexTotalTokens,
 			CurrentRetryAttempt: entry.RetryAttempt,
 			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
 		}
-		if entry.Issue != nil {
-			row.State = entry.Issue.State
-		}
+		row.State = entry.LastKnownIssueState
 		if entry.Dispatch != nil {
 			row.DispatchKind = string(entry.Dispatch.Kind)
 			row.ExpectedOutcome = string(entry.Dispatch.ExpectedOutcome)
@@ -1920,17 +2304,26 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		row.LastEventAt = entry.Session.LastCodexTimestamp
 		running = append(running, row)
 	}
+	sort.SliceStable(running, func(i int, j int) bool {
+		if running[i].IssueIdentifier != running[j].IssueIdentifier {
+			return running[i].IssueIdentifier < running[j].IssueIdentifier
+		}
+		return running[i].IssueID < running[j].IssueID
+	})
 
-	recovering := make([]RecoveringSnapshot, 0, len(o.state.Recovering))
-	for issueID, entry := range o.state.Recovering {
+	recovering := make([]RecoveringSnapshot, 0, len(o.state.Records))
+	for issueID, entry := range o.state.Records {
+		if entry == nil || entry.Runtime.Status != contract.IssueStatusActive || !entry.NeedsRecovery || isRecordRunning(entry) {
+			continue
+		}
 		row := RecoveringSnapshot{
 			IssueID:         issueID,
-			IssueIdentifier: entry.Identifier,
-			WorkspacePath:   entry.WorkspacePath,
-			State:           entry.State,
-			Strategy:        string(entry.Strategy),
-			Source:          string(entry.Source),
-			ObservedAt:      entry.ObservedAt,
+			IssueIdentifier: recordIdentifier(entry),
+			WorkspacePath:   recordWorkspacePath(entry),
+			State:           entry.LastKnownIssueState,
+			Strategy:        "conservative_recovery",
+			Source:          "ledger",
+			ObservedAt:      recordUpdatedAt(entry, now),
 			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
 		}
 		if entry.Dispatch != nil {
@@ -1950,21 +2343,31 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return recovering[i].IssueID < recovering[j].IssueID
 	})
 
-	awaitingMerge := make([]AwaitingMergeSnapshot, 0, len(o.state.AwaitingMerge))
-	for issueID, entry := range o.state.AwaitingMerge {
+	awaitingMerge := make([]AwaitingMergeSnapshot, 0, len(o.awaitingMergeRecords))
+	for issueID, entry := range o.awaitingMergeRecords {
+		pr := entry.Runtime.DurableRefs.PullRequest
+		lastError := (*string)(nil)
+		if entry.Runtime.Reason != nil {
+			if value, ok := entry.Runtime.Reason.Details["last_error"].(string); ok {
+				lastError = optionalError(value)
+			}
+		}
 		awaitingMerge = append(awaitingMerge, AwaitingMergeSnapshot{
 			IssueID:         issueID,
-			IssueIdentifier: entry.Identifier,
-			WorkspacePath:   entry.WorkspacePath,
-			State:           entry.State,
-			Branch:          entry.Branch,
-			PRNumber:        entry.PRNumber,
-			PRURL:           entry.PRURL,
-			PRState:         entry.PRState,
-			AwaitingSince:   entry.AwaitingSince,
-			LastError:       entry.LastError,
+			IssueIdentifier: recordIdentifier(entry),
+			WorkspacePath:   recordWorkspacePath(entry),
+			State:           entry.LastKnownIssueState,
+			Branch:          recordBranch(entry),
+			AwaitingSince:   recordUpdatedAt(entry, now),
+			LastError:       lastError,
 			AttemptCount:    attemptCountFromRetry(entry.RetryAttempt),
 		})
+		item := &awaitingMerge[len(awaitingMerge)-1]
+		if pr != nil {
+			item.PRNumber = pr.Number
+			item.PRURL = pr.URL
+			item.PRState = pr.State
+		}
 	}
 	sort.SliceStable(awaitingMerge, func(i int, j int) bool {
 		if awaitingMerge[i].IssueIdentifier != awaitingMerge[j].IssueIdentifier {
@@ -1973,23 +2376,31 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return awaitingMerge[i].IssueID < awaitingMerge[j].IssueID
 	})
 
-	awaitingIntervention := make([]AwaitingInterventionSnapshot, 0, len(o.state.AwaitingIntervention))
-	for issueID, entry := range o.state.AwaitingIntervention {
+	awaitingIntervention := make([]AwaitingInterventionSnapshot, 0, len(o.awaitingInterventionRecords))
+	for issueID, entry := range o.awaitingInterventionRecords {
+		pr := entry.Runtime.DurableRefs.PullRequest
+		reasonCode := ""
+		if entry.Runtime.Reason != nil {
+			reasonCode = string(entry.Runtime.Reason.ReasonCode)
+		}
 		awaitingIntervention = append(awaitingIntervention, AwaitingInterventionSnapshot{
 			IssueID:             issueID,
-			IssueIdentifier:     entry.Identifier,
-			WorkspacePath:       entry.WorkspacePath,
-			Branch:              entry.Branch,
-			PRNumber:            entry.PRNumber,
-			PRURL:               entry.PRURL,
-			PRState:             entry.PRState,
-			Reason:              entry.Reason,
-			ExpectedOutcome:     entry.ExpectedOutcome,
-			PreviousBranch:      entry.PreviousBranch,
+			IssueIdentifier:     recordIdentifier(entry),
+			WorkspacePath:       recordWorkspacePath(entry),
+			Branch:              recordBranch(entry),
+			Reason:              reasonCode,
+			ExpectedOutcome:     string(o.currentWorkflow().Completion.Mode),
+			PreviousBranch:      recordBranch(entry),
 			LastKnownIssueState: entry.LastKnownIssueState,
-			ObservedAt:          entry.ObservedAt,
+			ObservedAt:          recordUpdatedAt(entry, now),
 			AttemptCount:        attemptCountFromRetry(entry.RetryAttempt),
 		})
+		item := &awaitingIntervention[len(awaitingIntervention)-1]
+		if pr != nil {
+			item.PRNumber = pr.Number
+			item.PRURL = pr.URL
+			item.PRState = pr.State
+		}
 	}
 	sort.SliceStable(awaitingIntervention, func(i int, j int) bool {
 		if awaitingIntervention[i].IssueIdentifier != awaitingIntervention[j].IssueIdentifier {
@@ -1998,15 +2409,23 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return awaitingIntervention[i].IssueID < awaitingIntervention[j].IssueID
 	})
 
-	retrying := make([]RetrySnapshot, 0, len(o.state.RetryAttempts))
-	for issueID, entry := range o.state.RetryAttempts {
+	retrying := make([]RetrySnapshot, 0, len(o.retryRecords))
+	for issueID, entry := range o.retryRecords {
+		lastError := (*string)(nil)
+		if entry.Runtime.Reason != nil {
+			if value, ok := entry.Runtime.Reason.Details["last_error"].(string); ok {
+				lastError = optionalError(value)
+			}
+		}
 		row := RetrySnapshot{
 			IssueID:         issueID,
-			IssueIdentifier: entry.Identifier,
-			WorkspacePath:   entry.WorkspacePath,
-			Attempt:         entry.Attempt,
-			DueAt:           entry.DueAt,
-			Error:           entry.Error,
+			IssueIdentifier: recordIdentifier(entry),
+			WorkspacePath:   recordWorkspacePath(entry),
+			Attempt:         entry.RetryAttempt,
+			Error:           lastError,
+		}
+		if entry.RetryDueAt != nil {
+			row.DueAt = *entry.RetryDueAt
 		}
 		if entry.Dispatch != nil {
 			row.DispatchKind = string(entry.Dispatch.Kind)
@@ -2025,91 +2444,6 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return retrying[i].IssueID < retrying[j].IssueID
 	})
 
-	var protectedPersistedState *durableRuntimeState
-	if o.isProtectedLocked() && o.lastPersistedState != nil {
-		persisted := cloneDurableRuntimeState(*o.lastPersistedState)
-		protectedPersistedState = &persisted
-		running = make([]RunningSnapshot, 0)
-		recovering = make([]RecoveringSnapshot, 0, len(persisted.Recovering))
-		for _, item := range persisted.Recovering {
-			row := RecoveringSnapshot{
-				IssueID:         item.IssueID,
-				IssueIdentifier: item.Identifier,
-				WorkspacePath:   item.WorkspacePath,
-				State:           item.State,
-				Strategy:        item.Strategy,
-				Source:          item.Source,
-				ObservedAt:      item.ObservedAt,
-				AttemptCount:    attemptCountFromRetry(item.RetryAttempt),
-			}
-			dispatch := durableDispatchToModel(item.Dispatch)
-			if dispatch != nil {
-				row.DispatchKind = string(dispatch.Kind)
-				row.ExpectedOutcome = string(dispatch.ExpectedOutcome)
-				if dispatch.Reason != nil {
-					reason := string(*dispatch.Reason)
-					row.ContinuationReason = &reason
-				}
-			}
-			recovering = append(recovering, row)
-		}
-		awaitingMerge = make([]AwaitingMergeSnapshot, 0, len(persisted.AwaitingMerge))
-		for _, item := range persisted.AwaitingMerge {
-			awaitingMerge = append(awaitingMerge, AwaitingMergeSnapshot{
-				IssueID:         item.IssueID,
-				IssueIdentifier: item.Identifier,
-				WorkspacePath:   item.WorkspacePath,
-				State:           item.State,
-				Branch:          item.Branch,
-				PRNumber:        item.PRNumber,
-				PRURL:           item.PRURL,
-				PRState:         item.PRState,
-				AwaitingSince:   item.AwaitingSince,
-				LastError:       optionalError(pointerString(item.LastError)),
-				AttemptCount:    attemptCountFromRetry(item.RetryAttempt),
-			})
-		}
-		awaitingIntervention = make([]AwaitingInterventionSnapshot, 0, len(persisted.AwaitingIntervention))
-		for _, item := range persisted.AwaitingIntervention {
-			awaitingIntervention = append(awaitingIntervention, AwaitingInterventionSnapshot{
-				IssueID:             item.IssueID,
-				IssueIdentifier:     item.Identifier,
-				WorkspacePath:       item.WorkspacePath,
-				Branch:              item.Branch,
-				PRNumber:            item.PRNumber,
-				PRURL:               item.PRURL,
-				PRState:             item.PRState,
-				Reason:              item.Reason,
-				ExpectedOutcome:     item.ExpectedOutcome,
-				PreviousBranch:      item.PreviousBranch,
-				LastKnownIssueState: item.LastKnownIssueState,
-				ObservedAt:          item.ObservedAt,
-				AttemptCount:        attemptCountFromRetry(item.RetryAttempt),
-			})
-		}
-		retrying = make([]RetrySnapshot, 0, len(persisted.Retrying))
-		for _, item := range persisted.Retrying {
-			row := RetrySnapshot{
-				IssueID:         item.IssueID,
-				IssueIdentifier: item.Identifier,
-				WorkspacePath:   item.WorkspacePath,
-				Attempt:         item.Attempt,
-				DueAt:           item.DueAt,
-				Error:           optionalError(pointerString(item.Error)),
-			}
-			dispatch := durableDispatchToModel(item.Dispatch)
-			if dispatch != nil {
-				row.DispatchKind = string(dispatch.Kind)
-				row.ExpectedOutcome = string(dispatch.ExpectedOutcome)
-				if dispatch.Reason != nil {
-					reason := string(*dispatch.Reason)
-					row.ContinuationReason = &reason
-				}
-			}
-			retrying = append(retrying, row)
-		}
-	}
-
 	alerts := make([]AlertSnapshot, 0, len(o.healthAlerts))
 	for _, alert := range o.healthAlerts {
 		alerts = append(alerts, alert)
@@ -2124,83 +2458,50 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		return alerts[i].Message < alerts[j].Message
 	})
 
-	derived := make([]ObservationSnapshot, 0, len(o.state.RetryAttempts)+len(o.state.AwaitingMerge))
-	if protectedPersistedState != nil {
-		for _, entry := range protectedPersistedState.Retrying {
-			if entry.Error == nil {
-				continue
-			}
-			errorText := pointerString(entry.Error)
-			lowerError := strings.ToLower(errorText)
-			switch {
-			case isStallErrorText(errorText) && entry.StallCount > 1:
-				derived = append(derived, ObservationSnapshot{
-					Code:            "repeated_stall",
-					Level:           "warn",
-					Message:         errorText,
-					IssueID:         entry.IssueID,
-					IssueIdentifier: entry.Identifier,
-				})
-			case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
-				derived = append(derived, ObservationSnapshot{
-					Code:            "workspace_hook_failure",
-					Level:           "warn",
-					Message:         errorText,
-					IssueID:         entry.IssueID,
-					IssueIdentifier: entry.Identifier,
-				})
-			}
+	derived := make([]ObservationSnapshot, 0, len(o.retryRecords)+len(o.awaitingMergeRecords))
+	for issueID, entry := range o.retryRecords {
+		if entry.Runtime.Reason == nil {
+			continue
 		}
-		for _, entry := range protectedPersistedState.AwaitingMerge {
-			if entry.LastError == nil {
-				continue
-			}
+		errorText, _ := entry.Runtime.Reason.Details["last_error"].(string)
+		if strings.TrimSpace(errorText) == "" {
+			continue
+		}
+		lowerError := strings.ToLower(errorText)
+		switch {
+		case isStallErrorText(errorText) && entry.StallCount > 1:
 			derived = append(derived, ObservationSnapshot{
-				Code:            "merge_status_unknown",
+				Code:            "repeated_stall",
 				Level:           "warn",
-				Message:         pointerString(entry.LastError),
-				IssueID:         entry.IssueID,
-				IssueIdentifier: entry.Identifier,
-			})
-		}
-	} else {
-		for issueID, entry := range o.state.RetryAttempts {
-			if entry.Error == nil {
-				continue
-			}
-			errorText := *entry.Error
-			lowerError := strings.ToLower(errorText)
-			switch {
-			case isStallErrorText(errorText) && entry.StallCount > 1:
-				derived = append(derived, ObservationSnapshot{
-					Code:            "repeated_stall",
-					Level:           "warn",
-					Message:         errorText,
-					IssueID:         issueID,
-					IssueIdentifier: entry.Identifier,
-				})
-			case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
-				derived = append(derived, ObservationSnapshot{
-					Code:            "workspace_hook_failure",
-					Level:           "warn",
-					Message:         errorText,
-					IssueID:         issueID,
-					IssueIdentifier: entry.Identifier,
-				})
-			}
-		}
-		for issueID, entry := range o.state.AwaitingMerge {
-			if entry.LastError == nil {
-				continue
-			}
-			derived = append(derived, ObservationSnapshot{
-				Code:            "merge_status_unknown",
-				Level:           "warn",
-				Message:         *entry.LastError,
+				Message:         errorText,
 				IssueID:         issueID,
-				IssueIdentifier: entry.Identifier,
+				IssueIdentifier: recordIdentifier(entry),
+			})
+		case strings.Contains(lowerError, model.ErrWorkspaceHookFailed.Code), strings.Contains(lowerError, model.ErrWorkspaceHookTimeout.Code):
+			derived = append(derived, ObservationSnapshot{
+				Code:            "workspace_hook_failure",
+				Level:           "warn",
+				Message:         errorText,
+				IssueID:         issueID,
+				IssueIdentifier: recordIdentifier(entry),
 			})
 		}
+	}
+	for issueID, entry := range o.awaitingMergeRecords {
+		if entry.Runtime.Reason == nil {
+			continue
+		}
+		errorText, _ := entry.Runtime.Reason.Details["last_error"].(string)
+		if strings.TrimSpace(errorText) == "" {
+			continue
+		}
+		derived = append(derived, ObservationSnapshot{
+			Code:            "merge_status_unknown",
+			Level:           "warn",
+			Message:         errorText,
+			IssueID:         issueID,
+			IssueIdentifier: recordIdentifier(entry),
+		})
 	}
 	sort.SliceStable(derived, func(i int, j int) bool {
 		if derived[i].Code != derived[j].Code {
@@ -2268,22 +2569,16 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 
 	mode := o.serviceModeLocked()
 	protectionReason := ""
-	protectedAt := (*time.Time)(nil)
-	restartRequired := false
-	if o.state.Protection != nil {
-		protectionReason = o.state.Protection.Reason
-		protectedAt = cloneTimePtr(&o.state.Protection.EnteredAt)
-		restartRequired = o.state.Protection.MustRestart
+	restartRequired := mode == model.ServiceModeUnavailable
+	if len(o.state.Service.Reasons) > 0 {
+		protectionReason = string(o.state.Service.Reasons[0].ReasonCode)
 	}
 
 	totals := o.state.CodexTotals
 	rateLimits := o.state.CodexRateLimits
-	if protectedPersistedState != nil {
-		totals = protectedPersistedState.TokenTotal
-		rateLimits = nil
-	} else {
-		for _, entry := range o.state.Running {
-			totals.SecondsRunning += now.Sub(entry.StartedAt).Seconds()
+	for _, entry := range o.runningRecords {
+		if entry.StartedAt != nil {
+			totals.SecondsRunning += now.Sub(*entry.StartedAt).Seconds()
 		}
 	}
 
@@ -2294,7 +2589,7 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 			StartedAt:        o.startedAt,
 			Mode:             mode,
 			ProtectionReason: protectionReason,
-			ProtectedAt:      protectedAt,
+			ProtectedAt:      nil,
 			RestartRequired:  restartRequired,
 		},
 		Counts: SnapshotCounts{
@@ -2378,19 +2673,19 @@ func (o *Orchestrator) isDispatchEligible(issue model.Issue, cfg *model.ServiceC
 
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-	if _, ok := o.state.Running[issue.ID]; ok {
+	if _, ok := o.runningRecords[issue.ID]; ok {
 		return false
 	}
-	if _, ok := o.state.Recovering[issue.ID]; ok {
+	if record := o.state.Records[issue.ID]; record != nil && record.NeedsRecovery {
 		return false
 	}
-	if _, ok := o.state.AwaitingMerge[issue.ID]; ok {
+	if _, ok := o.awaitingMergeRecords[issue.ID]; ok {
 		return false
 	}
-	if _, ok := o.state.AwaitingIntervention[issue.ID]; ok {
+	if _, ok := o.awaitingInterventionRecords[issue.ID]; ok {
 		return false
 	}
-	if _, ok := o.state.RetryAttempts[issue.ID]; ok && !ignoreClaim {
+	if _, ok := o.retryRecords[issue.ID]; ok && !ignoreClaim {
 		return false
 	}
 
@@ -2408,7 +2703,7 @@ func (o *Orchestrator) hasAvailableSlots(issue model.Issue, cfg *model.ServiceCo
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 
-	if cfg.MaxConcurrentAgents <= len(o.state.Running) {
+	if cfg.MaxConcurrentAgents <= len(o.runningRecords) {
 		return false
 	}
 	normalized := model.NormalizeState(issue.State)
@@ -2417,8 +2712,8 @@ func (o *Orchestrator) hasAvailableSlots(issue model.Issue, cfg *model.ServiceCo
 		return true
 	}
 	count := 0
-	for _, entry := range o.state.Running {
-		if model.NormalizeState(entry.Issue.State) == normalized {
+	for _, entry := range o.runningRecords {
+		if model.NormalizeState(entry.LastKnownIssueState) == normalized {
 			count++
 		}
 	}
@@ -2469,74 +2764,123 @@ func (o *Orchestrator) runtimeContext() context.Context {
 }
 
 func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, issueState string, workspacePath string, branch string, retryAttempt int, stallCount int, pr *PullRequestInfo, lastError *string) {
-	var errorCopy *string
-	if lastError != nil {
-		errorCopy = optionalError(*lastError)
-	}
-	entry := &model.AwaitingMergeEntry{
-		Identifier:    identifier,
-		State:         issueState,
-		WorkspacePath: workspacePath,
-		Branch:        branch,
-		RetryAttempt:  retryAttempt,
-		StallCount:    stallCount,
-		AwaitingSince: o.now().UTC(),
-		LastError:     errorCopy,
-	}
-	if pr != nil {
-		entry.PRNumber = pr.Number
-		entry.PRURL = pr.URL
-		entry.PRState = string(pr.State)
-		entry.PRBaseOwner = pr.BaseOwner
-		entry.PRBaseRepo = pr.BaseRepo
-		entry.PRHeadOwner = pr.HeadOwner
-	}
-
 	o.mu.Lock()
 	if o.isProtectedLocked() {
 		o.mu.Unlock()
 		return
 	}
-	delete(o.pendingResume, issueID)
-	delete(o.state.Recovering, issueID)
-	o.state.AwaitingMerge[issueID] = entry
+	record := o.state.Records[issueID]
+	if record == nil {
+		record = &model.IssueRecord{
+			Runtime: contract.IssueRuntimeRecord{
+				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
+				SourceRef: contract.SourceRef{
+					SourceKind:       contract.SourceKindLinear,
+					SourceID:         strings.TrimSpace(issueID),
+					SourceIdentifier: strings.TrimSpace(identifier),
+				},
+				DurableRefs: contract.DurableRefs{
+					LedgerPath: ledgerPathForConfig(o.currentConfig()),
+				},
+			},
+		}
+		o.state.Records[issueID] = record
+	}
+	record.RetryAttempt = retryAttempt
+	record.StallCount = stallCount
+	record.LastKnownIssueState = issueState
+	record.NeedsRecovery = false
+	record.RetryDueAt = nil
+	record.Runtime.SourceRef.SourceIdentifier = identifier
+	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
+	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
+	if pr != nil {
+		record.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
+			Number: pr.Number,
+			URL:    pr.URL,
+			State:  string(pr.State),
+		}
+	}
+	reasonDetails := map[string]any{
+		"record_id": record.Runtime.RecordID,
+	}
+	if lastError != nil {
+		reasonDetails["last_error"] = *lastError
+	}
+	o.setRecordStatusLocked(record, contract.IssueStatusAwaitingMerge, &contract.Reason{
+		ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
+		Category:   contract.CategoryRecord,
+		Details:    reasonDetails,
+	}, &contract.Observation{
+		Running: false,
+		Summary: "awaiting pull request merge",
+	})
+	o.reindexRecordLocked(issueID, record)
+	delete(o.pendingRecovery, issueID)
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 }
 
 func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, expectedOutcome model.CompletionMode, reason string, issueState string, pr *PullRequestInfo) {
-	entry := &model.AwaitingInterventionEntry{
-		Identifier:          identifier,
-		WorkspacePath:       workspacePath,
-		Branch:              branch,
-		RetryAttempt:        retryAttempt,
-		StallCount:          stallCount,
-		ObservedAt:          o.now().UTC(),
-		Reason:              reason,
-		ExpectedOutcome:     string(expectedOutcome),
-		PreviousBranch:      branch,
-		LastKnownIssueState: issueState,
-	}
-	if pr != nil {
-		entry.PRNumber = pr.Number
-		entry.PRURL = pr.URL
-		entry.PRState = string(pr.State)
-		entry.PRBaseOwner = pr.BaseOwner
-		entry.PRBaseRepo = pr.BaseRepo
-		entry.PRHeadOwner = pr.HeadOwner
-	}
-
-	o.logger.Warn("issue awaiting manual intervention", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "pr_state", entry.PRState, "reason", reason)
+	o.logger.Warn("issue awaiting manual intervention", "issue_id", issueID, "issue_identifier", identifier, "branch", branch, "reason", reason)
 
 	o.mu.Lock()
 	if o.isProtectedLocked() {
 		o.mu.Unlock()
 		return
 	}
-	delete(o.pendingResume, issueID)
-	delete(o.state.Recovering, issueID)
-	delete(o.state.AwaitingMerge, issueID)
-	o.state.AwaitingIntervention[issueID] = entry
+	record := o.state.Records[issueID]
+	if record == nil {
+		record = &model.IssueRecord{
+			Runtime: contract.IssueRuntimeRecord{
+				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
+				SourceRef: contract.SourceRef{
+					SourceKind:       contract.SourceKindLinear,
+					SourceID:         strings.TrimSpace(issueID),
+					SourceIdentifier: strings.TrimSpace(identifier),
+				},
+				DurableRefs: contract.DurableRefs{
+					LedgerPath: ledgerPathForConfig(o.currentConfig()),
+				},
+			},
+		}
+		o.state.Records[issueID] = record
+	}
+	reasonCode := contract.ReasonRecordBlockedAwaitingIntervention
+	if reason == string(model.ContinuationReasonTrackerIssueMissing) || reason == "recovery_uncertain" {
+		reasonCode = contract.ReasonRecordBlockedRecoveryUncertain
+	}
+	record.RetryAttempt = retryAttempt
+	record.StallCount = stallCount
+	record.LastKnownIssueState = issueState
+	record.NeedsRecovery = false
+	record.Runtime.SourceRef.SourceIdentifier = identifier
+	record.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
+	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
+	if pr != nil {
+		record.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
+			Number: pr.Number,
+			URL:    pr.URL,
+			State:  string(pr.State),
+		}
+	}
+	o.setRecordStatusLocked(record, contract.IssueStatusAwaitingIntervention, &contract.Reason{
+		ReasonCode: reasonCode,
+		Category:   contract.CategoryRecord,
+		Details: map[string]any{
+			"record_id":        record.Runtime.RecordID,
+			"cause":            reason,
+			"expected_outcome": string(expectedOutcome),
+			"previous_branch":  branch,
+		},
+	}, &contract.Observation{
+		Running: false,
+		Summary: "operator intervention required",
+	})
+	o.reindexRecordLocked(issueID, record)
+	delete(o.pendingRecovery, issueID)
 	version := o.commitStateLocked(true)
 	event := o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, pr)
 	if version > 0 {
@@ -2561,19 +2905,32 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 		o.mu.Unlock()
 		return false
 	}
-	current := o.state.AwaitingMerge[issueID]
-	awaitingSince := o.now().UTC()
-	postMergeRetryCount := 0
+	current := o.state.Records[issueID]
 	if current == nil {
-		current = &model.AwaitingMergeEntry{}
-		o.state.AwaitingMerge[issueID] = current
-	} else {
-		if !current.AwaitingSince.IsZero() {
-			awaitingSince = current.AwaitingSince
+		current = &model.IssueRecord{
+			Runtime: contract.IssueRuntimeRecord{
+				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
+				SourceRef: contract.SourceRef{
+					SourceKind:       contract.SourceKindLinear,
+					SourceID:         strings.TrimSpace(issueID),
+					SourceIdentifier: strings.TrimSpace(identifier),
+				},
+				DurableRefs: contract.DurableRefs{
+					LedgerPath: ledgerPathForConfig(o.currentConfig()),
+				},
+			},
 		}
-		postMergeRetryCount = current.PostMergeRetryCount
+		o.state.Records[issueID] = current
 	}
-	postMergeRetryCount++
+	postMergeRetryCount := 1
+	if current.Runtime.Reason != nil {
+		if value, ok := current.Runtime.Reason.Details["post_merge_retry_count"].(int); ok {
+			postMergeRetryCount = value + 1
+		}
+		if value, ok := current.Runtime.Reason.Details["post_merge_retry_count"].(float64); ok {
+			postMergeRetryCount = int(value) + 1
+		}
+	}
 	if postMergeRetryCount > maxPostMergeCloseRetries {
 		o.mu.Unlock()
 		o.moveToAwaitingIntervention(issueID, identifier, workspacePath, branch, retryAttempt, stallCount, model.CompletionModePullRequest, "post_merge_transition_failed", issueState, pr)
@@ -2581,27 +2938,36 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 	}
 
 	nextRetryAt := o.now().UTC().Add(postMergeRetryDelay(postMergeRetryCount, o.currentConfig().MaxRetryBackoffMS))
-	current.Identifier = identifier
-	current.State = issueState
-	current.WorkspacePath = workspacePath
-	current.Branch = branch
 	current.RetryAttempt = retryAttempt
 	current.StallCount = stallCount
-	current.AwaitingSince = awaitingSince
-	current.LastError = optionalError(errorText)
-	current.PostMergeRetryCount = postMergeRetryCount
-	current.NextPostMergeRetryAt = &nextRetryAt
+	current.LastKnownIssueState = issueState
+	current.Runtime.SourceRef.SourceIdentifier = identifier
+	current.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
+	current.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
+	current.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
+	current.RetryDueAt = &nextRetryAt
 	if pr != nil {
-		current.PRNumber = pr.Number
-		current.PRURL = pr.URL
-		current.PRState = string(pr.State)
-		current.PRBaseOwner = pr.BaseOwner
-		current.PRBaseRepo = pr.BaseRepo
-		current.PRHeadOwner = pr.HeadOwner
+		current.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
+			Number: pr.Number,
+			URL:    pr.URL,
+			State:  string(pr.State),
+		}
 	}
-	delete(o.pendingResume, issueID)
-	delete(o.state.Recovering, issueID)
-	delete(o.state.AwaitingIntervention, issueID)
+	o.setRecordStatusLocked(current, contract.IssueStatusAwaitingMerge, &contract.Reason{
+		ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
+		Category:   contract.CategoryRecord,
+		Details: map[string]any{
+			"record_id":                current.Runtime.RecordID,
+			"last_error":               errorText,
+			"post_merge_retry_count":   postMergeRetryCount,
+			"next_post_merge_retry_at": nextRetryAt.Format(time.RFC3339Nano),
+		},
+	}, &contract.Observation{
+		Running: false,
+		Summary: "awaiting post-merge retry",
+	})
+	o.reindexRecordLocked(issueID, current)
+	delete(o.pendingRecovery, issueID)
 	o.commitStateLocked(true)
 	o.mu.Unlock()
 	return false
@@ -2640,39 +3006,51 @@ func (o *Orchestrator) stageMergedPullRequestCompletion(issueID string, identifi
 		return 0, true
 	}
 
-	current := o.state.AwaitingMerge[issueID]
-	awaitingSince := o.now().UTC()
-	postMergeRetryCount := 0
+	current := o.state.Records[issueID]
 	if current == nil {
-		current = &model.AwaitingMergeEntry{}
-		o.state.AwaitingMerge[issueID] = current
-	} else {
-		if !current.AwaitingSince.IsZero() {
-			awaitingSince = current.AwaitingSince
+		current = &model.IssueRecord{
+			Runtime: contract.IssueRuntimeRecord{
+				RecordID: contract.RecordID(fmt.Sprintf("rec_%s_%s", contract.SourceKindLinear, strings.TrimSpace(issueID))),
+				SourceRef: contract.SourceRef{
+					SourceKind:       contract.SourceKindLinear,
+					SourceID:         strings.TrimSpace(issueID),
+					SourceIdentifier: strings.TrimSpace(identifier),
+				},
+				DurableRefs: contract.DurableRefs{
+					LedgerPath: ledgerPathForConfig(o.currentConfig()),
+				},
+			},
 		}
-		postMergeRetryCount = current.PostMergeRetryCount
+		o.state.Records[issueID] = current
 	}
-	current.Identifier = identifier
-	current.State = issueState
-	current.WorkspacePath = workspacePath
-	current.Branch = branch
 	current.RetryAttempt = retryAttempt
 	current.StallCount = stallCount
-	current.AwaitingSince = awaitingSince
-	current.LastError = nil
-	current.PostMergeRetryCount = postMergeRetryCount
-	current.NextPostMergeRetryAt = nil
+	current.LastKnownIssueState = issueState
+	current.NeedsRecovery = false
+	current.RetryDueAt = nil
+	current.Runtime.SourceRef.SourceIdentifier = identifier
+	current.Runtime.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
+	current.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
+	current.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: branch}
 	if pr != nil {
-		current.PRNumber = pr.Number
-		current.PRURL = pr.URL
-		current.PRState = string(pr.State)
-		current.PRBaseOwner = pr.BaseOwner
-		current.PRBaseRepo = pr.BaseRepo
-		current.PRHeadOwner = pr.HeadOwner
+		current.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
+			Number: pr.Number,
+			URL:    pr.URL,
+			State:  string(pr.State),
+		}
 	}
-	delete(o.pendingResume, issueID)
-	delete(o.state.Recovering, issueID)
-	delete(o.state.AwaitingIntervention, issueID)
+	o.setRecordStatusLocked(current, contract.IssueStatusAwaitingMerge, &contract.Reason{
+		ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
+		Category:   contract.CategoryRecord,
+		Details: map[string]any{
+			"record_id": current.Runtime.RecordID,
+		},
+	}, &contract.Observation{
+		Running: false,
+		Summary: "awaiting pull request merge",
+	})
+	o.reindexRecordLocked(issueID, current)
+	delete(o.pendingRecovery, issueID)
 	version := o.commitStateLocked(true)
 	if version > 0 && action != nil {
 		o.pendingPostMergeTransitions[issueID] = version
@@ -2745,39 +3123,75 @@ func (o *Orchestrator) lookupPullRequestByHeadBranch(ctx context.Context, worksp
 	return o.prLookup.FindByHeadBranch(ctx, workspacePath, branch)
 }
 
-func pullRequestInfoFromAwaitingMerge(entry model.AwaitingMergeEntry) *PullRequestInfo {
-	if entry.PRNumber <= 0 && strings.TrimSpace(entry.Branch) == "" {
+func pullRequestInfoFromAwaitingMerge(record *model.IssueRecord) *PullRequestInfo {
+	if record == nil {
+		return nil
+	}
+	pr := record.Runtime.DurableRefs.PullRequest
+	branch := recordBranch(record)
+	if pr == nil && branch == "" {
 		return nil
 	}
 	return &PullRequestInfo{
-		Number:     entry.PRNumber,
-		URL:        entry.PRURL,
-		HeadBranch: entry.Branch,
-		HeadOwner:  entry.PRHeadOwner,
-		BaseOwner:  entry.PRBaseOwner,
-		BaseRepo:   entry.PRBaseRepo,
-		State:      PullRequestState(entry.PRState),
+		HeadBranch: branch,
+		State:      PullRequestState(""),
 	}
 }
 
-func (o *Orchestrator) lookupAwaitingMergePullRequest(ctx context.Context, workspacePath string, entry model.AwaitingMergeEntry) (*PullRequestInfo, error) {
+func (o *Orchestrator) lookupAwaitingMergePullRequest(ctx context.Context, workspacePath string, entry *model.IssueRecord) (*PullRequestInfo, error) {
 	if o.prLookup == nil {
 		return nil, errors.New("pull request lookup is not configured")
 	}
-	return o.prLookup.Refresh(ctx, workspacePath, pullRequestInfoFromAwaitingMerge(entry))
+	pr := pullRequestInfoFromAwaitingMerge(entry)
+	if pr != nil && entry != nil && entry.Runtime.DurableRefs.PullRequest != nil {
+		ref := entry.Runtime.DurableRefs.PullRequest
+		pr.Number = ref.Number
+		pr.URL = ref.URL
+		pr.State = PullRequestState(ref.State)
+	}
+	return o.prLookup.Refresh(ctx, workspacePath, pr)
 }
 
 func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID string, identifier string) {
+	o.completeIssueWithOutcome(ctx, issueID, identifier, contract.ResultOutcomeSucceeded, "issue reached a terminal state")
+}
+
+func (o *Orchestrator) completeAbandonedIssue(ctx context.Context, issueID string, identifier string, summary string) {
+	o.completeIssueWithOutcome(ctx, issueID, identifier, contract.ResultOutcomeAbandoned, summary)
+}
+
+func (o *Orchestrator) completeIssueWithOutcome(ctx context.Context, issueID string, identifier string, outcome contract.ResultOutcome, summary string) {
 	o.mu.Lock()
 	if o.isProtectedLocked() {
 		o.mu.Unlock()
 		return
 	}
-	delete(o.pendingResume, issueID)
-	delete(o.state.Recovering, issueID)
-	delete(o.state.AwaitingMerge, issueID)
-	delete(o.state.AwaitingIntervention, issueID)
-	o.rememberCompletedLocked(issueID)
+	delete(o.pendingRecovery, issueID)
+	record := o.removeRecordLocked(issueID)
+	if record == nil {
+		o.mu.Unlock()
+		return
+	}
+	record.WorkerCancel = nil
+	record.RetryTimer = nil
+	record.StartedAt = nil
+	record.NeedsRecovery = false
+	record.Runtime.Status = contract.IssueStatusCompleted
+	record.Runtime.Reason = nil
+	record.Runtime.Observation = &contract.Observation{
+		Running: false,
+		Summary: summary,
+	}
+	record.Runtime.Result = &contract.Result{
+		Outcome:     outcome,
+		Summary:     summary,
+		CompletedAt: o.now().UTC().Format(time.RFC3339Nano),
+		Details: map[string]any{
+			"record_id": record.Runtime.RecordID,
+		},
+	}
+	record.Runtime.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
+	o.rememberCompletedLocked(cloneRuntimeRecord(record.Runtime))
 	version := o.commitStateLocked(true)
 	event := o.newIssueCompletedEvent(issueID, identifier)
 	if version > 0 {
@@ -2968,23 +3382,22 @@ func bashSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func (o *Orchestrator) rememberCompletedLocked(issueID string) {
-	if strings.TrimSpace(issueID) == "" {
+func (o *Orchestrator) rememberCompletedLocked(record contract.IssueRuntimeRecord) {
+	if strings.TrimSpace(string(record.RecordID)) == "" {
 		return
 	}
-	if _, exists := o.state.Completed[issueID]; exists {
-		return
+	next := make([]contract.IssueRuntimeRecord, 0, len(o.state.CompletedWindow)+1)
+	next = append(next, cloneRuntimeRecord(record))
+	for _, item := range o.state.CompletedWindow {
+		if item.RecordID == record.RecordID {
+			continue
+		}
+		next = append(next, cloneRuntimeRecord(item))
+		if o.maxCompleted > 0 && len(next) >= o.maxCompleted {
+			break
+		}
 	}
-	o.state.Completed[issueID] = struct{}{}
-	if o.maxCompleted <= 0 {
-		return
-	}
-	o.completedOrder = append(o.completedOrder, issueID)
-	for len(o.completedOrder) > o.maxCompleted {
-		evicted := o.completedOrder[0]
-		o.completedOrder = o.completedOrder[1:]
-		delete(o.state.Completed, evicted)
-	}
+	o.state.CompletedWindow = next
 }
 
 func maxInt(left int, right int) int {

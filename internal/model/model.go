@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"symphony-go/internal/model/contract"
 )
 
 type Issue struct {
@@ -58,11 +60,12 @@ type CompletionContract struct {
 	OnClosedPR  CompletionAction
 }
 
-type ServiceMode string
+type ServiceMode = contract.ServiceMode
 
 const (
-	ServiceModeNormal    ServiceMode = "normal"
-	ServiceModeProtected ServiceMode = "protected"
+	ServiceModeServing     ServiceMode = contract.ServiceModeServing
+	ServiceModeDegraded    ServiceMode = contract.ServiceModeDegraded
+	ServiceModeUnavailable ServiceMode = contract.ServiceModeUnavailable
 )
 
 type DispatchKind string
@@ -484,20 +487,36 @@ type ProtectedResultEntry struct {
 	Dispatch      *DispatchContext
 }
 
+type RuntimeServiceState struct {
+	Mode               ServiceMode
+	RecoveryInProgress bool
+	Reasons            []contract.Reason
+}
+
+type IssueRecord struct {
+	Runtime             contract.IssueRuntimeRecord
+	RetryDueAt          *time.Time
+	RetryAttempt        int
+	StallCount          int
+	LastKnownIssue      *Issue
+	LastKnownIssueState string
+	StartedAt           *time.Time
+	WorkerCancel        context.CancelFunc
+	RetryTimer          *time.Timer
+	Session             LiveSession
+	Dispatch            *DispatchContext
+	NeedsRecovery       bool
+}
+
 type OrchestratorState struct {
-	PollIntervalMS       int
-	MaxConcurrentAgents  int
-	Mode                 ServiceMode
-	Protection           *ProtectedState
-	Running              map[string]*RunningEntry
-	Recovering           map[string]*RecoveryEntry
-	AwaitingMerge        map[string]*AwaitingMergeEntry
-	AwaitingIntervention map[string]*AwaitingInterventionEntry
-	RetryAttempts        map[string]*RetryEntry
-	ProtectedResults     map[string]*ProtectedResultEntry
-	Completed            map[string]struct{}
-	CodexTotals          TokenTotals
-	CodexRateLimits      any
+	PollIntervalMS      int
+	MaxConcurrentAgents int
+	Service             RuntimeServiceState
+	Records             map[string]*IssueRecord
+	ProtectedResults    map[string]*ProtectedResultEntry
+	CompletedWindow     []contract.IssueRuntimeRecord
+	CodexTotals         TokenTotals
+	CodexRateLimits     any
 }
 
 type RunningEntry struct {
