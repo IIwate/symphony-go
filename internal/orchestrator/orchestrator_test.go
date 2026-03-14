@@ -338,6 +338,34 @@ func TestConservativeRecoveryCanPromoteToAwaitingMerge(t *testing.T) {
 	}
 }
 
+func TestPullRequestInfoFromAwaitingMergeUsesPersistedReasonDetails(t *testing.T) {
+	record := &model.IssueRecord{
+		Runtime: contract.IssueRuntimeRecord{
+			DurableRefs: contract.DurableRefs{
+				Branch: &contract.BranchRef{Name: "feature/abc-1"},
+				PullRequest: &contract.PullRequestRef{
+					Number: 42,
+					URL:    "https://github.example/pr/42",
+					State:  "open",
+				},
+			},
+			Reason: ptrReason(contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{
+				"pr_base_owner": "IIwate",
+				"pr_base_repo":  "symphony-go",
+				"pr_head_owner": "IIwate",
+			})),
+		},
+	}
+
+	pr := pullRequestInfoFromAwaitingMerge(record)
+	if pr == nil {
+		t.Fatal("pullRequestInfoFromAwaitingMerge() = nil")
+	}
+	if pr.BaseOwner != "IIwate" || pr.BaseRepo != "symphony-go" || pr.HeadOwner != "IIwate" {
+		t.Fatalf("pull request owners = %+v", pr)
+	}
+}
+
 func TestHandleSessionPersistenceWriteFailureSetsUnavailableServiceMode(t *testing.T) {
 	o, _, _ := newTestOrchestrator(t)
 

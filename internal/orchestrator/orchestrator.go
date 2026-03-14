@@ -584,6 +584,14 @@ func recordPullRequest(record *model.IssueRecord) *PullRequestInfo {
 	}
 }
 
+func recordReasonDetailString(record *model.IssueRecord, key string) string {
+	if record == nil || record.Runtime.Reason == nil || record.Runtime.Reason.Details == nil {
+		return ""
+	}
+	value, _ := record.Runtime.Reason.Details[key].(string)
+	return strings.TrimSpace(value)
+}
+
 func isRecordRunning(record *model.IssueRecord) bool {
 	return record != nil && record.Runtime.Status == contract.IssueStatusActive && record.Runtime.Observation != nil && record.Runtime.Observation.Running
 }
@@ -1810,9 +1818,12 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 					ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
 					Category:   contract.CategoryRecord,
 					Details: map[string]any{
-						"record_id": current.Runtime.RecordID,
-						"pr_number": pr.Number,
-						"pr_state":  pr.State,
+						"record_id":     current.Runtime.RecordID,
+						"pr_number":     pr.Number,
+						"pr_state":      pr.State,
+						"pr_base_owner": pr.BaseOwner,
+						"pr_base_repo":  pr.BaseRepo,
+						"pr_head_owner": pr.HeadOwner,
 					},
 				})
 				o.commitStateLocked(true)
@@ -1840,9 +1851,12 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 					ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
 					Category:   contract.CategoryRecord,
 					Details: map[string]any{
-						"record_id":  current.Runtime.RecordID,
-						"last_error": errorText,
-						"pr_state":   pr.State,
+						"record_id":     current.Runtime.RecordID,
+						"last_error":    errorText,
+						"pr_state":      pr.State,
+						"pr_base_owner": pr.BaseOwner,
+						"pr_base_repo":  pr.BaseRepo,
+						"pr_head_owner": pr.HeadOwner,
 					},
 				})
 				o.commitStateLocked(true)
@@ -2808,6 +2822,13 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 	if lastError != nil {
 		reasonDetails["last_error"] = *lastError
 	}
+	if pr != nil {
+		reasonDetails["pr_number"] = pr.Number
+		reasonDetails["pr_state"] = pr.State
+		reasonDetails["pr_base_owner"] = pr.BaseOwner
+		reasonDetails["pr_base_repo"] = pr.BaseRepo
+		reasonDetails["pr_head_owner"] = pr.HeadOwner
+	}
 	o.setRecordStatusLocked(record, contract.IssueStatusAwaitingMerge, &contract.Reason{
 		ReasonCode: contract.ReasonRecordBlockedAwaitingMerge,
 		Category:   contract.CategoryRecord,
@@ -2966,6 +2987,13 @@ func (o *Orchestrator) handleFailedPostMergeTransition(issueID string, identifie
 		Running: false,
 		Summary: "awaiting post-merge retry",
 	})
+	if pr != nil && current.Runtime.Reason != nil {
+		current.Runtime.Reason.Details["pr_number"] = pr.Number
+		current.Runtime.Reason.Details["pr_state"] = pr.State
+		current.Runtime.Reason.Details["pr_base_owner"] = pr.BaseOwner
+		current.Runtime.Reason.Details["pr_base_repo"] = pr.BaseRepo
+		current.Runtime.Reason.Details["pr_head_owner"] = pr.HeadOwner
+	}
 	o.reindexRecordLocked(issueID, current)
 	delete(o.pendingRecovery, issueID)
 	o.commitStateLocked(true)
@@ -3049,6 +3077,13 @@ func (o *Orchestrator) stageMergedPullRequestCompletion(issueID string, identifi
 		Running: false,
 		Summary: "awaiting pull request merge",
 	})
+	if pr != nil && current.Runtime.Reason != nil {
+		current.Runtime.Reason.Details["pr_number"] = pr.Number
+		current.Runtime.Reason.Details["pr_state"] = pr.State
+		current.Runtime.Reason.Details["pr_base_owner"] = pr.BaseOwner
+		current.Runtime.Reason.Details["pr_base_repo"] = pr.BaseRepo
+		current.Runtime.Reason.Details["pr_head_owner"] = pr.HeadOwner
+	}
 	o.reindexRecordLocked(issueID, current)
 	delete(o.pendingRecovery, issueID)
 	version := o.commitStateLocked(true)
@@ -3134,6 +3169,9 @@ func pullRequestInfoFromAwaitingMerge(record *model.IssueRecord) *PullRequestInf
 	}
 	return &PullRequestInfo{
 		HeadBranch: branch,
+		HeadOwner:  recordReasonDetailString(record, "pr_head_owner"),
+		BaseOwner:  recordReasonDetailString(record, "pr_base_owner"),
+		BaseRepo:   recordReasonDetailString(record, "pr_base_repo"),
 		State:      PullRequestState(""),
 	}
 }
