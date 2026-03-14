@@ -237,6 +237,168 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 	}
 }
 
+func TestMainIntegration_RunCommandExposesUnavailableServiceMode(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	writeRunProjectConfig(t, configDir, "", 0)
+
+	serviceReason := contract.MustReason(contract.ReasonServiceUnavailableCoreDependency, map[string]any{
+		"component": "ledger_store",
+		"detail":    "disk full",
+	})
+	discovery := contract.DiscoveryDocument{
+		APIVersion: contract.APIVersionV1,
+		Instance: contract.InstanceDocument{
+			ID:      "automation",
+			Name:    "symphony",
+			Version: "dev",
+		},
+		Source: contract.SourceDocument{
+			Kind: contract.SourceKindLinear,
+			Name: "linear-main",
+		},
+		ServiceMode:        contract.ServiceModeUnavailable,
+		RecoveryInProgress: false,
+		Capabilities: contract.CapabilityDocument{
+			EventProtocol:  "sse",
+			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
+			Notifications:  []string{"webhook"},
+			Sources:        []contract.SourceKind{contract.SourceKindLinear},
+		},
+		Reasons: []contract.Reason{serviceReason},
+		Limits: contract.LimitDocument{
+			CompletedWindowSize: 100,
+		},
+	}
+	snapshot := contract.ServiceStateSnapshot{
+		GeneratedAt:        "2026-03-14T00:00:00Z",
+		ServiceMode:        contract.ServiceModeUnavailable,
+		RecoveryInProgress: false,
+		Reasons:            []contract.Reason{serviceReason},
+		Counts:             contract.StateCounts{},
+		Records:            []contract.IssueRuntimeRecord{},
+		CompletedWindow: contract.CompletedWindow{
+			Limit:   100,
+			Records: []contract.IssueRuntimeRecord{},
+		},
+	}
+
+	signalCtx, signalCancel := context.WithCancel(context.Background())
+	defer signalCancel()
+
+	fake := &fakeOrchestrator{
+		discovery: discovery,
+		snapshot:  snapshot,
+		wait: func() {
+			<-signalCtx.Done()
+		},
+	}
+	fake.requestRefresh = func() orchestrator.RefreshRequestResult {
+		reason := contract.MustReason(contract.ReasonControlRefreshRejectedServiceMode, map[string]any{
+			"service_mode": contract.ServiceModeUnavailable,
+		})
+		return contract.ControlResult{
+			Action:              contract.ControlActionRefresh,
+			Status:              contract.ControlStatusRejected,
+			Reason:              &reason,
+			RecommendedNextStep: "检查核心依赖后重试",
+			Timestamp:           "2026-03-14T00:00:01Z",
+		}
+	}
+
+	serverStarted := make(chan struct{})
+	serverAddr := ""
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
+		return fake
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
+		httpSrv, err := server.Start(runtime, logger, host, port)
+		if err == nil {
+			serverAddr = httpSrv.Addr()
+			close(serverStarted)
+		}
+		return httpSrv, err
+	}
+	watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition) error, func(error)) error {
+		return nil
+	}
+	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+		return signalCtx, func() {}
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- execute([]string{"run", "--config-dir", configDir}, io.Discard, io.Discard)
+	}()
+
+	select {
+	case <-serverStarted:
+	case err := <-errCh:
+		t.Fatalf("execute() returned before server start: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("http server did not start")
+	}
+
+	baseURL := "http://" + serverAddr
+	discoveryResp := fetchJSON[contract.DiscoveryDocument](t, http.MethodGet, baseURL+"/api/v1/discovery", nil)
+	if discoveryResp.ServiceMode != contract.ServiceModeUnavailable {
+		t.Fatalf("discovery service_mode = %q, want %q", discoveryResp.ServiceMode, contract.ServiceModeUnavailable)
+	}
+	if len(discoveryResp.Reasons) != 1 || discoveryResp.Reasons[0].ReasonCode != contract.ReasonServiceUnavailableCoreDependency {
+		t.Fatalf("discovery reasons = %#v, want %q", discoveryResp.Reasons, contract.ReasonServiceUnavailableCoreDependency)
+	}
+
+	stateResp := fetchJSON[contract.ServiceStateSnapshot](t, http.MethodGet, baseURL+"/api/v1/state", nil)
+	if stateResp.ServiceMode != contract.ServiceModeUnavailable {
+		t.Fatalf("state service_mode = %q, want %q", stateResp.ServiceMode, contract.ServiceModeUnavailable)
+	}
+	if len(stateResp.Reasons) != 1 || stateResp.Reasons[0].ReasonCode != contract.ReasonServiceUnavailableCoreDependency {
+		t.Fatalf("state reasons = %#v, want %q", stateResp.Reasons, contract.ReasonServiceUnavailableCoreDependency)
+	}
+
+	eventsResp, err := http.Get(baseURL + "/api/v1/events")
+	if err != nil {
+		t.Fatalf("GET /api/v1/events error = %v", err)
+	}
+	reader := bufio.NewReader(eventsResp.Body)
+	firstEvent := readMainSSEEvent(t, reader)
+	if firstEvent.Event != string(contract.EventTypeSnapshot) {
+		t.Fatalf("first event = %q, want %q", firstEvent.Event, contract.EventTypeSnapshot)
+	}
+	var envelope contract.EventEnvelope
+	if err := json.Unmarshal([]byte(firstEvent.Data), &envelope); err != nil {
+		t.Fatalf("Unmarshal(snapshot event) error = %v", err)
+	}
+	if envelope.ServiceMode != contract.ServiceModeUnavailable {
+		t.Fatalf("snapshot service_mode = %q, want %q", envelope.ServiceMode, contract.ServiceModeUnavailable)
+	}
+
+	controlResp := fetchJSON[contract.ControlResult](t, http.MethodPost, baseURL+"/api/v1/control/refresh", strings.NewReader("{}"))
+	if controlResp.Status != contract.ControlStatusRejected {
+		t.Fatalf("refresh status = %q, want %q", controlResp.Status, contract.ControlStatusRejected)
+	}
+	if controlResp.Reason == nil || controlResp.Reason.ReasonCode != contract.ReasonControlRefreshRejectedServiceMode {
+		t.Fatalf("refresh reason = %#v, want %q", controlResp.Reason, contract.ReasonControlRefreshRejectedServiceMode)
+	}
+
+	_ = eventsResp.Body.Close()
+	signalCancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("execute() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run command did not exit")
+	}
+}
+
 type mainSSEEvent struct {
 	Event string
 	Data  string

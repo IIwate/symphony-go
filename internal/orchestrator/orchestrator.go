@@ -321,7 +321,7 @@ func cloneRuntimeRecord(value contract.IssueRuntimeRecord) contract.IssueRuntime
 
 func cloneCompletedWindow(records []contract.IssueRuntimeRecord) []contract.IssueRuntimeRecord {
 	if len(records) == 0 {
-		return nil
+		return []contract.IssueRuntimeRecord{}
 	}
 	cloned := make([]contract.IssueRuntimeRecord, 0, len(records))
 	for _, record := range records {
@@ -332,7 +332,7 @@ func cloneCompletedWindow(records []contract.IssueRuntimeRecord) []contract.Issu
 
 func cloneServiceReasons(reasons []contract.Reason) []contract.Reason {
 	if len(reasons) == 0 {
-		return nil
+		return []contract.Reason{}
 	}
 	cloned := make([]contract.Reason, 0, len(reasons))
 	for _, reason := range reasons {

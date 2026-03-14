@@ -49,6 +49,31 @@ func TestDiscoveryEndpointReturnsFormalContract(t *testing.T) {
 	}
 }
 
+func TestDiscoveryEndpointSerializesReasonsAsArray(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+	handler := NewHandler(runtime, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	reasons, ok := payload["reasons"].([]any)
+	if !ok {
+		t.Fatalf("reasons json type = %T, want []any", payload["reasons"])
+	}
+	if len(reasons) != 0 {
+		t.Fatalf("reasons = %#v, want empty array", reasons)
+	}
+}
+
 func TestStateEndpointReturnsFormalSnapshot(t *testing.T) {
 	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
 	handler := NewHandler(runtime, nil)

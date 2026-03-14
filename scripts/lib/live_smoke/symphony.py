@@ -7,12 +7,10 @@ import json
 import os
 import socket
 from pathlib import Path
-import sys
 from typing import Any
-from urllib import error as urlerror
 from urllib import request
 
-from live_smoke.paths import bash_single_quote, repo_root, temp_root, to_bash_path
+from live_smoke.paths import repo_root, temp_root
 from live_smoke.shell import ManagedProcess
 
 
@@ -25,20 +23,23 @@ class SmokeConfig:
     linear_api_key: str
     linear_project_slug: str
     linear_branch_scope: str
-    session_state_path: Path | None = None
+    codex_command: str = "codex app-server"
+    ledger_path: Path | None = None
     notification_port: int | None = None
+    broken_notification_port: int | None = None
+    broken_notification_channels: tuple[str, ...] = ()
+
+
+@dataclass
+class SSEEvent:
+    event: str
+    data: str
 
 
 def allocate_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
-
-
-def build_fake_app_server_command() -> str:
-    python_path = bash_single_quote(to_bash_path(Path(sys.executable)))
-    server_path = bash_single_quote(to_bash_path(repo_root() / "scripts" / "lib" / "live_smoke" / "fake_app_server.py"))
-    return f"{python_path} {server_path}"
 
 
 def symphony_binary_name() -> str:
@@ -61,7 +62,7 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
     for name in ["sources", "flows", "prompts", "hooks", "local"]:
         (config.base_dir / name).mkdir(parents=True, exist_ok=True)
 
-    command = json.dumps(build_fake_app_server_command())
+    command = json.dumps(config.codex_command)
     workspace_root = str((temp_root() / f"workspaces-{config.namespace}").resolve()).replace("\\", "/")
     project_lines = [
         "runtime:",
@@ -74,26 +75,34 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
         "    max_turns: 1",
         "  codex:",
         f"    command: {command}",
-        "    turn_timeout_ms: 30000",
-        "    read_timeout_ms: 5000",
-        "    stall_timeout_ms: 30000",
+        "    approval_policy: never",
+        "    thread_sandbox: workspace-write",
+        "    turn_sandbox_policy:",
+        "      type: workspaceWrite",
+        "    turn_timeout_ms: 120000",
+        "    read_timeout_ms: 15000",
+        "    stall_timeout_ms: 120000",
         "  server:",
         f"    port: {config.port}",
     ]
-    if config.session_state_path is not None:
-        session_state_path = str(config.session_state_path.resolve()).replace("\\", "/")
+    if config.ledger_path is not None:
+        ledger_path = str(config.ledger_path.resolve()).replace("\\", "/")
         project_lines.extend(
             [
                 "  session_persistence:",
                 "    enabled: true",
                 "    kind: file",
                 "    file:",
-                f"      path: {session_state_path}",
+                f"      path: {ledger_path}",
                 "      flush_interval_ms: 200",
                 "      fsync_on_critical: true",
             ]
         )
     if config.notification_port is not None:
+        broken_channels = set(config.broken_notification_channels)
+        broken_port = config.broken_notification_port if config.broken_notification_port is not None else config.notification_port
+        webhook_port = broken_port if "local-webhook" in broken_channels else config.notification_port
+        slack_port = broken_port if "local-slack" in broken_channels else config.notification_port
         project_lines.extend(
             [
                 "  notifications:",
@@ -104,14 +113,14 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
                 "        subscriptions:",
                 "          types: [issue_intervention_required, issue_completed]",
                 "        webhook:",
-                f"          url: http://127.0.0.1:{config.notification_port}/webhook",
+                f"          url: http://127.0.0.1:{webhook_port}/webhook",
                 "      - id: local-slack",
                 "        display_name: Local Slack",
                 "        kind: slack",
                 "        subscriptions:",
                 "          types: [issue_intervention_required, issue_completed]",
                 "        slack:",
-                f"          incoming_webhook_url: http://127.0.0.1:{config.notification_port}/slack",
+                f"          incoming_webhook_url: http://127.0.0.1:{slack_port}/slack",
                 "    defaults:",
                 "      timeout_ms: 3000",
                 "      retry_count: 0",
@@ -337,12 +346,25 @@ def post_json(url: str, payload: dict[str, Any] | None = None) -> dict[str, Any]
     with request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+def open_events_stream(url: str, *, timeout_seconds: int = 600):
+    req = request.Request(url, headers={"Accept": "text/event-stream"})
+    return request.urlopen(req, timeout=timeout_seconds)
 
-def fetch_issue_state(base_url: str, identifier: str) -> tuple[int, dict[str, Any] | None]:
-    url = f"{base_url}/api/v1/{identifier}"
-    try:
-        return 200, fetch_json(url)
-    except urlerror.HTTPError as exc:
-        if exc.code == 404:
-            return 404, json.loads(exc.read().decode("utf-8"))
-        raise
+
+def read_sse_event(stream) -> SSEEvent:
+    event_type = ""
+    data_lines: list[str] = []
+    while True:
+        raw = stream.readline()
+        if not raw:
+            raise RuntimeError("SSE stream closed before event completed")
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if event_type or data_lines:
+                return SSEEvent(event=event_type, data="\n".join(data_lines))
+            continue
+        if line.startswith("event: "):
+            event_type = line.removeprefix("event: ").strip()
+            continue
+        if line.startswith("data: "):
+            data_lines.append(line.removeprefix("data: ").strip())
