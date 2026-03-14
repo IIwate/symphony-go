@@ -1,0 +1,123 @@
+name: Live Smoke
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Smoke phase
+        required: true
+        default: heavy
+        type: choice
+        options:
+          - heavy
+          - all
+      repo:
+        description: GitHub repository used by live smoke
+        required: true
+        default: IIwate/linear-test
+        type: string
+
+jobs:
+  live-smoke:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    concurrency:
+      group: live-smoke-ci-gate
+      cancel-in-progress: false
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      GH_TOKEN: ${{ secrets.LIVE_SMOKE_GH_TOKEN }}
+      LINEAR_API_KEY: ${{ secrets.LIVE_SMOKE_LINEAR_API_KEY }}
+      LINEAR_PROJECT_SLUG: ${{ secrets.LIVE_SMOKE_LINEAR_PROJECT_SLUG }}
+      GIT_TERMINAL_PROMPT: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Codex CLI
+        shell: pwsh
+        run: |
+          npm install -g @openai/codex@0.114.0
+          codex --version
+
+      - name: Configure Codex
+        shell: pwsh
+        env:
+          OPENAI_BASE_URL: ${{ secrets.LIVE_SMOKE_OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.LIVE_SMOKE_OPENAI_API_KEY }}
+        run: |
+          if (-not $env:OPENAI_BASE_URL) { throw "Missing secret LIVE_SMOKE_OPENAI_BASE_URL" }
+          if (-not $env:OPENAI_API_KEY) { throw "Missing secret LIVE_SMOKE_OPENAI_API_KEY" }
+          $codexDir = Join-Path $env:USERPROFILE ".codex"
+          New-Item -ItemType Directory -Force $codexDir | Out-Null
+          $configPath = Join-Path $codexDir "config.toml"
+          @(
+            'model_provider = "custom"'
+            'model = "gpt-5.4"'
+            'model_reasoning_effort = "xhigh"'
+            'plan_mode_reasoning_effort = "xhigh"'
+            'disable_response_storage = true'
+            'sandbox_mode = "workspace-write"'
+            'approval_policy = "never"'
+            'network_access = true'
+            ''
+            '[model_providers.custom]'
+            'name = "custom"'
+            'wire_api = "responses"'
+            'requires_openai_auth = true'
+            "base_url = `"$env:OPENAI_BASE_URL`""
+          ) | Set-Content -Path $configPath -Encoding utf8
+          $env:OPENAI_API_KEY | codex login --with-api-key
+          codex login status
+
+      - name: Configure Git Identity
+        shell: pwsh
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global credential.interactive never
+
+      - name: Configure GitHub Auth For Git
+        shell: pwsh
+        run: |
+          if (-not $env:GH_TOKEN) { throw "Missing secret LIVE_SMOKE_GH_TOKEN" }
+          gh auth status
+          gh auth setup-git
+
+      - name: Run Live Smoke
+        shell: pwsh
+        run: |
+          if (-not $env:GH_TOKEN) { throw "Missing secret LIVE_SMOKE_GH_TOKEN" }
+          if (-not $env:LINEAR_API_KEY) { throw "Missing secret LIVE_SMOKE_LINEAR_API_KEY" }
+          if (-not $env:LINEAR_PROJECT_SLUG) { throw "Missing secret LIVE_SMOKE_LINEAR_PROJECT_SLUG" }
+          $phase = "${{ github.event_name == 'workflow_dispatch' && inputs.phase || 'all' }}"
+          $repo = "${{ github.event_name == 'workflow_dispatch' && inputs.repo || 'IIwate/linear-test' }}"
+          if ("${{ github.event_name }}" -eq "pull_request") {
+            $namespace = "live-smoke-pr-${{ github.event.pull_request.number }}-$env:GITHUB_RUN_ATTEMPT"
+          } else {
+            $namespace = "live-smoke-dispatch-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          }
+          py -3 scripts/live_smoke.py --phase $phase --repo $repo --branch-namespace $namespace

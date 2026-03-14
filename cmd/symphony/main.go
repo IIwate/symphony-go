@@ -19,6 +19,7 @@ import (
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
 	"symphony-go/internal/orchestrator"
+	"symphony-go/internal/runtimepolicy"
 	"symphony-go/internal/server"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workspace"
@@ -30,7 +31,7 @@ type orchestratorService interface {
 	Wait()
 	RunOnce(context.Context, bool)
 	NotifyWorkflowReload(*model.WorkflowDefinition)
-	RequestRefresh()
+	RequestRefresh() orchestrator.RefreshRequestResult
 }
 
 type httpServer interface {
@@ -45,6 +46,7 @@ type runtimeState struct {
 	config       *model.ServiceConfig
 	portOverride *int
 	configDir    string
+	profile      string
 }
 
 var (
@@ -65,11 +67,11 @@ var (
 	newAgentRunnerFactory = func(configFn func() *model.ServiceConfig, logger *slog.Logger) agent.Runner {
 		return agent.NewRunner(configFn, logger, nil)
 	}
-	newOrchestratorFactory = func(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, logger *slog.Logger) orchestratorService {
-		return orchestrator.NewOrchestrator(trackerClient, workspaceManager, runner, configFn, workflowFn, logger)
+	newOrchestratorFactory = func(trackerClient tracker.Client, workspaceManager workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, identityFn func() orchestrator.RuntimeIdentity, logger *slog.Logger) orchestratorService {
+		return orchestrator.NewOrchestrator(trackerClient, workspaceManager, runner, configFn, workflowFn, identityFn, logger)
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
-		return server.Start(runtime, logger, port)
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
+		return server.Start(runtime, logger, host, port)
 	}
 	notifySignalContext = func(parent context.Context, signals ...os.Signal) (context.Context, context.CancelFunc) {
 		return signal.NotifyContext(parent, signals...)
@@ -120,13 +122,9 @@ func newRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "symphony",
 		Short: "Symphony automation runner",
-		Args: func(cmd *cobra.Command, args []string) error {
-			if len(args) > 0 {
-				return fmt.Errorf("workflow path argument is no longer supported; use --config-dir")
-			}
-			return nil
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
 		},
-		RunE:          runRunCmd,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -134,17 +132,8 @@ func newRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	rootCmd.SetOut(stdout)
 	rootCmd.SetErr(stderr)
 
-	rootCmd.PersistentFlags().String("config-dir", "automation", "path to automation config directory")
-	rootCmd.PersistentFlags().String("profile", "", "runtime profile name")
-	rootCmd.PersistentFlags().String("log-level", "info", "debug/info/warn/error")
-	rootCmd.PersistentFlags().String("log-file", "", "path to log file")
-	rootCmd.PersistentFlags().Bool("non-interactive", false, "disable interactive prompts and setup wizard")
-
-	rootCmd.Flags().Int("port", -1, "HTTP server port")
-	rootCmd.Flags().Bool("dry-run", false, "run a single validation cycle and exit")
-
-	rootCmd.AddCommand(newSetupCommand())
-	rootCmd.AddCommand(newConfigCommand())
+	rootCmd.AddCommand(newRunCommand())
+	rootCmd.AddCommand(newDoctorCommand())
 	return rootCmd
 }
 
@@ -177,6 +166,18 @@ func (s *runtimeState) CurrentWorkflow() *model.WorkflowDefinition {
 	return s.definition
 }
 
+func (s *runtimeState) CurrentIdentity() orchestrator.RuntimeIdentity {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return runtimepolicy.BuildRuntimeIdentity(runtimepolicy.IdentityInput{
+		ConfigDir:            s.configDir,
+		Profile:              s.profile,
+		AutomationDefinition: s.repoDef,
+		ServiceConfig:        s.config,
+	})
+}
+
 func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.WorkflowDefinition, error) {
 	newDefinition, err := resolveActiveWorkflow(repoDef)
 	if err != nil {
@@ -196,24 +197,9 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 	currentCfg := s.config
 	s.mu.RUnlock()
 
-	if currentRepoDef != nil {
-		if strings.TrimSpace(currentRepoDef.Profile) != strings.TrimSpace(repoDef.Profile) {
-			return nil, fmt.Errorf("profile selection changed: restart required")
-		}
-		if selectedSourceKind(currentRepoDef) != selectedSourceKind(repoDef) {
-			return nil, fmt.Errorf("source.kind changed: restart required")
-		}
-		if !enabledSourcesEqual(currentRepoDef, repoDef) {
-			return nil, fmt.Errorf("selection.enabled_sources changed: restart required")
-		}
-	}
-	if currentCfg != nil {
-		if currentCfg.WorkspaceRoot != newCfg.WorkspaceRoot {
-			return nil, fmt.Errorf("runtime.workspace.root changed: restart required")
-		}
-		if !serverPortEqual(currentCfg.ServerPort, newCfg.ServerPort) {
-			return nil, fmt.Errorf("runtime.server.port changed: restart required")
-		}
+	decision := runtimepolicy.EvaluateReload(currentRepoDef, repoDef, currentCfg, newCfg)
+	if decision.RequiresRestart() {
+		return nil, runtimepolicy.NewRestartRequiredError(decision)
 	}
 	if err := config.ValidateForDispatch(newCfg); err != nil {
 		return nil, err
@@ -224,6 +210,7 @@ func (s *runtimeState) ApplyReload(repoDef *model.AutomationDefinition) (*model.
 	s.definition = newDefinition
 	s.config = newCfg
 	s.configDir = repoDef.RootDir
+	s.profile = repoDef.Profile
 	s.mu.Unlock()
 
 	return newDefinition, nil
@@ -244,56 +231,4 @@ func validateLogLevel(value string) error {
 	default:
 		return fmt.Errorf("unsupported log level %q", value)
 	}
-}
-
-func serverPortEqual(left *int, right *int) bool {
-	switch {
-	case left == nil && right == nil:
-		return true
-	case left == nil || right == nil:
-		return false
-	default:
-		return *left == *right
-	}
-}
-
-func enabledSourcesEqual(left *model.AutomationDefinition, right *model.AutomationDefinition) bool {
-	leftSources := nilSafeSources(left)
-	rightSources := nilSafeSources(right)
-	if len(leftSources) != len(rightSources) {
-		return false
-	}
-	for i := range leftSources {
-		if leftSources[i] != rightSources[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func nilSafeSources(def *model.AutomationDefinition) []string {
-	if def == nil {
-		return nil
-	}
-	sources := append([]string(nil), def.Selection.EnabledSources...)
-	for i := range sources {
-		sources[i] = strings.TrimSpace(sources[i])
-	}
-	return sources
-}
-
-func selectedSourceKind(def *model.AutomationDefinition) string {
-	if def == nil || len(def.Selection.EnabledSources) != 1 {
-		return ""
-	}
-	sourceName := strings.TrimSpace(def.Selection.EnabledSources[0])
-	if sourceName == "" {
-		return ""
-	}
-	sourceDef := def.Sources[sourceName]
-	if sourceDef == nil {
-		return ""
-	}
-	value, _ := sourceDef.Raw["kind"].(string)
-	return model.NormalizeState(value)
 }

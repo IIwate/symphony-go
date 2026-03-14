@@ -126,6 +126,8 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	copyMapField(configMap, "codex", def.Runtime)
 	copyMapField(configMap, "server", def.Runtime)
 	copyMapField(configMap, "orchestrator", def.Runtime)
+	copyMapField(configMap, "session_persistence", def.Runtime)
+	copyMapField(configMap, "notifications", def.Runtime)
 
 	workspaceMap := cloneStringMap(getMapValue(def.Runtime, "workspace"))
 	if branchScope, ok := resolvedSource["branch_scope"]; ok {

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import time
 
 from live_smoke.shell import run
+
+SMOKE_ARTIFACT_DIR = "live-smoke-artifacts"
 
 
 @dataclass
@@ -19,12 +22,20 @@ class PullRequest:
     merge_state_status: str | None = None
 
 
+def git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if os.name == "nt":
+        env.setdefault("GIT_SSL_BACKEND", "openssl")
+        env.setdefault("GIT_HTTP_VERSION", "HTTP/1.1")
+    return env
+
+
 def ensure_gh_auth() -> None:
     run(["gh", "auth", "status"])
 
 
 def git_clone(repo_url: str, target_dir: Path) -> None:
-    run(["git", "clone", repo_url, str(target_dir)])
+    run(["git", "clone", repo_url, str(target_dir)], env=git_env())
 
 
 def prepare_pull_request(
@@ -37,12 +48,14 @@ def prepare_pull_request(
 ) -> PullRequest:
     clone_dir = work_root / "repo"
     git_clone(repo_url, clone_dir)
-    run(["git", "checkout", "-b", branch], cwd=clone_dir)
-    marker = clone_dir / f"{branch.replace('/', '-')}.txt"
+    run(["git", "checkout", "-b", branch], cwd=clone_dir, env=git_env())
+    marker_dir = clone_dir / SMOKE_ARTIFACT_DIR
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / f"{branch.replace('/', '-')}.txt"
     marker.write_text(f"live smoke {int(time.time())}\n", encoding="utf-8")
-    run(["git", "add", marker.name], cwd=clone_dir)
-    run(["git", "commit", "-m", f"test: live smoke {branch}"], cwd=clone_dir)
-    run(["git", "push", "-u", "origin", branch], cwd=clone_dir)
+    run(["git", "add", marker.relative_to(clone_dir).as_posix()], cwd=clone_dir, env=git_env())
+    run(["git", "commit", "-m", f"test: live smoke {branch}"], cwd=clone_dir, env=git_env())
+    run(["git", "push", "-u", "origin", branch], cwd=clone_dir, env=git_env())
     result = run(
         [
             "gh",

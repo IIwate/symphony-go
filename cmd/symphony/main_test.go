@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,8 +19,8 @@ import (
 	"symphony-go/internal/loader"
 	"symphony-go/internal/logging"
 	"symphony-go/internal/model"
+	"symphony-go/internal/model/contract"
 	"symphony-go/internal/orchestrator"
-	"symphony-go/internal/secret"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workspace"
 )
@@ -42,14 +43,97 @@ func TestRunCLIUsesDefaultAutomationDir(t *testing.T) {
 	defer restore()
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := runCLI([]string{"--dry-run"}, &stdout, &stderr); exitCode != 0 {
+	if exitCode := runCLI([]string{"run", "--dry-run"}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "dry-run 仍会访问 tracker 并执行 startupCleanup") {
-		t.Fatalf("stderr = %q, want dry-run side-effect warning", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "dry-run 校验通过") {
 		t.Fatalf("stderr = %q, want dry-run success message", stderr.String())
+	}
+}
+
+func TestRunCLIDryRunSkipsRuntimeDependencies(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	restore := stubDependencies(t)
+	defer restore()
+
+	configDir := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	statePath := filepath.Join(configDir, "local", "runtime-ledger.json")
+	writeFile(t, statePath, "not-json\n")
+	projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+  codex:
+    command: codex app-server
+  session_persistence:
+    enabled: true
+    kind: file
+    file:
+      path: ./local/runtime-ledger.json
+      flush_interval_ms: 1000
+      fsync_on_critical: true
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, filepath.ToSlash(filepath.Join(filepath.Dir(configDir), "workspaces")))
+	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
+
+	trackerCalls := 0
+	workspaceCalls := 0
+	runnerCalls := 0
+	orchestratorCalls := 0
+	serverCalls := 0
+	watchCalls := 0
+
+	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
+		trackerCalls++
+		return &fakeTrackerClient{}, nil
+	}
+	newWorkspaceFactory = func(func() *model.ServiceConfig, *slog.Logger) (workspace.Manager, error) {
+		workspaceCalls++
+		return &fakeWorkspaceManager{}, nil
+	}
+	newAgentRunnerFactory = func(func() *model.ServiceConfig, *slog.Logger) agent.Runner {
+		runnerCalls++
+		return fakeAgentRunner{}
+	}
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
+		orchestratorCalls++
+		return &fakeOrchestrator{}
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
+		serverCalls++
+		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
+	}
+	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
+		watchCalls++
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI([]string{"run", "--dry-run", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if trackerCalls != 0 || workspaceCalls != 0 || runnerCalls != 0 || orchestratorCalls != 0 || serverCalls != 0 || watchCalls != 0 {
+		t.Fatalf(
+			"dry-run initialized runtime deps: tracker=%d workspace=%d runner=%d orchestrator=%d server=%d watch=%d",
+			trackerCalls,
+			workspaceCalls,
+			runnerCalls,
+			orchestratorCalls,
+			serverCalls,
+			watchCalls,
+		)
+	}
+	content, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", statePath, err)
+	}
+	if string(content) != "not-json\n" {
+		t.Fatalf("runtime ledger content changed during dry-run: %q", string(content))
 	}
 }
 
@@ -97,7 +181,7 @@ func TestRunCLIFailsWhenDefaultAutomationMissing(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := runCLI(nil, &stdout, &stderr); exitCode == 0 {
+	if exitCode := runCLI([]string{"run"}, &stdout, &stderr); exitCode == 0 {
 		t.Fatalf("runCLI() exitCode = %d, want non-zero", exitCode)
 	}
 	if !strings.Contains(stderr.String(), "missing_workflow_file") {
@@ -105,13 +189,26 @@ func TestRunCLIFailsWhenDefaultAutomationMissing(t *testing.T) {
 	}
 }
 
-func TestRunCLIConfigDoctorReady(t *testing.T) {
+func TestRunCLIRequiresExplicitSubcommand(t *testing.T) {
+	restore := stubDependencies(t)
+	defer restore()
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := runCLI(nil, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "run") || !strings.Contains(stdout.String(), "doctor") {
+		t.Fatalf("stdout = %q, want run/doctor help output", stdout.String())
+	}
+}
+
+func TestRunCLIDoctorReady(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "secret-key")
 	configDir := filepath.Join(t.TempDir(), "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
+	if exitCode := runCLI([]string{"doctor", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "配置已完整") {
@@ -119,7 +216,7 @@ func TestRunCLIConfigDoctorReady(t *testing.T) {
 	}
 }
 
-func TestRunCLIConfigDoctorReportsMissingSecret(t *testing.T) {
+func TestRunCLIDoctorReportsMissingSecret(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
 	if err := os.Unsetenv("LINEAR_API_KEY"); err != nil {
@@ -127,7 +224,7 @@ func TestRunCLIConfigDoctorReportsMissingSecret(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := runCLI([]string{"config", "doctor", "--config-dir", configDir}, &stdout, &stderr); exitCode == 0 {
+	if exitCode := runCLI([]string{"doctor", "--config-dir", configDir}, &stdout, &stderr); exitCode == 0 {
 		t.Fatalf("runCLI() exitCode = %d, want non-zero", exitCode)
 	}
 	if !strings.Contains(stderr.String(), "missing required secrets") || !strings.Contains(stderr.String(), "LINEAR_API_KEY") {
@@ -135,242 +232,30 @@ func TestRunCLIConfigDoctorReportsMissingSecret(t *testing.T) {
 	}
 }
 
-func TestConfigSetWritesEnvLocalFromStdin(t *testing.T) {
+func TestRunCLIRejectsRemovedCommands(t *testing.T) {
 	restore := stubDependencies(t)
 	defer restore()
 
-	configDir := filepath.Join(t.TempDir(), "automation")
-	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	stdinIsTerminal = func() bool { return false }
-
-	var stdout, stderr bytes.Buffer
-	cmd := newRootCommand(&stdout, &stderr)
-	cmd.SetIn(strings.NewReader("secret-key\n"))
-	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	cases := [][]string{
+		{"setup"},
+		{"config"},
+		{"config", "set"},
+		{"wizard"},
 	}
-
-	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	if !strings.Contains(string(content), "LINEAR_API_KEY=secret-key") {
-		t.Fatalf("env.local = %q, want written key", string(content))
-	}
-	if !strings.Contains(stdout.String(), "当前运行实例不会自动更新") {
-		t.Fatalf("stdout = %q, want runtime update warning", stdout.String())
+	for _, args := range cases {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if exitCode := runCLI(args, &stdout, &stderr); exitCode == 0 {
+				t.Fatalf("runCLI(%v) exitCode = %d, want non-zero", args, exitCode)
+			}
+			if !strings.Contains(stderr.String(), "unknown command") {
+				t.Fatalf("stderr = %q, want unknown command", stderr.String())
+			}
+		})
 	}
 }
 
-func TestConfigSetReadsOnlyFirstStdinLine(t *testing.T) {
-	restore := stubDependencies(t)
-	defer restore()
-
-	configDir := filepath.Join(t.TempDir(), "automation")
-	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	stdinIsTerminal = func() bool { return false }
-	stdoutIsTerminal = func() bool { return false }
-
-	var stdout, stderr bytes.Buffer
-	cmd := newRootCommand(&stdout, &stderr)
-	cmd.SetIn(strings.NewReader("secret-key\nignored-line\n"))
-	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	if string(content) != "LINEAR_API_KEY=secret-key\n" {
-		t.Fatalf("env.local = %q, want only first stdin line", string(content))
-	}
-}
-
-func TestConfigSetAllowsRuntimeEnvReference(t *testing.T) {
-	restore := stubDependencies(t)
-	defer restore()
-
-	t.Setenv("LINEAR_API_KEY", "secret-key")
-	configDir := filepath.Join(t.TempDir(), "automation")
-	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	writeFile(t, filepath.Join(configDir, "project.yaml"), `runtime:
-  codex:
-    command: $CODEX_COMMAND
-selection:
-  dispatch_flow: implement
-  enabled_sources:
-    - linear-main
-defaults:
-  profile: null
-`)
-	stdinIsTerminal = func() bool { return false }
-	stdoutIsTerminal = func() bool { return false }
-
-	var stdout, stderr bytes.Buffer
-	cmd := newRootCommand(&stdout, &stderr)
-	cmd.SetIn(strings.NewReader("codex --profile test\n"))
-	cmd.SetArgs([]string{"config", "set", "CODEX_COMMAND", "--config-dir", configDir, "--non-interactive"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	if string(content) != "CODEX_COMMAND=\"codex --profile test\"\n" {
-		t.Fatalf("env.local = %q, want runtime env key written", string(content))
-	}
-}
-
-func TestConfigSetUsesInteractivePromptForSensitiveKey(t *testing.T) {
-	restore := stubDependencies(t)
-	defer restore()
-
-	configDir := filepath.Join(t.TempDir(), "automation")
-	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	stdinIsTerminal = func() bool { return true }
-	stdoutIsTerminal = func() bool { return true }
-
-	var (
-		gotTitle       string
-		gotDescription string
-		gotSensitive   bool
-	)
-	promptSingleValueFunc = func(title string, description string, sensitive bool) (string, error) {
-		gotTitle = title
-		gotDescription = description
-		gotSensitive = sensitive
-		return "interactive-secret", nil
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd := newRootCommand(&stdout, &stderr)
-	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	if gotTitle != "LINEAR_API_KEY" {
-		t.Fatalf("title = %q, want LINEAR_API_KEY", gotTitle)
-	}
-	if gotDescription == "" {
-		t.Fatal("description = empty, want interactive prompt description")
-	}
-	if !gotSensitive {
-		t.Fatal("sensitive = false, want true")
-	}
-}
-
-func TestConfigSetUsesInteractivePromptForNonSensitiveKey(t *testing.T) {
-	restore := stubDependencies(t)
-	defer restore()
-
-	configDir := filepath.Join(t.TempDir(), "automation")
-	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	writeFile(t, filepath.Join(configDir, "sources", "linear-main.yaml"), `kind: linear
-api_key: $LINEAR_API_KEY
-project_slug: $LINEAR_PROJECT_SLUG
-branch_scope: demo-scope
-active_states: ["Todo", "In Progress"]
-terminal_states: ["Closed", "Done"]
-`)
-	stdinIsTerminal = func() bool { return true }
-	stdoutIsTerminal = func() bool { return true }
-
-	gotSensitive := true
-	promptSingleValueFunc = func(title string, description string, sensitive bool) (string, error) {
-		gotSensitive = sensitive
-		return "demo-project", nil
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd := newRootCommand(&stdout, &stderr)
-	cmd.SetArgs([]string{"config", "set", "LINEAR_PROJECT_SLUG", "--config-dir", configDir})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	if gotSensitive {
-		t.Fatal("sensitive = true, want false")
-	}
-}
-
-func TestConfigSetNonInteractiveReadsFromStdinEvenWhenTerminal(t *testing.T) {
-	restore := stubDependencies(t)
-	defer restore()
-
-	configDir := filepath.Join(t.TempDir(), "automation")
-	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	stdinIsTerminal = func() bool { return true }
-	stdoutIsTerminal = func() bool { return true }
-
-	promptCalled := false
-	promptSingleValueFunc = func(title string, description string, sensitive bool) (string, error) {
-		promptCalled = true
-		return "should-not-be-used", nil
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd := newRootCommand(&stdout, &stderr)
-	cmd.SetIn(strings.NewReader("stdin-secret\n"))
-	cmd.SetArgs([]string{"config", "set", "LINEAR_API_KEY", "--config-dir", configDir, "--non-interactive"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	if promptCalled {
-		t.Fatal("promptSingleValueFunc was called, want stdin path")
-	}
-
-	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	if string(content) != "LINEAR_API_KEY=stdin-secret\n" {
-		t.Fatalf("env.local = %q, want non-interactive stdin value", string(content))
-	}
-}
-
-func TestConfigSetAllowsRuntimeEnvKey(t *testing.T) {
-	restore := stubDependencies(t)
-	defer restore()
-
-	configDir := filepath.Join(t.TempDir(), "automation")
-	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	writeFile(t, filepath.Join(configDir, "project.yaml"), `runtime:
-  codex:
-    command: $CODEX_COMMAND
-selection:
-  dispatch_flow: implement
-  enabled_sources:
-    - linear-main
-defaults:
-  profile: null
-`)
-	stdinIsTerminal = func() bool { return false }
-	stdoutIsTerminal = func() bool { return false }
-
-	var stdout, stderr bytes.Buffer
-	cmd := newRootCommand(&stdout, &stderr)
-	cmd.SetIn(strings.NewReader("codex app-server --profile strict\n"))
-	cmd.SetArgs([]string{"config", "set", "CODEX_COMMAND", "--config-dir", configDir})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	content, err := os.ReadFile(filepath.Join(configDir, "local", "env.local"))
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-	if !strings.Contains(string(content), `CODEX_COMMAND="codex app-server --profile strict"`) {
-		t.Fatalf("env.local = %q, want CODEX_COMMAND entry", string(content))
-	}
-}
-
-func TestSetupRunsWizardWhenSecretsMissing(t *testing.T) {
+func TestRunCLIRunDoesNotWriteSecretsInteractively(t *testing.T) {
 	restore := stubDependencies(t)
 	defer restore()
 
@@ -380,30 +265,17 @@ func TestSetupRunsWizardWhenSecretsMissing(t *testing.T) {
 		t.Fatalf("Unsetenv() error = %v", err)
 	}
 
-	wizardCalled := false
-	runWizardFunc = func(diagnosis *config.ConfigDiagnosis, envLocalPath string, store *secret.Store, stderr io.Writer) error {
-		wizardCalled = true
-		_, _ = fmt.Fprintln(stderr, "检测到以下密钥缺失，开始交互式配置")
-		if err := envfile.Upsert(envLocalPath, "LINEAR_API_KEY", "wizard-secret"); err != nil {
-			return err
-		}
-		return store.Set("LINEAR_API_KEY", "wizard-secret")
-	}
-	stdinIsTerminal = func() bool { return true }
-	stdoutIsTerminal = func() bool { return true }
-
 	var stdout, stderr bytes.Buffer
-	if exitCode := runCLI([]string{"setup", "--config-dir", configDir}, &stdout, &stderr); exitCode != 0 {
-		t.Fatalf("runCLI() exitCode = %d, stderr = %s", exitCode, stderr.String())
+	if exitCode := runCLI([]string{"run", "--config-dir", configDir}, &stdout, &stderr); exitCode == 0 {
+		t.Fatalf("runCLI() exitCode = %d, want non-zero", exitCode)
 	}
-	if !wizardCalled {
-		t.Fatal("wizard was not called")
+	if !strings.Contains(stderr.String(), "missing required secrets") {
+		t.Fatalf("stderr = %q, want diagnosis output", stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "配置已完成") {
-		t.Fatalf("stdout = %q, want setup completion message", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "检测到以下密钥缺失") {
-		t.Fatalf("stderr = %q, want wizard stderr notice", stderr.String())
+	if _, err := os.Stat(filepath.Join(configDir, "local", "env.local")); err == nil {
+		t.Fatal("env.local was created, want no secret write side effect")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("Stat(env.local) error = %v", err)
 	}
 }
 
@@ -443,6 +315,334 @@ func TestRuntimeStateApplyReloadKeepsPortOverride(t *testing.T) {
 	}
 }
 
+func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, "automation")
+	workspaceRoot := filepath.ToSlash(filepath.Join(tmpDir, "workspaces"))
+	writeAutomationConfig(t, configDir, automationFixtureOptions{WorkspaceRoot: workspaceRoot})
+	writeFile(t, filepath.Join(configDir, "flows", "other-flow.yaml"), "prompt: prompts/other.md.liquid\n")
+	writeFile(t, filepath.Join(configDir, "prompts", "other.md.liquid"), "other flow\n")
+
+	writeProject := func(workspaceValue string, branchNamespace string, sessionPath string, notificationURL string, pollInterval int, dispatchFlow string, codexCommand string, maxConcurrentAgents int, agentExtras string) {
+		agentBlock := fmt.Sprintf("    max_concurrent_agents: %d\n    max_turns: 20\n", maxConcurrentAgents)
+		if agentExtras != "" {
+			agentBlock += agentExtras
+		}
+		projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+    branch_namespace: %s
+  polling:
+    interval_ms: %d
+  agent:
+%s  codex:
+    command: %s
+  session_persistence:
+    enabled: true
+    kind: file
+    file:
+      path: %s
+      flush_interval_ms: 1000
+      fsync_on_critical: true
+  notifications:
+    channels:
+      - id: ops
+        display_name: Ops
+        kind: webhook
+        subscriptions:
+          types: [system_alert]
+        webhook:
+          url: %s
+    defaults:
+      timeout_ms: 5000
+      retry_count: 2
+      retry_delay_ms: 1000
+      queue_size: 64
+      critical_queue_size: 16
+selection:
+  dispatch_flow: %s
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, workspaceValue, branchNamespace, pollInterval, agentBlock, codexCommand, sessionPath, notificationURL, dispatchFlow)
+		writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
+	}
+
+	writeProject(workspaceRoot, "runner-a", "./automation/local/runtime-ledger.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server", 10, "")
+
+	repoDef, err := loader.Load(configDir, "")
+	if err != nil {
+		t.Fatalf("loader.Load() error = %v", err)
+	}
+	definition, err := loader.ResolveActiveWorkflow(repoDef)
+	if err != nil {
+		t.Fatalf("loader.ResolveActiveWorkflow() error = %v", err)
+	}
+	cfg, err := config.NewFromWorkflow(definition)
+	if err != nil {
+		t.Fatalf("config.NewFromWorkflow() error = %v", err)
+	}
+	state := &runtimeState{
+		repoDef:    repoDef,
+		definition: definition,
+		config:     cfg,
+		configDir:  repoDef.RootDir,
+		profile:    repoDef.Profile,
+	}
+
+	tests := []struct {
+		name              string
+		workspace         string
+		branchNamespace   string
+		sessionPath       string
+		url               string
+		pollInterval      int
+		dispatchFlow      string
+		codexCommand      string
+		maxConcurrent     int
+		agentExtras       string
+		wantErr           string
+		wantURL           string
+		wantPoll          int
+		wantMaxConcurrent int
+		wantStateLimit    int
+	}{
+		{
+			name:            "session persistence",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/other-runtime-ledger.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			wantErr:         "runtime.session_persistence changed: restart required",
+		},
+		{
+			name:            "workspace root",
+			workspace:       filepath.ToSlash(filepath.Join(tmpDir, "other-workspaces")),
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/runtime-ledger.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			wantErr:         "runtime.workspace.root changed: restart required",
+		},
+		{
+			name:            "workspace branch namespace",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-b",
+			sessionPath:     "./automation/local/runtime-ledger.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			wantErr:         "runtime.workspace.branch_namespace changed: restart required",
+		},
+		{
+			name:            "dispatch flow",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/runtime-ledger.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "other-flow",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			wantErr:         "selection.dispatch_flow changed: restart required",
+		},
+		{
+			name:            "codex command",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/runtime-ledger.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex next-server",
+			maxConcurrent:   10,
+			wantErr:         "runtime.codex.command changed: restart required",
+		},
+		{
+			name:            "notifications",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/runtime-ledger.json",
+			url:             "https://hooks.example.com/b",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			wantURL:         "https://hooks.example.com/b",
+		},
+		{
+			name:            "poll interval",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/runtime-ledger.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    45000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			wantPoll:        45000,
+		},
+		{
+			name:              "max concurrent agents",
+			workspace:         workspaceRoot,
+			branchNamespace:   "runner-a",
+			sessionPath:       "./automation/local/runtime-ledger.json",
+			url:               "https://hooks.example.com/a",
+			pollInterval:      30000,
+			dispatchFlow:      "implement",
+			codexCommand:      "codex app-server",
+			maxConcurrent:     3,
+			wantMaxConcurrent: 3,
+		},
+		{
+			name:            "max concurrent agents by state",
+			workspace:       workspaceRoot,
+			branchNamespace: "runner-a",
+			sessionPath:     "./automation/local/runtime-ledger.json",
+			url:             "https://hooks.example.com/a",
+			pollInterval:    30000,
+			dispatchFlow:    "implement",
+			codexCommand:    "codex app-server",
+			maxConcurrent:   10,
+			agentExtras: "    max_concurrent_agents_by_state:\n" +
+				"      todo: 2\n",
+			wantStateLimit: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			writeProject(tc.workspace, tc.branchNamespace, tc.sessionPath, tc.url, tc.pollInterval, tc.dispatchFlow, tc.codexCommand, tc.maxConcurrent, tc.agentExtras)
+			reloaded, err := loader.Load(configDir, "")
+			if err != nil {
+				t.Fatalf("loader.Load() reload error = %v", err)
+			}
+			_, err = state.ApplyReload(reloaded)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ApplyReload() error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ApplyReload() error = %v", err)
+			}
+			if tc.wantURL != "" {
+				if got := state.CurrentConfig().Notifications.Channels[0].Webhook.URL; got != tc.wantURL {
+					t.Fatalf("Notifications.Channels[0].Webhook.URL = %q, want %q", got, tc.wantURL)
+				}
+			}
+			if tc.wantPoll != 0 && state.CurrentConfig().PollIntervalMS != tc.wantPoll {
+				t.Fatalf("PollIntervalMS = %d, want %d", state.CurrentConfig().PollIntervalMS, tc.wantPoll)
+			}
+			if tc.wantMaxConcurrent != 0 && state.CurrentConfig().MaxConcurrentAgents != tc.wantMaxConcurrent {
+				t.Fatalf("MaxConcurrentAgents = %d, want %d", state.CurrentConfig().MaxConcurrentAgents, tc.wantMaxConcurrent)
+			}
+			if tc.wantStateLimit != 0 && state.CurrentConfig().MaxConcurrentAgentsByState["todo"] != tc.wantStateLimit {
+				t.Fatalf("MaxConcurrentAgentsByState[todo] = %d, want %d", state.CurrentConfig().MaxConcurrentAgentsByState["todo"], tc.wantStateLimit)
+			}
+		})
+	}
+}
+
+func TestExecuteFailsWhenSessionStateIdentityMismatch(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	restore := stubDependencies(t)
+	defer restore()
+
+	tmpDir := t.TempDir()
+	configDir := filepath.Join(tmpDir, "automation")
+	writeAutomationConfig(t, configDir, automationFixtureOptions{})
+	statePath := filepath.Join(configDir, "local", "runtime-ledger.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(statePath), err)
+	}
+	projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+  codex:
+    command: codex app-server
+  session_persistence:
+    enabled: true
+    kind: file
+    file:
+      path: ./local/runtime-ledger.json
+      flush_interval_ms: 1000
+      fsync_on_critical: true
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
+	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
+	writeFile(t, statePath, fmt.Sprintf(`{
+  "version": 5,
+  "identity": {
+    "compatibility": {
+      "profile": "",
+      "active_source": "linear-main",
+      "source_kind": "",
+      "flow_name": "implement",
+      "tracker_kind": "different",
+      "tracker_repo": "",
+      "tracker_project_slug": "demo"
+    },
+    "descriptor": {
+      "config_root": "C:/different/root",
+      "workspace_root": "",
+      "session_persistence_kind": "file",
+      "session_state_path": "%s"
+    }
+  },
+  "saved_at": "2026-03-12T00:00:00Z"
+}
+`, filepath.ToSlash(statePath)))
+
+	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
+		return &fakeTrackerClient{}, nil
+	}
+	newWorkspaceFactory = func(func() *model.ServiceConfig, *slog.Logger) (workspace.Manager, error) {
+		return &fakeWorkspaceManager{}, nil
+	}
+	newAgentRunnerFactory = func(func() *model.ServiceConfig, *slog.Logger) agent.Runner {
+		return fakeAgentRunner{}
+	}
+	newOrchestratorFactory = func(tc tracker.Client, wm workspace.Manager, runner agent.Runner, configFn func() *model.ServiceConfig, workflowFn func() *model.WorkflowDefinition, identityFn func() orchestrator.RuntimeIdentity, logger *slog.Logger) orchestratorService {
+		return orchestrator.NewOrchestrator(tc, wm, runner, configFn, workflowFn, identityFn, logger)
+	}
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
+		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
+	}
+	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+		return context.WithCancel(parent)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := execute([]string{"run", "--config-dir", configDir}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("execute() error = nil, want session state identity mismatch failure")
+	}
+	if !strings.Contains(err.Error(), "delete the file and restart") {
+		t.Fatalf("execute() error = %v, want delete/restart guidance", err)
+	}
+	if !strings.Contains(err.Error(), "identity does not match current runtime") {
+		t.Fatalf("execute() error = %v, want identity mismatch detail", err)
+	}
+}
+
 func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "secret-key")
 	var reloadCount int
@@ -453,7 +653,7 @@ func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{notifyReload: func(_ *model.WorkflowDefinition) { reloadCount++ }}
 	}
 	watchAutomationDefinition = func(ctx context.Context, dir string, profile string, onChange func(*model.AutomationDefinition) error, onError func(error)) error {
@@ -477,7 +677,7 @@ func TestExecuteStartsWatcherAndNotifiesReload(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if err := execute([]string{"--config-dir", configDir}, &stdout, &stderr); err != nil {
+	if err := execute([]string{"run", "--config-dir", configDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("execute() error = %v", err)
 	}
 	if !watchCalled {
@@ -501,7 +701,7 @@ func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
 	waitReturned := make(chan struct{})
 	shutdownCalled := make(chan struct{})
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{
 			start: func(context.Context) error {
 				close(started)
@@ -513,7 +713,7 @@ func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
 			},
 		}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		return &fakeHTTPServer{
 			addr: "127.0.0.1:8080",
 			shutdown: func(context.Context) error {
@@ -536,7 +736,7 @@ func TestExecuteGracefulShutdownOnContextCancel(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- execute([]string{"--config-dir", configDir, "--port", "8080"}, io.Discard, io.Discard)
+		errCh <- execute([]string{"run", "--config-dir", configDir, "--port", "8080"}, io.Discard, io.Discard)
 	}()
 
 	select {
@@ -572,7 +772,7 @@ func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
 	releaseWait := make(chan struct{})
 	shutdownCalled := make(chan struct{})
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{
 			start: func(context.Context) error {
 				close(started)
@@ -584,7 +784,7 @@ func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
 			},
 		}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		return &fakeHTTPServer{
 			addr: "127.0.0.1:8081",
 			shutdown: func(context.Context) error {
@@ -602,7 +802,7 @@ func TestExecuteShutdownWaitsForWorkers(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- execute([]string{"--config-dir", configDir, "--port", "8081"}, io.Discard, io.Discard)
+		errCh <- execute([]string{"run", "--config-dir", configDir, "--port", "8081"}, io.Discard, io.Discard)
 	}()
 
 	select {
@@ -652,7 +852,7 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 	shutdownCount := 0
 	gotPort := -1
 
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{
 			start: func(context.Context) error {
 				close(started)
@@ -663,7 +863,7 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 			},
 		}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		gotPort = port
 		return &fakeHTTPServer{
 			addr: "127.0.0.1:9090",
@@ -683,7 +883,7 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- execute([]string{"--config-dir", configDir, "--port", "9090"}, io.Discard, io.Discard)
+		errCh <- execute([]string{"run", "--config-dir", configDir, "--port", "9090"}, io.Discard, io.Discard)
 	}()
 
 	select {
@@ -711,6 +911,81 @@ func TestExecuteShutdownWithHTTPServer(t *testing.T) {
 	}
 }
 
+func TestExecutePassesListenHostConfigurationToHTTPServer(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+
+	tests := []struct {
+		name     string
+		host     string
+		expected string
+	}{
+		{name: "default localhost", expected: "127.0.0.1"},
+		{name: "explicit remote host", host: "0.0.0.0", expected: "0.0.0.0"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := stubDependencies(t)
+			defer restore()
+
+			configDir := filepath.Join(t.TempDir(), "automation")
+			writeAutomationConfig(t, configDir, automationFixtureOptions{})
+			writeRunProjectConfig(t, configDir, tc.host, 0)
+
+			signalCtx, signalCancel := context.WithCancel(context.Background())
+			started := make(chan struct{})
+			gotHost := ""
+			gotPort := -1
+
+			newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
+				return &fakeOrchestrator{
+					start: func(context.Context) error {
+						close(started)
+						return nil
+					},
+					wait: func() {
+						<-signalCtx.Done()
+					},
+				}
+			}
+			newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
+				gotHost = host
+				gotPort = port
+				return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
+			}
+			watchAutomationDefinition = func(context.Context, string, string, func(*model.AutomationDefinition) error, func(error)) error {
+				return nil
+			}
+			notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
+				return signalCtx, func() {}
+			}
+
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- execute([]string{"run", "--config-dir", configDir}, io.Discard, io.Discard)
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("orchestrator did not start")
+			}
+
+			signalCancel()
+
+			if err := <-errCh; err != nil {
+				t.Fatalf("execute() error = %v", err)
+			}
+			if gotHost != tc.expected {
+				t.Fatalf("http host = %q, want %q", gotHost, tc.expected)
+			}
+			if gotPort != 0 {
+				t.Fatalf("http port = %d, want 0", gotPort)
+			}
+		})
+	}
+}
+
 func stubDependencies(t *testing.T) func() {
 	t.Helper()
 	origLoadEnv := loadEnvFile
@@ -724,10 +999,6 @@ func stubDependencies(t *testing.T) func() {
 	origOrchestrator := newOrchestratorFactory
 	origHTTPServer := newHTTPServerFactory
 	origNotify := notifySignalContext
-	origStdinIsTerminal := stdinIsTerminal
-	origStdoutIsTerminal := stdoutIsTerminal
-	origPromptSingleValue := promptSingleValueFunc
-	origRunWizard := runWizardFunc
 
 	loadEnvFile = envfile.Load
 	loadAutomationDefinition = loader.Load
@@ -747,19 +1018,15 @@ func stubDependencies(t *testing.T) func() {
 	newAgentRunnerFactory = func(func() *model.ServiceConfig, *slog.Logger) agent.Runner {
 		return fakeAgentRunner{}
 	}
-	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ *slog.Logger) orchestratorService {
+	newOrchestratorFactory = func(_ tracker.Client, _ workspace.Manager, _ agent.Runner, _ func() *model.ServiceConfig, _ func() *model.WorkflowDefinition, _ func() orchestrator.RuntimeIdentity, _ *slog.Logger) orchestratorService {
 		return &fakeOrchestrator{}
 	}
-	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, port int) (httpServer, error) {
+	newHTTPServerFactory = func(runtime orchestratorService, logger *slog.Logger, host string, port int) (httpServer, error) {
 		return &fakeHTTPServer{addr: "127.0.0.1:0"}, nil
 	}
 	notifySignalContext = func(parent context.Context, _ ...os.Signal) (context.Context, context.CancelFunc) {
 		return context.WithCancel(parent)
 	}
-	stdinIsTerminal = func() bool { return false }
-	stdoutIsTerminal = func() bool { return false }
-	promptSingleValueFunc = promptSingleValue
-	runWizardFunc = runWizard
 
 	return func() {
 		loadEnvFile = origLoadEnv
@@ -773,10 +1040,6 @@ func stubDependencies(t *testing.T) func() {
 		newOrchestratorFactory = origOrchestrator
 		newHTTPServerFactory = origHTTPServer
 		notifySignalContext = origNotify
-		stdinIsTerminal = origStdinIsTerminal
-		stdoutIsTerminal = origStdoutIsTerminal
-		promptSingleValueFunc = origPromptSingleValue
-		runWizardFunc = origRunWizard
 	}
 }
 
@@ -804,11 +1067,16 @@ type fakeAgentRunner struct{}
 func (fakeAgentRunner) Run(context.Context, agent.RunParams) error { return nil }
 
 type fakeOrchestrator struct {
-	runOnce      func(context.Context, bool)
-	notifyReload func(*model.WorkflowDefinition)
-	start        func(context.Context) error
-	wait         func()
-	snapshot     orchestrator.Snapshot
+	mu             sync.Mutex
+	runOnce        func(context.Context, bool)
+	notifyReload   func(*model.WorkflowDefinition)
+	requestRefresh func() orchestrator.RefreshRequestResult
+	start          func(context.Context) error
+	wait           func()
+	discovery      orchestrator.DiscoveryDocument
+	snapshot       orchestrator.Snapshot
+	nextID         int
+	subscribers    map[int]chan orchestrator.Snapshot
 }
 
 func (f *fakeOrchestrator) Start(ctx context.Context) error {
@@ -836,12 +1104,65 @@ func (f *fakeOrchestrator) NotifyWorkflowReload(def *model.WorkflowDefinition) {
 	}
 }
 
-func (f *fakeOrchestrator) RequestRefresh()                 {}
-func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot { return f.snapshot }
+func (f *fakeOrchestrator) Discovery() orchestrator.DiscoveryDocument {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.discovery
+}
+
+func (f *fakeOrchestrator) RequestRefresh() orchestrator.RefreshRequestResult {
+	if f.requestRefresh != nil {
+		return f.requestRefresh()
+	}
+	reason := contract.MustReason(contract.ReasonControlRefreshAccepted, map[string]any{
+		"service_mode": contract.ServiceModeServing,
+	})
+	return contract.ControlResult{
+		Action:              contract.ControlActionRefresh,
+		Status:              contract.ControlStatusAccepted,
+		Reason:              &reason,
+		RecommendedNextStep: "等待 SSE 通知后回读 /api/v1/state",
+		Timestamp:           "2026-03-14T00:00:00Z",
+	}
+}
+func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapshot
+}
 func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func()) {
+	f.mu.Lock()
+	if f.subscribers == nil {
+		f.subscribers = map[int]chan orchestrator.Snapshot{}
+	}
 	ch := make(chan orchestrator.Snapshot, max(1, buffer))
-	ch <- f.snapshot
-	return ch, func() { close(ch) }
+	id := f.nextID
+	f.nextID++
+	f.subscribers[id] = ch
+	snapshot := f.snapshot
+	f.mu.Unlock()
+	ch <- snapshot
+	return ch, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if existing, ok := f.subscribers[id]; ok {
+			delete(f.subscribers, id)
+			close(existing)
+		}
+	}
+}
+
+func (f *fakeOrchestrator) publish(snapshot orchestrator.Snapshot) {
+	f.mu.Lock()
+	f.snapshot = snapshot
+	subscribers := make([]chan orchestrator.Snapshot, 0, len(f.subscribers))
+	for _, ch := range f.subscribers {
+		subscribers = append(subscribers, ch)
+	}
+	f.mu.Unlock()
+	for _, ch := range subscribers {
+		ch <- snapshot
+	}
 }
 
 type fakeHTTPServer struct {
@@ -914,6 +1235,31 @@ terminal_states: ["Closed", "Done"]
 	writeFile(t, filepath.Join(root, "flows", "implement.yaml"), `prompt: prompts/implement.md.liquid
 `)
 	writeFile(t, filepath.Join(root, "prompts", "implement.md.liquid"), opts.PromptTemplate+"\n")
+}
+
+func writeRunProjectConfig(t *testing.T, root string, host string, port int) {
+	t.Helper()
+
+	workspaceRoot := filepath.ToSlash(filepath.Join(filepath.Dir(root), "workspaces"))
+	hostBlock := ""
+	if strings.TrimSpace(host) != "" {
+		hostBlock = fmt.Sprintf("    host: %s\n", host)
+	}
+	projectYAML := fmt.Sprintf(`runtime:
+  workspace:
+    root: %s
+  codex:
+    command: codex app-server
+  server:
+%s    port: %d
+selection:
+  dispatch_flow: implement
+  enabled_sources:
+    - linear-main
+defaults:
+  profile: null
+`, workspaceRoot, hostBlock, port)
+	writeFile(t, filepath.Join(root, "project.yaml"), projectYAML)
 }
 
 func writeFile(t *testing.T, path string, content string) {

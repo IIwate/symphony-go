@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"symphony-go/internal/model/contract"
 )
 
 type Issue struct {
@@ -58,6 +60,14 @@ type CompletionContract struct {
 	OnClosedPR  CompletionAction
 }
 
+type ServiceMode = contract.ServiceMode
+
+const (
+	ServiceModeServing     ServiceMode = contract.ServiceModeServing
+	ServiceModeDegraded    ServiceMode = contract.ServiceModeDegraded
+	ServiceModeUnavailable ServiceMode = contract.ServiceModeUnavailable
+)
+
 type DispatchKind string
 
 const (
@@ -69,10 +79,11 @@ const (
 type ContinuationReason string
 
 const (
-	ContinuationReasonUnfinishedIssue      ContinuationReason = "unfinished_issue"
-	ContinuationReasonMissingPR            ContinuationReason = "missing_pr"
-	ContinuationReasonClosedUnmergedPR     ContinuationReason = "pr_closed_unmerged"
-	ContinuationReasonMergedPRAutoCloseOff ContinuationReason = "merged_pr_auto_close_disabled"
+	ContinuationReasonUnfinishedIssue     ContinuationReason = "unfinished_issue"
+	ContinuationReasonMissingPR           ContinuationReason = "missing_pr"
+	ContinuationReasonClosedUnmergedPR    ContinuationReason = "pr_closed_unmerged"
+	ContinuationReasonMergedPRNotTerminal ContinuationReason = "merged_pr_source_not_terminal"
+	ContinuationReasonTrackerIssueMissing ContinuationReason = "tracker_issue_missing_during_recovery"
 )
 
 type PRContext struct {
@@ -187,7 +198,6 @@ type ServiceConfig struct {
 	MaxTurns                         int
 	MaxRetryBackoffMS                int
 	MaxConcurrentAgentsByState       map[string]int
-	OrchestratorAutoCloseOnPR        bool
 	CodexCommand                     string
 	CodexApprovalPolicy              string
 	CodexThreadSandbox               string
@@ -195,7 +205,145 @@ type ServiceConfig struct {
 	CodexTurnTimeoutMS               int
 	CodexReadTimeoutMS               int
 	CodexStallTimeoutMS              int
+	ServerHost                       string
 	ServerPort                       *int
+	SessionPersistence               SessionPersistenceConfig
+	Notifications                    NotificationsConfig
+}
+
+type SessionPersistenceKind string
+
+const (
+	SessionPersistenceKindFile SessionPersistenceKind = "file"
+)
+
+type SessionPersistenceFileConfig struct {
+	Path            string
+	FlushIntervalMS int
+	FsyncOnCritical bool
+}
+
+type SessionPersistenceConfig struct {
+	Enabled bool
+	Kind    SessionPersistenceKind
+	File    SessionPersistenceFileConfig
+}
+
+type NotificationChannelKind string
+
+const (
+	NotificationChannelKindWebhook NotificationChannelKind = "webhook"
+	NotificationChannelKindSlack   NotificationChannelKind = "slack"
+)
+
+type NotificationEventType string
+
+const (
+	NotificationEventIssueDispatched           NotificationEventType = "issue_dispatched"
+	NotificationEventIssueCompleted            NotificationEventType = "issue_completed"
+	NotificationEventIssueFailed               NotificationEventType = "issue_failed"
+	NotificationEventIssueInterventionRequired NotificationEventType = "issue_intervention_required"
+	NotificationEventSystemAlert               NotificationEventType = "system_alert"
+	NotificationEventSystemAlertCleared        NotificationEventType = "system_alert_cleared"
+)
+
+type RuntimeEventFamily string
+
+const (
+	RuntimeEventFamilyIssue  RuntimeEventFamily = "issue"
+	RuntimeEventFamilyHealth RuntimeEventFamily = "health"
+)
+
+type RuntimeEventPriority string
+
+const (
+	RuntimeEventPriorityNormal   RuntimeEventPriority = "normal"
+	RuntimeEventPriorityCritical RuntimeEventPriority = "critical"
+)
+
+type NotificationSubscriptionConfig struct {
+	Families []RuntimeEventFamily
+	Types    []NotificationEventType
+}
+
+type NotificationDeliveryConfig struct {
+	TimeoutMS         int
+	RetryCount        int
+	RetryDelayMS      int
+	QueueSize         int
+	CriticalQueueSize int
+}
+
+type WebhookNotificationConfig struct {
+	URL     string
+	Headers map[string]string
+}
+
+type SlackNotificationConfig struct {
+	IncomingWebhookURL string
+}
+
+type NotificationChannelConfig struct {
+	ID            string
+	DisplayName   string
+	Kind          NotificationChannelKind
+	Subscriptions NotificationSubscriptionConfig
+	Delivery      NotificationDeliveryConfig
+	Webhook       *WebhookNotificationConfig
+	Slack         *SlackNotificationConfig
+}
+
+type NotificationsConfig struct {
+	Channels []NotificationChannelConfig
+	Defaults NotificationDeliveryConfig
+}
+
+type RuntimeEventSubject struct {
+	IssueID       string `json:"issue_id,omitempty"`
+	Identifier    string `json:"identifier,omitempty"`
+	WorkspacePath string `json:"workspace_path,omitempty"`
+}
+
+type RuntimeEventDispatch struct {
+	Kind               string  `json:"kind,omitempty"`
+	ExpectedOutcome    string  `json:"expected_outcome,omitempty"`
+	ContinuationReason *string `json:"continuation_reason,omitempty"`
+	AttemptCount       int     `json:"attempt_count,omitempty"`
+}
+
+type RuntimeEventPullRequest struct {
+	Number int    `json:"number,omitempty"`
+	URL    string `json:"url,omitempty"`
+	State  string `json:"state,omitempty"`
+	Branch string `json:"branch,omitempty"`
+}
+
+type RuntimeEventFailure struct {
+	Phase string `json:"phase,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+type RuntimeEventAlert struct {
+	Code    string `json:"code,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Level   string `json:"level,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+type RuntimeEvent struct {
+	Version     int                      `json:"version"`
+	EventID     string                   `json:"event_id"`
+	Type        NotificationEventType    `json:"type"`
+	Family      RuntimeEventFamily       `json:"family"`
+	Priority    RuntimeEventPriority     `json:"priority"`
+	Level       string                   `json:"level"`
+	OccurredAt  time.Time                `json:"occurred_at"`
+	Summary     string                   `json:"summary"`
+	Subject     *RuntimeEventSubject     `json:"subject,omitempty"`
+	Dispatch    *RuntimeEventDispatch    `json:"dispatch,omitempty"`
+	PullRequest *RuntimeEventPullRequest `json:"pull_request,omitempty"`
+	Failure     *RuntimeEventFailure     `json:"failure,omitempty"`
+	Alert       *RuntimeEventAlert       `json:"alert,omitempty"`
 }
 
 type Workspace struct {
@@ -286,17 +434,89 @@ type AwaitingInterventionEntry struct {
 	LastKnownIssueState string
 }
 
+type RecoveryStrategy string
+
+const (
+	RecoveryStrategyContinuationRetry RecoveryStrategy = "continuation_retry"
+	RecoveryStrategyPostRunResume     RecoveryStrategy = "post_run_resume"
+)
+
+type RecoverySource string
+
+const (
+	RecoverySourceRunning   RecoverySource = "running"
+	RecoverySourceRecovered RecoverySource = "recovered"
+	RecoverySourceSucceeded RecoverySource = "succeeded"
+)
+
+type RecoveryEntry struct {
+	Identifier    string
+	WorkspacePath string
+	FinalBranch   string
+	State         string
+	RetryAttempt  int
+	StallCount    int
+	ObservedAt    time.Time
+	Strategy      RecoveryStrategy
+	Source        RecoverySource
+	Dispatch      *DispatchContext
+}
+
+type ProtectedResultOutcome string
+
+const (
+	ProtectedResultOutcomeSucceeded ProtectedResultOutcome = "succeeded"
+	ProtectedResultOutcomeFailed    ProtectedResultOutcome = "failed"
+)
+
+type ProtectedState struct {
+	Reason      string
+	EnteredAt   time.Time
+	MustRestart bool
+}
+
+type ProtectedResultEntry struct {
+	Identifier    string
+	WorkspacePath string
+	Outcome       ProtectedResultOutcome
+	Phase         RunPhase
+	Error         *string
+	FinalBranch   string
+	ObservedAt    time.Time
+	RetryAttempt  int
+	Dispatch      *DispatchContext
+}
+
+type RuntimeServiceState struct {
+	Mode               ServiceMode
+	RecoveryInProgress bool
+	Reasons            []contract.Reason
+}
+
+type IssueRecord struct {
+	Runtime             contract.IssueRuntimeRecord
+	RetryDueAt          *time.Time
+	RetryAttempt        int
+	StallCount          int
+	LastKnownIssue      *Issue
+	LastKnownIssueState string
+	StartedAt           *time.Time
+	WorkerCancel        context.CancelFunc
+	RetryTimer          *time.Timer
+	Session             LiveSession
+	Dispatch            *DispatchContext
+	NeedsRecovery       bool
+}
+
 type OrchestratorState struct {
-	PollIntervalMS       int
-	MaxConcurrentAgents  int
-	Running              map[string]*RunningEntry
-	AwaitingMerge        map[string]*AwaitingMergeEntry
-	AwaitingIntervention map[string]*AwaitingInterventionEntry
-	Claimed              map[string]struct{}
-	RetryAttempts        map[string]*RetryEntry
-	Completed            map[string]struct{}
-	CodexTotals          TokenTotals
-	CodexRateLimits      any
+	PollIntervalMS      int
+	MaxConcurrentAgents int
+	Service             RuntimeServiceState
+	Records             map[string]*IssueRecord
+	ProtectedResults    map[string]*ProtectedResultEntry
+	CompletedWindow     []contract.IssueRuntimeRecord
+	CodexTotals         TokenTotals
+	CodexRateLimits     any
 }
 
 type RunningEntry struct {
@@ -425,8 +645,6 @@ var (
 	ErrLinearGraphQLErrors       = &TrackerError{Code: "linear_graphql_errors"}
 	ErrLinearUnknownPayload      = &TrackerError{Code: "linear_unknown_payload"}
 	ErrLinearMissingEndCursor    = &TrackerError{Code: "linear_missing_end_cursor"}
-	ErrLinearStateNotFound       = &TrackerError{Code: "linear_state_not_found"}
-	ErrLinearTransitionFailed    = &TrackerError{Code: "linear_transition_failed"}
 )
 
 var workspaceKeyPattern = regexp.MustCompile(`[^A-Za-z0-9._-]`)

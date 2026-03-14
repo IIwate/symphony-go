@@ -3,20 +3,23 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
+	"reflect"
+	"sort"
 	"strings"
-	"time"
 
+	"symphony-go/internal/model/contract"
 	"symphony-go/internal/orchestrator"
 )
 
 type RuntimeSource interface {
+	Discovery() orchestrator.DiscoveryDocument
 	Snapshot() orchestrator.Snapshot
-	RequestRefresh()
+	RequestRefresh() orchestrator.RefreshRequestResult
 	SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func())
 }
 
@@ -27,13 +30,13 @@ type Server struct {
 	listener net.Listener
 }
 
-func Start(runtime RuntimeSource, logger *slog.Logger, port int) (*Server, error) {
+func Start(runtime RuntimeSource, logger *slog.Logger, host string, port int) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	handler := NewHandler(runtime, logger)
 
-	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	listener, err := net.Listen("tcp", net.JoinHostPort(normalizeListenHost(host), fmt.Sprintf("%d", port)))
 	if err != nil {
 		return nil, err
 	}
@@ -73,45 +76,42 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
+	mux.HandleFunc("/api/v1/discovery", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, logger)
+			writeMethodNotAllowed(w, logger, http.MethodGet)
 			return
 		}
-		writeDashboard(w)
+		writeJSON(w, http.StatusOK, runtime.Discovery(), logger)
 	})
 	mux.HandleFunc("/api/v1/state", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, logger)
+			writeMethodNotAllowed(w, logger, http.MethodGet)
 			return
 		}
-		writeJSON(w, http.StatusOK, toStateResponse(runtime.Snapshot()), logger)
+		writeJSON(w, http.StatusOK, runtime.Snapshot(), logger)
 	})
-	mux.HandleFunc("/api/v1/refresh", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/control/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			writeMethodNotAllowed(w, logger)
+			writeMethodNotAllowed(w, logger, http.MethodPost)
 			return
 		}
-		runtime.RequestRefresh()
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"queued":       true,
-			"coalesced":    false,
-			"requested_at": time.Now().UTC().Format(time.RFC3339),
-			"operations":   []string{"poll", "reconcile"},
-		}, logger)
+		payload := runtime.RequestRefresh()
+		status := http.StatusOK
+		if payload.Status == contract.ControlStatusAccepted {
+			status = http.StatusAccepted
+		}
+		writeJSON(w, status, payload, logger)
 	})
 	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, logger)
+			writeMethodNotAllowed(w, logger, http.MethodGet)
 			return
 		}
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			writeError(w, http.StatusInternalServerError, "stream_not_supported", "response writer does not support flushing", logger)
+			writeError(w, http.StatusServiceUnavailable, contract.ErrorServiceUnavailable, "response writer does not support streaming", logger, map[string]any{
+				"path": r.URL.Path,
+			})
 			return
 		}
 
@@ -119,10 +119,10 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 
-		updates, unsubscribe := runtime.SubscribeSnapshots(4)
+		updates, unsubscribe := runtime.SubscribeSnapshots(8)
 		defer unsubscribe()
 
-		first := true
+		builder := &sseEventBuilder{}
 		for {
 			select {
 			case <-r.Context().Done():
@@ -131,452 +131,203 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 				if !ok {
 					return
 				}
-				eventName := "update"
-				if first {
-					eventName = "snapshot"
-					first = false
+				event, emit := builder.Next(snapshot)
+				if !emit {
+					continue
 				}
-				if err := writeSSEEvent(w, eventName, toStateResponse(snapshot)); err != nil {
+				if err := writeSSEEvent(w, string(event.EventType), event); err != nil {
 					return
 				}
 				flusher.Flush()
 			}
 		}
 	})
-	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, logger)
-			return
-		}
-		identifier := strings.TrimPrefix(r.URL.Path, "/api/v1/")
-		if identifier == "" || strings.Contains(identifier, "/") {
-			http.NotFound(w, r)
-			return
-		}
-		response, ok := findIssueResponse(runtime.Snapshot(), identifier)
-		if !ok {
-			writeError(w, http.StatusNotFound, "issue_not_found", "issue not found", logger)
-			return
-		}
-		writeJSON(w, http.StatusOK, response, logger)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, contract.ErrorAPINotFound, "resource not found", logger, map[string]any{
+			"path": r.URL.Path,
+		})
 	})
 
 	return mux
 }
 
-type stateResponse struct {
-	GeneratedAt          string                         `json:"generated_at"`
-	Service              serviceResponse                `json:"service"`
-	Counts               stateCounts                    `json:"counts"`
-	Running              []runningResponse              `json:"running"`
-	AwaitingMerge        []awaitingMergeResponse        `json:"awaiting_merge"`
-	AwaitingIntervention []awaitingInterventionResponse `json:"awaiting_intervention"`
-	Retrying             []retryResponse                `json:"retrying"`
-	Alerts               []alertResponse                `json:"alerts"`
-	CodexTotals          totalsResponse                 `json:"codex_totals"`
-	RateLimits           any                            `json:"rate_limits"`
+type sseEventBuilder struct {
+	sequence uint64
+	previous *orchestrator.Snapshot
 }
 
-type serviceResponse struct {
-	Version       string  `json:"version"`
-	StartedAt     string  `json:"started_at"`
-	UptimeSeconds float64 `json:"uptime_seconds"`
+func (b *sseEventBuilder) Next(snapshot orchestrator.Snapshot) (*contract.EventEnvelope, bool) {
+	if b.previous != nil && equivalentSnapshots(*b.previous, snapshot) {
+		copySnapshot := snapshot
+		b.previous = &copySnapshot
+		return nil, false
+	}
+
+	b.sequence++
+	eventType := contract.EventTypeStateChanged
+	recordIDs := changedRecordIDs(snapshot, b.previous)
+	reason := eventReason(snapshot, b.previous, recordIDs)
+	if b.previous == nil {
+		eventType = contract.EventTypeSnapshot
+	}
+
+	event := &contract.EventEnvelope{
+		EventID:     fmt.Sprintf("evt-%d", b.sequence),
+		EventType:   eventType,
+		Timestamp:   snapshot.GeneratedAt,
+		ServiceMode: snapshot.ServiceMode,
+		RecordIDs:   recordIDs,
+		Reason:      reason,
+	}
+
+	copySnapshot := snapshot
+	b.previous = &copySnapshot
+	return event, true
 }
 
-type stateCounts struct {
-	Running              int `json:"running"`
-	AwaitingMerge        int `json:"awaiting_merge"`
-	AwaitingIntervention int `json:"awaiting_intervention"`
-	Retrying             int `json:"retrying"`
+func equivalentSnapshots(left orchestrator.Snapshot, right orchestrator.Snapshot) bool {
+	return left.ServiceMode == right.ServiceMode &&
+		left.RecoveryInProgress == right.RecoveryInProgress &&
+		reflect.DeepEqual(left.Reasons, right.Reasons) &&
+		reflect.DeepEqual(left.Counts, right.Counts) &&
+		reflect.DeepEqual(left.Records, right.Records) &&
+		reflect.DeepEqual(left.CompletedWindow, right.CompletedWindow)
 }
 
-type runningResponse struct {
-	IssueID             string         `json:"issue_id"`
-	IssueIdentifier     string         `json:"issue_identifier"`
-	State               string         `json:"state"`
-	DispatchKind        string         `json:"dispatch_kind,omitempty"`
-	ExpectedOutcome     string         `json:"expected_outcome,omitempty"`
-	ContinuationReason  *string        `json:"continuation_reason"`
-	SessionID           string         `json:"session_id"`
-	TurnCount           int            `json:"turn_count"`
-	LastEvent           string         `json:"last_event"`
-	LastMessage         string         `json:"last_message"`
-	StartedAt           string         `json:"started_at"`
-	LastEventAt         *string        `json:"last_event_at"`
-	Tokens              totalsResponse `json:"tokens"`
-	CurrentRetryAttempt int            `json:"current_retry_attempt"`
+func changedRecordIDs(current orchestrator.Snapshot, previous *orchestrator.Snapshot) []contract.RecordID {
+	currentRecords := snapshotRecordIndex(current)
+	if previous == nil {
+		return sortedRecordIDs(currentRecords)
+	}
+
+	previousRecords := snapshotRecordIndex(*previous)
+	changed := make([]contract.RecordID, 0, len(currentRecords)+len(previousRecords))
+	seen := map[contract.RecordID]struct{}{}
+	for recordID, currentRecord := range currentRecords {
+		previousRecord, ok := previousRecords[recordID]
+		if ok && reflect.DeepEqual(previousRecord, currentRecord) {
+			continue
+		}
+		changed = append(changed, recordID)
+		seen[recordID] = struct{}{}
+	}
+	for recordID := range previousRecords {
+		if _, ok := currentRecords[recordID]; ok {
+			continue
+		}
+		if _, ok := seen[recordID]; ok {
+			continue
+		}
+		changed = append(changed, recordID)
+	}
+	sort.SliceStable(changed, func(i int, j int) bool {
+		return changed[i] < changed[j]
+	})
+	return changed
 }
 
-type retryResponse struct {
-	IssueID            string  `json:"issue_id"`
-	IssueIdentifier    string  `json:"issue_identifier"`
-	DispatchKind       string  `json:"dispatch_kind,omitempty"`
-	ExpectedOutcome    string  `json:"expected_outcome,omitempty"`
-	ContinuationReason *string `json:"continuation_reason"`
-	Attempt            int     `json:"attempt"`
-	DueAt              string  `json:"due_at"`
-	Error              *string `json:"error"`
+func snapshotRecordIndex(snapshot orchestrator.Snapshot) map[contract.RecordID]contract.IssueRuntimeRecord {
+	records := make(map[contract.RecordID]contract.IssueRuntimeRecord, len(snapshot.Records)+len(snapshot.CompletedWindow.Records))
+	for _, record := range snapshot.Records {
+		records[record.RecordID] = record
+	}
+	for _, record := range snapshot.CompletedWindow.Records {
+		records[record.RecordID] = record
+	}
+	return records
 }
 
-type awaitingMergeResponse struct {
-	IssueID         string  `json:"issue_id"`
-	IssueIdentifier string  `json:"issue_identifier"`
-	WorkspacePath   string  `json:"workspace_path"`
-	State           string  `json:"state"`
-	Branch          string  `json:"branch"`
-	PRNumber        int     `json:"pr_number"`
-	PRURL           string  `json:"pr_url"`
-	PRState         string  `json:"pr_state"`
-	AwaitingSince   string  `json:"awaiting_since"`
-	LastError       *string `json:"last_error"`
+func sortedRecordIDs(records map[contract.RecordID]contract.IssueRuntimeRecord) []contract.RecordID {
+	ids := make([]contract.RecordID, 0, len(records))
+	for recordID := range records {
+		ids = append(ids, recordID)
+	}
+	sort.SliceStable(ids, func(i int, j int) bool {
+		return ids[i] < ids[j]
+	})
+	return ids
 }
 
-type awaitingInterventionResponse struct {
-	IssueID             string `json:"issue_id"`
-	IssueIdentifier     string `json:"issue_identifier"`
-	WorkspacePath       string `json:"workspace_path"`
-	Branch              string `json:"branch"`
-	PRNumber            int    `json:"pr_number"`
-	PRURL               string `json:"pr_url"`
-	PRState             string `json:"pr_state"`
-	Reason              string `json:"reason,omitempty"`
-	ExpectedOutcome     string `json:"expected_outcome,omitempty"`
-	PreviousBranch      string `json:"previous_branch,omitempty"`
-	LastKnownIssueState string `json:"last_known_issue_state,omitempty"`
-	ObservedAt          string `json:"observed_at"`
+func eventReason(current orchestrator.Snapshot, previous *orchestrator.Snapshot, recordIDs []contract.RecordID) *contract.Reason {
+	if previous == nil {
+		if len(current.Reasons) == 0 {
+			return nil
+		}
+		return cloneReason(&current.Reasons[0])
+	}
+	if current.ServiceMode != previous.ServiceMode || !reflect.DeepEqual(current.Reasons, previous.Reasons) {
+		if len(current.Reasons) > 0 {
+			return cloneReason(&current.Reasons[0])
+		}
+		if len(previous.Reasons) > 0 {
+			return cloneReason(&previous.Reasons[0])
+		}
+		return nil
+	}
+	if len(recordIDs) != 1 {
+		return nil
+	}
+
+	recordID := recordIDs[0]
+	currentRecords := snapshotRecordIndex(current)
+	if record, ok := currentRecords[recordID]; ok && record.Reason != nil {
+		return cloneReason(record.Reason)
+	}
+	previousRecords := snapshotRecordIndex(*previous)
+	if record, ok := previousRecords[recordID]; ok && record.Reason != nil {
+		return cloneReason(record.Reason)
+	}
+	return nil
 }
 
-type alertResponse struct {
-	Code            string `json:"code"`
-	Level           string `json:"level"`
-	Message         string `json:"message"`
-	IssueID         string `json:"issue_id,omitempty"`
-	IssueIdentifier string `json:"issue_identifier,omitempty"`
-}
-
-type totalsResponse struct {
-	InputTokens    int64   `json:"input_tokens"`
-	OutputTokens   int64   `json:"output_tokens"`
-	TotalTokens    int64   `json:"total_tokens"`
-	SecondsRunning float64 `json:"seconds_running"`
-}
-
-type issueResponse struct {
-	GeneratedAt          string                        `json:"generated_at"`
-	Identifier           string                        `json:"identifier"`
-	Status               string                        `json:"status"`
-	WorkspacePath        string                        `json:"workspace_path,omitempty"`
-	LastError            *string                       `json:"last_error"`
-	AttemptCount         int                           `json:"attempt_count"`
-	Running              *runningResponse              `json:"running"`
-	AwaitingMerge        *awaitingMergeResponse        `json:"awaiting_merge"`
-	AwaitingIntervention *awaitingInterventionResponse `json:"awaiting_intervention"`
-	Retry                *retryResponse                `json:"retry"`
-}
-
-func toStateResponse(snapshot orchestrator.Snapshot) stateResponse {
-	serviceStartedAt := ""
-	uptimeSeconds := 0.0
-	if !snapshot.Service.StartedAt.IsZero() {
-		serviceStartedAt = snapshot.Service.StartedAt.UTC().Format(time.RFC3339)
-		uptimeSeconds = snapshot.GeneratedAt.Sub(snapshot.Service.StartedAt).Seconds()
-		if uptimeSeconds < 0 {
-			uptimeSeconds = 0
+func cloneReason(reason *contract.Reason) *contract.Reason {
+	if reason == nil {
+		return nil
+	}
+	copyReason := *reason
+	if reason.Details != nil {
+		copyReason.Details = map[string]any{}
+		for key, value := range reason.Details {
+			copyReason.Details[key] = value
 		}
 	}
-
-	running := make([]runningResponse, 0, len(snapshot.Running))
-	for _, item := range snapshot.Running {
-		var lastEventAt *string
-		if item.LastEventAt != nil {
-			text := item.LastEventAt.UTC().Format(time.RFC3339)
-			lastEventAt = &text
-		}
-		running = append(running, runningResponse{
-			IssueID:             item.IssueID,
-			IssueIdentifier:     item.IssueIdentifier,
-			State:               item.State,
-			DispatchKind:        item.DispatchKind,
-			ExpectedOutcome:     item.ExpectedOutcome,
-			ContinuationReason:  item.ContinuationReason,
-			SessionID:           item.SessionID,
-			TurnCount:           item.TurnCount,
-			LastEvent:           item.LastEvent,
-			LastMessage:         item.LastMessage,
-			StartedAt:           item.StartedAt.UTC().Format(time.RFC3339),
-			LastEventAt:         lastEventAt,
-			CurrentRetryAttempt: item.CurrentRetryAttempt,
-			Tokens: totalsResponse{
-				InputTokens:  item.InputTokens,
-				OutputTokens: item.OutputTokens,
-				TotalTokens:  item.TotalTokens,
-			},
-		})
-	}
-
-	awaitingMerge := make([]awaitingMergeResponse, 0, len(snapshot.AwaitingMerge))
-	for _, item := range snapshot.AwaitingMerge {
-		awaitingMerge = append(awaitingMerge, awaitingMergeResponse{
-			IssueID:         item.IssueID,
-			IssueIdentifier: item.IssueIdentifier,
-			WorkspacePath:   item.WorkspacePath,
-			State:           item.State,
-			Branch:          item.Branch,
-			PRNumber:        item.PRNumber,
-			PRURL:           item.PRURL,
-			PRState:         item.PRState,
-			AwaitingSince:   item.AwaitingSince.UTC().Format(time.RFC3339),
-			LastError:       item.LastError,
-		})
-	}
-
-	awaitingIntervention := make([]awaitingInterventionResponse, 0, len(snapshot.AwaitingIntervention))
-	for _, item := range snapshot.AwaitingIntervention {
-		awaitingIntervention = append(awaitingIntervention, awaitingInterventionResponse{
-			IssueID:             item.IssueID,
-			IssueIdentifier:     item.IssueIdentifier,
-			WorkspacePath:       item.WorkspacePath,
-			Branch:              item.Branch,
-			PRNumber:            item.PRNumber,
-			PRURL:               item.PRURL,
-			PRState:             item.PRState,
-			Reason:              item.Reason,
-			ExpectedOutcome:     item.ExpectedOutcome,
-			PreviousBranch:      item.PreviousBranch,
-			LastKnownIssueState: item.LastKnownIssueState,
-			ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
-		})
-	}
-
-	retrying := make([]retryResponse, 0, len(snapshot.Retrying))
-	for _, item := range snapshot.Retrying {
-		retrying = append(retrying, retryResponse{
-			IssueID:            item.IssueID,
-			IssueIdentifier:    item.IssueIdentifier,
-			DispatchKind:       item.DispatchKind,
-			ExpectedOutcome:    item.ExpectedOutcome,
-			ContinuationReason: item.ContinuationReason,
-			Attempt:            item.Attempt,
-			DueAt:              item.DueAt.UTC().Format(time.RFC3339),
-			Error:              item.Error,
-		})
-	}
-
-	alerts := make([]alertResponse, 0, len(snapshot.Alerts))
-	for _, item := range snapshot.Alerts {
-		alerts = append(alerts, alertResponse{
-			Code:            item.Code,
-			Level:           item.Level,
-			Message:         item.Message,
-			IssueID:         item.IssueID,
-			IssueIdentifier: item.IssueIdentifier,
-		})
-	}
-
-	return stateResponse{
-		GeneratedAt: snapshot.GeneratedAt.UTC().Format(time.RFC3339),
-		Service: serviceResponse{
-			Version:       snapshot.Service.Version,
-			StartedAt:     serviceStartedAt,
-			UptimeSeconds: uptimeSeconds,
-		},
-		Counts: stateCounts{
-			Running:              snapshot.Counts.Running,
-			AwaitingMerge:        snapshot.Counts.AwaitingMerge,
-			AwaitingIntervention: snapshot.Counts.AwaitingIntervention,
-			Retrying:             snapshot.Counts.Retrying,
-		},
-		Running:              running,
-		AwaitingMerge:        awaitingMerge,
-		AwaitingIntervention: awaitingIntervention,
-		Retrying:             retrying,
-		Alerts:               alerts,
-		CodexTotals: totalsResponse{
-			InputTokens:    snapshot.CodexTotals.InputTokens,
-			OutputTokens:   snapshot.CodexTotals.OutputTokens,
-			TotalTokens:    snapshot.CodexTotals.TotalTokens,
-			SecondsRunning: snapshot.CodexTotals.SecondsRunning,
-		},
-		RateLimits: snapshot.RateLimits,
-	}
+	return &copyReason
 }
 
-func findIssueResponse(snapshot orchestrator.Snapshot, identifier string) (issueResponse, bool) {
-	for _, item := range snapshot.Running {
-		var runningLastEventAt *string
-		if item.LastEventAt != nil {
-			text := item.LastEventAt.UTC().Format(time.RFC3339)
-			runningLastEventAt = &text
-		}
-		if item.IssueIdentifier == identifier {
-			copyItem := runningResponse{
-				IssueID:             item.IssueID,
-				IssueIdentifier:     item.IssueIdentifier,
-				State:               item.State,
-				DispatchKind:        item.DispatchKind,
-				ExpectedOutcome:     item.ExpectedOutcome,
-				ContinuationReason:  item.ContinuationReason,
-				SessionID:           item.SessionID,
-				TurnCount:           item.TurnCount,
-				LastEvent:           item.LastEvent,
-				LastMessage:         item.LastMessage,
-				StartedAt:           item.StartedAt.UTC().Format(time.RFC3339),
-				LastEventAt:         runningLastEventAt,
-				CurrentRetryAttempt: item.CurrentRetryAttempt,
-				Tokens: totalsResponse{
-					InputTokens:  item.InputTokens,
-					OutputTokens: item.OutputTokens,
-					TotalTokens:  item.TotalTokens,
-				},
-			}
-			return issueResponse{
-				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),
-				Identifier:    identifier,
-				Status:        "running",
-				WorkspacePath: item.WorkspacePath,
-				AttemptCount:  item.AttemptCount,
-				Running:       &copyItem,
-			}, true
-		}
+func normalizeListenHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "127.0.0.1"
 	}
-	for _, item := range snapshot.AwaitingMerge {
-		if item.IssueIdentifier == identifier {
-			copyItem := awaitingMergeResponse{
-				IssueID:         item.IssueID,
-				IssueIdentifier: item.IssueIdentifier,
-				WorkspacePath:   item.WorkspacePath,
-				State:           item.State,
-				Branch:          item.Branch,
-				PRNumber:        item.PRNumber,
-				PRURL:           item.PRURL,
-				PRState:         item.PRState,
-				AwaitingSince:   item.AwaitingSince.UTC().Format(time.RFC3339),
-				LastError:       item.LastError,
-			}
-			return issueResponse{
-				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),
-				Identifier:    identifier,
-				Status:        "awaiting_merge",
-				WorkspacePath: item.WorkspacePath,
-				LastError:     item.LastError,
-				AttemptCount:  item.AttemptCount,
-				AwaitingMerge: &copyItem,
-			}, true
-		}
-	}
-	for _, item := range snapshot.AwaitingIntervention {
-		if item.IssueIdentifier == identifier {
-			copyItem := awaitingInterventionResponse{
-				IssueID:             item.IssueID,
-				IssueIdentifier:     item.IssueIdentifier,
-				WorkspacePath:       item.WorkspacePath,
-				Branch:              item.Branch,
-				PRNumber:            item.PRNumber,
-				PRURL:               item.PRURL,
-				PRState:             item.PRState,
-				Reason:              item.Reason,
-				ExpectedOutcome:     item.ExpectedOutcome,
-				PreviousBranch:      item.PreviousBranch,
-				LastKnownIssueState: item.LastKnownIssueState,
-				ObservedAt:          item.ObservedAt.UTC().Format(time.RFC3339),
-			}
-			return issueResponse{
-				GeneratedAt:          snapshot.GeneratedAt.UTC().Format(time.RFC3339),
-				Identifier:           identifier,
-				Status:               "awaiting_intervention",
-				WorkspacePath:        item.WorkspacePath,
-				AttemptCount:         item.AttemptCount,
-				AwaitingIntervention: &copyItem,
-			}, true
-		}
-	}
-	for _, item := range snapshot.Retrying {
-		if item.IssueIdentifier == identifier {
-			copyItem := retryResponse{
-				IssueID:            item.IssueID,
-				IssueIdentifier:    item.IssueIdentifier,
-				DispatchKind:       item.DispatchKind,
-				ExpectedOutcome:    item.ExpectedOutcome,
-				ContinuationReason: item.ContinuationReason,
-				Attempt:            item.Attempt,
-				DueAt:              item.DueAt.UTC().Format(time.RFC3339),
-				Error:              item.Error,
-			}
-			return issueResponse{
-				GeneratedAt:   snapshot.GeneratedAt.UTC().Format(time.RFC3339),
-				Identifier:    identifier,
-				Status:        "retrying",
-				WorkspacePath: item.WorkspacePath,
-				LastError:     item.Error,
-				AttemptCount:  item.Attempt,
-				Retry:         &copyItem,
-			}, true
-		}
-	}
-	return issueResponse{}, false
-}
-
-func writeDashboard(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	const page = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>Symphony-Go Dashboard</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 24px; }
-    pre { background: #111; color: #eee; padding: 16px; overflow: auto; }
-  </style>
-</head>
-<body>
-  <h1>Symphony-Go</h1>
-  <p>运行时状态面板</p>
-  <pre id="state">loading...</pre>
-  <script>
-    const state = document.getElementById('state');
-    const render = async () => {
-      const res = await fetch('/api/v1/state');
-      state.textContent = JSON.stringify(await res.json(), null, 2);
-    };
-    render();
-    const events = new EventSource('/api/v1/events');
-    events.addEventListener('snapshot', (ev) => state.textContent = JSON.stringify(JSON.parse(ev.data), null, 2));
-    events.addEventListener('update', (ev) => state.textContent = JSON.stringify(JSON.parse(ev.data), null, 2));
-  </script>
-</body>
-</html>`
-	_, _ = io.WriteString(w, page)
+	return host
 }
 
 func writeSSEEvent(w io.Writer, event string, payload any) error {
-	raw, err := json.Marshal(payload)
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	_, err = io.WriteString(w, "event: "+event+"\ndata: "+string(raw)+"\n\n")
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, body)
 	return err
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any, logger *slog.Logger) {
-	if logger == nil {
-		logger = slog.Default()
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		logger.Warn("http response encode failed", "status", status, "error", err.Error())
+	if err := json.NewEncoder(w).Encode(payload); err != nil && logger != nil {
+		logger.Error("write json response", "error", err.Error())
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, code string, message string, logger *slog.Logger) {
-	writeJSON(w, status, map[string]any{
-		"error": map[string]any{
-			"code":    code,
-			"message": message,
-		},
-	}, logger)
+func writeError(w http.ResponseWriter, status int, code contract.ErrorCode, message string, logger *slog.Logger, details map[string]any) {
+	writeJSON(w, status, contract.MustErrorResponse(code, message, details), logger)
 }
 
-func writeMethodNotAllowed(w http.ResponseWriter, logger *slog.Logger) {
-	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", logger)
+func writeMethodNotAllowed(w http.ResponseWriter, logger *slog.Logger, allowed ...string) {
+	for _, method := range allowed {
+		if method != "" {
+			w.Header().Add("Allow", method)
+		}
+	}
+	writeError(w, http.StatusMethodNotAllowed, contract.ErrorAPIMethodNotAllowed, "method not allowed", logger, nil)
 }
