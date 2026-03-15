@@ -3,6 +3,7 @@ package contract
 import (
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 type ObjectType string
@@ -147,6 +148,46 @@ type ObjectRelation struct {
 	Type       RelationType `json:"type"`
 	TargetID   string       `json:"target_id"`
 	TargetType ObjectType   `json:"target_type"`
+}
+
+var coreRelationTargets = map[ObjectType]map[RelationType]ObjectType{
+	ObjectTypeJob: {
+		RelationTypeJobRun: ObjectTypeRun,
+	},
+	ObjectTypeRun: {
+		RelationTypeRunIntervention: ObjectTypeIntervention,
+		RelationTypeRunOutcome:      ObjectTypeOutcome,
+	},
+	ObjectTypeOutcome: {
+		RelationTypeOutcomeArtifact: ObjectTypeArtifact,
+	},
+}
+
+func (r ObjectRelation) ValidateForSource(source ObjectType) error {
+	if !source.IsValid() {
+		return fmt.Errorf("invalid source object type %q", source)
+	}
+	if !r.Type.IsValid() {
+		return fmt.Errorf("invalid relation type %q", r.Type)
+	}
+	if strings.TrimSpace(r.TargetID) == "" {
+		return fmt.Errorf("relation %q target_id is required", r.Type)
+	}
+	if !r.TargetType.IsValid() {
+		return fmt.Errorf("relation %q has invalid target type %q", r.Type, r.TargetType)
+	}
+	allowedTargets, ok := coreRelationTargets[source]
+	if !ok {
+		return fmt.Errorf("object type %q does not define formal outbound relations", source)
+	}
+	expectedTarget, ok := allowedTargets[r.Type]
+	if !ok {
+		return fmt.Errorf("relation %q is not allowed for source object type %q", r.Type, source)
+	}
+	if r.TargetType != expectedTarget {
+		return fmt.Errorf("relation %q from %q must target %q, got %q", r.Type, source, expectedTarget, r.TargetType)
+	}
+	return nil
 }
 
 type CapabilityCategory string
@@ -492,23 +533,27 @@ func (s ReferenceStatus) IsValid() bool {
 type InstanceRole string
 
 const (
-	InstanceRoleLeader   InstanceRole = "leader"
-	InstanceRoleStandby  InstanceRole = "standby"
-	InstanceRoleFollower InstanceRole = "follower"
+	InstanceRoleLeader  InstanceRole = "leader"
+	InstanceRoleStandby InstanceRole = "standby"
 )
 
 func (r InstanceRole) IsValid() bool {
 	switch r {
-	case InstanceRoleLeader, InstanceRoleStandby, InstanceRoleFollower:
+	case InstanceRoleLeader, InstanceRoleStandby:
 		return true
 	default:
 		return false
 	}
 }
 
+func (a ControlAction) IsServiceAction() bool {
+	return a == ControlActionRefresh
+}
+
+// IsValid only accepts object-level control actions.
 func (a ControlAction) IsValid() bool {
 	switch a {
-	case ControlActionRefresh, ControlActionCancel, ControlActionRetry, ControlActionResume, ControlActionResolveIntervention, ControlActionTerminate:
+	case ControlActionCancel, ControlActionRetry, ControlActionResume, ControlActionResolveIntervention, ControlActionTerminate:
 		return true
 	default:
 		return false
@@ -778,6 +823,15 @@ type ObjectContext struct {
 	Reasons    []Reason         `json:"reasons,omitempty"`
 	Decision   *Decision        `json:"decision,omitempty"`
 	ErrorCode  ErrorCode        `json:"error_code,omitempty"`
+}
+
+func (c ObjectContext) ValidateForSource(source ObjectType) error {
+	for _, relation := range c.Relations {
+		if err := relation.ValidateForSource(source); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type Job struct {

@@ -91,6 +91,38 @@ func TestFormalEnumsAndStateMachinesAreClosedSets(t *testing.T) {
 	if OutcomeConclusion("partial").IsValid() {
 		t.Fatal(`OutcomeConclusion("partial").IsValid() = true, want false`)
 	}
+
+	roles := []InstanceRole{
+		InstanceRoleLeader,
+		InstanceRoleStandby,
+	}
+	for _, role := range roles {
+		if !role.IsValid() {
+			t.Fatalf("InstanceRole(%q).IsValid() = false", role)
+		}
+	}
+	if InstanceRole("follower").IsValid() {
+		t.Fatal(`InstanceRole("follower").IsValid() = true, want false`)
+	}
+
+	actions := []ControlAction{
+		ControlActionCancel,
+		ControlActionRetry,
+		ControlActionResume,
+		ControlActionResolveIntervention,
+		ControlActionTerminate,
+	}
+	for _, action := range actions {
+		if !action.IsValid() {
+			t.Fatalf("ControlAction(%q).IsValid() = false", action)
+		}
+	}
+	if ControlActionRefresh.IsValid() {
+		t.Fatal(`ControlActionRefresh.IsValid() = true, want false`)
+	}
+	if !ControlActionRefresh.IsServiceAction() {
+		t.Fatal("ControlActionRefresh.IsServiceAction() = false, want true")
+	}
 }
 
 func TestReasonDecisionAndErrorDescriptorsAreStructured(t *testing.T) {
@@ -208,9 +240,12 @@ func TestFormalObjectContractsMarshalStableFields(t *testing.T) {
 	run := Run{
 		BaseObject: BaseObject{ID: "run-1", ObjectType: ObjectTypeRun, DomainID: "domain-main", Visibility: VisibilityLevelRestricted, ContractVersion: APIVersionV1, CreatedAt: "2026-03-15T00:00:00Z", UpdatedAt: "2026-03-15T00:00:02Z"},
 		ObjectContext: ObjectContext{
-			Relations: []ObjectRelation{{Type: RelationTypeRunIntervention, TargetID: "int-1", TargetType: ObjectTypeIntervention}},
-			Reasons:   []Reason{MustReason(ReasonRunBlockedInterventionRequired, map[string]any{"intervention_id": "int-1"})},
-			Decision:  &decision,
+			Relations: []ObjectRelation{
+				{Type: RelationTypeRunIntervention, TargetID: "int-1", TargetType: ObjectTypeIntervention},
+				{Type: RelationTypeRunOutcome, TargetID: "out-1", TargetType: ObjectTypeOutcome},
+			},
+			Reasons:  []Reason{MustReason(ReasonRunBlockedInterventionRequired, map[string]any{"intervention_id": "int-1"})},
+			Decision: &decision,
 		},
 		State:   RunStatusInterventionRequired,
 		Phase:   RunPhaseSummaryBlocked,
@@ -219,8 +254,7 @@ func TestFormalObjectContractsMarshalStableFields(t *testing.T) {
 	intervention := Intervention{
 		BaseObject: BaseObject{ID: "int-1", ObjectType: ObjectTypeIntervention, DomainID: "domain-main", Visibility: VisibilityLevelRestricted, ContractVersion: APIVersionV1, CreatedAt: "2026-03-15T00:00:02Z", UpdatedAt: "2026-03-15T00:00:03Z"},
 		ObjectContext: ObjectContext{
-			Relations: []ObjectRelation{{Type: RelationTypeRunOutcome, TargetID: "out-1", TargetType: ObjectTypeOutcome}},
-			Reasons:   []Reason{MustReason(ReasonInterventionInputRequired, map[string]any{"field": "resolution"})},
+			Reasons: []Reason{MustReason(ReasonInterventionInputRequired, map[string]any{"field": "resolution"})},
 		},
 		State:      InterventionStatusOpen,
 		TemplateID: "code_change.reviewable_pr_blocked",
@@ -275,16 +309,114 @@ func TestFormalObjectContractsMarshalStableFields(t *testing.T) {
 		},
 	}
 
+	if err := job.ObjectContext.ValidateForSource(job.ObjectType); err != nil {
+		t.Fatalf("job.ObjectContext.ValidateForSource() error = %v", err)
+	}
+	if err := run.ObjectContext.ValidateForSource(run.ObjectType); err != nil {
+		t.Fatalf("run.ObjectContext.ValidateForSource() error = %v", err)
+	}
+	if err := intervention.ObjectContext.ValidateForSource(intervention.ObjectType); err != nil {
+		t.Fatalf("intervention.ObjectContext.ValidateForSource() error = %v", err)
+	}
+	if err := outcome.ObjectContext.ValidateForSource(outcome.ObjectType); err != nil {
+		t.Fatalf("outcome.ObjectContext.ValidateForSource() error = %v", err)
+	}
+
 	assertJSONHasKeys(t, ref, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "state", "type", "system", "locator"})
 	assertJSONHasKeys(t, MustReason(ReasonCapabilityStaticUnsupported, map[string]any{"capability": CapabilitySubmitJob}), []string{"object_type", "reason_code", "category", "summary", "visibility", "details"})
 	assertJSONHasKeys(t, decision, []string{"id", "object_type", "domain_id", "contract_version", "created_at", "updated_at", "visibility", "decision_code", "category", "summary", "recommended_actions", "details"})
 	assertJSONHasKeys(t, job, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "relations", "references", "reasons", "decision", "error_code", "state", "job_type"})
 	assertJSONHasKeys(t, run, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "relations", "reasons", "decision", "state", "phase", "attempt"})
-	assertJSONHasKeys(t, intervention, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "relations", "reasons", "state", "template_id", "summary", "required_inputs", "allowed_actions", "resolution"})
+	assertJSONHasKeys(t, intervention, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "reasons", "state", "template_id", "summary", "required_inputs", "allowed_actions", "resolution"})
 	assertJSONHasKeys(t, outcome, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "relations", "decision", "state", "summary", "completed_at"})
 	assertJSONHasKeys(t, artifact, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "state", "kind", "role"})
 	assertJSONHasKeys(t, instance, []string{"id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "state", "name", "version", "role", "static_capabilities", "available_capabilities"})
 	assertJSONHasKeys(t, capabilities, []string{"static", "available"})
+}
+
+func TestObjectContextValidateForSourceRejectsInvalidCoreRelations(t *testing.T) {
+	validCases := []struct {
+		name   string
+		source ObjectType
+		ctx    ObjectContext
+	}{
+		{
+			name:   "job run relation",
+			source: ObjectTypeJob,
+			ctx: ObjectContext{
+				Relations: []ObjectRelation{{Type: RelationTypeJobRun, TargetID: "run-1", TargetType: ObjectTypeRun}},
+			},
+		},
+		{
+			name:   "run core relations",
+			source: ObjectTypeRun,
+			ctx: ObjectContext{
+				Relations: []ObjectRelation{
+					{Type: RelationTypeRunIntervention, TargetID: "int-1", TargetType: ObjectTypeIntervention},
+					{Type: RelationTypeRunOutcome, TargetID: "out-1", TargetType: ObjectTypeOutcome},
+				},
+			},
+		},
+		{
+			name:   "outcome artifact relation",
+			source: ObjectTypeOutcome,
+			ctx: ObjectContext{
+				Relations: []ObjectRelation{{Type: RelationTypeOutcomeArtifact, TargetID: "art-1", TargetType: ObjectTypeArtifact}},
+			},
+		},
+		{
+			name:   "intervention without outbound relation",
+			source: ObjectTypeIntervention,
+			ctx:    ObjectContext{},
+		},
+	}
+
+	for _, tc := range validCases {
+		if err := tc.ctx.ValidateForSource(tc.source); err != nil {
+			t.Fatalf("%s: ValidateForSource() error = %v", tc.name, err)
+		}
+	}
+
+	invalidCases := []struct {
+		name   string
+		source ObjectType
+		ctx    ObjectContext
+	}{
+		{
+			name:   "job cannot point to outcome",
+			source: ObjectTypeJob,
+			ctx: ObjectContext{
+				Relations: []ObjectRelation{{Type: RelationTypeRunOutcome, TargetID: "out-1", TargetType: ObjectTypeOutcome}},
+			},
+		},
+		{
+			name:   "run outcome must target outcome type",
+			source: ObjectTypeRun,
+			ctx: ObjectContext{
+				Relations: []ObjectRelation{{Type: RelationTypeRunOutcome, TargetID: "out-1", TargetType: ObjectTypeArtifact}},
+			},
+		},
+		{
+			name:   "artifact cannot define outbound relation",
+			source: ObjectTypeArtifact,
+			ctx: ObjectContext{
+				Relations: []ObjectRelation{{Type: RelationTypeOutcomeArtifact, TargetID: "art-1", TargetType: ObjectTypeArtifact}},
+			},
+		},
+		{
+			name:   "relation target id required",
+			source: ObjectTypeOutcome,
+			ctx: ObjectContext{
+				Relations: []ObjectRelation{{Type: RelationTypeOutcomeArtifact, TargetID: "", TargetType: ObjectTypeArtifact}},
+			},
+		},
+	}
+
+	for _, tc := range invalidCases {
+		if err := tc.ctx.ValidateForSource(tc.source); err == nil {
+			t.Fatalf("%s: ValidateForSource() = nil, want error", tc.name)
+		}
+	}
 }
 
 func TestOfficialJobTypeDefinitionsAreCompleteAndCloneSafe(t *testing.T) {
