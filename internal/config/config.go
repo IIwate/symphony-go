@@ -23,226 +23,62 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 		return nil, model.NewWorkflowError(model.ErrWorkflowParseError, "workflow definition is nil", nil)
 	}
 
-	configMap := def.Config
-	if configMap == nil {
-		configMap = map[string]any{}
+	contractConfig, err := ParseWorkflowContract(def)
+	if err != nil {
+		return nil, err
 	}
 
 	cfg := defaultServiceConfig()
 	cfg.AutomationRootDir = strings.TrimSpace(def.RootDir)
-
-	tracker := getMap(configMap, "tracker")
-	cfg.TrackerKind = model.NormalizeState(getString(tracker, "kind", ""))
-	if endpoint := strings.TrimSpace(getString(tracker, "endpoint", "")); endpoint != "" {
-		cfg.TrackerEndpoint = endpoint
-	}
-	cfg.TrackerAPIKey = strings.TrimSpace(getString(tracker, "api_key", ""))
-	cfg.TrackerProjectSlug = strings.TrimSpace(getString(tracker, "project_slug", ""))
-	linear := getMap(tracker, "linear")
-	if enabled, ok := getBool(linear, "children_block_parent"); ok {
-		cfg.TrackerLinearChildrenBlockParent = enabled
-	}
-	cfg.TrackerRepo = strings.TrimSpace(getString(tracker, "repo", ""))
-	if states, ok := getStringSlice(tracker, "active_states"); ok && len(states) > 0 {
-		cfg.ActiveStates = states
-	}
-	if states, ok := getStringSlice(tracker, "terminal_states"); ok && len(states) > 0 {
-		cfg.TerminalStates = states
-	}
-
-	polling := getMap(configMap, "polling")
-	if interval, ok := getInt(polling, "interval_ms"); ok && interval > 0 {
-		cfg.PollIntervalMS = interval
-	}
-
-	workspace := getMap(configMap, "workspace")
-	if root := expandHomePath(strings.TrimSpace(getString(workspace, "root", ""))); root != "" {
-		cfg.WorkspaceRoot = root
-	}
-	cfg.WorkspaceLinearBranchScope = slugifyScopeValue(getString(workspace, "linear_branch_scope", ""))
-	cfg.WorkspaceBranchNamespace = strings.TrimSpace(getString(workspace, "branch_namespace", ""))
-	workspaceGit := getMap(workspace, "git")
-	cfg.WorkspaceGitAuthorName = strings.TrimSpace(getString(workspaceGit, "author_name", ""))
-	cfg.WorkspaceGitAuthorEmail = strings.TrimSpace(getString(workspaceGit, "author_email", ""))
-
-	hooks := getMap(configMap, "hooks")
-	if value, ok := getOptionalString(hooks, "after_create"); ok {
-		cfg.HookAfterCreate = stringPointer(value)
-	}
-	if value, ok := getOptionalString(hooks, "before_run"); ok {
-		cfg.HookBeforeRun = stringPointer(value)
-	}
-	if value, ok := getOptionalString(hooks, "before_run_continuation"); ok {
-		cfg.HookBeforeRunContinuation = stringPointer(value)
-	}
-	if value, ok := getOptionalString(hooks, "after_run"); ok {
-		cfg.HookAfterRun = stringPointer(value)
-	}
-	if value, ok := getOptionalString(hooks, "before_remove"); ok {
-		cfg.HookBeforeRemove = stringPointer(value)
-	}
-	if timeout, ok := getInt(hooks, "timeout_ms"); ok && timeout > 0 {
-		cfg.HookTimeoutMS = timeout
+	cfg.TrackerKind = contractConfig.Source.Kind
+	cfg.TrackerEndpoint = contractConfig.Source.Endpoint
+	cfg.TrackerProjectSlug = contractConfig.Source.ProjectSlug
+	cfg.TrackerLinearChildrenBlockParent = contractConfig.Source.LinearChildrenBlockParent
+	cfg.TrackerRepo = contractConfig.Source.Repo
+	cfg.ActiveStates = append([]string(nil), contractConfig.Source.ActiveStates...)
+	cfg.TerminalStates = append([]string(nil), contractConfig.Source.TerminalStates...)
+	cfg.PollIntervalMS = contractConfig.Domain.PollIntervalMS
+	cfg.WorkspaceRoot = contractConfig.Domain.WorkspaceRoot
+	cfg.WorkspaceLinearBranchScope = contractConfig.Source.BranchScope
+	cfg.WorkspaceBranchNamespace = contractConfig.Domain.BranchNamespace
+	cfg.WorkspaceGitAuthorName = contractConfig.Domain.GitAuthorName
+	cfg.WorkspaceGitAuthorEmail = contractConfig.Domain.GitAuthorEmail
+	cfg.HookAfterCreate = cloneStringPtr(contractConfig.Execution.HookAfterCreate)
+	cfg.HookBeforeRun = cloneStringPtr(contractConfig.Execution.HookBeforeRun)
+	cfg.HookBeforeRunContinuation = cloneStringPtr(contractConfig.Execution.HookBeforeRunContinuation)
+	cfg.HookAfterRun = cloneStringPtr(contractConfig.Execution.HookAfterRun)
+	cfg.HookBeforeRemove = cloneStringPtr(contractConfig.Execution.HookBeforeRemove)
+	cfg.HookTimeoutMS = contractConfig.Execution.HookTimeoutMS
+	cfg.MaxConcurrentAgents = contractConfig.Execution.MaxConcurrentAgents
+	cfg.MaxTurns = contractConfig.Execution.MaxTurns
+	cfg.MaxRetryBackoffMS = contractConfig.Execution.MaxRetryBackoffMS
+	cfg.MaxConcurrentAgentsByState = cloneIntMap(contractConfig.Execution.MaxConcurrentAgentsByState)
+	cfg.CodexCommand = contractConfig.Execution.Codex.Command
+	cfg.CodexApprovalPolicy = contractConfig.Execution.Codex.ApprovalPolicy
+	cfg.CodexThreadSandbox = contractConfig.Execution.Codex.ThreadSandbox
+	cfg.CodexTurnSandboxPolicy = contractConfig.Execution.Codex.TurnSandboxPolicy
+	cfg.CodexTurnTimeoutMS = contractConfig.Execution.Codex.TurnTimeoutMS
+	cfg.CodexReadTimeoutMS = contractConfig.Execution.Codex.ReadTimeoutMS
+	cfg.CodexStallTimeoutMS = contractConfig.Execution.Codex.StallTimeoutMS
+	cfg.ServerHost = contractConfig.Service.ServerHost
+	cfg.ServerPort = cloneIntPtr(contractConfig.Service.ServerPort)
+	cfg.SessionPersistence.Enabled = contractConfig.Persistence.BackendKind == PersistenceBackendKindFile
+	if cfg.SessionPersistence.Enabled {
+		cfg.SessionPersistence.Kind = model.SessionPersistenceKindFile
+		cfg.SessionPersistence.File.Path = contractConfig.Persistence.FilePath
+		cfg.SessionPersistence.File.FlushIntervalMS = contractConfig.Persistence.FlushIntervalMS
+		cfg.SessionPersistence.File.FsyncOnCritical = contractConfig.Persistence.FsyncOnCritical
 	}
 
-	agent := getMap(configMap, "agent")
-	if maxConcurrent, ok := getInt(agent, "max_concurrent_agents"); ok && maxConcurrent > 0 {
-		cfg.MaxConcurrentAgents = maxConcurrent
-	}
-	if maxTurns, ok := getInt(agent, "max_turns"); ok && maxTurns > 0 {
-		cfg.MaxTurns = maxTurns
-	}
-	if maxBackoff, ok := getInt(agent, "max_retry_backoff_ms"); ok && maxBackoff > 0 {
-		cfg.MaxRetryBackoffMS = maxBackoff
-	}
-	if byState := getMap(agent, "max_concurrent_agents_by_state"); len(byState) > 0 {
-		cfg.MaxConcurrentAgentsByState = normalizePositiveIntMap(byState)
-	}
-
-	codex := getMap(configMap, "codex")
-	if command := strings.TrimSpace(getString(codex, "command", "")); command != "" {
-		cfg.CodexCommand = command
-	}
-	if approvalPolicy := strings.TrimSpace(getString(codex, "approval_policy", "")); approvalPolicy != "" {
-		cfg.CodexApprovalPolicy = approvalPolicy
-	}
-	if threadSandbox := strings.TrimSpace(getString(codex, "thread_sandbox", "")); threadSandbox != "" {
-		cfg.CodexThreadSandbox = threadSandbox
-	}
-	if sandboxPolicy, ok := codex["turn_sandbox_policy"]; ok && sandboxPolicy != nil {
-		cfg.CodexTurnSandboxPolicy = stringifyValue(sandboxPolicy)
-	}
-	if turnTimeout, ok := getInt(codex, "turn_timeout_ms"); ok && turnTimeout > 0 {
-		cfg.CodexTurnTimeoutMS = turnTimeout
-	}
-	if readTimeout, ok := getInt(codex, "read_timeout_ms"); ok && readTimeout > 0 {
-		cfg.CodexReadTimeoutMS = readTimeout
-	}
-	if stallTimeout, ok := getInt(codex, "stall_timeout_ms"); ok {
-		cfg.CodexStallTimeoutMS = stallTimeout
-	}
-
-	server := getMap(configMap, "server")
-	if host := strings.TrimSpace(getString(server, "host", "")); host != "" {
-		cfg.ServerHost = host
-	}
-	if port, ok := getInt(server, "port"); ok && port >= 0 {
-		cfg.ServerPort = &port
-	}
-
-	sessionPersistence := getMap(configMap, "session_persistence")
-	if err := rejectLegacySessionPersistenceKeys(sessionPersistence); err != nil {
+	secretValue, ok, err := secret.DefaultRegistry.Resolve(contractConfig.Source.APIKeyRef, secret.DefaultResolver)
+	if err != nil {
 		return nil, err
 	}
-	if enabled, ok := getBool(sessionPersistence, "enabled"); ok {
-		cfg.SessionPersistence.Enabled = enabled
-	}
-	if kind := strings.TrimSpace(getString(sessionPersistence, "kind", "")); kind != "" {
-		cfg.SessionPersistence.Kind = model.SessionPersistenceKind(model.NormalizeState(kind))
-	}
-	filePersistence := getMap(sessionPersistence, "file")
-	path := expandHomePath(strings.TrimSpace(getString(filePersistence, "path", "")))
-	if path != "" {
-		cfg.SessionPersistence.File.Path = path
-	}
-	flushInterval, ok := getInt(filePersistence, "flush_interval_ms")
 	if ok {
-		cfg.SessionPersistence.File.FlushIntervalMS = flushInterval
-	}
-	fsyncOnCritical, ok := getBool(filePersistence, "fsync_on_critical")
-	if ok {
-		cfg.SessionPersistence.File.FsyncOnCritical = fsyncOnCritical
-	}
-	if cfg.SessionPersistence.Enabled && cfg.SessionPersistence.Kind == "" {
-		cfg.SessionPersistence.Kind = model.SessionPersistenceKindFile
+		cfg.TrackerAPIKey = secretValue
 	}
 
-	notifications := getMap(configMap, "notifications")
-	notificationDefaults := getMap(notifications, "defaults")
-	if timeoutMS, ok := getInt(notificationDefaults, "timeout_ms"); ok {
-		cfg.Notifications.Defaults.TimeoutMS = timeoutMS
-	}
-	if retryCount, ok := getInt(notificationDefaults, "retry_count"); ok {
-		cfg.Notifications.Defaults.RetryCount = retryCount
-	}
-	if retryDelayMS, ok := getInt(notificationDefaults, "retry_delay_ms"); ok {
-		cfg.Notifications.Defaults.RetryDelayMS = retryDelayMS
-	}
-	if queueSize, ok := getInt(notificationDefaults, "queue_size"); ok {
-		cfg.Notifications.Defaults.QueueSize = queueSize
-	}
-	if criticalQueueSize, ok := getInt(notificationDefaults, "critical_queue_size"); ok {
-		cfg.Notifications.Defaults.CriticalQueueSize = criticalQueueSize
-	}
-	channelMaps := getMapSlice(notifications, "channels")
-	if len(channelMaps) > 0 {
-		cfg.Notifications.Channels = make([]model.NotificationChannelConfig, 0, len(channelMaps))
-		for index, channel := range channelMaps {
-			if err := rejectLegacyNotificationChannelKeys(channel, index); err != nil {
-				return nil, err
-			}
-			parsed := model.NotificationChannelConfig{
-				ID:          strings.TrimSpace(getString(channel, "id", "")),
-				DisplayName: strings.TrimSpace(getString(channel, "display_name", "")),
-				Kind:        model.NotificationChannelKind(model.NormalizeState(getString(channel, "kind", ""))),
-				Delivery:    cfg.Notifications.Defaults,
-			}
-			if parsed.DisplayName == "" {
-				parsed.DisplayName = parsed.ID
-			}
-
-			subscriptions := getMap(channel, "subscriptions")
-			if families, ok := getStringSlice(subscriptions, "families"); ok && len(families) > 0 {
-				parsed.Subscriptions.Families = make([]model.RuntimeEventFamily, 0, len(families))
-				for _, family := range families {
-					parsed.Subscriptions.Families = append(parsed.Subscriptions.Families, model.RuntimeEventFamily(model.NormalizeState(family)))
-				}
-			}
-			eventNames, ok := getStringSlice(subscriptions, "types")
-			if ok && len(eventNames) > 0 {
-				parsed.Subscriptions.Types = make([]model.NotificationEventType, 0, len(eventNames))
-				for _, eventName := range eventNames {
-					parsed.Subscriptions.Types = append(parsed.Subscriptions.Types, model.NotificationEventType(strings.ToLower(strings.TrimSpace(eventName))))
-				}
-			}
-
-			delivery := getMap(channel, "delivery")
-			if timeoutMS, ok := getInt(delivery, "timeout_ms"); ok {
-				parsed.Delivery.TimeoutMS = timeoutMS
-			}
-			if retryCount, ok := getInt(delivery, "retry_count"); ok {
-				parsed.Delivery.RetryCount = retryCount
-			}
-			if retryDelayMS, ok := getInt(delivery, "retry_delay_ms"); ok {
-				parsed.Delivery.RetryDelayMS = retryDelayMS
-			}
-			if queueSize, ok := getInt(delivery, "queue_size"); ok {
-				parsed.Delivery.QueueSize = queueSize
-			}
-			if criticalQueueSize, ok := getInt(delivery, "critical_queue_size"); ok {
-				parsed.Delivery.CriticalQueueSize = criticalQueueSize
-			}
-
-			switch parsed.Kind {
-			case model.NotificationChannelKindWebhook:
-				webhook := getMap(channel, "webhook")
-				urlText := strings.TrimSpace(getString(webhook, "url", ""))
-				headers := getStringMap(getMap(webhook, "headers"))
-				parsed.Webhook = &model.WebhookNotificationConfig{
-					URL:     urlText,
-					Headers: headers,
-				}
-			case model.NotificationChannelKindSlack:
-				slack := getMap(channel, "slack")
-				urlText := strings.TrimSpace(getString(slack, "incoming_webhook_url", ""))
-				parsed.Slack = &model.SlackNotificationConfig{
-					IncomingWebhookURL: urlText,
-				}
-			}
-			cfg.Notifications.Channels = append(cfg.Notifications.Channels, parsed)
-		}
-	}
-
+	cfg.Notifications = resolveNotificationConfig(contractConfig)
 	return cfg, nil
 }
 
@@ -281,22 +117,22 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 		return model.NewWorkflowError(model.ErrWorkflowParseError, "service config is nil", nil)
 	}
 	if cfg.TrackerKind == "" {
-		return model.NewTrackerError(model.ErrUnsupportedTrackerKind, "tracker.kind is required", nil)
+		return model.NewTrackerError(model.ErrUnsupportedTrackerKind, "source_adapter.kind is required", nil)
 	}
 	if cfg.TrackerKind != "linear" {
-		return model.NewTrackerError(model.ErrUnsupportedTrackerKind, fmt.Sprintf("unsupported tracker.kind %q", cfg.TrackerKind), nil)
+		return model.NewTrackerError(model.ErrUnsupportedTrackerKind, fmt.Sprintf("unsupported source_adapter.kind %q", cfg.TrackerKind), nil)
 	}
 	if strings.TrimSpace(cfg.TrackerAPIKey) == "" {
-		return model.NewTrackerError(model.ErrMissingTrackerAPIKey, "tracker.api_key is required", nil)
+		return model.NewTrackerError(model.ErrMissingTrackerAPIKey, "source_adapter.credentials.api_key_ref is required", nil)
 	}
 	if strings.TrimSpace(cfg.TrackerProjectSlug) == "" {
-		return model.NewTrackerError(model.ErrMissingTrackerProjectSlug, "tracker.project_slug is required", nil)
+		return model.NewTrackerError(model.ErrMissingTrackerProjectSlug, "source_adapter.project_slug is required", nil)
 	}
 	if strings.TrimSpace(cfg.WorkspaceLinearBranchScope) == "" {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "source.branch_scope is required for linear tracker", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "source_adapter.branch_scope is required for linear source", nil)
 	}
 	if strings.TrimSpace(cfg.CodexCommand) == "" {
-		return model.NewWorkflowError(model.ErrInvalidCodexCommand, "codex.command is required", nil)
+		return model.NewWorkflowError(model.ErrInvalidCodexCommand, "execution.backend.codex.command is required", nil)
 	}
 	if err := validateSessionPersistenceConfig(cfg.SessionPersistence); err != nil {
 		return err
@@ -350,6 +186,91 @@ func defaultServiceConfig() *model.ServiceConfig {
 			},
 		},
 	}
+}
+
+func resolveNotificationConfig(contractConfig WorkflowContract) model.NotificationsConfig {
+	result := model.NotificationsConfig{
+		Defaults: model.NotificationDeliveryConfig{
+			TimeoutMS:         contractConfig.Service.Notifications.Defaults.TimeoutMS,
+			RetryCount:        contractConfig.Service.Notifications.Defaults.RetryCount,
+			RetryDelayMS:      contractConfig.Service.Notifications.Defaults.RetryDelayMS,
+			QueueSize:         contractConfig.Service.Notifications.Defaults.QueueSize,
+			CriticalQueueSize: contractConfig.Service.Notifications.Defaults.CriticalQueueSize,
+		},
+	}
+	if len(contractConfig.Service.Notifications.Channels) == 0 {
+		return result
+	}
+
+	result.Channels = make([]model.NotificationChannelConfig, 0, len(contractConfig.Service.Notifications.Channels))
+	for _, channel := range contractConfig.Service.Notifications.Channels {
+		parsed := model.NotificationChannelConfig{
+			ID:            channel.ID,
+			DisplayName:   channel.DisplayName,
+			Kind:          channel.Kind,
+			Subscriptions: channel.Subscriptions,
+			Delivery:      channel.Delivery,
+		}
+		switch channel.Kind {
+		case model.NotificationChannelKindWebhook:
+			headers := map[string]string{}
+			if channel.Webhook != nil {
+				for key, ref := range channel.Webhook.HeaderRefs {
+					value, ok, err := secret.DefaultRegistry.Resolve(ref, secret.DefaultResolver)
+					if err == nil && ok {
+						headers[key] = value
+					}
+				}
+				urlText, ok, err := secret.DefaultRegistry.Resolve(channel.Webhook.URLRef, secret.DefaultResolver)
+				if err == nil && ok {
+					parsed.Webhook = &model.WebhookNotificationConfig{
+						URL:     urlText,
+						Headers: headers,
+					}
+				} else {
+					parsed.Webhook = &model.WebhookNotificationConfig{Headers: headers}
+				}
+			}
+		case model.NotificationChannelKindSlack:
+			if channel.Slack != nil {
+				urlText, ok, err := secret.DefaultRegistry.Resolve(channel.Slack.IncomingWebhookURLRef, secret.DefaultResolver)
+				if err == nil && ok {
+					parsed.Slack = &model.SlackNotificationConfig{IncomingWebhookURL: urlText}
+				} else {
+					parsed.Slack = &model.SlackNotificationConfig{}
+				}
+			}
+		}
+		result.Channels = append(result.Channels, parsed)
+	}
+	return result
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func cloneIntPtr(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func cloneIntMap(source map[string]int) map[string]int {
+	if len(source) == 0 {
+		return map[string]int{}
+	}
+	result := make(map[string]int, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func getMap(source map[string]any, key string) map[string]any {
@@ -613,13 +534,13 @@ func validateSessionPersistenceConfig(cfg model.SessionPersistenceConfig) error 
 	switch kind {
 	case model.SessionPersistenceKindFile:
 	default:
-		return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.session_persistence.kind %q is unsupported", kind), nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("persistence.backend.kind %q is unsupported", kind), nil)
 	}
 	if strings.TrimSpace(cfg.File.Path) == "" {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.session_persistence.file.path is required", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "persistence.file.path is required", nil)
 	}
 	if cfg.File.FlushIntervalMS <= 0 {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.session_persistence.file.flush_interval_ms must be > 0", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "persistence.file.flush_interval_ms must be > 0", nil)
 	}
 	return nil
 }
@@ -629,19 +550,19 @@ func validateNotificationsConfig(cfg model.NotificationsConfig) error {
 		return nil
 	}
 	if cfg.Defaults.TimeoutMS <= 0 {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.timeout_ms must be > 0", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "service.notifications.defaults.timeout_ms must be > 0", nil)
 	}
 	if cfg.Defaults.RetryCount < 0 {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.retry_count must be >= 0", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "service.notifications.defaults.retry_count must be >= 0", nil)
 	}
 	if cfg.Defaults.RetryDelayMS < 0 {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.retry_delay_ms must be >= 0", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "service.notifications.defaults.retry_delay_ms must be >= 0", nil)
 	}
 	if cfg.Defaults.QueueSize <= 0 {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.queue_size must be > 0", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "service.notifications.defaults.queue_size must be > 0", nil)
 	}
 	if cfg.Defaults.CriticalQueueSize <= 0 {
-		return model.NewWorkflowError(model.ErrWorkflowParseError, "runtime.notifications.defaults.critical_queue_size must be > 0", nil)
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "service.notifications.defaults.critical_queue_size must be > 0", nil)
 	}
 
 	seenIDs := make(map[string]struct{}, len(cfg.Channels))
@@ -649,65 +570,65 @@ func validateNotificationsConfig(cfg model.NotificationsConfig) error {
 	allowedFamilies := runtimeEventFamilySet()
 	for index, channel := range cfg.Channels {
 		if strings.TrimSpace(channel.ID) == "" {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].id is required", index), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].id is required", index), nil)
 		}
 		if _, exists := seenIDs[channel.ID]; exists {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].id %q is duplicated", index, channel.ID), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].id %q is duplicated", index, channel.ID), nil)
 		}
 		seenIDs[channel.ID] = struct{}{}
 
 		switch channel.Kind {
 		case model.NotificationChannelKindWebhook, model.NotificationChannelKindSlack:
 		default:
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].kind %q is unsupported", index, channel.Kind), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].kind %q is unsupported", index, channel.Kind), nil)
 		}
 
 		if len(channel.Subscriptions.Families) == 0 && len(channel.Subscriptions.Types) == 0 {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].subscriptions must declare at least one family or type", index), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].subscriptions must declare at least one family or type", index), nil)
 		}
 		for _, family := range channel.Subscriptions.Families {
 			if _, ok := allowedFamilies[family]; !ok {
-				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].subscriptions.families contains unsupported family %q", index, family), nil)
+				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].subscriptions.families contains unsupported family %q", index, family), nil)
 			}
 		}
 		for _, eventType := range channel.Subscriptions.Types {
 			if _, ok := allowedEvents[eventType]; !ok {
-				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].subscriptions.types contains unsupported event %q", index, eventType), nil)
+				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].subscriptions.types contains unsupported event %q", index, eventType), nil)
 			}
 		}
 
 		if channel.Delivery.TimeoutMS <= 0 {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].delivery.timeout_ms must be > 0", index), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].delivery.timeout_ms must be > 0", index), nil)
 		}
 		if channel.Delivery.RetryCount < 0 {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].delivery.retry_count must be >= 0", index), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].delivery.retry_count must be >= 0", index), nil)
 		}
 		if channel.Delivery.RetryDelayMS < 0 {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].delivery.retry_delay_ms must be >= 0", index), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].delivery.retry_delay_ms must be >= 0", index), nil)
 		}
 		if channel.Delivery.QueueSize <= 0 {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].delivery.queue_size must be > 0", index), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].delivery.queue_size must be > 0", index), nil)
 		}
 		if channel.Delivery.CriticalQueueSize <= 0 {
-			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].delivery.critical_queue_size must be > 0", index), nil)
+			return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].delivery.critical_queue_size must be > 0", index), nil)
 		}
 
 		switch channel.Kind {
 		case model.NotificationChannelKindWebhook:
 			if channel.Webhook == nil || strings.TrimSpace(channel.Webhook.URL) == "" {
-				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].webhook.url is required", index), nil)
+				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].webhook.url is required", index), nil)
 			}
 			for key, value := range channel.Webhook.Headers {
 				if strings.TrimSpace(key) == "" {
-					return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].webhook.headers contains an empty key", index), nil)
+					return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].webhook.headers contains an empty key", index), nil)
 				}
 				if strings.TrimSpace(value) == "" {
-					return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].webhook.headers.%s is required", index, key), nil)
+					return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].webhook.headers.%s is required", index, key), nil)
 				}
 			}
 		case model.NotificationChannelKindSlack:
 			if channel.Slack == nil || strings.TrimSpace(channel.Slack.IncomingWebhookURL) == "" {
-				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("runtime.notifications.channels[%d].slack.incoming_webhook_url is required", index), nil)
+				return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.notifications.channels[%d].slack.incoming_webhook_url is required", index), nil)
 			}
 		}
 	}

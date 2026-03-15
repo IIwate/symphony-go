@@ -10,7 +10,9 @@ type CodeCategory string
 
 const (
 	CategoryAPI          CodeCategory = "api"
+	CategoryAction       CodeCategory = "action"
 	CategoryCapability   CodeCategory = "capability"
+	CategoryCheckpoint   CodeCategory = "checkpoint"
 	CategoryConfig       CodeCategory = "config"
 	CategoryControl      CodeCategory = "control"
 	CategoryIntervention CodeCategory = "intervention"

@@ -14,6 +14,7 @@ const (
 	ObjectTypeIntervention ObjectType = "intervention"
 	ObjectTypeOutcome      ObjectType = "outcome"
 	ObjectTypeArtifact     ObjectType = "artifact"
+	ObjectTypeAction       ObjectType = "action"
 	ObjectTypeInstance     ObjectType = "instance"
 	ObjectTypeReference    ObjectType = "reference"
 	ObjectTypeReason       ObjectType = "reason"
@@ -22,7 +23,7 @@ const (
 
 func (t ObjectType) IsValid() bool {
 	switch t {
-	case ObjectTypeJob, ObjectTypeRun, ObjectTypeIntervention, ObjectTypeOutcome, ObjectTypeArtifact, ObjectTypeInstance, ObjectTypeReference, ObjectTypeReason, ObjectTypeDecision:
+	case ObjectTypeJob, ObjectTypeRun, ObjectTypeIntervention, ObjectTypeOutcome, ObjectTypeArtifact, ObjectTypeAction, ObjectTypeInstance, ObjectTypeReference, ObjectTypeReason, ObjectTypeDecision:
 		return true
 	default:
 		return false
@@ -130,14 +131,16 @@ type RelationType string
 
 const (
 	RelationTypeJobRun          RelationType = "job.run"
+	RelationTypeJobAction       RelationType = "job.action"
 	RelationTypeRunIntervention RelationType = "run.intervention"
 	RelationTypeRunOutcome      RelationType = "run.outcome"
 	RelationTypeOutcomeArtifact RelationType = "outcome.artifact"
+	RelationTypeActionReference RelationType = "action.reference"
 )
 
 func (t RelationType) IsValid() bool {
 	switch t {
-	case RelationTypeJobRun, RelationTypeRunIntervention, RelationTypeRunOutcome, RelationTypeOutcomeArtifact:
+	case RelationTypeJobRun, RelationTypeJobAction, RelationTypeRunIntervention, RelationTypeRunOutcome, RelationTypeOutcomeArtifact, RelationTypeActionReference:
 		return true
 	default:
 		return false
@@ -152,7 +155,8 @@ type ObjectRelation struct {
 
 var coreRelationTargets = map[ObjectType]map[RelationType]ObjectType{
 	ObjectTypeJob: {
-		RelationTypeJobRun: ObjectTypeRun,
+		RelationTypeJobRun:    ObjectTypeRun,
+		RelationTypeJobAction: ObjectTypeAction,
 	},
 	ObjectTypeRun: {
 		RelationTypeRunIntervention: ObjectTypeIntervention,
@@ -160,6 +164,9 @@ var coreRelationTargets = map[ObjectType]map[RelationType]ObjectType{
 	},
 	ObjectTypeOutcome: {
 		RelationTypeOutcomeArtifact: ObjectTypeArtifact,
+	},
+	ObjectTypeAction: {
+		RelationTypeActionReference: ObjectTypeReference,
 	},
 }
 
@@ -320,6 +327,7 @@ const (
 	RunStatusQueued               RunStatus = "queued"
 	RunStatusRunning              RunStatus = "running"
 	RunStatusInterventionRequired RunStatus = "intervention_required"
+	RunStatusContinuationPending  RunStatus = "continuation_pending"
 	RunStatusCompleted            RunStatus = "completed"
 	RunStatusFailed               RunStatus = "failed"
 	RunStatusCanceled             RunStatus = "canceled"
@@ -328,8 +336,9 @@ const (
 
 var runStatusTransitions = map[RunStatus][]RunStatus{
 	RunStatusQueued:               {RunStatusRunning, RunStatusCanceled, RunStatusAbandoned},
-	RunStatusRunning:              {RunStatusInterventionRequired, RunStatusCompleted, RunStatusFailed, RunStatusCanceled, RunStatusAbandoned},
-	RunStatusInterventionRequired: {RunStatusRunning, RunStatusCompleted, RunStatusFailed, RunStatusCanceled, RunStatusAbandoned},
+	RunStatusRunning:              {RunStatusInterventionRequired, RunStatusContinuationPending, RunStatusCompleted, RunStatusFailed, RunStatusCanceled, RunStatusAbandoned},
+	RunStatusInterventionRequired: {RunStatusCanceled, RunStatusAbandoned},
+	RunStatusContinuationPending:  {RunStatusCanceled, RunStatusAbandoned},
 	RunStatusCompleted:            {},
 	RunStatusFailed:               {},
 	RunStatusCanceled:             {},
@@ -437,6 +446,57 @@ func (c OutcomeConclusion) IsValid() bool {
 	default:
 		return false
 	}
+}
+
+type ActionType string
+
+const (
+	ActionTypeSourceClosure ActionType = "source_closure"
+)
+
+func (t ActionType) IsValid() bool {
+	switch t {
+	case ActionTypeSourceClosure:
+		return true
+	default:
+		return false
+	}
+}
+
+type ActionStatus string
+
+const (
+	ActionStatusQueued               ActionStatus = "queued"
+	ActionStatusRunning              ActionStatus = "running"
+	ActionStatusExternalPending      ActionStatus = "external_pending"
+	ActionStatusInterventionRequired ActionStatus = "intervention_required"
+	ActionStatusCompleted            ActionStatus = "completed"
+	ActionStatusFailed               ActionStatus = "failed"
+	ActionStatusCanceled             ActionStatus = "canceled"
+)
+
+var actionStatusTransitions = map[ActionStatus][]ActionStatus{
+	ActionStatusQueued:               {ActionStatusRunning, ActionStatusCanceled},
+	ActionStatusRunning:              {ActionStatusExternalPending, ActionStatusInterventionRequired, ActionStatusCompleted, ActionStatusFailed, ActionStatusCanceled},
+	ActionStatusExternalPending:      {ActionStatusRunning, ActionStatusInterventionRequired, ActionStatusCompleted, ActionStatusFailed, ActionStatusCanceled},
+	ActionStatusInterventionRequired: {ActionStatusRunning, ActionStatusCanceled},
+	ActionStatusCompleted:            {},
+	ActionStatusFailed:               {},
+	ActionStatusCanceled:             {},
+}
+
+func (s ActionStatus) IsValid() bool {
+	_, ok := actionStatusTransitions[s]
+	return ok
+}
+
+func (s ActionStatus) CanTransitionTo(next ActionStatus) bool {
+	for _, candidate := range actionStatusTransitions[s] {
+		if candidate == next {
+			return true
+		}
+	}
+	return false
 }
 
 type ArtifactKind string
@@ -560,6 +620,229 @@ func (a ControlAction) IsValid() bool {
 	}
 }
 
+type CandidateDeliveryPointKind string
+
+const (
+	CandidateDeliveryPointReviewablePullRequest CandidateDeliveryPointKind = "reviewable_pull_request"
+	CandidateDeliveryPointTargetPRSnapshot      CandidateDeliveryPointKind = "target_pr_snapshot"
+	CandidateDeliveryPointAnalysisReportDraft   CandidateDeliveryPointKind = "analysis_report_draft"
+	CandidateDeliveryPointDiagnosticReportDraft CandidateDeliveryPointKind = "diagnostic_report_draft"
+)
+
+func (k CandidateDeliveryPointKind) IsValid() bool {
+	switch k {
+	case CandidateDeliveryPointReviewablePullRequest, CandidateDeliveryPointTargetPRSnapshot, CandidateDeliveryPointAnalysisReportDraft, CandidateDeliveryPointDiagnosticReportDraft:
+		return true
+	default:
+		return false
+	}
+}
+
+type CandidateDeliveryPoint struct {
+	Kind                   CandidateDeliveryPointKind `json:"kind"`
+	Summary                string                     `json:"summary"`
+	RequiredArtifactKinds  []ArtifactKind             `json:"required_artifact_kinds,omitempty"`
+	RequiredReferenceTypes []ReferenceType            `json:"required_reference_types,omitempty"`
+}
+
+func (p CandidateDeliveryPoint) Validate() error {
+	if !p.Kind.IsValid() {
+		return fmt.Errorf("invalid candidate delivery point kind %q", p.Kind)
+	}
+	if p.Summary == "" {
+		return fmt.Errorf("candidate delivery point %q summary is required", p.Kind)
+	}
+	for _, kind := range p.RequiredArtifactKinds {
+		if !kind.IsValid() {
+			return fmt.Errorf("candidate delivery point %q has invalid artifact kind %q", p.Kind, kind)
+		}
+	}
+	for _, referenceType := range p.RequiredReferenceTypes {
+		if !referenceType.IsValid() {
+			return fmt.Errorf("candidate delivery point %q has invalid reference type %q", p.Kind, referenceType)
+		}
+	}
+	if len(p.RequiredArtifactKinds) == 0 && len(p.RequiredReferenceTypes) == 0 {
+		return fmt.Errorf("candidate delivery point %q requires at least one artifact or reference constraint", p.Kind)
+	}
+	return nil
+}
+
+type CandidateDelivery struct {
+	Kind        CandidateDeliveryPointKind `json:"kind"`
+	Reached     bool                       `json:"reached"`
+	ReachedAt   string                     `json:"reached_at,omitempty"`
+	Summary     string                     `json:"summary,omitempty"`
+	ArtifactIDs []string                   `json:"artifact_ids,omitempty"`
+}
+
+func (d CandidateDelivery) Validate() error {
+	if !d.Kind.IsValid() {
+		return fmt.Errorf("invalid candidate delivery kind %q", d.Kind)
+	}
+	if d.Reached && d.ReachedAt == "" {
+		return fmt.Errorf("candidate delivery %q reached_at is required when reached", d.Kind)
+	}
+	return nil
+}
+
+type CheckpointType string
+
+const (
+	CheckpointTypeBusiness CheckpointType = "business"
+	CheckpointTypeRecovery CheckpointType = "recovery"
+)
+
+func (t CheckpointType) IsValid() bool {
+	switch t {
+	case CheckpointTypeBusiness, CheckpointTypeRecovery:
+		return true
+	default:
+		return false
+	}
+}
+
+type BusinessCheckpointRule struct {
+	Type                      CheckpointType             `json:"type"`
+	CandidateDeliveryKind     CandidateDeliveryPointKind `json:"candidate_delivery_kind"`
+	Summary                   string                     `json:"summary"`
+	RequiredArtifactKinds     []ArtifactKind             `json:"required_artifact_kinds,omitempty"`
+	RequiredReferenceTypes    []ReferenceType            `json:"required_reference_types,omitempty"`
+	RequiresRemotePublication bool                       `json:"requires_remote_publication"`
+}
+
+func (r BusinessCheckpointRule) Validate() error {
+	if r.Type != CheckpointTypeBusiness {
+		return fmt.Errorf("business checkpoint rule must use type %q", CheckpointTypeBusiness)
+	}
+	if !r.CandidateDeliveryKind.IsValid() {
+		return fmt.Errorf("business checkpoint rule has invalid candidate delivery kind %q", r.CandidateDeliveryKind)
+	}
+	if r.Summary == "" {
+		return fmt.Errorf("business checkpoint rule summary is required")
+	}
+	for _, kind := range r.RequiredArtifactKinds {
+		if !kind.IsValid() {
+			return fmt.Errorf("business checkpoint rule has invalid artifact kind %q", kind)
+		}
+	}
+	for _, referenceType := range r.RequiredReferenceTypes {
+		if !referenceType.IsValid() {
+			return fmt.Errorf("business checkpoint rule has invalid reference type %q", referenceType)
+		}
+	}
+	if len(r.RequiredArtifactKinds) == 0 && len(r.RequiredReferenceTypes) == 0 {
+		return fmt.Errorf("business checkpoint rule requires at least one artifact or reference constraint")
+	}
+	return nil
+}
+
+type Checkpoint struct {
+	Type         CheckpointType  `json:"type"`
+	Summary      string          `json:"summary"`
+	CapturedAt   string          `json:"captured_at"`
+	Stage        RunPhaseSummary `json:"stage"`
+	ArtifactIDs  []string        `json:"artifact_ids,omitempty"`
+	ReferenceIDs []string        `json:"reference_ids,omitempty"`
+	BaseSHA      string          `json:"base_sha,omitempty"`
+	Branch       string          `json:"branch,omitempty"`
+	Reason       *Reason         `json:"reason,omitempty"`
+}
+
+func (c Checkpoint) Validate() error {
+	if !c.Type.IsValid() {
+		return fmt.Errorf("invalid checkpoint type %q", c.Type)
+	}
+	if c.Summary == "" {
+		return fmt.Errorf("checkpoint summary is required")
+	}
+	if c.CapturedAt == "" {
+		return fmt.Errorf("checkpoint captured_at is required")
+	}
+	if !c.Stage.IsValid() {
+		return fmt.Errorf("invalid checkpoint stage %q", c.Stage)
+	}
+	if len(c.ArtifactIDs) == 0 && len(c.ReferenceIDs) == 0 {
+		return fmt.Errorf("checkpoint requires at least one artifact or reference id")
+	}
+	return nil
+}
+
+type ReviewerMode string
+
+const (
+	ReviewerModeReadOnly ReviewerMode = "read_only"
+)
+
+func (m ReviewerMode) IsValid() bool {
+	switch m {
+	case ReviewerModeReadOnly:
+		return true
+	default:
+		return false
+	}
+}
+
+type ReviewGateStatus string
+
+const (
+	ReviewGateStatusPending              ReviewGateStatus = "pending"
+	ReviewGateStatusReviewing            ReviewGateStatus = "reviewing"
+	ReviewGateStatusPassed               ReviewGateStatus = "passed"
+	ReviewGateStatusChangesRequested     ReviewGateStatus = "changes_requested"
+	ReviewGateStatusInterventionRequired ReviewGateStatus = "intervention_required"
+)
+
+func (s ReviewGateStatus) IsValid() bool {
+	switch s {
+	case ReviewGateStatusPending, ReviewGateStatusReviewing, ReviewGateStatusPassed, ReviewGateStatusChangesRequested, ReviewGateStatusInterventionRequired:
+		return true
+	default:
+		return false
+	}
+}
+
+type ReviewGatePolicy struct {
+	Required     bool         `json:"required"`
+	ReviewerMode ReviewerMode `json:"reviewer_mode"`
+	MaxFixRounds int          `json:"max_fix_rounds"`
+}
+
+func (p ReviewGatePolicy) Validate() error {
+	if !p.Required {
+		return nil
+	}
+	if !p.ReviewerMode.IsValid() {
+		return fmt.Errorf("invalid reviewer mode %q", p.ReviewerMode)
+	}
+	if p.MaxFixRounds <= 0 {
+		return fmt.Errorf("max_fix_rounds must be greater than zero")
+	}
+	return nil
+}
+
+type ReviewGate struct {
+	ReviewGatePolicy
+	Status        ReviewGateStatus `json:"status"`
+	FixRoundsUsed int              `json:"fix_rounds_used"`
+}
+
+func (g ReviewGate) Validate() error {
+	if err := g.ReviewGatePolicy.Validate(); err != nil {
+		return err
+	}
+	if !g.Status.IsValid() {
+		return fmt.Errorf("invalid review gate status %q", g.Status)
+	}
+	if g.FixRoundsUsed < 0 {
+		return fmt.Errorf("fix_rounds_used must be non-negative")
+	}
+	if g.MaxFixRounds > 0 && g.FixRoundsUsed > g.MaxFixRounds {
+		return fmt.Errorf("fix_rounds_used must not exceed max_fix_rounds")
+	}
+	return nil
+}
+
 type InterventionInputKind string
 
 const (
@@ -616,10 +899,12 @@ func (f InterventionInputField) Validate() error {
 }
 
 type CompletionCriterion struct {
-	Code                  string              `json:"code"`
-	Summary               string              `json:"summary"`
-	AcceptableOutcomes    []OutcomeConclusion `json:"acceptable_outcomes"`
-	RequiredArtifactKinds []ArtifactKind      `json:"required_artifact_kinds"`
+	Code                   string              `json:"code"`
+	Summary                string              `json:"summary"`
+	AcceptableOutcomes     []OutcomeConclusion `json:"acceptable_outcomes"`
+	RequiredArtifactKinds  []ArtifactKind      `json:"required_artifact_kinds,omitempty"`
+	RequiredReferenceTypes []ReferenceType     `json:"required_reference_types,omitempty"`
+	RequiresMergedTarget   bool                `json:"requires_merged_target"`
 }
 
 func (c CompletionCriterion) Validate() error {
@@ -637,13 +922,21 @@ func (c CompletionCriterion) Validate() error {
 			return fmt.Errorf("completion criterion %q has invalid outcome %q", c.Code, outcome)
 		}
 	}
-	if len(c.RequiredArtifactKinds) == 0 {
-		return fmt.Errorf("completion criterion %q requires at least one artifact kind", c.Code)
-	}
 	for _, kind := range c.RequiredArtifactKinds {
 		if !kind.IsValid() {
 			return fmt.Errorf("completion criterion %q has invalid artifact kind %q", c.Code, kind)
 		}
+	}
+	for _, referenceType := range c.RequiredReferenceTypes {
+		if !referenceType.IsValid() {
+			return fmt.Errorf("completion criterion %q has invalid reference type %q", c.Code, referenceType)
+		}
+	}
+	if len(c.RequiredArtifactKinds) == 0 && len(c.RequiredReferenceTypes) == 0 {
+		return fmt.Errorf("completion criterion %q requires at least one artifact or reference kind", c.Code)
+	}
+	if c.RequiresMergedTarget && len(c.RequiredReferenceTypes) == 0 {
+		return fmt.Errorf("completion criterion %q requires merged target evidence via reference types", c.Code)
 	}
 	return nil
 }
@@ -721,6 +1014,9 @@ type JobTypeDefinition struct {
 	Type                  JobType                `json:"type"`
 	Summary               string                 `json:"summary"`
 	Target                TargetReferencePolicy  `json:"target"`
+	CandidateDelivery     CandidateDeliveryPoint `json:"candidate_delivery"`
+	BusinessCheckpoint    BusinessCheckpointRule `json:"business_checkpoint"`
+	ReviewGate            ReviewGatePolicy       `json:"review_gate"`
 	CompletionCriteria    []CompletionCriterion  `json:"completion_criteria"`
 	DefaultArtifacts      []ArtifactExpectation  `json:"default_artifacts"`
 	InterventionTemplates []InterventionTemplate `json:"intervention_templates"`
@@ -735,6 +1031,18 @@ func (d JobTypeDefinition) Validate() error {
 	}
 	if err := d.Target.Validate(); err != nil {
 		return fmt.Errorf("job type %q target: %w", d.Type, err)
+	}
+	if err := d.CandidateDelivery.Validate(); err != nil {
+		return fmt.Errorf("job type %q candidate delivery: %w", d.Type, err)
+	}
+	if err := d.BusinessCheckpoint.Validate(); err != nil {
+		return fmt.Errorf("job type %q business checkpoint: %w", d.Type, err)
+	}
+	if d.BusinessCheckpoint.CandidateDeliveryKind != d.CandidateDelivery.Kind {
+		return fmt.Errorf("job type %q business checkpoint must align with candidate delivery kind %q", d.Type, d.CandidateDelivery.Kind)
+	}
+	if err := d.ReviewGate.Validate(); err != nil {
+		return fmt.Errorf("job type %q review gate: %w", d.Type, err)
 	}
 	if len(d.CompletionCriteria) == 0 {
 		return fmt.Errorf("job type %q requires completion criteria", d.Type)
@@ -817,6 +1125,27 @@ type BaseObject struct {
 	Extensions      Extensions      `json:"extensions,omitempty"`
 }
 
+type ActionSummary struct {
+	HasPendingExternalActions bool         `json:"has_pending_external_actions"`
+	PendingCount              int          `json:"pending_count"`
+	PendingTypes              []ActionType `json:"pending_types,omitempty"`
+}
+
+func (s ActionSummary) Validate() error {
+	if s.PendingCount < 0 {
+		return fmt.Errorf("pending_count must be non-negative")
+	}
+	for _, actionType := range s.PendingTypes {
+		if !actionType.IsValid() {
+			return fmt.Errorf("invalid pending action type %q", actionType)
+		}
+	}
+	if !s.HasPendingExternalActions && s.PendingCount != 0 {
+		return fmt.Errorf("pending_count must be zero when no pending external actions exist")
+	}
+	return nil
+}
+
 type ObjectContext struct {
 	Relations  []ObjectRelation `json:"relations,omitempty"`
 	References []Reference      `json:"references,omitempty"`
@@ -837,16 +1166,20 @@ func (c ObjectContext) ValidateForSource(source ObjectType) error {
 type Job struct {
 	BaseObject
 	ObjectContext
-	State   JobStatus `json:"state"`
-	JobType JobType   `json:"job_type"`
+	State         JobStatus     `json:"state"`
+	JobType       JobType       `json:"job_type"`
+	ActionSummary ActionSummary `json:"action_summary"`
 }
 
 type Run struct {
 	BaseObject
 	ObjectContext
-	State   RunStatus       `json:"state"`
-	Phase   RunPhaseSummary `json:"phase"`
-	Attempt int             `json:"attempt"`
+	State             RunStatus          `json:"state"`
+	Phase             RunPhaseSummary    `json:"phase"`
+	Attempt           int                `json:"attempt"`
+	CandidateDelivery *CandidateDelivery `json:"candidate_delivery,omitempty"`
+	ReviewGate        *ReviewGate        `json:"review_gate,omitempty"`
+	Checkpoints       []Checkpoint       `json:"checkpoints,omitempty"`
 }
 
 type InterventionResolution struct {
@@ -883,6 +1216,14 @@ type Artifact struct {
 	Kind    ArtifactKind   `json:"kind"`
 	Role    ArtifactRole   `json:"role"`
 	Locator string         `json:"locator,omitempty"`
+}
+
+type Action struct {
+	BaseObject
+	ObjectContext
+	State   ActionStatus `json:"state"`
+	Type    ActionType   `json:"type"`
+	Summary string       `json:"summary"`
 }
 
 type Instance struct {

@@ -28,11 +28,11 @@ func runDoctorCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	repoDef, _, cfg, err := loadCommandConfig(opts.configDir, opts.profile)
+	repoDef, definition, cfg, err := loadCommandConfig(opts.configDir, opts.profile)
 	if err != nil {
 		return err
 	}
-	diagnosis := config.DiagnoseConfig(cfg, repoDef)
+	diagnosis := config.DiagnoseConfig(cfg, definition, repoDef)
 	if diagnosis.IsReady() {
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "配置已完整")
 		return nil

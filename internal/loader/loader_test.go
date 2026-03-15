@@ -19,8 +19,8 @@ func TestLoadProjectOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got := getMapValue(def.Runtime, "codex")["command"]; got != "codex app-server" {
-		t.Fatalf("runtime.codex.command = %v, want codex app-server", got)
+	if got := getMapValue(getMapValue(getMapValue(def.Runtime, "execution"), "backend"), "codex")["command"]; got != "codex app-server" {
+		t.Fatalf("execution.backend.codex.command = %v, want codex app-server", got)
 	}
 	if got := def.Selection.DispatchFlow; got != "implement" {
 		t.Fatalf("dispatch flow = %q, want implement", got)
@@ -33,15 +33,15 @@ func TestLoadProjectOnly(t *testing.T) {
 func TestLoadWithProfile(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		ProfileName: "dev",
-		ProfileYAML: "runtime:\n  polling:\n    interval_ms: 10000\n",
+		ProfileYAML: "domain:\n  polling:\n    interval_ms: 10000\n",
 	})
 
 	def, err := Load(root, "dev")
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got := getMapValue(def.Runtime, "polling")["interval_ms"]; got != 10000 {
-		t.Fatalf("runtime.polling.interval_ms = %v, want 10000", got)
+	if got := getMapValue(getMapValue(def.Runtime, "domain"), "polling")["interval_ms"]; got != 10000 {
+		t.Fatalf("domain.polling.interval_ms = %v, want 10000", got)
 	}
 	if def.Profile != "dev" {
 		t.Fatalf("profile = %q, want dev", def.Profile)
@@ -50,22 +50,22 @@ func TestLoadWithProfile(t *testing.T) {
 
 func TestLoadWithLocalOverrides(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
-		LocalOverridesYAML: "runtime:\n  agent:\n    max_concurrent_agents: 2\n",
+		LocalOverridesYAML: "execution:\n  agent:\n    max_concurrent_agents: 2\n",
 	})
 
 	def, err := Load(root, "")
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got := getMapValue(def.Runtime, "agent")["max_concurrent_agents"]; got != 2 {
-		t.Fatalf("runtime.agent.max_concurrent_agents = %v, want 2", got)
+	if got := getMapValue(getMapValue(def.Runtime, "execution"), "agent")["max_concurrent_agents"]; got != 2 {
+		t.Fatalf("execution.agent.max_concurrent_agents = %v, want 2", got)
 	}
 }
 
 func TestLoadSourcesRegistry(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		ExtraSources: map[string]string{
-			"github-core.yaml": "kind: github\napi_key: $GITHUB_TOKEN\nowner: org\nrepo: repo\n",
+			"github-core.yaml": "kind: github\ncredentials:\n  api_key_ref:\n    kind: env\n    name: GITHUB_TOKEN\nowner: org\nrepo: repo\n",
 		},
 	})
 
@@ -109,9 +109,9 @@ func TestResolveActiveWorkflowSingleSource(t *testing.T) {
 		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
 	}
 
-	trackerConfig := getMapValue(workflowDef.Config, "tracker")
-	if got := trackerConfig["kind"]; got != "linear" {
-		t.Fatalf("tracker.kind = %v, want linear", got)
+	sourceConfig := getMapValue(workflowDef.Config, "source_adapter")
+	if got := sourceConfig["kind"]; got != "linear" {
+		t.Fatalf("source_adapter.kind = %v, want linear", got)
 	}
 	if got := workflowDef.Source["branch_scope"]; got != "demo-scope" {
 		t.Fatalf("source.branch_scope = %v, want demo-scope", got)
@@ -123,17 +123,26 @@ func TestResolveActiveWorkflowSingleSource(t *testing.T) {
 
 func TestResolveActiveWorkflowMultipleSourcesRejected(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
-		ProjectYAML: `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+		ProjectYAML: `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
     - github-core
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 `,
 		ExtraSources: map[string]string{
-			"github-core.yaml": "kind: github\napi_key: $GITHUB_TOKEN\nowner: org\nrepo: repo\n",
+			"github-core.yaml": "kind: github\ncredentials:\n  api_key_ref:\n    kind: env\n    name: GITHUB_TOKEN\nowner: org\nrepo: repo\n",
 		},
 	})
 
@@ -148,23 +157,30 @@ selection:
 
 func TestResolveActiveWorkflowMappingTable(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
-		ProjectYAML: `runtime:
-  polling:
-    interval_ms: 15000
-  hooks:
-    timeout_ms: 12345
-  workspace:
-    root: ~/workspaces
-  agent:
-    max_turns: 5
-  codex:
-    command: codex app-server
+		ProjectYAML: `service:
+  contract_version: v1
+  instance_name: symphony
   server:
     port: 8080
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+domain:
+  polling:
+    interval_ms: 15000
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+  hooks:
+    timeout_ms: 12345
+  agent:
+    max_turns: 5
+job_policy:
+  dispatch_flow: implement
 `,
 		FlowYAML: `prompt: prompts/implement.md.liquid
 hooks:
@@ -190,27 +206,27 @@ completion:
 		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
 	}
 
-	if got := getMapValue(workflowDef.Config, "polling")["interval_ms"]; got != 15000 {
-		t.Fatalf("polling.interval_ms = %v, want 15000", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "domain"), "polling")["interval_ms"]; got != 15000 {
+		t.Fatalf("domain.polling.interval_ms = %v, want 15000", got)
 	}
-	if got := getMapValue(workflowDef.Config, "workspace")["linear_branch_scope"]; got != "demo-scope" {
-		t.Fatalf("workspace.linear_branch_scope = %v, want demo-scope", got)
+	if got := getMapValue(workflowDef.Config, "source_adapter")["branch_scope"]; got != "demo-scope" {
+		t.Fatalf("source_adapter.branch_scope = %v, want demo-scope", got)
 	}
-	if got := getMapValue(workflowDef.Config, "tracker")["project_slug"]; got != "demo" {
-		t.Fatalf("tracker.project_slug = %v, want demo", got)
+	if got := getMapValue(workflowDef.Config, "source_adapter")["project_slug"]; got != "demo" {
+		t.Fatalf("source_adapter.project_slug = %v, want demo", got)
 	}
-	if got := getMapValue(workflowDef.Config, "hooks")["before_run"]; got != "echo before-run" {
-		t.Fatalf("hooks.before_run = %v, want echo before-run", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run"]; got != "echo before-run" {
+		t.Fatalf("execution.hooks.before_run = %v, want echo before-run", got)
 	}
-	if got := getMapValue(workflowDef.Config, "hooks")["before_run_continuation"]; got != "echo before-run" {
-		t.Fatalf("hooks.before_run_continuation = %v, want echo before-run", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run_continuation"]; got != "echo before-run" {
+		t.Fatalf("execution.hooks.before_run_continuation = %v, want echo before-run", got)
 	}
-	if got := getMapValue(workflowDef.Config, "hooks")["timeout_ms"]; got != 12345 {
-		t.Fatalf("hooks.timeout_ms = %v, want 12345", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["timeout_ms"]; got != 12345 {
+		t.Fatalf("execution.hooks.timeout_ms = %v, want 12345", got)
 	}
-	value, ok := getMapValue(workflowDef.Config, "hooks")["after_run"]
+	value, ok := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["after_run"]
 	if !ok || value != nil {
-		t.Fatalf("hooks.after_run = %v, want explicit nil", value)
+		t.Fatalf("execution.hooks.after_run = %v, want explicit nil", value)
 	}
 	if workflowDef.Completion.Mode != model.CompletionModePullRequest {
 		t.Fatalf("completion mode = %q, want pull_request", workflowDef.Completion.Mode)
@@ -268,7 +284,10 @@ func TestResolveActiveWorkflowResolvesSourceEnvStrings(t *testing.T) {
 
 	root := writeLoaderFixture(t, loaderFixtureOptions{})
 	writeLoaderFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE
 active_states: ["Todo", "In Progress"]
@@ -284,11 +303,11 @@ terminal_states: ["Closed", "Done"]
 		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
 	}
 
-	if got := getMapValue(workflowDef.Config, "tracker")["project_slug"]; got != "demo-from-env" {
-		t.Fatalf("tracker.project_slug = %v, want demo-from-env", got)
+	if got := getMapValue(workflowDef.Config, "source_adapter")["project_slug"]; got != "demo-from-env" {
+		t.Fatalf("source_adapter.project_slug = %v, want demo-from-env", got)
 	}
-	if got := getMapValue(workflowDef.Config, "workspace")["linear_branch_scope"]; got != "Demo Scope" {
-		t.Fatalf("workspace.linear_branch_scope = %v, want Demo Scope", got)
+	if got := getMapValue(workflowDef.Config, "source_adapter")["branch_scope"]; got != "Demo Scope" {
+		t.Fatalf("source_adapter.branch_scope = %v, want Demo Scope", got)
 	}
 	if got := workflowDef.Source["project_slug"]; got != "demo-from-env" {
 		t.Fatalf("source.project_slug = %v, want demo-from-env", got)
@@ -372,8 +391,8 @@ func TestResolveActiveWorkflowTreatsSingleLineHookWithSlashAsInlineScript(t *tes
 	if err != nil {
 		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
 	}
-	if got := getMapValue(workflowDef.Config, "hooks")["before_run"]; got != script {
-		t.Fatalf("hooks.before_run = %v, want inline script", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run"]; got != script {
+		t.Fatalf("execution.hooks.before_run = %v, want inline script", got)
 	}
 }
 
@@ -413,8 +432,8 @@ func TestResolveActiveWorkflowTreatsInlineHookWithSlashAsScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
 	}
-	if got := getMapValue(workflowDef.Config, "hooks")["before_run"]; got != "git remote set-url origin https://example.test/repo.git" {
-		t.Fatalf("hooks.before_run = %v, want inline hook script", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run"]; got != "git remote set-url origin https://example.test/repo.git" {
+		t.Fatalf("execution.hooks.before_run = %v, want inline hook script", got)
 	}
 }
 
@@ -441,7 +460,10 @@ func TestResolveActiveWorkflowUsesDefaultResolver(t *testing.T) {
 
 	root := writeLoaderFixture(t, loaderFixtureOptions{})
 	writeLoaderFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE
 active_states: ["Todo", "In Progress"]
@@ -456,11 +478,11 @@ terminal_states: ["Closed", "Done"]
 	if err != nil {
 		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
 	}
-	if got := getMapValue(workflowDef.Config, "tracker")["project_slug"]; got != "resolver-project" {
-		t.Fatalf("tracker.project_slug = %v, want resolver-project", got)
+	if got := getMapValue(workflowDef.Config, "source_adapter")["project_slug"]; got != "resolver-project" {
+		t.Fatalf("source_adapter.project_slug = %v, want resolver-project", got)
 	}
-	if got := getMapValue(workflowDef.Config, "workspace")["linear_branch_scope"]; got != "Resolver Scope" {
-		t.Fatalf("workspace.linear_branch_scope = %v, want Resolver Scope", got)
+	if got := getMapValue(workflowDef.Config, "source_adapter")["branch_scope"]; got != "Resolver Scope" {
+		t.Fatalf("source_adapter.branch_scope = %v, want Resolver Scope", got)
 	}
 }
 
@@ -628,7 +650,7 @@ func TestWatchIgnoresLocalRuntimeScratchFileChange(t *testing.T) {
 func TestWatchReloadsActiveDefaultProfileFile(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		ProfileName: "dev",
-		ProfileYAML: "runtime:\n  polling:\n    interval_ms: 10000\n",
+		ProfileYAML: "domain:\n  polling:\n    interval_ms: 10000\n",
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -641,13 +663,22 @@ func TestWatchReloadsActiveDefaultProfileFile(t *testing.T) {
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: dev
 `)
@@ -657,32 +688,41 @@ defaults:
 		t.Fatalf("Profile = %q, want dev", updated.Profile)
 	}
 
-	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "runtime:\n  polling:\n    interval_ms: 15000\n")
+	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "domain:\n  polling:\n    interval_ms: 15000\n")
 	updated = awaitWatchUpdate(t, updates)
 	if updated.Profile != "dev" {
 		t.Fatalf("Profile = %q after profile update, want dev", updated.Profile)
 	}
-	if got := getMapValue(updated.Runtime, "polling")["interval_ms"]; got != 15000 {
-		t.Fatalf("runtime.polling.interval_ms = %v, want 15000", got)
+	if got := getMapValue(getMapValue(updated.Runtime, "domain"), "polling")["interval_ms"]; got != 15000 {
+		t.Fatalf("domain.polling.interval_ms = %v, want 15000", got)
 	}
 }
 
 func TestWatchTracksActiveProfileAfterDefaultProfileSwitch(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
-		ProjectYAML: `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+		ProjectYAML: `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: dev
 `,
 		ProfileName: "dev",
-		ProfileYAML: "runtime:\n  agent:\n    max_turns: 3\n",
+		ProfileYAML: "execution:\n  agent:\n    max_turns: 3\n",
 	})
-	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "runtime:\n  agent:\n    max_turns: 7\n")
+	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "execution:\n  agent:\n    max_turns: 7\n")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -695,13 +735,22 @@ defaults:
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: prod
 `)
@@ -710,32 +759,41 @@ defaults:
 		t.Fatalf("updated profile = %q, want prod", updated.Profile)
 	}
 
-	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "runtime:\n  agent:\n    max_turns: 9\n")
+	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "execution:\n  agent:\n    max_turns: 9\n")
 	updated = awaitWatchUpdate(t, updates)
 	if updated.Profile != "prod" {
 		t.Fatalf("updated profile = %q, want prod", updated.Profile)
 	}
-	if got := getMapValue(updated.Runtime, "agent")["max_turns"]; got != 9 {
-		t.Fatalf("runtime.agent.max_turns = %v, want 9", got)
+	if got := getMapValue(getMapValue(updated.Runtime, "execution"), "agent")["max_turns"]; got != 9 {
+		t.Fatalf("execution.agent.max_turns = %v, want 9", got)
 	}
 }
 
 func TestWatchKeepsAcceptedProfileWhenProfileSwitchRejected(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
-		ProjectYAML: `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+		ProjectYAML: `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: dev
 `,
 		ProfileName: "dev",
-		ProfileYAML: "runtime:\n  polling:\n    interval_ms: 10000\n",
+		ProfileYAML: "domain:\n  polling:\n    interval_ms: 10000\n",
 	})
-	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "runtime:\n  polling:\n    interval_ms: 20000\n")
+	writeLoaderFile(t, filepath.Join(root, "profiles", "prod.yaml"), "domain:\n  polling:\n    interval_ms: 20000\n")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -755,13 +813,22 @@ defaults:
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: prod
 `)
@@ -771,30 +838,39 @@ defaults:
 	time.Sleep(300 * time.Millisecond)
 	drainWatchUpdates(updates)
 
-	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "runtime:\n  polling:\n    interval_ms: 15000\n")
+	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "domain:\n  polling:\n    interval_ms: 15000\n")
 	updated := awaitWatchUpdate(t, updates)
 	if updated.Profile != "dev" {
 		t.Fatalf("Profile = %q, want dev", updated.Profile)
 	}
-	if got := getMapValue(updated.Runtime, "polling")["interval_ms"]; got != 15000 {
-		t.Fatalf("runtime.polling.interval_ms = %v, want 15000", got)
+	if got := getMapValue(getMapValue(updated.Runtime, "domain"), "polling")["interval_ms"]; got != 15000 {
+		t.Fatalf("domain.polling.interval_ms = %v, want 15000", got)
 	}
 }
 
 func TestWatchKeepsAcceptedProfileWhenSelectedProfileIsInvalid(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
-		ProjectYAML: `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+		ProjectYAML: `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: dev
 `,
 		ProfileName: "dev",
-		ProfileYAML: "runtime:\n  polling:\n    interval_ms: 10000\n",
+		ProfileYAML: "domain:\n  polling:\n    interval_ms: 10000\n",
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -812,13 +888,22 @@ defaults:
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+	writeLoaderFile(t, filepath.Join(root, "project.yaml"), `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: prod
 `)
@@ -828,13 +913,13 @@ defaults:
 	time.Sleep(300 * time.Millisecond)
 	drainWatchUpdates(updates)
 
-	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "runtime:\n  polling:\n    interval_ms: 16000\n")
+	writeLoaderFile(t, filepath.Join(root, "profiles", "dev.yaml"), "domain:\n  polling:\n    interval_ms: 16000\n")
 	updated := awaitWatchUpdate(t, updates)
 	if updated.Profile != "dev" {
 		t.Fatalf("Profile = %q, want dev", updated.Profile)
 	}
-	if got := getMapValue(updated.Runtime, "polling")["interval_ms"]; got != 16000 {
-		t.Fatalf("runtime.polling.interval_ms = %v, want 16000", got)
+	if got := getMapValue(getMapValue(updated.Runtime, "domain"), "polling")["interval_ms"]; got != 16000 {
+		t.Fatalf("domain.polling.interval_ms = %v, want 16000", got)
 	}
 }
 
@@ -909,13 +994,23 @@ func writeLoaderFixture(t *testing.T, opts loaderFixtureOptions) string {
 
 	projectYAML := opts.ProjectYAML
 	if projectYAML == "" {
-		projectYAML = `runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+		projectYAML = `service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  id: default
+  workspace:
+    root: ~/workspaces
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
 defaults:
   profile: null
 `
@@ -931,7 +1026,10 @@ defaults:
 
 	writeLoaderFile(t, filepath.Join(root, "project.yaml"), projectYAML)
 	writeLoaderFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 project_slug: demo
 branch_scope: demo-scope
 active_states: ["Todo", "In Progress"]
