@@ -51,15 +51,18 @@ type durablePRContext struct {
 }
 
 type durableDispatchContext struct {
-	Kind               string            `json:"kind,omitempty"`
-	RetryAttempt       *int              `json:"retry_attempt,omitempty"`
-	ExpectedOutcome    string            `json:"expected_outcome,omitempty"`
-	OnMissingPR        string            `json:"on_missing_pr,omitempty"`
-	OnClosedPR         string            `json:"on_closed_pr,omitempty"`
-	Reason             *string           `json:"reason,omitempty"`
-	PreviousBranch     *string           `json:"previous_branch,omitempty"`
-	PreviousPR         *durablePRContext `json:"previous_pr,omitempty"`
-	PreviousIssueState *string           `json:"previous_issue_state,omitempty"`
+	JobType            string                       `json:"job_type,omitempty"`
+	Kind               string                       `json:"kind,omitempty"`
+	RetryAttempt       *int                         `json:"retry_attempt,omitempty"`
+	ExpectedOutcome    string                       `json:"expected_outcome,omitempty"`
+	OnMissingPR        string                       `json:"on_missing_pr,omitempty"`
+	OnClosedPR         string                       `json:"on_closed_pr,omitempty"`
+	Reason             *string                      `json:"reason,omitempty"`
+	PreviousBranch     *string                      `json:"previous_branch,omitempty"`
+	PreviousPR         *durablePRContext            `json:"previous_pr,omitempty"`
+	PreviousIssueState *string                      `json:"previous_issue_state,omitempty"`
+	RecoveryCheckpoint *model.RecoveryCheckpoint    `json:"recovery_checkpoint,omitempty"`
+	ReviewFeedback     *model.ReviewFeedbackContext `json:"review_feedback,omitempty"`
 }
 
 type durableServiceMetadata struct {
@@ -68,11 +71,13 @@ type durableServiceMetadata struct {
 }
 
 type durableRecordMetadata struct {
-	RetryAttempt        int                     `json:"retry_attempt,omitempty"`
-	StallCount          int                     `json:"stall_count,omitempty"`
-	LastKnownIssueState string                  `json:"last_known_issue_state,omitempty"`
-	NeedsRecovery       bool                    `json:"needs_recovery,omitempty"`
-	Dispatch            *durableDispatchContext `json:"dispatch,omitempty"`
+	RetryAttempt        int                      `json:"retry_attempt,omitempty"`
+	StallCount          int                      `json:"stall_count,omitempty"`
+	LastKnownIssueState string                   `json:"last_known_issue_state,omitempty"`
+	NeedsRecovery       bool                     `json:"needs_recovery,omitempty"`
+	Dispatch            *durableDispatchContext  `json:"dispatch,omitempty"`
+	Run                 *model.RunState          `json:"run,omitempty"`
+	Intervention        *model.InterventionState `json:"intervention,omitempty"`
 }
 
 type scheduledDurableState struct {
@@ -594,6 +599,8 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 			LastKnownIssueState: record.LastKnownIssueState,
 			NeedsRecovery:       record.NeedsRecovery || isRecordRunning(record),
 			Dispatch:            durableDispatchFromModel(record.Dispatch),
+			Run:                 model.CloneRunState(record.Run),
+			Intervention:        model.CloneInterventionState(record.Intervention),
 		}
 	}
 	for _, record := range o.state.CompletedWindow {
@@ -668,6 +675,8 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 			record.LastKnownIssueState = meta.LastKnownIssueState
 			record.NeedsRecovery = meta.NeedsRecovery
 			record.Dispatch = durableDispatchToModel(meta.Dispatch)
+			record.Run = model.CloneRunState(meta.Run)
+			record.Intervention = model.CloneInterventionState(meta.Intervention)
 		}
 		if item.RetryDueAt != nil {
 			if dueAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*item.RetryDueAt)); err == nil {
@@ -787,6 +796,64 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 		return err
 	}
 
+	if entry.Run != nil {
+		if decision.Disposition == DispositionAwaitingMerge {
+			markRunCandidateDelivery(entry, decision.PR)
+		} else if decision.Disposition == DispositionCompleted {
+			switch jobTypeForDispatch(entry.Dispatch) {
+			case contract.JobTypeAnalysis, contract.JobTypeDiagnostic:
+				markRunCandidateDelivery(entry, nil)
+			}
+		}
+		if entry.Run.CandidateDelivery != nil && entry.Run.CandidateDelivery.Reached && entry.Run.ReviewGate != nil &&
+			entry.Run.ReviewGate.Status != contract.ReviewGateStatusPassed &&
+			entry.Run.ReviewGate.Status != contract.ReviewGateStatusInterventionRequired {
+			reviewIssue := model.CloneIssue(entry.LastKnownIssue)
+			if reviewIssue == nil {
+				reviewIssue = &model.Issue{
+					ID:         issueID,
+					Identifier: recordIdentifier(entry),
+					Title:      recordIdentifier(entry),
+					State:      issueState,
+				}
+			}
+			workerCtx, cancel := context.WithCancel(o.runtimeContext())
+			o.mu.Lock()
+			current := o.state.Records[issueID]
+			if current == nil {
+				o.mu.Unlock()
+				cancel()
+				return nil
+			}
+			startedAt := o.now().UTC()
+			current.StartedAt = &startedAt
+			current.WorkerCancel = cancel
+			current.NeedsRecovery = false
+			current.Dispatch = model.CloneDispatchContext(entry.Dispatch)
+			current.Run = model.CloneRunState(entry.Run)
+			current.LastKnownIssue = model.CloneIssue(reviewIssue)
+			current.LastKnownIssueState = issueState
+			openRunReviewGate(current)
+			o.setRecordStatusLocked(current, contract.IssueStatusActive, nil, &contract.Observation{
+				Running: true,
+				Summary: "review in progress",
+			})
+			snapshot := cloneIssueRecord(current)
+			version := o.commitStateLocked(true)
+			action := func() {
+				o.launchReviewWorker(workerCtx, *reviewIssue, snapshot)
+			}
+			if version > 0 {
+				o.schedulePersistedActionLocked(version, action)
+			}
+			o.mu.Unlock()
+			if version == 0 {
+				action()
+			}
+			return nil
+		}
+	}
+
 	switch decision.Disposition {
 	case DispositionCompleted:
 		o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
@@ -807,16 +874,30 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 		if baseDispatch == nil {
 			baseDispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
 		}
+		checkpointReason := contract.MustReason(contract.ReasonRunContinuationPending, map[string]any{
+			"record_id": entry.Runtime.RecordID,
+			"cause":     reason,
+		})
+		checkpoint, checkpointErr := o.captureCheckpointFn(ctx, entry, contract.RunPhaseSummaryPublishing, &checkpointReason)
+		if checkpointErr != nil {
+			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, decision.ExpectedOutcome, "recovery_uncertain", issueState, decision.PR)
+			return checkpointErr
+		}
 		retryDispatch := continuationDispatchContext(baseDispatch, normalizeCompletionContract(model.CompletionContract{
 			Mode:        decision.ExpectedOutcome,
 			OnMissingPR: dispatchCompletionAction(baseDispatch, "missing"),
 			OnClosedPR:  dispatchCompletionAction(baseDispatch, "closed"),
 		}), reason, decision.FinalBranch, decision.PR, issueState)
+		retryDispatch.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(checkpoint)
 		o.mu.Lock()
 		current := o.state.Records[issueID]
 		if current != nil {
 			current.NeedsRecovery = false
-			o.scheduleRetryLocked(issueID, recordIdentifier(entry), maxInt(entry.RetryAttempt, 1), nil, true, entry.StallCount, retryDispatch)
+			nextAttempt := entry.RetryAttempt + 1
+			if nextAttempt <= 0 {
+				nextAttempt = 1
+			}
+			o.scheduleRetryLocked(issueID, recordIdentifier(entry), nextAttempt, nil, true, entry.StallCount, retryDispatch)
 			o.commitStateLocked(true)
 		}
 		o.mu.Unlock()
@@ -921,6 +1002,8 @@ func cloneDurableRuntimeState(state durableRuntimeState) durableRuntimeState {
 			LastKnownIssueState: meta.LastKnownIssueState,
 			NeedsRecovery:       meta.NeedsRecovery,
 			Dispatch:            cloneDurableDispatchContext(meta.Dispatch),
+			Run:                 model.CloneRunState(meta.Run),
+			Intervention:        model.CloneInterventionState(meta.Intervention),
 		}
 	}
 	copyState.Records = append([]contract.IssueLedgerRecord(nil), state.Records...)
@@ -961,6 +1044,8 @@ func cloneDurableDispatchContext(dispatch *durableDispatchContext) *durableDispa
 		prCopy := *dispatch.PreviousPR
 		copyValue.PreviousPR = &prCopy
 	}
+	copyValue.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	copyValue.ReviewFeedback = cloneReviewFeedbackContext(dispatch.ReviewFeedback)
 	return &copyValue
 }
 
@@ -969,6 +1054,7 @@ func durableDispatchFromModel(dispatch *model.DispatchContext) *durableDispatchC
 		return nil
 	}
 	result := &durableDispatchContext{
+		JobType:         string(dispatch.JobType),
 		Kind:            string(dispatch.Kind),
 		ExpectedOutcome: string(dispatch.ExpectedOutcome),
 		OnMissingPR:     string(dispatch.OnMissingPR),
@@ -999,6 +1085,8 @@ func durableDispatchFromModel(dispatch *model.DispatchContext) *durableDispatchC
 			HeadBranch: dispatch.PreviousPR.HeadBranch,
 		}
 	}
+	result.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	result.ReviewFeedback = cloneReviewFeedbackContext(dispatch.ReviewFeedback)
 	return result
 }
 
@@ -1007,6 +1095,7 @@ func durableDispatchToModel(dispatch *durableDispatchContext) *model.DispatchCon
 		return nil
 	}
 	result := &model.DispatchContext{
+		JobType:         contract.JobType(strings.TrimSpace(dispatch.JobType)),
 		Kind:            model.DispatchKind(strings.TrimSpace(dispatch.Kind)),
 		ExpectedOutcome: model.CompletionMode(strings.TrimSpace(dispatch.ExpectedOutcome)),
 		OnMissingPR:     model.CompletionAction(strings.TrimSpace(dispatch.OnMissingPR)),
@@ -1037,7 +1126,18 @@ func durableDispatchToModel(dispatch *durableDispatchContext) *model.DispatchCon
 			HeadBranch: dispatch.PreviousPR.HeadBranch,
 		}
 	}
+	result.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	result.ReviewFeedback = cloneReviewFeedbackContext(dispatch.ReviewFeedback)
 	return result
+}
+
+func cloneReviewFeedbackContext(value *model.ReviewFeedbackContext) *model.ReviewFeedbackContext {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Findings = append([]model.ReviewFinding(nil), value.Findings...)
+	return &copyValue
 }
 
 func cloneTimePtr(value *time.Time) *time.Time {

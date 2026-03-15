@@ -37,6 +37,7 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	cfg.TrackerRepo = contractConfig.Source.Repo
 	cfg.ActiveStates = append([]string(nil), contractConfig.Source.ActiveStates...)
 	cfg.TerminalStates = append([]string(nil), contractConfig.Source.TerminalStates...)
+	cfg.DomainID = contractConfig.Domain.ID
 	cfg.PollIntervalMS = contractConfig.Domain.PollIntervalMS
 	cfg.WorkspaceRoot = contractConfig.Domain.WorkspaceRoot
 	cfg.WorkspaceLinearBranchScope = contractConfig.Source.BranchScope
@@ -52,6 +53,9 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	cfg.MaxConcurrentAgents = contractConfig.Execution.MaxConcurrentAgents
 	cfg.MaxTurns = contractConfig.Execution.MaxTurns
 	cfg.MaxRetryBackoffMS = contractConfig.Execution.MaxRetryBackoffMS
+	cfg.RunBudgetTotalMS = contractConfig.Execution.RunBudgetTotalMS
+	cfg.RunExecutionBudgetMS = contractConfig.Execution.RunExecutionBudgetMS
+	cfg.RunReviewFixBudgetMS = contractConfig.Execution.RunReviewFixBudgetMS
 	cfg.MaxConcurrentAgentsByState = cloneIntMap(contractConfig.Execution.MaxConcurrentAgentsByState)
 	cfg.CodexCommand = contractConfig.Execution.Codex.Command
 	cfg.CodexApprovalPolicy = contractConfig.Execution.Codex.ApprovalPolicy
@@ -134,6 +138,18 @@ func ValidateForDispatch(cfg *model.ServiceConfig) error {
 	if strings.TrimSpace(cfg.CodexCommand) == "" {
 		return model.NewWorkflowError(model.ErrInvalidCodexCommand, "execution.backend.codex.command is required", nil)
 	}
+	if cfg.RunExecutionBudgetMS <= 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.execution must be > 0", nil)
+	}
+	if cfg.RunReviewFixBudgetMS < 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.review_fix must be >= 0", nil)
+	}
+	if cfg.RunBudgetTotalMS <= 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.total must be > 0", nil)
+	}
+	if cfg.RunBudgetTotalMS < cfg.RunExecutionBudgetMS+cfg.RunReviewFixBudgetMS {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.total must be >= execution + review_fix", nil)
+	}
 	if err := validateSessionPersistenceConfig(cfg.SessionPersistence); err != nil {
 		return err
 	}
@@ -153,12 +169,16 @@ func defaultServiceConfig() *model.ServiceConfig {
 		TrackerLinearChildrenBlockParent: true,
 		ActiveStates:                     []string{"Todo", "In Progress"},
 		TerminalStates:                   []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"},
+		DomainID:                         "default",
 		PollIntervalMS:                   30000,
 		WorkspaceRoot:                    filepath.Join(os.TempDir(), "symphony_workspaces"),
 		HookTimeoutMS:                    60000,
 		MaxConcurrentAgents:              10,
 		MaxTurns:                         20,
 		MaxRetryBackoffMS:                300000,
+		RunBudgetTotalMS:                 3600000,
+		RunExecutionBudgetMS:             3600000,
+		RunReviewFixBudgetMS:             0,
 		MaxConcurrentAgentsByState:       map[string]int{},
 		CodexCommand:                     "codex app-server",
 		CodexApprovalPolicy:              "never",

@@ -3,11 +3,13 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,18 +22,30 @@ import (
 	"symphony-go/internal/model/contract"
 	"symphony-go/internal/shell"
 	"symphony-go/internal/tracker"
+	"symphony-go/internal/workflow"
 	"symphony-go/internal/workspace"
 )
 
+type WorkerKind string
+
+const (
+	WorkerKindExecution WorkerKind = "execution"
+	WorkerKindReview    WorkerKind = "review"
+)
+
 type WorkerResult struct {
-	IssueID      string
-	Identifier   string
-	Attempt      *int
-	StartedAt    time.Time
-	Phase        model.RunPhase
-	Err          error
-	HasNewOpenPR bool
-	FinalBranch  string
+	Kind           WorkerKind
+	IssueID        string
+	Identifier     string
+	Attempt        *int
+	StartedAt      time.Time
+	Phase          model.RunPhase
+	Err            error
+	HasNewOpenPR   bool
+	FinalBranch    string
+	ReviewStatus   contract.ReviewGateStatus
+	ReviewSummary  string
+	ReviewFindings []model.ReviewFinding
 }
 
 type CodexUpdate struct {
@@ -135,19 +149,20 @@ type RuntimeIdentity struct {
 }
 
 type Orchestrator struct {
-	tracker           tracker.Client
-	workspace         workspace.Manager
-	runner            agent.Runner
-	configFn          func() *model.ServiceConfig
-	workflowFn        func() *model.WorkflowDefinition
-	runtimeIdentityFn func() RuntimeIdentity
-	logger            *slog.Logger
-	now               func() time.Time
-	randFloat         func() float64
-	gitBranchFn       func(context.Context, string) (string, error)
-	prLookup          PullRequestLookup
-	stateStore        stateStore
-	notifier          notifier
+	tracker             tracker.Client
+	workspace           workspace.Manager
+	runner              agent.Runner
+	configFn            func() *model.ServiceConfig
+	workflowFn          func() *model.WorkflowDefinition
+	runtimeIdentityFn   func() RuntimeIdentity
+	logger              *slog.Logger
+	now                 func() time.Time
+	randFloat           func() float64
+	gitBranchFn         func(context.Context, string) (string, error)
+	captureCheckpointFn func(context.Context, *model.IssueRecord, contract.RunPhaseSummary, *contract.Reason) (*model.RecoveryCheckpoint, error)
+	prLookup            PullRequestLookup
+	stateStore          stateStore
+	notifier            notifier
 
 	tickTimer      *time.Timer
 	workerResultCh chan WorkerResult
@@ -202,23 +217,24 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 	healthAlerts := map[string]AlertSnapshot{}
 
 	o := &Orchestrator{
-		tracker:           trackerClient,
-		workspace:         workspaceManager,
-		runner:            runner,
-		configFn:          configFn,
-		workflowFn:        workflowFn,
-		runtimeIdentityFn: runtimeIdentityFn,
-		logger:            logger,
-		now:               time.Now,
-		randFloat:         func() float64 { return 0.5 },
-		gitBranchFn:       defaultGitBranch,
-		workerResultCh:    make(chan WorkerResult, 128),
-		codexUpdateCh:     make(chan CodexUpdate, 1024),
-		configReloadCh:    make(chan struct{}, 8),
-		refreshCh:         make(chan struct{}, 8),
-		retryFireCh:       make(chan string, 128),
-		shutdownCh:        make(chan struct{}),
-		doneCh:            make(chan struct{}),
+		tracker:             trackerClient,
+		workspace:           workspaceManager,
+		runner:              runner,
+		configFn:            configFn,
+		workflowFn:          workflowFn,
+		runtimeIdentityFn:   runtimeIdentityFn,
+		logger:              logger,
+		now:                 time.Now,
+		randFloat:           func() float64 { return 0.5 },
+		gitBranchFn:         defaultGitBranch,
+		captureCheckpointFn: nil,
+		workerResultCh:      make(chan WorkerResult, 128),
+		codexUpdateCh:       make(chan CodexUpdate, 1024),
+		configReloadCh:      make(chan struct{}, 8),
+		refreshCh:           make(chan struct{}, 8),
+		retryFireCh:         make(chan string, 128),
+		shutdownCh:          make(chan struct{}),
+		doneCh:              make(chan struct{}),
 		state: model.OrchestratorState{
 			Service: model.RuntimeServiceState{
 				Mode: model.ServiceModeServing,
@@ -242,6 +258,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		serviceVersion:              BuildVersion,
 	}
 	o.prLookup = newGitHubPRLookup()
+	o.captureCheckpointFn = o.captureRecoveryCheckpoint
 	o.applyCurrentConfigLocked()
 	o.refreshSnapshotLocked()
 	return o
@@ -388,8 +405,280 @@ func cloneIssueRecord(record *model.IssueRecord) *model.IssueRecord {
 	copyValue.LastKnownIssue = model.CloneIssue(record.LastKnownIssue)
 	copyValue.StartedAt = cloneTimePtr(record.StartedAt)
 	copyValue.Dispatch = model.CloneDispatchContext(record.Dispatch)
+	copyValue.Run = model.CloneRunState(record.Run)
+	copyValue.Intervention = model.CloneInterventionState(record.Intervention)
 	copyValue.RetryTimer = nil
 	copyValue.WorkerCancel = nil
+	return &copyValue
+}
+
+func jobTypeForDispatch(dispatch *model.DispatchContext) contract.JobType {
+	if dispatch != nil && dispatch.JobType.IsValid() {
+		return dispatch.JobType
+	}
+	if dispatch != nil && dispatch.ExpectedOutcome == model.CompletionModePullRequest {
+		return contract.JobTypeCodeChange
+	}
+	return contract.JobTypeAnalysis
+}
+
+func jobTypeDefinitionForDispatch(dispatch *model.DispatchContext) (contract.JobTypeDefinition, bool) {
+	return contract.DescribeJobType(jobTypeForDispatch(dispatch))
+}
+
+func runPhaseSummaryForModelPhase(phase model.RunPhase) contract.RunPhaseSummary {
+	switch phase {
+	case model.PhasePreparingWorkspace, model.PhaseBuildingPrompt, model.PhaseLaunchingAgent, model.PhaseInitializingSession:
+		return contract.RunPhaseSummaryPreparing
+	case model.PhaseStreamingTurn:
+		return contract.RunPhaseSummaryExecuting
+	case model.PhaseFinishing:
+		return contract.RunPhaseSummaryPublishing
+	case model.PhaseTimedOut, model.PhaseStalled, model.PhaseCanceledByReconciliation, model.PhaseFailed:
+		return contract.RunPhaseSummaryBlocked
+	case model.PhaseSucceeded:
+		return contract.RunPhaseSummaryPublishing
+	default:
+		return contract.RunPhaseSummaryExecuting
+	}
+}
+
+func runBudgetForConfig(cfg *model.ServiceConfig) model.RunBudget {
+	if cfg == nil {
+		return model.RunBudget{}
+	}
+	return model.RunBudget{
+		TotalMS:     cfg.RunBudgetTotalMS,
+		ExecutionMS: cfg.RunExecutionBudgetMS,
+		ReviewFixMS: cfg.RunReviewFixBudgetMS,
+	}
+}
+
+func continuationCheckpointID(record *model.IssueRecord, attempt int) string {
+	recordID := "record"
+	if record != nil && strings.TrimSpace(string(record.Runtime.RecordID)) != "" {
+		recordID = strings.TrimSpace(string(record.Runtime.RecordID))
+	}
+	if attempt <= 0 {
+		attempt = 1
+	}
+	return fmt.Sprintf("chk-%s-%d", recordID, attempt)
+}
+
+func continuationArtifactID(record *model.IssueRecord, attempt int) string {
+	recordID := "record"
+	if record != nil && strings.TrimSpace(string(record.Runtime.RecordID)) != "" {
+		recordID = strings.TrimSpace(string(record.Runtime.RecordID))
+	}
+	if attempt <= 0 {
+		attempt = 1
+	}
+	return fmt.Sprintf("art-%s-recovery-%d", recordID, attempt)
+}
+
+func ensureRunState(record *model.IssueRecord, cfg *model.ServiceConfig, dispatch *model.DispatchContext, attempt int) *model.RunState {
+	if record == nil {
+		return nil
+	}
+	if record.Run != nil && record.Run.Attempt == attempt && dispatch != nil && dispatch.ReviewFeedback != nil {
+		record.Run.State = contract.RunStatusRunning
+		record.Run.Phase = contract.RunPhaseSummaryPreparing
+		record.Run.Reason = nil
+		record.Run.Decision = nil
+		record.Run.ErrorCode = ""
+		record.Run.ReviewSummary = dispatch.ReviewFeedback.Summary
+		record.Run.ReviewFindings = append([]model.ReviewFinding(nil), dispatch.ReviewFeedback.Findings...)
+		return record.Run
+	}
+	state := &model.RunState{
+		Attempt:     attempt,
+		State:       contract.RunStatusRunning,
+		Phase:       contract.RunPhaseSummaryPreparing,
+		Budget:      runBudgetForConfig(cfg),
+		Recovery:    model.CloneRecoveryCheckpoint(nil),
+		Checkpoints: nil,
+	}
+	if definition, ok := jobTypeDefinitionForDispatch(dispatch); ok && definition.ReviewGate.Required {
+		state.ReviewGate = &contract.ReviewGate{
+			ReviewGatePolicy: definition.ReviewGate,
+			Status:           contract.ReviewGateStatusPending,
+		}
+	}
+	if dispatch != nil && dispatch.RecoveryCheckpoint != nil {
+		state.Recovery = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	}
+	record.Run = state
+	return state
+}
+
+func updateRunPhase(record *model.IssueRecord, phase contract.RunPhaseSummary) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	record.Run.Phase = phase
+}
+
+func updateRunUsage(record *model.IssueRecord, executionMS int) {
+	if record == nil || record.Run == nil || executionMS <= 0 {
+		return
+	}
+	record.Run.Usage.ExecutionMS += executionMS
+	record.Run.Usage.TotalMS += executionMS
+}
+
+func updateRunReviewUsage(record *model.IssueRecord, reviewMS int) {
+	if record == nil || record.Run == nil || reviewMS <= 0 {
+		return
+	}
+	record.Run.Usage.ReviewFixMS += reviewMS
+	record.Run.Usage.TotalMS += reviewMS
+}
+
+func setRunContinuationPending(record *model.IssueRecord, checkpoint *model.RecoveryCheckpoint) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	checkpointID := ""
+	if checkpoint != nil {
+		if checkpoint.ArtifactID != "" {
+			checkpointID = checkpoint.ArtifactID
+		} else if len(checkpoint.Checkpoint.ArtifactIDs) > 0 {
+			checkpointID = checkpoint.Checkpoint.ArtifactIDs[0]
+		}
+	}
+	record.Run.State = contract.RunStatusContinuationPending
+	record.Run.Phase = contract.RunPhaseSummaryBlocked
+	record.Run.Recovery = model.CloneRecoveryCheckpoint(checkpoint)
+	record.Run.Decision = contractDecisionPtr(contract.MustDecision(contract.DecisionStartContinuationRun, map[string]any{
+		"checkpoint_id": checkpointID,
+	}))
+	record.Run.ErrorCode = ""
+	if checkpoint != nil {
+		record.Run.Checkpoints = append(record.Run.Checkpoints, checkpoint.Checkpoint)
+		record.Run.Reason = contractReasonPtr(contract.MustReason(contract.ReasonRunContinuationPending, map[string]any{
+			"checkpoint_id": checkpointID,
+		}))
+	}
+}
+
+func setRunIntervention(record *model.IssueRecord, reason contract.Reason, decision contract.Decision, errorCode contract.ErrorCode) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	record.Run.State = contract.RunStatusInterventionRequired
+	record.Run.Phase = contract.RunPhaseSummaryBlocked
+	record.Run.Reason = contractReasonPtr(reason)
+	record.Run.Decision = contractDecisionPtr(decision)
+	record.Run.ErrorCode = errorCode
+}
+
+func markRunCandidateDelivery(record *model.IssueRecord, pr *PullRequestInfo) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	definition, ok := jobTypeDefinitionForDispatch(record.Dispatch)
+	if !ok {
+		return
+	}
+	artifactIDs := []string{}
+	switch definition.Type {
+	case contract.JobTypeCodeChange, contract.JobTypeLandChange:
+		if pr == nil {
+			return
+		}
+		artifactIDs = append(artifactIDs, fmt.Sprintf("pr-%d", pr.Number))
+	case contract.JobTypeAnalysis:
+		artifactIDs = append(artifactIDs, fmt.Sprintf("art-%s-analysis-%d", record.Runtime.RecordID, currentAttempt(record)))
+	case contract.JobTypeDiagnostic:
+		artifactIDs = append(artifactIDs, fmt.Sprintf("art-%s-diagnostic-%d", record.Runtime.RecordID, currentAttempt(record)))
+	}
+	record.Run.CandidateDelivery = &contract.CandidateDelivery{
+		Kind:        definition.CandidateDelivery.Kind,
+		Reached:     true,
+		ReachedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		Summary:     definition.CandidateDelivery.Summary,
+		ArtifactIDs: artifactIDs,
+	}
+	checkpointReasonDetails := map[string]any{
+		"record_id": record.Runtime.RecordID,
+	}
+	checkpoint := contract.Checkpoint{
+		Type:        contract.CheckpointTypeBusiness,
+		Summary:     definition.BusinessCheckpoint.Summary,
+		CapturedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		Stage:       contract.RunPhaseSummaryPublishing,
+		ArtifactIDs: artifactIDs,
+	}
+	if pr != nil {
+		checkpoint.Branch = pr.HeadBranch
+		checkpointReasonDetails["pr_number"] = pr.Number
+	}
+	checkpoint.Reason = contractReasonPtr(contract.MustReason(contract.ReasonCheckpointBusinessCaptured, checkpointReasonDetails))
+	record.Run.Checkpoints = append(record.Run.Checkpoints, checkpoint)
+}
+
+func openRunReviewGate(record *model.IssueRecord) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	if record.Run.ReviewGate == nil {
+		if definition, ok := jobTypeDefinitionForDispatch(record.Dispatch); ok && definition.ReviewGate.Required {
+			record.Run.ReviewGate = &contract.ReviewGate{
+				ReviewGatePolicy: definition.ReviewGate,
+				Status:           contract.ReviewGateStatusPending,
+			}
+		}
+	}
+	if record.Run.ReviewGate == nil {
+		return
+	}
+	record.Run.ReviewGate.Status = contract.ReviewGateStatusReviewing
+	record.Run.Reason = contractReasonPtr(contract.MustReason(contract.ReasonRunReviewGateCandidateReady, map[string]any{
+		"record_id": record.Runtime.RecordID,
+	}))
+	record.Run.Decision = contractDecisionPtr(contract.MustDecision(contract.DecisionOpenReviewGate, map[string]any{
+		"record_id": record.Runtime.RecordID,
+	}))
+	record.Run.ErrorCode = ""
+}
+
+func markRunReviewPassed(record *model.IssueRecord, summary string) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	if record.Run.ReviewGate != nil {
+		record.Run.ReviewGate.Status = contract.ReviewGateStatusPassed
+	}
+	record.Run.ReviewSummary = strings.TrimSpace(summary)
+	record.Run.ReviewFindings = nil
+}
+
+func markRunReviewChangesRequested(record *model.IssueRecord, summary string, findings []model.ReviewFinding) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	if record.Run.ReviewGate != nil {
+		record.Run.ReviewGate.Status = contract.ReviewGateStatusChangesRequested
+	}
+	record.Run.ReviewSummary = strings.TrimSpace(summary)
+	record.Run.ReviewFindings = append([]model.ReviewFinding(nil), findings...)
+}
+
+func latestRunCheckpoint(record *model.IssueRecord) *contract.Checkpoint {
+	if record == nil || record.Run == nil || len(record.Run.Checkpoints) == 0 {
+		return nil
+	}
+	checkpoint := record.Run.Checkpoints[len(record.Run.Checkpoints)-1]
+	return &checkpoint
+}
+
+func contractReasonPtr(value contract.Reason) *contract.Reason {
+	copyValue := value
+	return &copyValue
+}
+
+func contractDecisionPtr(value contract.Decision) *contract.Decision {
+	copyValue := value
 	return &copyValue
 }
 
@@ -480,6 +769,12 @@ func isRecordRunning(record *model.IssueRecord) bool {
 
 func isRetryScheduled(record *model.IssueRecord) bool {
 	return record != nil && record.Runtime.Status == contract.IssueStatusRetryScheduled
+}
+
+func isContinuationPending(record *model.IssueRecord) bool {
+	return isRetryScheduled(record) &&
+		record.Runtime.Reason != nil &&
+		record.Runtime.Reason.ReasonCode == contract.ReasonRunContinuationPending
 }
 
 func isAwaitingMerge(record *model.IssueRecord) bool {
@@ -1017,6 +1312,10 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 			record.RetryTimer = nil
 		}
 		dispatch = model.CloneDispatchContext(record.Dispatch)
+	} else if record.Dispatch != nil && record.Dispatch.Kind == model.DispatchKindInterventionRetry {
+		dispatch = model.CloneDispatchContext(record.Dispatch)
+	} else if record.Dispatch != nil && record.Dispatch.ReviewFeedback != nil {
+		dispatch = model.CloneDispatchContext(record.Dispatch)
 	}
 	normalizedAttempt := 0
 	if attempt != nil {
@@ -1037,6 +1336,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 	record.Dispatch = model.CloneDispatchContext(dispatch)
 	record.Session = model.LiveSession{}
 	record.NeedsRecovery = false
+	record.Run = ensureRunState(record, o.currentConfig(), dispatch, attemptCountFromRetry(normalizedAttempt))
 	record.Runtime.Result = nil
 	record.LastKnownIssue = model.CloneIssue(&issue)
 	record.LastKnownIssueState = strings.TrimSpace(issue.State)
@@ -1083,6 +1383,7 @@ func (o *Orchestrator) launchWorker(workerCtx context.Context, issue model.Issue
 		defer o.workerWG.Done()
 
 		result := WorkerResult{
+			Kind:       WorkerKindExecution,
 			IssueID:    issue.ID,
 			Identifier: issue.Identifier,
 			Attempt:    attempt,
@@ -1115,17 +1416,25 @@ func (o *Orchestrator) launchWorker(workerCtx context.Context, issue model.Issue
 		}
 
 		workflowDef := o.currentWorkflow()
+		rawPrompt, promptErr := buildExecutionPrompt(workflowDef, issue, attempt, dispatch)
+		if promptErr != nil {
+			result.Err = model.NewAgentError(model.ErrResponseError, "render worker prompt", promptErr)
+			o.sendWorkerResult(result)
+			return
+		}
 
 		result.Phase = model.PhaseStreamingTurn
 		runErr := o.runner.Run(workerCtx, agent.RunParams{
-			Issue:          model.CloneIssue(&issue),
-			Attempt:        attempt,
-			WorkspacePath:  workspaceRef.Path,
-			PromptTemplate: workflowDef.PromptTemplate,
-			Source:         workflowDef.Source,
-			Dispatch:       model.CloneDispatchContext(dispatch),
-			ProcessEnv:     workspaceProcessEnv(workspaceRef),
-			MaxTurns:       o.currentConfig().MaxTurns,
+			Issue:             model.CloneIssue(&issue),
+			Attempt:           attempt,
+			WorkspacePath:     workspaceRef.Path,
+			PromptTemplate:    workflowDef.PromptTemplate,
+			RawPrompt:         rawPrompt,
+			Source:            workflowDef.Source,
+			Dispatch:          model.CloneDispatchContext(dispatch),
+			ProcessEnv:        workspaceProcessEnv(workspaceRef),
+			MaxTurns:          o.currentConfig().MaxTurns,
+			ExecutionBudgetMS: o.currentConfig().RunExecutionBudgetMS,
 			RefetchIssue: func(ctx context.Context, issueID string) (*model.Issue, error) {
 				issues, err := o.tracker.FetchIssueStatesByIDs(ctx, []string{issueID})
 				if err != nil {
@@ -1161,6 +1470,193 @@ func (o *Orchestrator) launchWorker(workerCtx context.Context, issue model.Issue
 				result.FinalBranch = finalBranch
 			}
 		}
+		o.sendWorkerResult(result)
+	}()
+}
+
+func buildExecutionPrompt(workflowDef *model.WorkflowDefinition, issue model.Issue, attempt *int, dispatch *model.DispatchContext) (string, error) {
+	var promptTemplate string
+	var source map[string]any
+	if workflowDef != nil {
+		promptTemplate = workflowDef.PromptTemplate
+		source = workflowDef.Source
+	}
+	prompt, err := workflow.RenderPrompt(promptTemplate, &issue, attempt, source, dispatch)
+	if err != nil {
+		return "", err
+	}
+	if dispatch == nil || dispatch.ReviewFeedback == nil {
+		return prompt, nil
+	}
+	return prompt + formatReviewFeedbackPrompt(dispatch.ReviewFeedback), nil
+}
+
+func formatReviewFeedbackPrompt(feedback *model.ReviewFeedbackContext) string {
+	if feedback == nil {
+		return ""
+	}
+	lines := []string{
+		"",
+		"Platform review feedback for this same Run:",
+	}
+	if strings.TrimSpace(feedback.Summary) != "" {
+		lines = append(lines, "Summary: "+strings.TrimSpace(feedback.Summary))
+	}
+	if len(feedback.Findings) > 0 {
+		lines = append(lines, "Address all requested changes before presenting the next candidate delivery:")
+		for _, finding := range feedback.Findings {
+			line := strings.TrimSpace(finding.Summary)
+			if strings.TrimSpace(finding.Code) != "" {
+				line = fmt.Sprintf("%s: %s", strings.TrimSpace(finding.Code), line)
+			}
+			if line != "" {
+				lines = append(lines, "- "+line)
+			}
+		}
+	}
+	return "\n" + strings.Join(lines, "\n")
+}
+
+func reviewBudgetForConfig(cfg *model.ServiceConfig) int {
+	if cfg == nil {
+		return 0
+	}
+	if cfg.RunReviewFixBudgetMS > 0 {
+		return cfg.RunReviewFixBudgetMS
+	}
+	return cfg.RunExecutionBudgetMS
+}
+
+func buildReviewPrompt(issue model.Issue, record *model.IssueRecord) string {
+	definition, _ := jobTypeDefinitionForDispatch(record.Dispatch)
+	candidateSummary := ""
+	if record != nil && record.Run != nil && record.Run.CandidateDelivery != nil {
+		candidateSummary = strings.TrimSpace(record.Run.CandidateDelivery.Summary)
+	}
+	artifactList := ""
+	if record != nil && record.Run != nil && record.Run.CandidateDelivery != nil && len(record.Run.CandidateDelivery.ArtifactIDs) > 0 {
+		artifactList = strings.Join(record.Run.CandidateDelivery.ArtifactIDs, ", ")
+	}
+	pr := recordPullRequest(record)
+	lines := []string{
+		"You are Symphony platform reviewer.",
+		"Read-only review only. Do not edit code. Do not edit documents. Do not invoke tools. Do not delegate or spawn sub-agents.",
+		fmt.Sprintf("Issue: %s", issue.Identifier),
+		fmt.Sprintf("Job type: %s", definition.Type),
+		fmt.Sprintf("Candidate rule: %s", definition.CandidateDelivery.Summary),
+	}
+	if candidateSummary != "" {
+		lines = append(lines, "Current candidate: "+candidateSummary)
+	}
+	if artifactList != "" {
+		lines = append(lines, "Candidate artifacts: "+artifactList)
+	}
+	if pr != nil {
+		lines = append(lines, fmt.Sprintf("Pull request: #%d %s (%s)", pr.Number, pr.URL, pr.State))
+	}
+	lines = append(lines,
+		"Return exactly one JSON object and nothing else.",
+		`{"status":"passed|changes_requested","summary":"short summary","findings":[{"code":"short_code","summary":"what must be fixed"}]}`,
+	)
+	return strings.Join(lines, "\n")
+}
+
+type reviewResponsePayload struct {
+	Status   string                `json:"status"`
+	Summary  string                `json:"summary"`
+	Findings []model.ReviewFinding `json:"findings"`
+}
+
+func parseReviewOutput(raw string) (contract.ReviewGateStatus, string, []model.ReviewFinding, error) {
+	body := strings.TrimSpace(raw)
+	if strings.HasPrefix(body, "```") {
+		body = strings.TrimPrefix(body, "```json")
+		body = strings.TrimPrefix(body, "```")
+		body = strings.TrimSuffix(strings.TrimSpace(body), "```")
+		body = strings.TrimSpace(body)
+	}
+	start := strings.Index(body, "{")
+	end := strings.LastIndex(body, "}")
+	if start < 0 || end < start {
+		return "", "", nil, fmt.Errorf("reviewer output does not contain a JSON object")
+	}
+	body = body[start : end+1]
+	var payload reviewResponsePayload
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return "", "", nil, err
+	}
+	status := contract.ReviewGateStatus(strings.TrimSpace(payload.Status))
+	switch status {
+	case contract.ReviewGateStatusPassed, contract.ReviewGateStatusChangesRequested:
+	default:
+		return "", "", nil, fmt.Errorf("unsupported review status %q", payload.Status)
+	}
+	return status, strings.TrimSpace(payload.Summary), append([]model.ReviewFinding(nil), payload.Findings...), nil
+}
+
+func (o *Orchestrator) launchReviewWorker(workerCtx context.Context, issue model.Issue, record *model.IssueRecord) {
+	if record == nil {
+		return
+	}
+	workspacePath := recordWorkspacePath(record)
+	attempt := record.RetryAttempt
+	dispatch := model.CloneDispatchContext(record.Dispatch)
+	o.workerWG.Add(1)
+	go func() {
+		defer o.workerWG.Done()
+		result := WorkerResult{
+			Kind:       WorkerKindReview,
+			IssueID:    issue.ID,
+			Identifier: issue.Identifier,
+			Attempt:    &attempt,
+			StartedAt:  o.now().UTC(),
+			Phase:      model.PhaseStreamingTurn,
+		}
+		if strings.TrimSpace(workspacePath) == "" {
+			result.Err = model.NewAgentError(model.ErrInvalidWorkspaceCWD, "review workspace path is empty", nil)
+			result.Phase = phaseFromError(result.Err)
+			o.sendWorkerResult(result)
+			return
+		}
+		reviewWorkspace := &model.Workspace{
+			Path:       workspacePath,
+			Identifier: issue.Identifier,
+			Dispatch:   model.CloneDispatchContext(dispatch),
+		}
+		fragments := make([]string, 0, 4)
+		runErr := o.runner.Run(workerCtx, agent.RunParams{
+			Issue:             model.CloneIssue(&issue),
+			WorkspacePath:     workspacePath,
+			RawPrompt:         buildReviewPrompt(issue, record),
+			Dispatch:          model.CloneDispatchContext(dispatch),
+			ProcessEnv:        workspaceProcessEnv(reviewWorkspace),
+			MaxTurns:          1,
+			ExecutionBudgetMS: reviewBudgetForConfig(o.currentConfig()),
+			ReadOnly:          true,
+			OnAssistantText: func(text string) {
+				fragments = append(fragments, text)
+			},
+			OnEvent: func(event agent.AgentEvent) {
+				o.sendCodexUpdate(CodexUpdate{IssueID: issue.ID, Event: event})
+			},
+		})
+		if runErr != nil {
+			result.Err = runErr
+			result.Phase = phaseFromError(runErr)
+			o.sendWorkerResult(result)
+			return
+		}
+		status, summary, findings, err := parseReviewOutput(strings.Join(fragments, "\n"))
+		if err != nil {
+			result.Err = model.NewAgentError(model.ErrResponseError, "parse reviewer output", err)
+			result.Phase = phaseFromError(result.Err)
+			o.sendWorkerResult(result)
+			return
+		}
+		result.Phase = model.PhaseSucceeded
+		result.ReviewStatus = status
+		result.ReviewSummary = summary
+		result.ReviewFindings = findings
 		o.sendWorkerResult(result)
 	}()
 }
@@ -1207,11 +1703,19 @@ func normalizeCompletionContract(contract model.CompletionContract) model.Comple
 func freshDispatchContext(contract model.CompletionContract) *model.DispatchContext {
 	contract = normalizeCompletionContract(contract)
 	return &model.DispatchContext{
+		JobType:         jobTypeForCompletion(contract),
 		Kind:            model.DispatchKindFresh,
 		ExpectedOutcome: contract.Mode,
 		OnMissingPR:     contract.OnMissingPR,
 		OnClosedPR:      contract.OnClosedPR,
 	}
+}
+
+func jobTypeForCompletion(completion model.CompletionContract) contract.JobType {
+	if completion.Mode == model.CompletionModePullRequest {
+		return contract.JobTypeCodeChange
+	}
+	return contract.JobTypeAnalysis
 }
 
 func dispatchCompletionAction(dispatch *model.DispatchContext, key string) model.CompletionAction {
@@ -1241,6 +1745,9 @@ func continuationDispatchContext(base *model.DispatchContext, fallback model.Com
 	if dispatch.ExpectedOutcome == "" {
 		dispatch.ExpectedOutcome = fallback.Mode
 	}
+	if !dispatch.JobType.IsValid() {
+		dispatch.JobType = jobTypeForCompletion(fallback)
+	}
 	if dispatch.OnMissingPR == "" {
 		dispatch.OnMissingPR = fallback.OnMissingPR
 	}
@@ -1255,6 +1762,7 @@ func continuationDispatchContext(base *model.DispatchContext, fallback model.Com
 	if strings.TrimSpace(issueState) != "" {
 		dispatch.PreviousIssueState = dispatchStringPtr(strings.TrimSpace(issueState))
 	}
+	dispatch.ReviewFeedback = nil
 	return dispatch
 }
 
@@ -1317,48 +1825,153 @@ func (o *Orchestrator) currentBranch(ctx context.Context, workspacePath string) 
 	return trimmed, nil
 }
 
+func (o *Orchestrator) captureRecoveryCheckpoint(ctx context.Context, record *model.IssueRecord, stage contract.RunPhaseSummary, reason *contract.Reason) (*model.RecoveryCheckpoint, error) {
+	if record == nil {
+		return nil, fmt.Errorf("record is nil")
+	}
+	workspacePath := recordWorkspacePath(record)
+	if strings.TrimSpace(workspacePath) == "" {
+		return nil, fmt.Errorf("workspace path is empty")
+	}
+
+	attempt := 1
+	if record.Run != nil && record.Run.Attempt > 0 {
+		attempt = record.Run.Attempt
+	}
+	artifactID := continuationArtifactID(record, attempt)
+	checkpointID := continuationCheckpointID(record, attempt)
+	ledgerPath := ledgerPathForConfig(o.currentConfig())
+	checkpointRoot := filepath.Join(filepath.Dir(ledgerPath), "checkpoints")
+	if strings.TrimSpace(ledgerPath) == "" {
+		checkpointRoot = filepath.Join(workspacePath, ".symphony", "checkpoints")
+	}
+	if err := os.MkdirAll(checkpointRoot, 0o755); err != nil {
+		return nil, err
+	}
+	fileBase := model.SanitizeWorkspaceKey(recordIdentifier(record))
+	if fileBase == "" {
+		fileBase = "record"
+	}
+	patchPath := filepath.Join(checkpointRoot, fmt.Sprintf("%s-%d.patch", fileBase, attempt))
+
+	baseSHA := ""
+	if stdout, _, err := runBashOutputWithTimeout(ctx, workspacePath, "git rev-parse HEAD", 15*time.Second); err == nil {
+		baseSHA = strings.TrimSpace(stdout)
+	}
+	branch := recordBranch(record)
+	if strings.TrimSpace(branch) == "" {
+		if currentBranch, err := o.currentBranch(ctx, workspacePath); err == nil {
+			branch = currentBranch
+		}
+	}
+
+	patchScript := `git diff --binary --no-color --no-ext-diff HEAD -- .
+while IFS= read -r file; do
+  git diff --binary --no-color --no-ext-diff --no-index -- /dev/null "$file" || true
+done < <(git ls-files --others --exclude-standard)`
+	patchBody, _, err := runBashOutputWithTimeout(ctx, workspacePath, patchScript, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(patchPath, []byte(patchBody), 0o644); err != nil {
+		return nil, err
+	}
+
+	hiddenRef := ""
+	hiddenCommit := ""
+	if stashSHA, _, err := runBashOutputWithTimeout(ctx, workspacePath, "git stash create 'symphony recovery checkpoint'", 15*time.Second); err == nil {
+		hiddenCommit = strings.TrimSpace(stashSHA)
+		if hiddenCommit != "" {
+			hiddenRef = fmt.Sprintf("refs/symphony/recovery/%s/%d", fileBase, attempt)
+			if _, _, updateErr := runBashOutputWithTimeout(ctx, workspacePath, fmt.Sprintf("git update-ref %s %s", bashSingleQuote(hiddenRef), bashSingleQuote(hiddenCommit)), 15*time.Second); updateErr != nil {
+				hiddenRef = ""
+				hiddenCommit = ""
+			}
+		}
+	}
+
+	checkpointReason := contract.MustReason(contract.ReasonCheckpointRecoveryCaptured, map[string]any{
+		"checkpoint_id": checkpointID,
+		"artifact_id":   artifactID,
+		"patch_path":    patchPath,
+		"workspace":     workspacePath,
+	})
+	if reason != nil && reason.ReasonCode != "" {
+		if checkpointReason.Details == nil {
+			checkpointReason.Details = map[string]any{}
+		}
+		checkpointReason.Details["cause"] = reason.ReasonCode
+	}
+	checkpoint := contract.Checkpoint{
+		Type:        contract.CheckpointTypeRecovery,
+		Summary:     "已记录可续跑的恢复 checkpoint。",
+		CapturedAt:  o.now().UTC().Format(time.RFC3339Nano),
+		Stage:       stage,
+		ArtifactIDs: []string{artifactID},
+		BaseSHA:     baseSHA,
+		Branch:      strings.TrimSpace(branch),
+		Reason:      contractReasonPtr(checkpointReason),
+	}
+	return &model.RecoveryCheckpoint{
+		ArtifactID:    artifactID,
+		PatchPath:     patchPath,
+		WorkspacePath: workspacePath,
+		HiddenRef:     hiddenRef,
+		HiddenCommit:  hiddenCommit,
+		Checkpoint:    checkpoint,
+	}, nil
+}
+
 func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath string, finalBranch string, dispatch *model.DispatchContext, issueState string) (*SuccessfulRunDecision, error) {
-	contract := normalizeCompletionContract(model.CompletionContract{
+	completion := normalizeCompletionContract(model.CompletionContract{
 		Mode:        model.CompletionModeNone,
 		OnMissingPR: dispatchCompletionAction(dispatch, "missing"),
 		OnClosedPR:  dispatchCompletionAction(dispatch, "closed"),
 	})
+	jobType := jobTypeForDispatch(dispatch)
 	if dispatch != nil {
 		if dispatch.ExpectedOutcome != "" {
-			contract.Mode = dispatch.ExpectedOutcome
+			completion.Mode = dispatch.ExpectedOutcome
 		}
 		if dispatch.OnMissingPR != "" {
-			contract.OnMissingPR = dispatch.OnMissingPR
+			completion.OnMissingPR = dispatch.OnMissingPR
 		}
 		if dispatch.OnClosedPR != "" {
-			contract.OnClosedPR = dispatch.OnClosedPR
+			completion.OnClosedPR = dispatch.OnClosedPR
 		}
 	}
 	branch := strings.TrimSpace(finalBranch)
-	if contract.Mode != model.CompletionModePullRequest {
+	if jobType == contract.JobTypeAnalysis || jobType == contract.JobTypeDiagnostic {
+		return &SuccessfulRunDecision{
+			Disposition:     DispositionCompleted,
+			ExpectedOutcome: completion.Mode,
+			FinalBranch:     branch,
+		}, nil
+	}
+	if completion.Mode != model.CompletionModePullRequest {
 		reason := model.ContinuationReasonUnfinishedIssue
 		return &SuccessfulRunDecision{
 			Disposition:     DispositionContinuation,
 			Reason:          &reason,
-			ExpectedOutcome: contract.Mode,
+			ExpectedOutcome: completion.Mode,
 			FinalBranch:     branch,
 		}, nil
 	}
 	if branch == "" {
-		return decisionForMissingPullRequest(contract, branch), nil
+		return decisionForMissingPullRequest(completion, branch), nil
 	}
 	pr, err := o.lookupPullRequestByHeadBranch(ctx, workspacePath, branch)
 	if err != nil {
 		return nil, err
 	}
 	if pr == nil {
-		return decisionForMissingPullRequest(contract, branch), nil
+		return decisionForMissingPullRequest(completion, branch), nil
 	}
 	switch pr.State {
 	case PullRequestStateOpen:
 		return &SuccessfulRunDecision{
 			Disposition:     DispositionAwaitingMerge,
-			ExpectedOutcome: contract.Mode,
+			ExpectedOutcome: completion.Mode,
 			PR:              clonePullRequestInfo(pr),
 			FinalBranch:     branch,
 		}, nil
@@ -1366,7 +1979,7 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 		if o.isTerminalState(issueState, o.currentConfig()) {
 			return &SuccessfulRunDecision{
 				Disposition:     DispositionCompleted,
-				ExpectedOutcome: contract.Mode,
+				ExpectedOutcome: completion.Mode,
 				PR:              clonePullRequestInfo(pr),
 				FinalBranch:     branch,
 			}, nil
@@ -1375,17 +1988,17 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 		return &SuccessfulRunDecision{
 			Disposition:     DispositionAwaitingIntervention,
 			Reason:          &reason,
-			ExpectedOutcome: contract.Mode,
+			ExpectedOutcome: completion.Mode,
 			PR:              clonePullRequestInfo(pr),
 			FinalBranch:     branch,
 		}, nil
 	case PullRequestStateClosed:
 		reason := model.ContinuationReasonClosedUnmergedPR
-		if contract.OnClosedPR == model.CompletionActionContinue {
+		if completion.OnClosedPR == model.CompletionActionContinue {
 			return &SuccessfulRunDecision{
 				Disposition:     DispositionContinuation,
 				Reason:          &reason,
-				ExpectedOutcome: contract.Mode,
+				ExpectedOutcome: completion.Mode,
 				PR:              clonePullRequestInfo(pr),
 				FinalBranch:     branch,
 			}, nil
@@ -1393,7 +2006,7 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 		return &SuccessfulRunDecision{
 			Disposition:     DispositionAwaitingIntervention,
 			Reason:          &reason,
-			ExpectedOutcome: contract.Mode,
+			ExpectedOutcome: completion.Mode,
 			PR:              clonePullRequestInfo(pr),
 			FinalBranch:     branch,
 		}, nil
@@ -1417,6 +2030,77 @@ func decisionForMissingPullRequest(contract model.CompletionContract, branch str
 		Reason:          &reason,
 		ExpectedOutcome: contract.Mode,
 		FinalBranch:     branch,
+	}
+}
+
+func (o *Orchestrator) handleReviewWorkerExit(result WorkerResult, entry *model.IssueRecord, identifier string, workspacePath string, dispatch *model.DispatchContext, issueState string) {
+	updateRunReviewUsage(entry, int(o.now().UTC().Sub(result.StartedAt).Milliseconds()))
+	updateRunPhase(entry, contract.RunPhaseSummaryVerifying)
+	expectedOutcome := normalizeCompletionContract(o.currentWorkflow().Completion).Mode
+	if dispatch != nil && dispatch.ExpectedOutcome != "" {
+		expectedOutcome = dispatch.ExpectedOutcome
+	}
+	if result.Err != nil {
+		o.mu.Unlock()
+		o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, recordBranch(entry), entry.RetryAttempt, entry.StallCount, expectedOutcome, "reviewer_unavailable", issueState, recordPullRequest(entry))
+		return
+	}
+
+	switch result.ReviewStatus {
+	case contract.ReviewGateStatusPassed:
+		markRunReviewPassed(entry, result.ReviewSummary)
+		if entry.Dispatch != nil {
+			entry.Dispatch.ReviewFeedback = nil
+		}
+		entry.NeedsRecovery = false
+		o.setRecordObservationLocked(entry, &contract.Observation{
+			Running: false,
+			Summary: "review passed; finalizing candidate delivery",
+		})
+		snapshot := cloneIssueRecord(entry)
+		o.commitStateLocked(true)
+		o.mu.Unlock()
+		_ = o.resumeRecoveredSuccessPath(o.runtimeContext(), result.IssueID, snapshot, issueState)
+		return
+	case contract.ReviewGateStatusChangesRequested:
+		if entry.Run != nil && entry.Run.ReviewGate != nil && entry.Run.ReviewGate.FixRoundsUsed >= entry.Run.ReviewGate.MaxFixRounds {
+			if entry.Run.ReviewGate != nil {
+				entry.Run.ReviewGate.Status = contract.ReviewGateStatusInterventionRequired
+			}
+			o.mu.Unlock()
+			o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, recordBranch(entry), entry.RetryAttempt, entry.StallCount, expectedOutcome, string(contract.ReasonRunReviewGateFixLimitReached), issueState, recordPullRequest(entry))
+			return
+		}
+		markRunReviewChangesRequested(entry, result.ReviewSummary, result.ReviewFindings)
+		if entry.Run != nil && entry.Run.ReviewGate != nil {
+			entry.Run.ReviewGate.FixRoundsUsed++
+		}
+		nextDispatch := model.CloneDispatchContext(dispatch)
+		if nextDispatch == nil {
+			nextDispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+		}
+		nextDispatch.ReviewFeedback = &model.ReviewFeedbackContext{
+			Summary:  result.ReviewSummary,
+			Findings: append([]model.ReviewFinding(nil), result.ReviewFindings...),
+		}
+		entry.Dispatch = model.CloneDispatchContext(nextDispatch)
+		issue := model.CloneIssue(entry.LastKnownIssue)
+		if issue == nil {
+			issue = &model.Issue{
+				ID:         result.IssueID,
+				Identifier: identifier,
+				Title:      identifier,
+				State:      issueState,
+			}
+		}
+		attempt := entry.RetryAttempt
+		o.mu.Unlock()
+		o.dispatchIssue(o.runtimeContext(), *issue, &attempt)
+		return
+	default:
+		o.mu.Unlock()
+		o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, recordBranch(entry), entry.RetryAttempt, entry.StallCount, expectedOutcome, "reviewer_unavailable", issueState, recordPullRequest(entry))
+		return
 	}
 }
 
@@ -1470,8 +2154,62 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 	o.addRuntimeLocked(entry)
 	entry.WorkerCancel = nil
 	entry.StartedAt = nil
+	if result.Kind == WorkerKindReview {
+		o.handleReviewWorkerExit(result, entry, identifier, workspacePath, dispatch, issueState)
+		return
+	}
+	updateRunUsage(entry, int(o.now().UTC().Sub(result.StartedAt).Milliseconds()))
+	updateRunPhase(entry, runPhaseSummaryForModelPhase(result.Phase))
 
 	if result.Err != nil {
+		if hardViolation, ok := model.AsHardViolation(result.Err); ok {
+			expectedOutcome := normalizeCompletionContract(o.currentWorkflow().Completion).Mode
+			if dispatch != nil && dispatch.ExpectedOutcome != "" {
+				expectedOutcome = dispatch.ExpectedOutcome
+			}
+			o.mu.Unlock()
+			o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, recordBranch(entry), retryAttempt, stallCount, expectedOutcome, string(contract.ReasonRunHardViolationDetected), issueState, recordPullRequest(entry))
+			o.logger.Warn("hard violation detected", "issue_id", result.IssueID, "issue_identifier", identifier, "violation_code", hardViolation.Code, "tool", hardViolation.Tool)
+			return
+		}
+		if errors.Is(result.Err, model.ErrTurnTimeout) {
+			captureRecord := cloneIssueRecord(entry)
+			captureReason := contract.MustReason(contract.ReasonRunContinuationPending, map[string]any{
+				"record_id": entry.Runtime.RecordID,
+				"cause":     model.ContinuationReasonExecutionBudgetExhausted,
+			})
+			o.setRecordObservationLocked(entry, &contract.Observation{
+				Running: false,
+				Summary: "capturing recovery checkpoint",
+			})
+			o.reindexRecordLocked(result.IssueID, entry)
+			o.mu.Unlock()
+
+			checkpoint, checkpointErr := o.captureCheckpointFn(o.runtimeContext(), captureRecord, contract.RunPhaseSummaryExecuting, &captureReason)
+			if checkpointErr != nil {
+				o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, recordBranch(captureRecord), retryAttempt, stallCount, model.CompletionModePullRequest, "recovery_uncertain", issueState, recordPullRequest(captureRecord))
+				return
+			}
+
+			continuationDispatch := continuationDispatchContext(dispatch, normalizeCompletionContract(o.currentWorkflow().Completion), model.ContinuationReasonExecutionBudgetExhausted, checkpoint.Checkpoint.Branch, recordPullRequest(captureRecord), issueState)
+			continuationDispatch.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(checkpoint)
+
+			o.mu.Lock()
+			current := o.state.Records[result.IssueID]
+			if current == nil {
+				o.mu.Unlock()
+				return
+			}
+			nextAttempt := retryAttempt + 1
+			if nextAttempt <= 0 {
+				nextAttempt = 1
+			}
+			current.NeedsRecovery = false
+			o.scheduleRetryLocked(result.IssueID, identifier, nextAttempt, optionalError(result.Err.Error()), true, stallCount, continuationDispatch)
+			o.commitStateLocked(true)
+			o.mu.Unlock()
+			return
+		}
 		nextAttempt := retryAttempt + 1
 		if nextAttempt <= 0 {
 			nextAttempt = 1
@@ -1574,6 +2312,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 			"turn_count": entry.Session.TurnCount,
 		},
 	}
+	updateRunPhase(entry, contract.RunPhaseSummaryExecuting)
 	o.setRecordObservationLocked(entry, observation)
 	o.reindexRecordLocked(update.IssueID, entry)
 	o.commitStateLocked(false)
@@ -1590,6 +2329,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	cfg := o.currentConfig()
 
 	o.mu.Lock()
+	stalledIDs := make([]string, 0)
 	for issueID, entry := range o.state.Records {
 		if !isRecordRunning(entry) {
 			continue
@@ -1606,7 +2346,7 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 			lastSeen = *entry.Session.LastCodexTimestamp
 		}
 		if o.now().Sub(lastSeen) > time.Duration(stallTimeout)*time.Millisecond {
-			o.terminateRunningLocked(ctx, issueID, false, true, "stalled session")
+			stalledIDs = append(stalledIDs, issueID)
 		}
 	}
 	ids := make([]string, 0, len(o.state.Records))
@@ -1616,6 +2356,10 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 		}
 	}
 	o.mu.Unlock()
+
+	for _, issueID := range stalledIDs {
+		o.handleStalledRunningRecord(ctx, issueID)
+	}
 
 	if len(ids) == 0 {
 		return false, false
@@ -1671,6 +2415,68 @@ func (o *Orchestrator) reconcileRunning(ctx context.Context) (bool, bool) {
 	}
 	o.commitStateLocked(true)
 	return true, true
+}
+
+func (o *Orchestrator) handleStalledRunningRecord(ctx context.Context, issueID string) {
+	o.mu.Lock()
+	if o.isProtectedLocked() {
+		o.mu.Unlock()
+		return
+	}
+	entry := o.runningRecords[issueID]
+	if entry == nil {
+		o.mu.Unlock()
+		return
+	}
+	identifier := recordIdentifier(entry)
+	workspacePath := recordWorkspacePath(entry)
+	retryAttempt := entry.RetryAttempt
+	stallCount := entry.StallCount + 1
+	dispatch := model.CloneDispatchContext(entry.Dispatch)
+	issueState := entry.LastKnownIssueState
+	if entry.WorkerCancel != nil {
+		entry.WorkerCancel()
+	}
+	entry.WorkerCancel = nil
+	entry.StartedAt = nil
+	updateRunPhase(entry, contract.RunPhaseSummaryBlocked)
+	o.setRecordObservationLocked(entry, &contract.Observation{
+		Running: false,
+		Summary: "capturing recovery checkpoint after stall",
+	})
+	o.reindexRecordLocked(issueID, entry)
+	snapshot := cloneIssueRecord(entry)
+	o.mu.Unlock()
+
+	checkpointReason := contract.MustReason(contract.ReasonRunContinuationPending, map[string]any{
+		"record_id": snapshot.Runtime.RecordID,
+		"cause":     "stalled_session",
+	})
+	checkpoint, checkpointErr := o.captureCheckpointFn(ctx, snapshot, contract.RunPhaseSummaryBlocked, &checkpointReason)
+	if checkpointErr != nil {
+		expectedOutcome := normalizeCompletionContract(o.currentWorkflow().Completion).Mode
+		if dispatch != nil && dispatch.ExpectedOutcome != "" {
+			expectedOutcome = dispatch.ExpectedOutcome
+		}
+		o.moveToAwaitingIntervention(issueID, identifier, workspacePath, recordBranch(snapshot), retryAttempt, stallCount, expectedOutcome, "recovery_uncertain", issueState, recordPullRequest(snapshot))
+		return
+	}
+
+	continuationDispatch := continuationDispatchContext(dispatch, normalizeCompletionContract(o.currentWorkflow().Completion), model.ContinuationReasonRecoverableRuntimeError, checkpoint.Checkpoint.Branch, recordPullRequest(snapshot), issueState)
+	continuationDispatch.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(checkpoint)
+
+	o.mu.Lock()
+	current := o.state.Records[issueID]
+	if current != nil {
+		nextAttempt := retryAttempt + 1
+		if nextAttempt <= 0 {
+			nextAttempt = 1
+		}
+		current.NeedsRecovery = false
+		o.scheduleRetryLocked(issueID, identifier, nextAttempt, optionalError("stalled session"), true, stallCount, continuationDispatch)
+		o.commitStateLocked(true)
+	}
+	o.mu.Unlock()
 }
 
 func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
@@ -2004,7 +2810,11 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 		}
 		current := o.retryRecords[issueID]
 		if current != nil && current.RetryDueAt != nil && !current.RetryDueAt.After(o.now().UTC()) {
-			o.scheduleRetryLocked(issueID, recordIdentifier(current), current.RetryAttempt+1, &errorText, false, current.StallCount, current.Dispatch)
+			nextAttempt := current.RetryAttempt + 1
+			if isContinuationPending(current) {
+				nextAttempt = current.RetryAttempt
+			}
+			o.scheduleRetryLocked(issueID, recordIdentifier(current), nextAttempt, &errorText, isContinuationPending(current), current.StallCount, current.Dispatch)
 			o.commitStateLocked(true)
 		}
 		o.mu.Unlock()
@@ -2056,7 +2866,11 @@ func (o *Orchestrator) processRetryIssue(ctx context.Context, issueID string) {
 		}
 		current := o.retryRecords[issueID]
 		if current != nil && current.RetryDueAt != nil && !current.RetryDueAt.After(o.now().UTC()) {
-			o.scheduleRetryLocked(issueID, issue.Identifier, current.RetryAttempt+1, &errorText, false, current.StallCount, current.Dispatch)
+			nextAttempt := current.RetryAttempt + 1
+			if isContinuationPending(current) {
+				nextAttempt = current.RetryAttempt
+			}
+			o.scheduleRetryLocked(issueID, issue.Identifier, nextAttempt, &errorText, isContinuationPending(current), current.StallCount, current.Dispatch)
 			o.commitStateLocked(true)
 		}
 		o.mu.Unlock()
@@ -2206,16 +3020,34 @@ func (o *Orchestrator) scheduleRetryLocked(issueID string, identifier string, at
 	record.RetryTimer = timer
 	record.Dispatch = retryDispatch
 	o.ensureRecordIdentityLocked(record, issueID, identifier)
+	reasonCode := contract.ReasonRecordBlockedRetryScheduled
+	reasonCategory := contract.CategoryRecord
+	reasonDetails := map[string]any{
+		"record_id": record.Runtime.RecordID,
+		"attempt":   attemptCountFromRetry(attempt),
+	}
+	observationSummary := "retry scheduled"
+	if continuation {
+		reasonCode = contract.ReasonRunContinuationPending
+		reasonCategory = contract.CategoryRun
+		observationSummary = "continuation pending"
+		if retryDispatch != nil && retryDispatch.RecoveryCheckpoint != nil {
+			if retryDispatch.RecoveryCheckpoint.ArtifactID != "" {
+				reasonDetails["checkpoint_id"] = retryDispatch.RecoveryCheckpoint.ArtifactID
+			}
+			if retryDispatch.RecoveryCheckpoint.PatchPath != "" {
+				reasonDetails["patch_path"] = retryDispatch.RecoveryCheckpoint.PatchPath
+			}
+			setRunContinuationPending(record, retryDispatch.RecoveryCheckpoint)
+		}
+	}
 	o.setRecordStatusLocked(record, contract.IssueStatusRetryScheduled, &contract.Reason{
-		ReasonCode: contract.ReasonRecordBlockedRetryScheduled,
-		Category:   contract.CategoryRecord,
-		Details: map[string]any{
-			"record_id": record.Runtime.RecordID,
-			"attempt":   attemptCountFromRetry(attempt),
-		},
+		ReasonCode: reasonCode,
+		Category:   reasonCategory,
+		Details:    reasonDetails,
 	}, &contract.Observation{
 		Running: false,
-		Summary: "retry scheduled",
+		Summary: observationSummary,
 	})
 	if errText != nil {
 		record.Runtime.Reason.Details["last_error"] = *errText
@@ -2611,10 +3443,106 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 		Running: false,
 		Summary: "awaiting pull request merge",
 	})
+	if record.Run != nil {
+		markRunCandidateDelivery(record, pr)
+		record.Run.State = contract.RunStatusCompleted
+		record.Run.Phase = contract.RunPhaseSummaryPublishing
+	}
 	o.reindexRecordLocked(issueID, record)
 	delete(o.pendingRecovery, issueID)
 	o.commitStateLocked(true)
 	o.mu.Unlock()
+}
+
+func cloneInterventionTemplateInputs(value []contract.InterventionInputField) []contract.InterventionInputField {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make([]contract.InterventionInputField, len(value))
+	for i, item := range value {
+		cloned := item
+		cloned.AllowedValues = append([]string(nil), item.AllowedValues...)
+		result[i] = cloned
+	}
+	return result
+}
+
+func interventionTemplateForRecord(record *model.IssueRecord) (contract.InterventionTemplate, bool) {
+	if record == nil {
+		return contract.InterventionTemplate{}, false
+	}
+	definition, ok := jobTypeDefinitionForDispatch(record.Dispatch)
+	if !ok || len(definition.InterventionTemplates) == 0 {
+		return contract.InterventionTemplate{}, false
+	}
+	return definition.InterventionTemplates[0], true
+}
+
+func buildInterventionState(cfg *model.ServiceConfig, now time.Time, record *model.IssueRecord, reason contract.Reason, decision contract.Decision, errorCode contract.ErrorCode) *model.InterventionState {
+	if record == nil {
+		return nil
+	}
+	template, ok := interventionTemplateForRecord(record)
+	if !ok {
+		return nil
+	}
+	domainID := "default"
+	if cfg != nil && strings.TrimSpace(cfg.DomainID) != "" {
+		domainID = strings.TrimSpace(cfg.DomainID)
+	}
+	id := fmt.Sprintf("int-%s-%d", record.Runtime.RecordID, currentAttempt(record))
+	state := &model.InterventionState{
+		Object: contract.Intervention{
+			BaseObject: contract.BaseObject{
+				ID:              id,
+				ObjectType:      contract.ObjectTypeIntervention,
+				DomainID:        domainID,
+				Visibility:      contract.VisibilityLevelRestricted,
+				ContractVersion: contract.APIVersionV1,
+				CreatedAt:       now.UTC().Format(time.RFC3339Nano),
+				UpdatedAt:       now.UTC().Format(time.RFC3339Nano),
+			},
+			ObjectContext: contract.ObjectContext{
+				Reasons:   []contract.Reason{reason},
+				Decision:  contractDecisionPtr(decision),
+				ErrorCode: errorCode,
+			},
+			State:          contract.InterventionStatusOpen,
+			TemplateID:     template.TemplateID,
+			Summary:        template.Summary,
+			RequiredInputs: cloneInterventionTemplateInputs(template.RequiredInputs),
+			AllowedActions: append([]contract.ControlAction(nil), template.AllowedActions...),
+		},
+		Handoff: model.InterventionHandoff{
+			Phase:              contract.RunPhaseSummaryBlocked,
+			Reason:             contractReasonPtr(reason),
+			Decision:           contractDecisionPtr(decision),
+			RecommendedActions: append([]contract.DecisionAction(nil), decision.RecommendedActions...),
+			RequiredInputs:     cloneInterventionTemplateInputs(template.RequiredInputs),
+		},
+	}
+	if record.Run != nil {
+		state.Handoff.Phase = record.Run.Phase
+		state.Handoff.ReviewSummary = strings.TrimSpace(record.Run.ReviewSummary)
+		state.Handoff.ReviewFindings = append([]model.ReviewFinding(nil), record.Run.ReviewFindings...)
+		if checkpoint := latestRunCheckpoint(record); checkpoint != nil {
+			cloned := *checkpoint
+			cloned.ArtifactIDs = append([]string(nil), checkpoint.ArtifactIDs...)
+			cloned.ReferenceIDs = append([]string(nil), checkpoint.ReferenceIDs...)
+			if checkpoint.Reason != nil {
+				clonedReason := *checkpoint.Reason
+				if len(checkpoint.Reason.Details) > 0 {
+					clonedReason.Details = map[string]any{}
+					for key, value := range checkpoint.Reason.Details {
+						clonedReason.Details[key] = value
+					}
+				}
+				cloned.Reason = &clonedReason
+			}
+			state.Handoff.Checkpoint = &cloned
+		}
+	}
+	return state
 }
 
 func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier string, workspacePath string, branch string, retryAttempt int, stallCount int, expectedOutcome model.CompletionMode, reason string, issueState string, pr *PullRequestInfo) {
@@ -2670,6 +3598,41 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 		Running: false,
 		Summary: "awaiting external intervention",
 	})
+	if record.Run != nil {
+		runReasonCode := contract.ReasonRunBlockedInterventionRequired
+		runDecisionCode := contract.DecisionResumeAfterIntervention
+		runErrorCode := contract.ErrorAPIInterventionConflict
+		if reason == string(contract.ReasonRunHardViolationDetected) {
+			runReasonCode = contract.ReasonRunHardViolationDetected
+			runDecisionCode = contract.DecisionEscalateHardViolation
+			runErrorCode = contract.ErrorRunHardViolationDetected
+		} else if reason == string(contract.ReasonRunReviewGateFixLimitReached) {
+			runReasonCode = contract.ReasonRunReviewGateFixLimitReached
+			runDecisionCode = contract.DecisionResumeAfterIntervention
+			runErrorCode = contract.ErrorReviewGateBlocked
+			if record.Run.ReviewGate != nil {
+				record.Run.ReviewGate.Status = contract.ReviewGateStatusInterventionRequired
+			}
+		}
+		runReason := contract.MustReason(runReasonCode, map[string]any{
+			"record_id": record.Runtime.RecordID,
+			"cause":     reason,
+		})
+		runDecision := contract.MustDecision(runDecisionCode, map[string]any{
+			"record_id": record.Runtime.RecordID,
+			"cause":     reason,
+		})
+		setRunIntervention(record, runReason, runDecision, runErrorCode)
+		record.Intervention = buildInterventionState(o.currentConfig(), o.now().UTC(), record, runReason, runDecision, runErrorCode)
+	} else {
+		record.Intervention = buildInterventionState(o.currentConfig(), o.now().UTC(), record, contract.MustReason(contract.ReasonRunBlockedInterventionRequired, map[string]any{
+			"record_id": record.Runtime.RecordID,
+			"cause":     reason,
+		}), contract.MustDecision(contract.DecisionResumeAfterIntervention, map[string]any{
+			"record_id": record.Runtime.RecordID,
+			"cause":     reason,
+		}), contract.ErrorAPIInterventionConflict)
+	}
 	o.reindexRecordLocked(issueID, record)
 	delete(o.pendingRecovery, issueID)
 	version := o.commitStateLocked(true)
@@ -2683,6 +3646,59 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	if version == 0 {
 		o.emitNotification(event)
 	}
+}
+
+func (o *Orchestrator) resumeIntervention(ctx context.Context, issue model.Issue, resolution contract.InterventionResolution) {
+	o.mu.Lock()
+	record := o.awaitingInterventionRecords[issue.ID]
+	if record == nil {
+		o.mu.Unlock()
+		return
+	}
+	baseDispatch := freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+	if record.Dispatch != nil {
+		baseDispatch.JobType = record.Dispatch.JobType
+		baseDispatch.ExpectedOutcome = record.Dispatch.ExpectedOutcome
+		baseDispatch.OnMissingPR = record.Dispatch.OnMissingPR
+		baseDispatch.OnClosedPR = record.Dispatch.OnClosedPR
+	}
+	baseDispatch.Kind = model.DispatchKindInterventionRetry
+	if strings.TrimSpace(recordBranch(record)) != "" {
+		baseDispatch.PreviousBranch = dispatchStringPtr(recordBranch(record))
+	}
+	baseDispatch.PreviousPR = pullRequestContext(recordPullRequest(record))
+	if strings.TrimSpace(record.LastKnownIssueState) != "" {
+		baseDispatch.PreviousIssueState = dispatchStringPtr(record.LastKnownIssueState)
+	}
+	if record.Run != nil && record.Run.Recovery != nil {
+		baseDispatch.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(record.Run.Recovery)
+	}
+	if record.Intervention != nil {
+		record.Intervention.Object.State = contract.InterventionStatusResolved
+		resolutionCopy := resolution
+		if len(resolution.ProvidedInputs) > 0 {
+			resolutionCopy.ProvidedInputs = map[string]any{}
+			for key, value := range resolution.ProvidedInputs {
+				resolutionCopy.ProvidedInputs[key] = value
+			}
+		}
+		if resolution.Decision != nil {
+			decisionCopy := *resolution.Decision
+			decisionCopy.RecommendedActions = append([]contract.DecisionAction(nil), resolution.Decision.RecommendedActions...)
+			if len(resolution.Decision.Details) > 0 {
+				decisionCopy.Details = map[string]any{}
+				for key, value := range resolution.Decision.Details {
+					decisionCopy.Details[key] = value
+				}
+			}
+			resolutionCopy.Decision = &decisionCopy
+		}
+		record.Intervention.Object.Resolution = &resolutionCopy
+	}
+	record.Dispatch = model.CloneDispatchContext(baseDispatch)
+	nextAttempt := record.RetryAttempt + 1
+	o.mu.Unlock()
+	o.dispatchIssue(ctx, issue, &nextAttempt)
 }
 
 func (o *Orchestrator) lookupPullRequestByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error) {

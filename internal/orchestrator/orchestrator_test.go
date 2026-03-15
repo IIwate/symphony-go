@@ -77,9 +77,14 @@ func (f *fakeWorkspace) CleanupWorkspace(_ context.Context, identifier string) e
 	return nil
 }
 
-type fakeRunner struct{}
+type fakeRunner struct {
+	runFn func(context.Context, agent.RunParams) error
+}
 
-func (fakeRunner) Run(context.Context, agent.RunParams) error {
+func (f fakeRunner) Run(ctx context.Context, params agent.RunParams) error {
+	if f.runFn != nil {
+		return f.runFn(ctx, params)
+	}
 	return nil
 }
 
@@ -118,6 +123,9 @@ func newTestConfig(t *testing.T) *model.ServiceConfig {
 		MaxConcurrentAgents:        2,
 		MaxTurns:                   1,
 		MaxRetryBackoffMS:          100,
+		RunBudgetTotalMS:           1000,
+		RunExecutionBudgetMS:       1000,
+		RunReviewFixBudgetMS:       0,
 		CodexCommand:               "codex app-server",
 		SessionPersistence: model.SessionPersistenceConfig{
 			Enabled: true,
@@ -681,6 +689,546 @@ func TestScheduleRetryLockedPropagatesUnifiedReasonIntoRuntimeAndLedger(t *testi
 	}
 }
 
+func TestHandleWorkerExitTurnTimeoutSchedulesContinuationWithRecoveryCheckpoint(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+
+	startedAt := o.now().Add(-2 * time.Second)
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusActive
+	record.Runtime.Observation = &contract.Observation{Running: true, Summary: "running"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+	record.StartedAt = &startedAt
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	o.reindexRecordLocked(issue.ID, record)
+	o.mu.Unlock()
+
+	o.captureCheckpointFn = func(context.Context, *model.IssueRecord, contract.RunPhaseSummary, *contract.Reason) (*model.RecoveryCheckpoint, error) {
+		return &model.RecoveryCheckpoint{
+			ArtifactID:    "art-timeout-1",
+			PatchPath:     filepath.Join(t.TempDir(), "timeout.patch"),
+			WorkspacePath: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier),
+			Checkpoint: contract.Checkpoint{
+				Type:        contract.CheckpointTypeRecovery,
+				Summary:     "已记录恢复 checkpoint。",
+				CapturedAt:  o.now().UTC().Format(time.RFC3339Nano),
+				Stage:       contract.RunPhaseSummaryExecuting,
+				ArtifactIDs: []string{"art-timeout-1"},
+				BaseSHA:     "abc123",
+				Branch:      "runner/demo-scope/abc-1",
+			},
+		}, nil
+	}
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:   issue.ID,
+		StartedAt: startedAt,
+		Phase:     model.PhaseTimedOut,
+		Err:       model.NewAgentError(model.ErrTurnTimeout, "turn timed out", nil),
+	})
+
+	current := o.retryRecords[issue.ID]
+	if current == nil {
+		t.Fatal("continuation record missing after turn timeout")
+	}
+	if current.Runtime.Reason == nil || current.Runtime.Reason.ReasonCode != contract.ReasonRunContinuationPending {
+		t.Fatalf("runtime reason = %#v, want %q", current.Runtime.Reason, contract.ReasonRunContinuationPending)
+	}
+	if current.Dispatch == nil || current.Dispatch.Kind != model.DispatchKindContinuation {
+		t.Fatalf("dispatch = %#v, want continuation dispatch", current.Dispatch)
+	}
+	if current.Dispatch.RecoveryCheckpoint == nil || current.Dispatch.RecoveryCheckpoint.ArtifactID != "art-timeout-1" {
+		t.Fatalf("recovery checkpoint = %#v, want art-timeout-1", current.Dispatch.RecoveryCheckpoint)
+	}
+	if current.Run == nil || current.Run.State != contract.RunStatusContinuationPending {
+		t.Fatalf("run state = %#v, want continuation_pending", current.Run)
+	}
+	if current.Run.Recovery == nil || current.Run.Recovery.Checkpoint.Type != contract.CheckpointTypeRecovery {
+		t.Fatalf("run recovery = %#v, want recovery checkpoint", current.Run.Recovery)
+	}
+}
+
+func TestHandleWorkerExitHardViolationMovesToIntervention(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+
+	startedAt := o.now().Add(-time.Second)
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusActive
+	record.Runtime.Observation = &contract.Observation{Running: true, Summary: "running"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+	record.StartedAt = &startedAt
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	o.reindexRecordLocked(issue.ID, record)
+	o.mu.Unlock()
+
+	o.handleWorkerExit(WorkerResult{
+		IssueID:   issue.ID,
+		StartedAt: startedAt,
+		Phase:     model.PhaseFailed,
+		Err:       model.NewHardViolationError(model.HardViolationSubAgent, "spawn_agent", "sub-agents are forbidden"),
+	})
+
+	current := o.awaitingInterventionRecords[issue.ID]
+	if current == nil {
+		t.Fatal("awaitingIntervention record missing after hard violation")
+	}
+	if current.Run == nil || current.Run.State != contract.RunStatusInterventionRequired {
+		t.Fatalf("run state = %#v, want intervention_required", current.Run)
+	}
+	if current.Run.ErrorCode != contract.ErrorRunHardViolationDetected {
+		t.Fatalf("run error_code = %q, want %q", current.Run.ErrorCode, contract.ErrorRunHardViolationDetected)
+	}
+	if current.Run.Reason == nil || current.Run.Reason.ReasonCode != contract.ReasonRunHardViolationDetected {
+		t.Fatalf("run reason = %#v, want %q", current.Run.Reason, contract.ReasonRunHardViolationDetected)
+	}
+}
+
+func TestHandleStalledRunningRecordSchedulesContinuationWithCheckpoint(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+
+	startedAt := o.now().Add(-time.Minute)
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusActive
+	record.Runtime.Observation = &contract.Observation{Running: true, Summary: "running"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+	record.StartedAt = &startedAt
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	o.reindexRecordLocked(issue.ID, record)
+	o.mu.Unlock()
+
+	o.captureCheckpointFn = func(context.Context, *model.IssueRecord, contract.RunPhaseSummary, *contract.Reason) (*model.RecoveryCheckpoint, error) {
+		return &model.RecoveryCheckpoint{
+			ArtifactID:    "art-stall-1",
+			PatchPath:     filepath.Join(t.TempDir(), "stall.patch"),
+			WorkspacePath: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier),
+			Checkpoint: contract.Checkpoint{
+				Type:        contract.CheckpointTypeRecovery,
+				Summary:     "已记录恢复 checkpoint。",
+				CapturedAt:  o.now().UTC().Format(time.RFC3339Nano),
+				Stage:       contract.RunPhaseSummaryBlocked,
+				ArtifactIDs: []string{"art-stall-1"},
+				BaseSHA:     "abc123",
+				Branch:      "runner/demo-scope/abc-1",
+			},
+		}, nil
+	}
+
+	o.handleStalledRunningRecord(context.Background(), issue.ID)
+
+	current := o.retryRecords[issue.ID]
+	if current == nil {
+		t.Fatal("continuation record missing after stalled run")
+	}
+	if current.Runtime.Reason == nil || current.Runtime.Reason.ReasonCode != contract.ReasonRunContinuationPending {
+		t.Fatalf("runtime reason = %#v, want %q", current.Runtime.Reason, contract.ReasonRunContinuationPending)
+	}
+	if current.Dispatch == nil || current.Dispatch.RecoveryCheckpoint == nil || current.Dispatch.RecoveryCheckpoint.ArtifactID != "art-stall-1" {
+		t.Fatalf("recovery checkpoint = %#v, want art-stall-1", current.Dispatch)
+	}
+	if current.StallCount != 1 {
+		t.Fatalf("stall count = %d, want 1", current.StallCount)
+	}
+}
+
+func TestJobTypeDefinitionForDispatchUsesExplicitJobType(t *testing.T) {
+	cases := []struct {
+		name     string
+		jobType  contract.JobType
+		expected contract.CandidateDeliveryPointKind
+	}{
+		{name: "code_change", jobType: contract.JobTypeCodeChange, expected: contract.CandidateDeliveryPointReviewablePullRequest},
+		{name: "land_change", jobType: contract.JobTypeLandChange, expected: contract.CandidateDeliveryPointTargetPRSnapshot},
+		{name: "analysis", jobType: contract.JobTypeAnalysis, expected: contract.CandidateDeliveryPointAnalysisReportDraft},
+		{name: "diagnostic", jobType: contract.JobTypeDiagnostic, expected: contract.CandidateDeliveryPointDiagnosticReportDraft},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			definition, ok := jobTypeDefinitionForDispatch(&model.DispatchContext{JobType: tc.jobType})
+			if !ok {
+				t.Fatalf("jobTypeDefinitionForDispatch(%q) = false, want true", tc.jobType)
+			}
+			if definition.CandidateDelivery.Kind != tc.expected {
+				t.Fatalf("candidate delivery kind = %q, want %q", definition.CandidateDelivery.Kind, tc.expected)
+			}
+			if !definition.ReviewGate.Required || definition.ReviewGate.ReviewerMode != contract.ReviewerModeReadOnly || definition.ReviewGate.MaxFixRounds != 2 {
+				t.Fatalf("review gate = %#v, want readonly required gate with max 2 fixes", definition.ReviewGate)
+			}
+		})
+	}
+}
+
+func TestResumeRecoveredSuccessPathLaunchesReadOnlyReviewer(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	o.gitBranchFn = func(context.Context, string) (string, error) {
+		return "runner/demo-scope/abc-1", nil
+	}
+	o.prLookup = fakePRLookup{
+		find: func(context.Context, string, string) (*PullRequestInfo, error) {
+			return &PullRequestInfo{
+				Number:     12,
+				URL:        "https://example.test/pr/12",
+				State:      PullRequestStateOpen,
+				HeadBranch: "runner/demo-scope/abc-1",
+			}, nil
+		},
+	}
+	paramsCh := make(chan agent.RunParams, 1)
+	o.runner = fakeRunner{runFn: func(_ context.Context, params agent.RunParams) error {
+		paramsCh <- params
+		if params.OnAssistantText != nil {
+			params.OnAssistantText(`{"status":"passed","summary":"review passed","findings":[]}`)
+		}
+		return nil
+	}}
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusActive
+	record.Runtime.Observation = &contract.Observation{Running: false, Summary: "awaiting recovery"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: "runner/demo-scope/abc-1"}
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeCodeChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = issue.State
+	record.NeedsRecovery = true
+	o.reindexRecordLocked(issue.ID, record)
+	snapshot := cloneIssueRecord(record)
+	o.mu.Unlock()
+
+	if err := o.resumeRecoveredSuccessPath(context.Background(), issue.ID, snapshot, issue.State); err != nil {
+		t.Fatalf("resumeRecoveredSuccessPath() error = %v", err)
+	}
+
+	var params agent.RunParams
+	select {
+	case params = <-paramsCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reviewer launch")
+	}
+	if !params.ReadOnly {
+		t.Fatal("reviewer run is not readonly")
+	}
+	if !strings.Contains(params.RawPrompt, "Read-only review only") {
+		t.Fatalf("review prompt = %q, want readonly instruction", params.RawPrompt)
+	}
+
+	reviewResult := takeWorkerResult(t, o)
+	if reviewResult.Kind != WorkerKindReview {
+		t.Fatalf("worker result kind = %q, want review", reviewResult.Kind)
+	}
+	o.handleWorkerExit(reviewResult)
+
+	current := o.awaitingMergeRecords[issue.ID]
+	if current == nil {
+		t.Fatal("awaitingMerge record missing after passed review")
+	}
+	if current.Run == nil || current.Run.ReviewGate == nil || current.Run.ReviewGate.Status != contract.ReviewGateStatusPassed {
+		t.Fatalf("review gate = %#v, want passed", current.Run)
+	}
+}
+
+func TestResumeRecoveredSuccessPathLaunchesReviewerForAnalysis(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	paramsCh := make(chan agent.RunParams, 1)
+	o.runner = fakeRunner{runFn: func(_ context.Context, params agent.RunParams) error {
+		paramsCh <- params
+		if params.OnAssistantText != nil {
+			params.OnAssistantText(`{"status":"passed","summary":"analysis review passed","findings":[]}`)
+		}
+		return nil
+	}}
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusActive
+	record.Runtime.Observation = &contract.Observation{Running: false, Summary: "awaiting recovery"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeAnalysis,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModeNone,
+	}
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = issue.State
+	record.NeedsRecovery = true
+	o.reindexRecordLocked(issue.ID, record)
+	snapshot := cloneIssueRecord(record)
+	o.mu.Unlock()
+
+	if err := o.resumeRecoveredSuccessPath(context.Background(), issue.ID, snapshot, issue.State); err != nil {
+		t.Fatalf("resumeRecoveredSuccessPath() error = %v", err)
+	}
+
+	select {
+	case params := <-paramsCh:
+		if !params.ReadOnly {
+			t.Fatal("analysis reviewer is not readonly")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for analysis reviewer launch")
+	}
+
+	reviewResult := takeWorkerResult(t, o)
+	o.handleWorkerExit(reviewResult)
+
+	if current := o.state.Records[issue.ID]; current != nil {
+		t.Fatalf("active record = %#v, want nil after completed analysis run", current)
+	}
+	if len(o.state.CompletedWindow) != 1 || o.state.CompletedWindow[0].Status != contract.IssueStatusCompleted {
+		t.Fatalf("completed window = %#v, want one completed record", o.state.CompletedWindow)
+	}
+	if reviewResult.ReviewStatus != contract.ReviewGateStatusPassed {
+		t.Fatalf("review result = %#v, want passed", reviewResult)
+	}
+}
+
+func TestReviewFixRoundsLimitMovesToIntervention(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	o.gitBranchFn = func(context.Context, string) (string, error) {
+		return "runner/demo-scope/abc-1", nil
+	}
+	o.runner = fakeRunner{}
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusActive
+	record.Runtime.Observation = &contract.Observation{Running: true, Summary: "review in progress"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: "runner/demo-scope/abc-1"}
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeCodeChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run.ReviewGate.Status = contract.ReviewGateStatusReviewing
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = issue.State
+	startedAt := o.now().Add(-time.Second)
+	record.StartedAt = &startedAt
+	o.reindexRecordLocked(issue.ID, record)
+	o.mu.Unlock()
+
+	for round := 1; round <= 2; round++ {
+		o.handleWorkerExit(WorkerResult{
+			Kind:          WorkerKindReview,
+			IssueID:       issue.ID,
+			Identifier:    issue.Identifier,
+			StartedAt:     startedAt,
+			ReviewStatus:  contract.ReviewGateStatusChangesRequested,
+			ReviewSummary: "need fixes",
+			ReviewFindings: []model.ReviewFinding{
+				{Code: "review.issue", Summary: "fix review feedback"},
+			},
+		})
+		current := o.state.Records[issue.ID]
+		if current == nil || current.Run == nil || current.Run.ReviewGate == nil {
+			t.Fatalf("round %d current run missing", round)
+		}
+		if current.Run.ReviewGate.FixRoundsUsed != round {
+			t.Fatalf("round %d fix rounds used = %d, want %d", round, current.Run.ReviewGate.FixRoundsUsed, round)
+		}
+		current.Runtime.Status = contract.IssueStatusActive
+		current.Runtime.Observation = &contract.Observation{Running: true, Summary: "review in progress"}
+		current.StartedAt = &startedAt
+		o.reindexRecordLocked(issue.ID, current)
+	}
+
+	o.handleWorkerExit(WorkerResult{
+		Kind:          WorkerKindReview,
+		IssueID:       issue.ID,
+		Identifier:    issue.Identifier,
+		StartedAt:     startedAt,
+		ReviewStatus:  contract.ReviewGateStatusChangesRequested,
+		ReviewSummary: "still blocked",
+		ReviewFindings: []model.ReviewFinding{
+			{Code: "review.issue", Summary: "needs a third fix round"},
+		},
+	})
+
+	current := o.awaitingInterventionRecords[issue.ID]
+	if current == nil {
+		t.Fatal("awaitingIntervention record missing after fix limit")
+	}
+	if current.Run == nil || current.Run.ReviewGate == nil || current.Run.ReviewGate.Status != contract.ReviewGateStatusInterventionRequired {
+		t.Fatalf("review gate = %#v, want intervention_required", current.Run)
+	}
+	if current.Run.Reason == nil || current.Run.Reason.ReasonCode != contract.ReasonRunReviewGateFixLimitReached {
+		t.Fatalf("run reason = %#v, want %q", current.Run.Reason, contract.ReasonRunReviewGateFixLimitReached)
+	}
+}
+
+func TestMoveToAwaitingInterventionBuildsFormalHandoff(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusActive
+	record.Runtime.Observation = &contract.Observation{Running: true, Summary: "review in progress"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: "runner/demo-scope/abc-1"}
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeCodeChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run.ReviewSummary = "review blocked"
+	record.Run.ReviewFindings = []model.ReviewFinding{{Code: "review.issue", Summary: "needs explicit human direction"}}
+	record.Run.Checkpoints = append(record.Run.Checkpoints, contract.Checkpoint{
+		Type:        contract.CheckpointTypeBusiness,
+		Summary:     "draft PR ready",
+		CapturedAt:  o.now().UTC().Format(time.RFC3339Nano),
+		Stage:       contract.RunPhaseSummaryPublishing,
+		ArtifactIDs: []string{"pr-12"},
+		Branch:      "runner/demo-scope/abc-1",
+	})
+	o.reindexRecordLocked(issue.ID, record)
+	o.mu.Unlock()
+
+	o.moveToAwaitingIntervention(issue.ID, issue.Identifier, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier), "runner/demo-scope/abc-1", 0, 0, model.CompletionModePullRequest, string(contract.ReasonRunReviewGateFixLimitReached), issue.State, &PullRequestInfo{
+		Number:     12,
+		URL:        "https://example.test/pr/12",
+		State:      PullRequestStateOpen,
+		HeadBranch: "runner/demo-scope/abc-1",
+	})
+
+	current := o.awaitingInterventionRecords[issue.ID]
+	if current == nil || current.Intervention == nil {
+		t.Fatal("formal intervention handoff missing")
+	}
+	if current.Intervention.Handoff.Reason == nil || current.Intervention.Handoff.Decision == nil {
+		t.Fatalf("handoff = %#v, want reason and decision", current.Intervention.Handoff)
+	}
+	if current.Intervention.Handoff.Phase != contract.RunPhaseSummaryBlocked {
+		t.Fatalf("handoff phase = %q, want blocked", current.Intervention.Handoff.Phase)
+	}
+	if current.Intervention.Handoff.ReviewSummary != "review blocked" {
+		t.Fatalf("handoff review summary = %q, want review blocked", current.Intervention.Handoff.ReviewSummary)
+	}
+	if len(current.Intervention.Handoff.ReviewFindings) != 1 {
+		t.Fatalf("handoff findings = %#v, want 1 finding", current.Intervention.Handoff.ReviewFindings)
+	}
+	if current.Intervention.Handoff.Checkpoint == nil || current.Intervention.Handoff.Checkpoint.Type != contract.CheckpointTypeBusiness {
+		t.Fatalf("handoff checkpoint = %#v, want business checkpoint", current.Intervention.Handoff.Checkpoint)
+	}
+	if len(current.Intervention.Handoff.RecommendedActions) == 0 || len(current.Intervention.Handoff.RequiredInputs) == 0 {
+		t.Fatalf("handoff = %#v, want recommended actions and required inputs", current.Intervention.Handoff)
+	}
+}
+
+func TestResumeInterventionStartsNewRunWithRecoveryContextOnly(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	o.gitBranchFn = func(context.Context, string) (string, error) {
+		return "runner/demo-scope/abc-1", nil
+	}
+	o.runner = fakeRunner{}
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Runtime.Status = contract.IssueStatusAwaitingIntervention
+	record.Runtime.Observation = &contract.Observation{Running: false, Summary: "awaiting intervention"}
+	record.Runtime.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
+	record.Runtime.DurableRefs.Branch = &contract.BranchRef{Name: "runner/demo-scope/abc-1"}
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeCodeChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+		ReviewFeedback: &model.ReviewFeedbackContext{
+			Summary:  "stale review feedback",
+			Findings: []model.ReviewFinding{{Code: "stale", Summary: "should not carry over"}},
+		},
+	}
+	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run.ReviewGate.FixRoundsUsed = 2
+	record.Run.Recovery = &model.RecoveryCheckpoint{
+		ArtifactID:    "art-1",
+		WorkspacePath: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier),
+		Checkpoint: contract.Checkpoint{
+			Type:        contract.CheckpointTypeRecovery,
+			Summary:     "saved recovery",
+			CapturedAt:  o.now().UTC().Format(time.RFC3339Nano),
+			Stage:       contract.RunPhaseSummaryBlocked,
+			ArtifactIDs: []string{"art-1"},
+			BaseSHA:     "abc123",
+			Branch:      "runner/demo-scope/abc-1",
+		},
+	}
+	record.Session = model.LiveSession{TurnCount: 7, LastCodexMessage: "stale"}
+	record.Intervention = &model.InterventionState{}
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = issue.State
+	o.reindexRecordLocked(issue.ID, record)
+	o.mu.Unlock()
+
+	o.resumeIntervention(context.Background(), issue, contract.InterventionResolution{
+		Action:         contract.ControlActionResolveIntervention,
+		ProvidedInputs: map[string]any{"resolution": "revise_scope"},
+		ResolvedAt:     o.now().UTC().Format(time.RFC3339Nano),
+	})
+
+	current := o.state.Records[issue.ID]
+	if current == nil || current.Run == nil {
+		t.Fatal("run missing after intervention resume")
+	}
+	if current.Run.Attempt != 2 {
+		t.Fatalf("run attempt = %d, want 2", current.Run.Attempt)
+	}
+	if current.Dispatch == nil || current.Dispatch.Kind != model.DispatchKindInterventionRetry {
+		t.Fatalf("dispatch = %#v, want intervention_retry", current.Dispatch)
+	}
+	if current.Dispatch.RecoveryCheckpoint == nil || current.Dispatch.RecoveryCheckpoint.ArtifactID != "art-1" {
+		t.Fatalf("recovery checkpoint = %#v, want art-1", current.Dispatch)
+	}
+	if current.Dispatch.ReviewFeedback != nil {
+		t.Fatalf("review feedback carried over = %#v, want nil", current.Dispatch.ReviewFeedback)
+	}
+	if current.Run.ReviewGate == nil || current.Run.ReviewGate.FixRoundsUsed != 0 {
+		t.Fatalf("review gate = %#v, want fresh run review gate", current.Run.ReviewGate)
+	}
+	if current.Session.TurnCount != 0 || current.Session.LastCodexMessage != "" {
+		t.Fatalf("session = %#v, want cleared transient session", current.Session)
+	}
+	if current.Intervention == nil || current.Intervention.Object.State != contract.InterventionStatusResolved || current.Intervention.Object.Resolution == nil {
+		t.Fatalf("intervention = %#v, want persisted resolved intervention object", current.Intervention)
+	}
+}
+
 func TestFileLedgerStoreRoundTrip(t *testing.T) {
 	cfg := model.SessionPersistenceConfig{
 		Enabled: true,
@@ -812,6 +1360,17 @@ func TestWriteDurableRuntimeStateOverwritesExistingFile(t *testing.T) {
 	}
 	if len(loaded.Records) != 1 || loaded.Records[0].RecordID != "rec_linear_linear-main_2" {
 		t.Fatalf("loaded records = %#v, want overwritten rec_linear_linear-main_2", loaded.Records)
+	}
+}
+
+func takeWorkerResult(t *testing.T, o *Orchestrator) WorkerResult {
+	t.Helper()
+	select {
+	case result := <-o.workerResultCh:
+		return result
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for worker result")
+		return WorkerResult{}
 	}
 }
 
