@@ -9,12 +9,19 @@ const (
 type CodeCategory string
 
 const (
-	CategoryAPI     CodeCategory = "api"
-	CategoryConfig  CodeCategory = "config"
-	CategoryControl CodeCategory = "control"
-	CategoryRecord  CodeCategory = "record"
-	CategoryRuntime CodeCategory = "runtime"
-	CategoryService CodeCategory = "service"
+	CategoryAPI          CodeCategory = "api"
+	CategoryCapability   CodeCategory = "capability"
+	CategoryConfig       CodeCategory = "config"
+	CategoryControl      CodeCategory = "control"
+	CategoryIntervention CodeCategory = "intervention"
+	CategoryJob          CodeCategory = "job"
+	CategoryOutcome      CodeCategory = "outcome"
+	CategoryRecord       CodeCategory = "record"
+	CategoryReference    CodeCategory = "reference"
+	CategoryRun          CodeCategory = "run"
+	CategoryRuntime      CodeCategory = "runtime"
+	CategorySecurity     CodeCategory = "security"
+	CategoryService      CodeCategory = "service"
 )
 
 type ServiceMode string
@@ -82,9 +89,18 @@ type SourceRef struct {
 type ReasonCode string
 
 type Reason struct {
-	ReasonCode ReasonCode     `json:"reason_code"`
-	Category   CodeCategory   `json:"category"`
-	Details    map[string]any `json:"details"`
+	ID              string          `json:"id,omitempty"`
+	ObjectType      ObjectType      `json:"object_type,omitempty"`
+	DomainID        string          `json:"domain_id,omitempty"`
+	ContractVersion APIVersion      `json:"contract_version,omitempty"`
+	CreatedAt       string          `json:"created_at,omitempty"`
+	UpdatedAt       string          `json:"updated_at,omitempty"`
+	Visibility      VisibilityLevel `json:"visibility,omitempty"`
+	ReasonCode      ReasonCode      `json:"reason_code"`
+	Category        CodeCategory    `json:"category"`
+	Summary         string          `json:"summary,omitempty"`
+	Details         map[string]any  `json:"details"`
+	Extensions      Extensions      `json:"extensions,omitempty"`
 }
 
 type ErrorCode string
@@ -100,7 +116,12 @@ type ErrorResponse struct {
 type ControlAction string
 
 const (
-	ControlActionRefresh ControlAction = "refresh"
+	ControlActionRefresh             ControlAction = "refresh"
+	ControlActionCancel              ControlAction = "cancel"
+	ControlActionRetry               ControlAction = "retry"
+	ControlActionResume              ControlAction = "resume"
+	ControlActionResolveIntervention ControlAction = "resolve_intervention"
+	ControlActionTerminate           ControlAction = "terminate"
 )
 
 type ControlStatus string
