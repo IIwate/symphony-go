@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/model/contract"
 )
 
 func TestCreateForIssueCreatesAndReusesWorkspace(t *testing.T) {
@@ -187,6 +188,105 @@ func TestPrepareForRunContinuationNewWorkspaceFallsBackToFreshHook(t *testing.T)
 	}
 	if got := runner.callCount("fresh"); got != 1 {
 		t.Fatalf("fresh before_run call count = %d, want 1", got)
+	}
+}
+
+func TestPrepareForRunUnhealthyContinuationWorkspaceAppliesRecoveryCheckpoint(t *testing.T) {
+	runner := &fakeRunner{stdoutByScript: map[string]string{"git rev-parse HEAD": "def456\n"}}
+	manager := newTestManager(t, runner)
+	workspacePath := filepath.Join(manager.currentConfig().WorkspaceRoot, "ABC-1")
+	if err := os.MkdirAll(filepath.Join(workspacePath, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	patchPath := filepath.Join(t.TempDir(), "checkpoint.patch")
+	if err := os.WriteFile(patchPath, []byte("diff --git a/a.txt b/a.txt\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(patch) error = %v", err)
+	}
+	workspace := &model.Workspace{
+		Path:         workspacePath,
+		WorkspaceKey: "ABC-1",
+		Identifier:   "ABC-1",
+		CreatedNow:   false,
+		Dispatch: &model.DispatchContext{
+			Kind: model.DispatchKindContinuation,
+			RecoveryCheckpoint: &model.RecoveryCheckpoint{
+				PatchPath:     patchPath,
+				WorkspacePath: workspacePath,
+				Checkpoint: contract.Checkpoint{
+					Type:        contract.CheckpointTypeRecovery,
+					Summary:     "已记录恢复 checkpoint。",
+					CapturedAt:  "2026-03-15T00:00:00Z",
+					Stage:       contract.RunPhaseSummaryExecuting,
+					ArtifactIDs: []string{"art-1"},
+					BaseSHA:     "abc123",
+				},
+			},
+		},
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+
+	applyScript := "git apply --3way --whitespace=nowarn '" + strings.ReplaceAll(patchPath, "\\", "/") + "'"
+	if runner.callCount("git rev-parse HEAD") != 1 {
+		t.Fatalf("health check call count = %d, want 1", runner.callCount("git rev-parse HEAD"))
+	}
+	if runner.callCount(applyScript) != 1 {
+		t.Fatalf("apply recovery call count = %d, want 1", runner.callCount(applyScript))
+	}
+	if !workspace.CreatedNow {
+		t.Fatal("workspace.CreatedNow = false, want true after unhealthy recovery reset")
+	}
+}
+
+func TestPrepareForRunHealthyContinuationWorkspaceSkipsRecoveryCheckpointApply(t *testing.T) {
+	patchBody := "diff --git a/a.txt b/a.txt\n"
+	runner := &fakeRunner{stdoutByScript: map[string]string{
+		"git rev-parse HEAD":  "abc123\n",
+		recoveryPatchScript(): patchBody,
+	}}
+	manager := newTestManager(t, runner)
+	workspacePath := filepath.Join(manager.currentConfig().WorkspaceRoot, "ABC-1")
+	if err := os.MkdirAll(filepath.Join(workspacePath, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	patchPath := filepath.Join(t.TempDir(), "checkpoint.patch")
+	if err := os.WriteFile(patchPath, []byte(patchBody), 0o644); err != nil {
+		t.Fatalf("WriteFile(patch) error = %v", err)
+	}
+	workspace := &model.Workspace{
+		Path:         workspacePath,
+		WorkspaceKey: "ABC-1",
+		Identifier:   "ABC-1",
+		CreatedNow:   false,
+		Dispatch: &model.DispatchContext{
+			Kind: model.DispatchKindContinuation,
+			RecoveryCheckpoint: &model.RecoveryCheckpoint{
+				PatchPath:     patchPath,
+				WorkspacePath: workspacePath,
+				Checkpoint: contract.Checkpoint{
+					Type:        contract.CheckpointTypeRecovery,
+					Summary:     "已记录恢复 checkpoint。",
+					CapturedAt:  "2026-03-15T00:00:00Z",
+					Stage:       contract.RunPhaseSummaryExecuting,
+					ArtifactIDs: []string{"art-1"},
+					BaseSHA:     "abc123",
+				},
+			},
+		},
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+
+	applyScript := "git apply --3way --whitespace=nowarn '" + strings.ReplaceAll(patchPath, "\\", "/") + "'"
+	if runner.callCount(applyScript) != 0 {
+		t.Fatalf("apply recovery call count = %d, want 0", runner.callCount(applyScript))
+	}
+	if workspace.CreatedNow {
+		t.Fatal("workspace.CreatedNow = true, want false when health check passes")
 	}
 }
 

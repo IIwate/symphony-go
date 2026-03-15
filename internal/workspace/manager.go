@@ -110,6 +110,9 @@ func (m *LocalManager) PrepareForRun(ctx context.Context, workspace *model.Works
 	if workspace == nil {
 		return model.NewWorkspaceError(model.ErrWorkspacePathConflict, "workspace is nil", nil)
 	}
+	if _, err := m.ensureRecoveryWorkspace(ctx, workspace); err != nil {
+		return err
+	}
 
 	for _, name := range []string{"tmp", ".elixir_ls"} {
 		path := filepath.Join(workspace.Path, name)
@@ -121,6 +124,11 @@ func (m *LocalManager) PrepareForRun(ctx context.Context, workspace *model.Works
 	cfg := m.currentConfig()
 	if hookName, hookScript := m.beforeRunHook(workspace, cfg); hookScript != nil {
 		if err := m.runFatalHook(ctx, workspace.Path, hookName, *hookScript, hookEnvForWorkspace(workspace)); err != nil {
+			return err
+		}
+	}
+	if checkpoint := recoveryCheckpointForWorkspace(workspace); checkpoint != nil && workspace.CreatedNow {
+		if err := m.applyRecoveryCheckpoint(ctx, workspace, checkpoint); err != nil {
 			return err
 		}
 	}
@@ -138,6 +146,112 @@ func (m *LocalManager) PrepareForRun(ctx context.Context, workspace *model.Works
 	}
 
 	workspace.GitAuthorName, workspace.GitAuthorEmail = m.resolveCommitIdentity(ctx, workspace.Path, workspace.BranchNamespace)
+	return nil
+}
+
+func recoveryCheckpointForWorkspace(workspace *model.Workspace) *model.RecoveryCheckpoint {
+	if workspace == nil || workspace.Dispatch == nil {
+		return nil
+	}
+	return workspace.Dispatch.RecoveryCheckpoint
+}
+
+func recoveryPatchScript() string {
+	return `git diff --binary --no-color --no-ext-diff HEAD -- .
+while IFS= read -r file; do
+  git diff --binary --no-color --no-ext-diff --no-index -- /dev/null "$file" || true
+done < <(git ls-files --others --exclude-standard)`
+}
+
+func (m *LocalManager) ensureRecoveryWorkspace(ctx context.Context, workspace *model.Workspace) (bool, error) {
+	checkpoint := recoveryCheckpointForWorkspace(workspace)
+	if checkpoint == nil || workspace == nil {
+		return false, nil
+	}
+	if workspace.CreatedNow {
+		return true, nil
+	}
+	healthy, err := m.workspaceHealthy(ctx, workspace.Path, checkpoint)
+	if err != nil {
+		return false, err
+	}
+	if healthy {
+		return false, nil
+	}
+	if err := os.RemoveAll(workspace.Path); err != nil {
+		return false, model.NewWorkspaceError(model.ErrWorkspacePathConflict, fmt.Sprintf("reset unhealthy workspace %q", workspace.Path), err)
+	}
+	if err := os.MkdirAll(workspace.Path, 0o755); err != nil {
+		return false, model.NewWorkspaceError(model.ErrWorkspacePathConflict, fmt.Sprintf("recreate workspace %q", workspace.Path), err)
+	}
+	workspace.CreatedNow = true
+	return true, nil
+}
+
+func (m *LocalManager) workspaceHealthy(ctx context.Context, workspacePath string, checkpoint *model.RecoveryCheckpoint) (bool, error) {
+	if checkpoint == nil {
+		return true, nil
+	}
+	absWorkspace, err := filepath.Abs(workspacePath)
+	if err == nil && strings.TrimSpace(checkpoint.WorkspacePath) != "" {
+		absCheckpoint, absErr := filepath.Abs(checkpoint.WorkspacePath)
+		if absErr == nil && !strings.EqualFold(absWorkspace, absCheckpoint) {
+			return false, nil
+		}
+	}
+	if _, err := os.Stat(filepath.Join(workspacePath, ".git")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, model.NewWorkspaceError(model.ErrWorkspacePathConflict, fmt.Sprintf("stat git metadata in %q", workspacePath), err)
+	}
+	if strings.TrimSpace(checkpoint.Checkpoint.BaseSHA) == "" {
+		return true, nil
+	}
+	stdout, _, err := m.runCommand(ctx, workspacePath, "git rev-parse HEAD")
+	if err != nil {
+		return false, nil
+	}
+	if strings.TrimSpace(stdout) != strings.TrimSpace(checkpoint.Checkpoint.BaseSHA) {
+		return false, nil
+	}
+	patchPath := strings.TrimSpace(checkpoint.PatchPath)
+	if patchPath == "" {
+		return true, nil
+	}
+	patchBody, err := os.ReadFile(patchPath)
+	if err != nil {
+		return false, nil
+	}
+	if len(patchBody) == 0 {
+		return true, nil
+	}
+	currentPatch, _, err := m.runCommand(ctx, workspacePath, recoveryPatchScript())
+	if err != nil {
+		return false, nil
+	}
+	return string(patchBody) == currentPatch, nil
+}
+
+func (m *LocalManager) applyRecoveryCheckpoint(ctx context.Context, workspace *model.Workspace, checkpoint *model.RecoveryCheckpoint) error {
+	if workspace == nil || checkpoint == nil {
+		return nil
+	}
+	patchPath := strings.TrimSpace(checkpoint.PatchPath)
+	if patchPath == "" {
+		return model.NewWorkspaceError(model.ErrWorkspacePathConflict, "recovery checkpoint patch path is empty", nil)
+	}
+	info, err := os.Stat(patchPath)
+	if err != nil {
+		return model.NewWorkspaceError(model.ErrWorkspacePathConflict, fmt.Sprintf("stat recovery checkpoint %q", patchPath), err)
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+	normalizedPatch := strings.ReplaceAll(patchPath, "\\", "/")
+	if _, _, err := m.runCommand(ctx, workspace.Path, fmt.Sprintf("git apply --3way --whitespace=nowarn %s", bashSingleQuote(normalizedPatch))); err != nil {
+		return model.NewWorkspaceError(model.ErrWorkspaceHookFailed, fmt.Sprintf("apply recovery checkpoint %q", patchPath), err)
+	}
 	return nil
 }
 
@@ -831,6 +945,20 @@ func hookEnvForWorkspace(workspace *model.Workspace) map[string]string {
 	if dispatch.PreviousPR != nil {
 		env["SYMPHONY_PREVIOUS_PR_NUMBER"] = strconv.Itoa(dispatch.PreviousPR.Number)
 		env["SYMPHONY_PREVIOUS_PR_STATE"] = dispatch.PreviousPR.State
+	}
+	if dispatch.RecoveryCheckpoint != nil {
+		if dispatch.RecoveryCheckpoint.PatchPath != "" {
+			env["SYMPHONY_RECOVERY_PATCH_PATH"] = dispatch.RecoveryCheckpoint.PatchPath
+		}
+		if dispatch.RecoveryCheckpoint.Checkpoint.BaseSHA != "" {
+			env["SYMPHONY_RECOVERY_BASE_SHA"] = dispatch.RecoveryCheckpoint.Checkpoint.BaseSHA
+		}
+		if dispatch.RecoveryCheckpoint.Checkpoint.Branch != "" {
+			env["SYMPHONY_RECOVERY_BRANCH"] = dispatch.RecoveryCheckpoint.Checkpoint.Branch
+		}
+		if dispatch.RecoveryCheckpoint.HiddenRef != "" {
+			env["SYMPHONY_RECOVERY_REF"] = dispatch.RecoveryCheckpoint.HiddenRef
+		}
 	}
 	return env
 }

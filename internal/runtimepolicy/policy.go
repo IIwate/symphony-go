@@ -199,6 +199,12 @@ func firstHotReloadAllowedChange(currentCfg *model.ServiceConfig, newCfg *model.
 		return "runtime.agent.max_concurrent_agents"
 	case currentCfg.MaxRetryBackoffMS != newCfg.MaxRetryBackoffMS:
 		return "runtime.agent.max_retry_backoff_ms"
+	case currentCfg.RunBudgetTotalMS != newCfg.RunBudgetTotalMS:
+		return "runtime.agent.run_budget_ms.total"
+	case currentCfg.RunExecutionBudgetMS != newCfg.RunExecutionBudgetMS:
+		return "runtime.agent.run_budget_ms.execution"
+	case currentCfg.RunReviewFixBudgetMS != newCfg.RunReviewFixBudgetMS:
+		return "runtime.agent.run_budget_ms.review_fix"
 	case !reflect.DeepEqual(currentCfg.MaxConcurrentAgentsByState, newCfg.MaxConcurrentAgentsByState):
 		return "runtime.agent.max_concurrent_agents_by_state"
 	case currentCfg.CodexReadTimeoutMS != newCfg.CodexReadTimeoutMS:

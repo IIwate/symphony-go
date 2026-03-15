@@ -99,6 +99,9 @@ type ExecutionContract struct {
 	MaxConcurrentAgents        int
 	MaxTurns                   int
 	MaxRetryBackoffMS          int
+	RunBudgetTotalMS           int
+	RunExecutionBudgetMS       int
+	RunReviewFixBudgetMS       int
 	MaxConcurrentAgentsByState map[string]int
 	HookAfterCreate            *string
 	HookBeforeRun              *string
@@ -221,6 +224,9 @@ func ParseWorkflowContract(def *model.WorkflowDefinition) (WorkflowContract, err
 			MaxConcurrentAgents:        10,
 			MaxTurns:                   20,
 			MaxRetryBackoffMS:          300000,
+			RunBudgetTotalMS:           3600000,
+			RunExecutionBudgetMS:       3600000,
+			RunReviewFixBudgetMS:       0,
 			MaxConcurrentAgentsByState: map[string]int{},
 			HookTimeoutMS:              60000,
 			Codex: CodexBackendContract{
@@ -299,6 +305,17 @@ func ParseWorkflowContract(def *model.WorkflowDefinition) (WorkflowContract, err
 	if value, ok := getInt(executionAgent, "max_retry_backoff_ms"); ok && value > 0 {
 		contractConfig.Execution.MaxRetryBackoffMS = value
 	}
+	if budgets := getMap(executionAgent, "run_budget_ms"); len(budgets) > 0 {
+		if value, ok := getInt(budgets, "total"); ok && value > 0 {
+			contractConfig.Execution.RunBudgetTotalMS = value
+		}
+		if value, ok := getInt(budgets, "execution"); ok && value > 0 {
+			contractConfig.Execution.RunExecutionBudgetMS = value
+		}
+		if value, ok := getInt(budgets, "review_fix"); ok && value >= 0 {
+			contractConfig.Execution.RunReviewFixBudgetMS = value
+		}
+	}
 	if byState := getMap(executionAgent, "max_concurrent_agents_by_state"); len(byState) > 0 {
 		contractConfig.Execution.MaxConcurrentAgentsByState = normalizePositiveIntMap(byState)
 	}
@@ -324,6 +341,12 @@ func ParseWorkflowContract(def *model.WorkflowDefinition) (WorkflowContract, err
 	codexMap := getMap(getMap(executionMap, "backend"), "codex")
 	if value, ok := getInt(codexMap, "turn_timeout_ms"); ok && value > 0 {
 		contractConfig.Execution.Codex.TurnTimeoutMS = value
+		if !hasKey(getMap(executionAgent, "run_budget_ms"), "execution") {
+			contractConfig.Execution.RunExecutionBudgetMS = value
+		}
+		if !hasKey(getMap(executionAgent, "run_budget_ms"), "total") {
+			contractConfig.Execution.RunBudgetTotalMS = value + contractConfig.Execution.RunReviewFixBudgetMS
+		}
 	}
 	if value, ok := getInt(codexMap, "read_timeout_ms"); ok && value > 0 {
 		contractConfig.Execution.Codex.ReadTimeoutMS = value
@@ -521,6 +544,14 @@ func valueAsMap(value any) map[string]any {
 	}
 }
 
+func hasKey(source map[string]any, key string) bool {
+	if len(source) == 0 {
+		return false
+	}
+	_, ok := source[key]
+	return ok
+}
+
 func parseJobTypes(source map[string]any) []contract.JobType {
 	values, ok := getStringSlice(source, "supported_types")
 	if !ok || len(values) == 0 {
@@ -605,6 +636,18 @@ func validateWorkflowContract(cfg WorkflowContract) error {
 	}
 	if strings.TrimSpace(cfg.Execution.Codex.Command) == "" {
 		return model.NewWorkflowError(model.ErrInvalidCodexCommand, "execution.backend.codex.command is required", nil)
+	}
+	if cfg.Execution.RunExecutionBudgetMS <= 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.execution must be > 0", nil)
+	}
+	if cfg.Execution.RunReviewFixBudgetMS < 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.review_fix must be >= 0", nil)
+	}
+	if cfg.Execution.RunBudgetTotalMS <= 0 {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.total must be > 0", nil)
+	}
+	if cfg.Execution.RunBudgetTotalMS < cfg.Execution.RunExecutionBudgetMS+cfg.Execution.RunReviewFixBudgetMS {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, "execution.agent.run_budget_ms.total must be >= execution + review_fix", nil)
 	}
 	if cfg.JobPolicy.DispatchFlow == "" {
 		return model.NewWorkflowError(model.ErrWorkflowParseError, "job_policy.dispatch_flow is required", nil)

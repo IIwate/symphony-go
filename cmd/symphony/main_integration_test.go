@@ -446,6 +446,9 @@ func newIntegrationServiceConfig(t *testing.T) *model.ServiceConfig {
 		MaxConcurrentAgents:        1,
 		MaxTurns:                   1,
 		MaxRetryBackoffMS:          100,
+		RunBudgetTotalMS:           1000,
+		RunExecutionBudgetMS:       1000,
+		RunReviewFixBudgetMS:       0,
 		CodexCommand:               "codex app-server",
 	}
 }
