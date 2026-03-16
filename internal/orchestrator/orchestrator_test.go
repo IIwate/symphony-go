@@ -621,6 +621,62 @@ func TestClassifySuccessfulRunReturnsCompletedForMergedTerminalSource(t *testing
 	}
 }
 
+func TestClassifySuccessfulRunReturnsCompletedForOpenPRCodeChange(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	o.prLookup = fakePRLookup{
+		find: func(context.Context, string, string) (*PullRequestInfo, error) {
+			return &PullRequestInfo{
+				Number:     10,
+				URL:        "https://example.invalid/pr/10",
+				State:      PullRequestStateOpen,
+				HeadBranch: "feature/abc-10",
+			}, nil
+		},
+	}
+
+	decision, err := o.classifySuccessfulRun(
+		context.Background(),
+		filepath.Join(o.currentConfig().WorkspaceRoot, "ABC-10"),
+		"feature/abc-10",
+		freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion)),
+		"In Progress",
+	)
+	if err != nil {
+		t.Fatalf("classifySuccessfulRun() error = %v", err)
+	}
+	if decision.Disposition != DispositionCompleted {
+		t.Fatalf("decision.Disposition = %q, want %q", decision.Disposition, DispositionCompleted)
+	}
+}
+
+func TestClassifySuccessfulRunReturnsCompletedForMergedActiveCodeChange(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	o.prLookup = fakePRLookup{
+		find: func(context.Context, string, string) (*PullRequestInfo, error) {
+			return &PullRequestInfo{
+				Number:     11,
+				URL:        "https://example.invalid/pr/11",
+				State:      PullRequestStateMerged,
+				HeadBranch: "feature/abc-11",
+			}, nil
+		},
+	}
+
+	decision, err := o.classifySuccessfulRun(
+		context.Background(),
+		filepath.Join(o.currentConfig().WorkspaceRoot, "ABC-11"),
+		"feature/abc-11",
+		freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion)),
+		"In Progress",
+	)
+	if err != nil {
+		t.Fatalf("classifySuccessfulRun() error = %v", err)
+	}
+	if decision.Disposition != DispositionCompleted {
+		t.Fatalf("decision.Disposition = %q, want %q", decision.Disposition, DispositionCompleted)
+	}
+}
+
 func TestOrchestratorStateDoesNotExposeLegacyBucketFields(t *testing.T) {
 	typ := reflect.TypeOf(model.OrchestratorState{})
 	disallowed := map[string]struct{}{
@@ -982,13 +1038,50 @@ func TestConservativeRecoveryMovesUnknownActiveRecordToAwaitingIntervention(t *t
 	}
 }
 
-func TestConservativeRecoveryCanPromoteToAwaitingMerge(t *testing.T) {
+func TestConservativeRecoveryCompletesCodeChangeAtReviewablePR(t *testing.T) {
 	o, trackerClient, _ := newTestOrchestrator(t)
 	issue := newIssue("1", "ABC-1", "In Progress")
 	trackerClient.issuesByID[issue.ID] = issue
 	record := o.ensureRecordLocked(issue)
 	record.NeedsRecovery = true
 	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+	setTestWorkspacePath(record, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier))
+	setTestBranchReference(record, "feature/abc-1", o.now().UTC().Format(time.RFC3339Nano))
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run.Object.ReviewGate.Status = contract.ReviewGateStatusPassed
+	syncRunStateMirrorsFromObject(record.Run)
+	o.prLookup = fakePRLookup{
+		find: func(context.Context, string, string) (*PullRequestInfo, error) {
+			return &PullRequestInfo{Number: 42, URL: "https://github.example/pr/42", State: PullRequestStateOpen, HeadBranch: "feature/abc-1"}, nil
+		},
+	}
+
+	o.reconcileRecovering(context.Background())
+
+	if current := o.candidateDeliveryForIssueLocked(issue.ID); current != nil {
+		t.Fatalf("candidateDeliveryForIssueLocked() = %#v, want nil for completed code_change", current)
+	}
+	if len(o.state.ArchivedJobs) != 1 {
+		t.Fatalf("ArchivedJobs size = %d, want 1", len(o.state.ArchivedJobs))
+	}
+	if got := o.state.ArchivedJobs[0].Outcome.State; got != contract.OutcomeConclusionSucceeded {
+		t.Fatalf("Outcome.State = %q, want %q", got, contract.OutcomeConclusionSucceeded)
+	}
+}
+
+func TestConservativeRecoveryCanPromoteLandChangeToAwaitingMerge(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	record := o.ensureRecordLocked(issue)
+	record.NeedsRecovery = true
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeLandChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
 	setTestWorkspacePath(record, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier))
 	setTestBranchReference(record, "feature/abc-1", o.now().UTC().Format(time.RFC3339Nano))
 	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
@@ -1049,7 +1142,13 @@ func TestReconcileAwaitingMergeKeepsPersistedPRWhenRefreshReturnsNil(t *testing.
 		},
 	}
 	record := o.ensureRecordLocked(issue)
-	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeLandChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
 	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	o.moveToAwaitingMerge(
 		issue.ID,
@@ -1078,6 +1177,45 @@ func TestReconcileAwaitingMergeKeepsPersistedPRWhenRefreshReturnsNil(t *testing.
 	}
 	if current.Lifecycle != model.JobLifecycleAwaitingMerge {
 		t.Fatalf("Lifecycle = %q, want %q", current.Lifecycle, model.JobLifecycleAwaitingMerge)
+	}
+}
+
+func TestReconcileAwaitingMergeCompletesLegacyCodeChangeRecord(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	record := o.ensureRecordLocked(issue)
+	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	o.moveToAwaitingMerge(
+		issue.ID,
+		issue.Identifier,
+		issue.State,
+		filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier),
+		"feature/abc-1",
+		1,
+		0,
+		&PullRequestInfo{
+			Number:    42,
+			URL:       "https://github.example/pr/42",
+			State:     PullRequestStateOpen,
+			BaseOwner: "IIwate",
+			BaseRepo:  "symphony-go",
+			HeadOwner: "IIwate",
+		},
+		nil,
+	)
+
+	o.reconcileAwaitingMerge(context.Background())
+
+	if current := o.candidateDeliveryForIssueLocked(issue.ID); current != nil {
+		t.Fatalf("candidateDeliveryForIssueLocked() = %#v, want nil after code_change completion", current)
+	}
+	if len(o.state.ArchivedJobs) != 1 || o.state.ArchivedJobs[0].Outcome == nil {
+		t.Fatalf("ArchivedJobs = %#v, want completed archived code_change", o.state.ArchivedJobs)
+	}
+	if got := o.state.ArchivedJobs[0].Outcome.State; got != contract.OutcomeConclusionSucceeded {
+		t.Fatalf("Outcome.State = %q, want %q", got, contract.OutcomeConclusionSucceeded)
 	}
 }
 
@@ -1491,12 +1629,17 @@ func TestResumeRecoveredSuccessPathLaunchesReadOnlyReviewer(t *testing.T) {
 	}
 	o.handleWorkerExit(reviewResult)
 
-	current := o.candidateDeliveryForIssueLocked(issue.ID)
-	if current == nil {
-		t.Fatal("awaitingMerge record missing after passed review")
+	if current := o.candidateDeliveryForIssueLocked(issue.ID); current != nil {
+		t.Fatalf("candidateDeliveryForIssueLocked() = %#v, want nil after completed code_change review", current)
 	}
-	if current.Run == nil || current.Run.ReviewGate == nil || current.Run.ReviewGate.Status != contract.ReviewGateStatusPassed {
-		t.Fatalf("review gate = %#v, want passed", current.Run)
+	if len(o.state.ArchivedJobs) != 1 || o.state.ArchivedJobs[0].Run == nil {
+		t.Fatalf("ArchivedJobs = %#v, want completed archived code_change", o.state.ArchivedJobs)
+	}
+	if o.state.ArchivedJobs[0].Run.ReviewGate == nil || o.state.ArchivedJobs[0].Run.ReviewGate.Status != contract.ReviewGateStatusPassed {
+		t.Fatalf("review gate = %#v, want passed", o.state.ArchivedJobs[0].Run)
+	}
+	if o.state.ArchivedJobs[0].Outcome == nil || o.state.ArchivedJobs[0].Outcome.State != contract.OutcomeConclusionSucceeded {
+		t.Fatalf("outcome = %#v, want succeeded", o.state.ArchivedJobs[0].Outcome)
 	}
 }
 

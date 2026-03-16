@@ -2614,6 +2614,14 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 	}
 	switch pr.State {
 	case PullRequestStateOpen:
+		if jobType == contract.JobTypeCodeChange {
+			return &SuccessfulRunDecision{
+				Disposition:     DispositionCompleted,
+				ExpectedOutcome: completion.Mode,
+				PR:              clonePullRequestInfo(pr),
+				FinalBranch:     branch,
+			}, nil
+		}
 		return &SuccessfulRunDecision{
 			Disposition:     DispositionAwaitingMerge,
 			ExpectedOutcome: completion.Mode,
@@ -2621,7 +2629,7 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 			FinalBranch:     branch,
 		}, nil
 	case PullRequestStateMerged:
-		if jobType == contract.JobTypeLandChange {
+		if jobType == contract.JobTypeLandChange || jobType == contract.JobTypeCodeChange {
 			return &SuccessfulRunDecision{
 				Disposition:     DispositionCompleted,
 				ExpectedOutcome: completion.Mode,
@@ -2637,10 +2645,8 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 				FinalBranch:     branch,
 			}, nil
 		}
-		reason := model.ContinuationReasonMergedPRNotTerminal
 		return &SuccessfulRunDecision{
-			Disposition:     DispositionAwaitingIntervention,
-			Reason:          &reason,
+			Disposition:     DispositionCompleted,
 			ExpectedOutcome: completion.Mode,
 			PR:              clonePullRequestInfo(pr),
 			FinalBranch:     branch,
@@ -3178,6 +3184,11 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 			}
 		}
 
+		if jobTypeForDispatch(entry.Dispatch) == contract.JobTypeCodeChange {
+			o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
+			continue
+		}
+
 		pr, err := o.lookupAwaitingMergePullRequest(ctx, recordWorkspacePath(entry), entry)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -3278,7 +3289,7 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 				o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
 				continue
 			}
-			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonMergedPRNotTerminal), issue.State, pr)
+			o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
 		case PullRequestStateClosed:
 			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonClosedUnmergedPR), entry.SourceState, pr)
 		default:

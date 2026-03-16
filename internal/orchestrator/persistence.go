@@ -1023,6 +1023,8 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 			o.markRunCandidateDelivery(entry, decision.PR)
 		} else if decision.Disposition == DispositionCompleted {
 			switch jobTypeForDispatch(entry.Dispatch) {
+			case contract.JobTypeCodeChange, contract.JobTypeLandChange:
+				o.markRunCandidateDelivery(entry, decision.PR)
 			case contract.JobTypeAnalysis, contract.JobTypeDiagnostic:
 				o.markRunCandidateDelivery(entry, nil)
 			}

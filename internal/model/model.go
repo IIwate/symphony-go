@@ -83,7 +83,6 @@ const (
 	ContinuationReasonUnfinishedIssue          ContinuationReason = "unfinished_issue"
 	ContinuationReasonMissingPR                ContinuationReason = "missing_pr"
 	ContinuationReasonClosedUnmergedPR         ContinuationReason = "pr_closed_unmerged"
-	ContinuationReasonMergedPRNotTerminal      ContinuationReason = "merged_pr_source_not_terminal"
 	ContinuationReasonExecutionBudgetExhausted ContinuationReason = "execution_budget_exhausted"
 	ContinuationReasonRecoverableRuntimeError  ContinuationReason = "recoverable_runtime_error"
 	ContinuationReasonTrackerIssueMissing      ContinuationReason = "tracker_issue_missing_during_recovery"

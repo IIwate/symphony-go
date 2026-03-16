@@ -15,7 +15,7 @@ from threading import Lock, Thread
 import time
 from typing import Callable
 
-from live_smoke.github import close_pull_request, ensure_gh_auth, git_env, merge_pull_request, prepare_pull_request
+from live_smoke.github import close_pull_request, ensure_gh_auth, git_env, prepare_pull_request
 from live_smoke.linear import LinearClient, TeamContext
 from live_smoke.paths import repo_root, temp_root
 from live_smoke.shell import require_command, run
@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             _run_step(
                 results,
-                "awaiting_merge_to_done",
+                "candidate_delivery_to_completed",
                 lambda: _run_merge_path_smoke(
                     resources,
                     linear,
@@ -611,16 +611,16 @@ def _run_merge_path_smoke(
             process,
             expected_event="snapshot",
             timeout_seconds=15,
-            description="awaiting_merge snapshot event",
+            description="candidate_delivery snapshot event",
         )
         control_payload = _assert_refresh_contract(base_url)
         if control_payload["status"] != "accepted":
-            raise RuntimeError(f"awaiting_merge refresh status mismatch: {control_payload}")
+            raise RuntimeError(f"candidate_delivery refresh status mismatch: {control_payload}")
         _wait_for(
             lambda: _read_sse_event(events, "object_changed"),
             process,
             timeout_seconds=60,
-            description="awaiting_merge object_changed",
+            description="candidate_delivery object_changed",
         )
         identifier = str(issue["identifier"])
         run = _wait_for(
@@ -634,72 +634,12 @@ def _run_merge_path_smoke(
             ),
             process,
             timeout_seconds=120,
-            description="awaiting_merge candidate delivery run",
+            description="candidate_delivery run",
             interval_seconds=0.5,
         )
         pr_ref = _require_reference(run, "github_pull_request")
         if int(str(pr_ref["external_id"])) != pr.number:
-            raise RuntimeError(f"awaiting_merge pr_number mismatch: {pr_ref['external_id']} != {pr.number}")
-
-        merge_pull_request(repo, pr.number)
-        resources.pull_request_numbers.remove(pr.number)
-        control_payload = _assert_refresh_contract(base_url)
-        if control_payload["status"] != "accepted":
-            raise RuntimeError(f"merged_pr_source_not_terminal refresh status mismatch: {control_payload}")
-        _wait_for(
-            lambda: _read_sse_event(events, "object_changed"),
-            process,
-            timeout_seconds=60,
-            description="merged_pr_source_not_terminal object_changed",
-        )
-        job = _wait_for(
-            lambda: _find_object_by_source_identifier(base_url, "job", identifier, state="intervention_required"),
-            process,
-            timeout_seconds=120,
-            description="merged_pr_source_not_terminal intervention_required job",
-            interval_seconds=0.5,
-        )
-        run = _wait_for(
-            lambda: _find_object_by_source_identifier(base_url, "run", identifier, state="intervention_required"),
-            process,
-            timeout_seconds=120,
-            description="merged_pr_source_not_terminal intervention_required run",
-            interval_seconds=0.5,
-        )
-        intervention = _wait_for(
-            lambda: (
-                related
-                if (related := _find_related_object(base_url, run, relation_type="run.intervention", target_type="intervention")) is not None
-                and related.get("state") == "open"
-                else None
-            ),
-            process,
-            timeout_seconds=120,
-            description="merged_pr_source_not_terminal open intervention",
-            interval_seconds=0.5,
-        )
-        reason = _require_reason_from_object(intervention, "run.blocked.intervention_required")
-        if reason.get("details", {}).get("cause") != "merged_pr_source_not_terminal":
-            raise RuntimeError(f"unexpected merged intervention reason: {reason}")
-        if job.get("state") != "intervention_required":
-            raise RuntimeError(f"job state mismatch: {job}")
-
-        linear.update_issue_state(str(issue["id"]), context.done_state_id)
-        control_payload = _assert_refresh_contract(base_url)
-        if control_payload["status"] != "accepted":
-            raise RuntimeError(f"completed refresh status mismatch: {control_payload}")
-        _wait_for(
-            lambda: _await_linear_done(linear, str(issue["id"])),
-            process,
-            timeout_seconds=120,
-            description="issue done after external source close",
-        )
-        _wait_for(
-            lambda: _read_sse_event(events, "object_changed"),
-            process,
-            timeout_seconds=60,
-            description="completed object_changed",
-        )
+            raise RuntimeError(f"candidate_delivery pr_number mismatch: {pr_ref['external_id']} != {pr.number}")
         completed_job = _wait_for(
             lambda: _find_object_by_source_identifier(base_url, "job", identifier, state="completed"),
             process,
@@ -723,7 +663,7 @@ def _run_merge_path_smoke(
         process.stop()
         resources.processes.remove(process)
         resources.issue_ids.remove(str(issue["id"]))
-    return f"{issue['identifier']} -> candidate_delivery -> intervention_required(merged_pr_source_not_terminal) -> outcome.succeeded"
+    return f"{issue['identifier']} -> candidate_delivery(reviewable_pr_created) -> outcome.succeeded"
 
 
 def _run_runtime_extensions_smoke(
@@ -1021,80 +961,6 @@ def _run_recovery_ledger_smoke(
         if int(str(restored_pr_ref["external_id"])) != pr.number:
             raise RuntimeError(f"formal_objects restored pr mismatch: {restored_pr_ref['external_id']} != {pr.number}")
 
-        merge_pull_request(repo, pr.number)
-        resources.pull_request_numbers.remove(pr.number)
-        _wait_for(
-            lambda: _read_sse_event(events, "object_changed"),
-            process,
-            timeout_seconds=60,
-            description="formal_objects merged intervention object_changed",
-        )
-        merge_job = _wait_for(
-            lambda: _find_object_by_source_identifier(base_url, "job", merge_identifier, state="intervention_required"),
-            process,
-            timeout_seconds=180,
-            description="formal_objects merged intervention job",
-            interval_seconds=0.5,
-        )
-        merge_run = _wait_for(
-            lambda: _find_object_by_source_identifier(base_url, "run", merge_identifier, state="intervention_required"),
-            process,
-            timeout_seconds=180,
-            description="formal_objects merged intervention run",
-            interval_seconds=0.5,
-        )
-        intervention = _wait_for(
-            lambda: (
-                related
-                if (related := _find_related_object(base_url, merge_run, relation_type="run.intervention", target_type="intervention")) is not None
-                and related.get("state") == "open"
-                else None
-            ),
-            process,
-            timeout_seconds=180,
-            description="formal_objects merged open intervention",
-            interval_seconds=0.5,
-        )
-        intervention_reason = _require_reason_from_object(intervention, "run.blocked.intervention_required")
-        if intervention_reason.get("details", {}).get("cause") != "merged_pr_source_not_terminal":
-            raise RuntimeError(f"unexpected formal_objects merge intervention reason: {intervention_reason}")
-        _wait_for(
-            lambda: _await_session_state_object(session_state_path, "job", merge_identifier, state="intervention_required"),
-            process,
-            timeout_seconds=15,
-            description="formal_objects merged intervention persisted",
-            interval_seconds=0.2,
-        )
-        _wait_for(
-            lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_intervention_required") or None,
-            process,
-            timeout_seconds=60,
-            description="formal_objects webhook intervention notification after merge",
-            interval_seconds=0.5,
-        )
-        _wait_for(
-            lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_intervention_required") or None,
-            process,
-            timeout_seconds=60,
-            description="formal_objects slack intervention notification after merge",
-            interval_seconds=0.5,
-        )
-        if merge_job.get("state") != "intervention_required":
-            raise RuntimeError(f"merged job state mismatch: {merge_job}")
-
-        linear.update_issue_state(str(merge_issue["id"]), context.done_state_id)
-        _wait_for(
-            lambda: _await_linear_done(linear, str(merge_issue["id"])),
-            process,
-            timeout_seconds=180,
-            description="formal_objects issue done after external source close",
-        )
-        _wait_for(
-            lambda: _read_sse_event(events, "object_changed"),
-            process,
-            timeout_seconds=60,
-            description="formal_objects completed object_changed",
-        )
         completed_job = _wait_for(
             lambda: _find_object_by_source_identifier(base_url, "job", merge_identifier, state="completed"),
             process,
@@ -1136,7 +1002,7 @@ def _run_recovery_ledger_smoke(
         linear.update_issue_state(str(persistence_issue["id"]), context.canceled_state_id)
         resources.issue_ids.remove(str(persistence_issue["id"]))
         resources.issue_ids.remove(str(merge_issue["id"]))
-        return f"{persistence_identifier}/intervention_required + {merge_identifier}/candidate_delivery_then_intervention -> outcome.succeeded recovered from session_state"
+        return f"{persistence_identifier}/intervention_required + {merge_identifier}/candidate_delivery_then_completed -> outcome.succeeded recovered from session_state"
     finally:
         if events is not None:
             events.close()
