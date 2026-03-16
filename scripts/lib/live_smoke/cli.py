@@ -1162,7 +1162,35 @@ def _run_unavailable_ledger_smoke(
 
 
 def _linear_branch_name(namespace: str, branch_scope: str, identifier: str) -> str:
-    return f"{namespace}/linear-{_slugify(branch_scope)}-{_slugify(identifier)}"
+    issue_short = f"linear-{_slugify(branch_scope)}-{_slugify(identifier)}"
+    return _build_runtime_branch_name(namespace, issue_short)
+
+
+def _build_runtime_branch_name(namespace: str, issue_short: str, suffix: str = "") -> str:
+    branch = f"{namespace}/{issue_short}"
+    if suffix.strip():
+        branch += f"-{suffix}"
+    if len(branch) <= 64:
+        return branch
+
+    max_namespace_len = 64 - 1 - len(issue_short)
+    if suffix.strip():
+        max_namespace_len -= len(suffix) + 1
+    if max_namespace_len < 1:
+        max_namespace_len = 1
+
+    trimmed_namespace = namespace.strip("-")
+    if len(trimmed_namespace) > max_namespace_len:
+        trimmed_namespace = trimmed_namespace[:max_namespace_len].strip("-")
+    if not trimmed_namespace:
+        trimmed_namespace = "w"
+
+    branch = f"{trimmed_namespace}/{issue_short}"
+    if suffix.strip():
+        branch += f"-{suffix}"
+    if len(branch) > 64:
+        branch = branch[:64].rstrip("-/")
+    return branch
 
 
 def _slugify(value: str) -> str:

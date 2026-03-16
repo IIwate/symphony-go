@@ -1648,6 +1648,9 @@ func TestResumeRecoveredSuccessPathLaunchesReadOnlyReviewer(t *testing.T) {
 	if !strings.Contains(params.RawPrompt, "Read-only review only") {
 		t.Fatalf("review prompt = %q, want readonly instruction", params.RawPrompt)
 	}
+	if !strings.Contains(params.RawPrompt, "Pull request: #12 https://example.test/pr/12 (open)") {
+		t.Fatalf("review prompt = %q, want pull request state carried into recovery review", params.RawPrompt)
+	}
 
 	reviewResult := takeWorkerResult(t, o)
 	if reviewResult.Kind != WorkerKindReview {

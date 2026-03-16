@@ -1055,12 +1055,10 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 				return nil
 			}
 			startedAt := o.now().UTC()
+			restoreRecoveredRuntimeState(current, entry, issueState)
 			current.StartedAt = &startedAt
 			current.WorkerCancel = cancel
 			current.NeedsRecovery = false
-			current.Dispatch = model.CloneDispatchContext(entry.Dispatch)
-			current.Run = model.CloneRunState(entry.Run)
-			current.SourceState = issueState
 			o.syncRecordFormalReferencesLocked(current, &model.Issue{ID: issueID, Identifier: recordIdentifier(entry), State: issueState}, recordBranch(current), recordPullRequest(current))
 			o.openRunReviewGate(current)
 			o.setRecordStatusLocked(current, model.JobLifecycleActive, nil, &contract.Observation{

@@ -150,6 +150,15 @@ class LiveSmokeCliContractTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             cli._assert_object_list_response(payload, "reason")
 
+    def test_linear_branch_name_matches_runtime_truncation(self) -> None:
+        branch = cli._linear_branch_name(
+            "live-smoke-local-20260317-030913-38256-feature",
+            "integration-scope",
+            "IIWATE-297",
+        )
+        self.assertEqual(branch, "live-smoke-local-20260317-03/linear-integration-scope-iiwate-297")
+        self.assertLessEqual(len(branch), 64)
+
     def test_session_state_surface_uses_formal_objects_snapshot(self) -> None:
         payload = {
             "version": 6,

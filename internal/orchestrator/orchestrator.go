@@ -410,6 +410,37 @@ func cloneJobRuntime(record *model.JobRuntime) *model.JobRuntime {
 	return &copyValue
 }
 
+func restoreRecoveredRuntimeState(current *model.JobRuntime, entry *model.JobRuntime, issueState string) {
+	if current == nil || entry == nil {
+		return
+	}
+	snapshot := cloneJobRuntime(entry)
+	if snapshot == nil {
+		return
+	}
+	current.Object = snapshot.Object
+	current.Lifecycle = snapshot.Lifecycle
+	current.Reason = snapshot.Reason
+	current.Observation = snapshot.Observation
+	current.UpdatedAt = snapshot.UpdatedAt
+	current.WorkspacePath = snapshot.WorkspacePath
+	current.SourceState = strings.TrimSpace(issueState)
+	if current.SourceState == "" {
+		current.SourceState = snapshot.SourceState
+	}
+	current.PullRequestState = snapshot.PullRequestState
+	current.RetryDueAt = snapshot.RetryDueAt
+	current.RetryAttempt = snapshot.RetryAttempt
+	current.StallCount = snapshot.StallCount
+	current.StartedAt = snapshot.StartedAt
+	current.Dispatch = snapshot.Dispatch
+	current.NeedsRecovery = snapshot.NeedsRecovery
+	current.Run = snapshot.Run
+	current.Intervention = snapshot.Intervention
+	current.Outcome = snapshot.Outcome
+	current.Artifacts = snapshot.Artifacts
+}
+
 func jobTypeForDispatch(dispatch *model.DispatchContext) contract.JobType {
 	if dispatch != nil && dispatch.JobType.IsValid() {
 		return dispatch.JobType
