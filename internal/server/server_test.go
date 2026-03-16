@@ -74,6 +74,63 @@ func TestStateEndpointReturnsCurrentCapabilitiesAndRole(t *testing.T) {
 	}
 }
 
+func TestFormalEndpointsDoNotExposeLegacyIssueFields(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
+	handler := NewHandler(runtime, nil)
+
+	t.Run("discovery", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		for _, forbidden := range []string{"service_mode", "recovery_in_progress", "reasons", "limits", "records"} {
+			if _, ok := payload[forbidden]; ok {
+				t.Fatalf("discovery still exposes legacy field %q: %#v", forbidden, payload)
+			}
+		}
+	})
+
+	t.Run("state", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		for _, forbidden := range []string{"counts", "records", "completed_window", "source", "limits"} {
+			if _, ok := payload[forbidden]; ok {
+				t.Fatalf("state still exposes legacy field %q: %#v", forbidden, payload)
+			}
+		}
+	})
+
+	t.Run("object_query", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/objects/action/act-1", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		item, ok := payload["item"].(map[string]any)
+		if !ok {
+			t.Fatalf("item = %#v, want object", payload["item"])
+		}
+		for _, forbidden := range []string{"record_id", "source_ref", "durable_refs", "result", "observation"} {
+			if _, ok := item[forbidden]; ok {
+				t.Fatalf("object query still exposes legacy field %q: %#v", forbidden, item)
+			}
+		}
+	})
+}
+
 func TestRefreshEndpointReturnsControlResultForLeader(t *testing.T) {
 	t.Run("accepted", func(t *testing.T) {
 		runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
@@ -218,6 +275,13 @@ func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
 	if len(firstEnvelope.Objects) != 2 {
 		t.Fatalf("len(objects) = %d, want 2", len(firstEnvelope.Objects))
 	}
+	var firstRaw map[string]any
+	if err := json.Unmarshal([]byte(first.Data), &firstRaw); err != nil {
+		t.Fatalf("Unmarshal(first raw) error = %v", err)
+	}
+	if _, ok := firstRaw["record_ids"]; ok {
+		t.Fatalf("snapshot event still exposes legacy record_ids: %#v", firstRaw)
+	}
 
 	runtime.publishEvent(contract.EventEnvelope{
 		EventID:         "evt-2",
@@ -239,6 +303,13 @@ func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
 	}
 	if len(secondEnvelope.Objects) != 1 || secondEnvelope.Objects[0].ObjectID != "act-1" {
 		t.Fatalf("objects = %#v, want act-1", secondEnvelope.Objects)
+	}
+	var secondRaw map[string]any
+	if err := json.Unmarshal([]byte(second.Data), &secondRaw); err != nil {
+		t.Fatalf("Unmarshal(second raw) error = %v", err)
+	}
+	if _, ok := secondRaw["record_ids"]; ok {
+		t.Fatalf("object_changed event still exposes legacy record_ids: %#v", secondRaw)
 	}
 }
 

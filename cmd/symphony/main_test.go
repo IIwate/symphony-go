@@ -631,7 +631,7 @@ defaults:
 `, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
 	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	writeFile(t, statePath, fmt.Sprintf(`{
-  "version": 6,
+  "version": %d,
   "identity": {
     "compatibility": {
       "profile": "",
@@ -651,7 +651,7 @@ defaults:
   },
   "saved_at": "2026-03-12T00:00:00Z"
 }
-`, filepath.ToSlash(statePath)))
+`, 7, filepath.ToSlash(statePath)))
 
 	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
 		return &fakeTrackerClient{}, nil
@@ -1025,6 +1025,43 @@ func TestExecutePassesListenHostConfigurationToHTTPServer(t *testing.T) {
 				t.Fatalf("http port = %d, want 0", gotPort)
 			}
 		})
+	}
+}
+
+func TestAutomationFixtureUsesFormalPersistenceSchema(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, root, automationFixtureOptions{})
+
+	raw, err := os.ReadFile(filepath.Join(root, "project.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile(project.yaml) error = %v", err)
+	}
+	text := string(raw)
+	for _, required := range []string{"service:\n", "domain:\n", "execution:\n", "job_policy:\n", "persistence:\n", "path: ./local/runtime-state.json"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("project.yaml missing %q: %s", required, text)
+		}
+	}
+	for _, forbidden := range []string{"runtime:\n", "selection:\n", "runtime-ledger.json"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("project.yaml still contains legacy token %q: %s", forbidden, text)
+		}
+	}
+}
+
+func TestRepositoryAutomationProjectKeepsFormalLedgerPath(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "automation", "project.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile(automation/project.yaml) error = %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "path: ./local/runtime-state.json") {
+		t.Fatalf("automation/project.yaml missing formal persistence path: %s", text)
+	}
+	for _, forbidden := range []string{"runtime-ledger.json", "runtime:\n", "selection:\n"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("automation/project.yaml still contains legacy token %q: %s", forbidden, text)
+		}
 	}
 }
 

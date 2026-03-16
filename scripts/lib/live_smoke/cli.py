@@ -485,7 +485,7 @@ def _run_missing_pr_smoke(
         timeout_seconds=30,
         description="symphony startup",
     )
-    if discovery_payload["service_mode"] != "serving" or state_payload["service_mode"] != "serving":
+    if state_payload["service_mode"] != "serving":
         raise RuntimeError(f"startup service_mode mismatch: discovery={discovery_payload} state={state_payload}")
 
     events = open_events_stream(f"{base_url}/api/v1/events")
@@ -504,30 +504,51 @@ def _run_missing_pr_smoke(
         if control_payload["status"] != "accepted":
             raise RuntimeError(f"refresh control status mismatch: {control_payload}")
 
-        updated_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, str(issue["identifier"]), status="awaiting_intervention") is not None
-                ),
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="missing_pr object_changed",
+        )
+        identifier = str(issue["identifier"])
+        job = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", identifier, state="intervention_required"),
+            process,
+            timeout_seconds=120,
+            description="missing_pr intervention_required job",
+            interval_seconds=0.5,
+        )
+        run = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "run", identifier, state="intervention_required"),
+            process,
+            timeout_seconds=120,
+            description="missing_pr intervention_required run",
+            interval_seconds=0.5,
+        )
+        intervention = _wait_for(
+            lambda: (
+                related
+                if (related := _find_related_object(base_url, run, relation_type="run.intervention", target_type="intervention")) is not None
+                and related.get("state") == "open"
+                else None
             ),
             process,
             timeout_seconds=120,
-            description="missing_pr SSE -> state",
+            description="missing_pr open intervention",
+            interval_seconds=0.5,
         )
-        record = _require_runtime_record(updated_state, str(issue["identifier"]), status="awaiting_intervention")
-        reason = record.get("reason")
-        if not isinstance(reason, dict) or reason.get("reason_code") != "record.blocked.awaiting_intervention":
-            raise RuntimeError(f"unexpected intervention reason: {record}")
+        reason = _require_reason_from_object(intervention, "run.blocked.intervention_required")
+        if reason.get("details", {}).get("cause") != "missing_pr":
+            raise RuntimeError(f"unexpected intervention reason: {intervention}")
+        if job.get("state") != "intervention_required":
+            raise RuntimeError(f"job state mismatch: {job}")
     finally:
         events.close()
         process.stop()
         resources.processes.remove(process)
         linear.update_issue_state(str(issue["id"]), context.canceled_state_id)
         resources.issue_ids.remove(str(issue["id"]))
-    return f"{issue['identifier']} -> awaiting_intervention via SSE/state; refresh=accepted"
+    return f"{issue['identifier']} -> intervention_required via object query; refresh=accepted"
 
 
 def _run_merge_path_smoke(
@@ -595,48 +616,73 @@ def _run_merge_path_smoke(
         control_payload = _assert_refresh_contract(base_url)
         if control_payload["status"] != "accepted":
             raise RuntimeError(f"awaiting_merge refresh status mismatch: {control_payload}")
-        waiting_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    record := _find_runtime_record(payload, str(issue["identifier"]))
-                )
-                is not None
-                and record.get("status") == "awaiting_merge",
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="awaiting_merge object_changed",
+        )
+        identifier = str(issue["identifier"])
+        run = _wait_for(
+            lambda: (
+                current
+                if (current := _find_object_by_source_identifier(base_url, "run", identifier, state="completed")) is not None
+                and current.get("phase") == "publishing"
+                and isinstance(current.get("candidate_delivery"), dict)
+                and current["candidate_delivery"].get("reached") is True
+                else None
             ),
             process,
             timeout_seconds=120,
-            description="awaiting_merge SSE -> state",
+            description="awaiting_merge candidate delivery run",
+            interval_seconds=0.5,
         )
-        record = _require_runtime_record(waiting_state, str(issue["identifier"]), status="awaiting_merge")
-        pr_ref = _require_durable_ref(record, "pull_request")
-        if int(pr_ref["number"]) != pr.number:
-            raise RuntimeError(f"awaiting_merge pr_number mismatch: {pr_ref['number']} != {pr.number}")
+        pr_ref = _require_reference(run, "github_pull_request")
+        if int(str(pr_ref["external_id"])) != pr.number:
+            raise RuntimeError(f"awaiting_merge pr_number mismatch: {pr_ref['external_id']} != {pr.number}")
 
         merge_pull_request(repo, pr.number)
         resources.pull_request_numbers.remove(pr.number)
         control_payload = _assert_refresh_contract(base_url)
         if control_payload["status"] != "accepted":
             raise RuntimeError(f"merged_pr_source_not_terminal refresh status mismatch: {control_payload}")
-        intervention_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, str(issue["identifier"]), status="awaiting_intervention") is not None
-                ),
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="merged_pr_source_not_terminal object_changed",
+        )
+        job = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", identifier, state="intervention_required"),
+            process,
+            timeout_seconds=120,
+            description="merged_pr_source_not_terminal intervention_required job",
+            interval_seconds=0.5,
+        )
+        run = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "run", identifier, state="intervention_required"),
+            process,
+            timeout_seconds=120,
+            description="merged_pr_source_not_terminal intervention_required run",
+            interval_seconds=0.5,
+        )
+        intervention = _wait_for(
+            lambda: (
+                related
+                if (related := _find_related_object(base_url, run, relation_type="run.intervention", target_type="intervention")) is not None
+                and related.get("state") == "open"
+                else None
             ),
             process,
             timeout_seconds=120,
-            description="merged_pr_source_not_terminal SSE -> state",
+            description="merged_pr_source_not_terminal open intervention",
+            interval_seconds=0.5,
         )
-        record = _require_runtime_record(intervention_state, str(issue["identifier"]), status="awaiting_intervention")
-        reason = _require_reason(record, "record.blocked.awaiting_intervention")
+        reason = _require_reason_from_object(intervention, "run.blocked.intervention_required")
         if reason.get("details", {}).get("cause") != "merged_pr_source_not_terminal":
             raise RuntimeError(f"unexpected merged intervention reason: {reason}")
+        if job.get("state") != "intervention_required":
+            raise RuntimeError(f"job state mismatch: {job}")
 
         linear.update_issue_state(str(issue["id"]), context.done_state_id)
         control_payload = _assert_refresh_contract(base_url)
@@ -648,29 +694,36 @@ def _run_merge_path_smoke(
             timeout_seconds=120,
             description="issue done after external source close",
         )
-        completed_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, str(issue["identifier"])) is None
-                    and _find_completed_record(payload, str(issue["identifier"])) is not None
-                ),
-            ),
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="completed object_changed",
+        )
+        completed_job = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", identifier, state="completed"),
             process,
             timeout_seconds=180,
-            description="completed_window SSE -> state",
+            description="completed job",
+            interval_seconds=0.5,
         )
-        completed = _require_completed_record(completed_state, str(issue["identifier"]), outcome="succeeded")
-        if completed["status"] != "completed":
-            raise RuntimeError(f"completed_window status mismatch: {completed}")
+        outcome = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "outcome", identifier, state="succeeded"),
+            process,
+            timeout_seconds=180,
+            description="completed outcome",
+            interval_seconds=0.5,
+        )
+        if completed_job.get("state") != "completed":
+            raise RuntimeError(f"completed job state mismatch: {completed_job}")
+        if outcome.get("state") != "succeeded":
+            raise RuntimeError(f"outcome state mismatch: {outcome}")
     finally:
         events.close()
         process.stop()
         resources.processes.remove(process)
         resources.issue_ids.remove(str(issue["id"]))
-    return f"{issue['identifier']} -> awaiting_intervention(merged_pr_source_not_terminal) -> completed_window.succeeded"
+    return f"{issue['identifier']} -> candidate_delivery -> intervention_required(merged_pr_source_not_terminal) -> outcome.succeeded"
 
 
 def _run_runtime_extensions_smoke(
@@ -748,8 +801,8 @@ def _run_recovery_ledger_smoke(
 
     try:
         port = allocate_port()
-        base_dir = resources.temp_dir / "runtime-state"
-        ledger_path = base_dir / "local" / "runtime-state.json"
+        base_dir = resources.temp_dir / "formal-objects"
+        session_state_path = base_dir / "local" / "runtime-state.json"
         namespace = f"{branch_namespace}-feature"
         config = SmokeConfig(
             base_dir=base_dir,
@@ -760,7 +813,7 @@ def _run_recovery_ledger_smoke(
             linear_project_slug=project_slug,
             linear_branch_scope=branch_scope,
             codex_command=codex_command,
-            ledger_path=ledger_path,
+            session_state_path=session_state_path,
             notification_port=notification_server.server_port,
         )
         write_smoke_config(
@@ -775,47 +828,60 @@ def _run_recovery_ledger_smoke(
             lambda: _await_formal_startup(base_url),
             process,
             timeout_seconds=30,
-            description="runtime_state startup",
+            description="formal_objects startup",
         )
         _assert_discovery_source(fetch_json(f"{base_url}/api/v1/discovery"), kind="linear", name="linear-main")
         events = open_events_stream(f"{base_url}/api/v1/events")
-        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_state snapshot")
+        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="formal_objects snapshot")
 
-        persistence_issue = linear.create_issue(f"{issue_prefix} runtime_state persistence {int(time.time())}", context)
+        persistence_issue = linear.create_issue(f"{issue_prefix} formal_objects persistence {int(time.time())}", context)
         resources.issue_ids.append(str(persistence_issue["id"]))
         persistence_identifier = str(persistence_issue["identifier"])
 
-        persistence_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, persistence_identifier, status="awaiting_intervention") is not None
-                ),
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="formal_objects intervention object_changed",
+        )
+        job = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", persistence_identifier, state="intervention_required"),
+            process,
+            timeout_seconds=120,
+            description="formal_objects intervention_required job",
+            interval_seconds=0.5,
+        )
+        run = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "run", persistence_identifier, state="intervention_required"),
+            process,
+            timeout_seconds=120,
+            description="formal_objects intervention_required run",
+            interval_seconds=0.5,
+        )
+        intervention = _wait_for(
+            lambda: (
+                related
+                if (related := _find_related_object(base_url, run, relation_type="run.intervention", target_type="intervention")) is not None
+                and related.get("state") == "open"
+                else None
             ),
             process,
             timeout_seconds=120,
-            description="runtime_state awaiting_intervention via SSE",
+            description="formal_objects open intervention",
+            interval_seconds=0.5,
         )
-        record = _require_runtime_record(persistence_state, persistence_identifier, status="awaiting_intervention")
-        _assert_source_anchor(
-            record,
-            "runtime_state.record",
-            source_kind="linear",
-            source_name="linear-main",
-            source_id=str(persistence_issue["id"]),
-            source_identifier=persistence_identifier,
-        )
-        reason = _require_reason(record, "record.blocked.awaiting_intervention")
-        if reason["category"] != "record":
-            raise RuntimeError(f"awaiting_intervention reason category mismatch: {reason}")
+        reason = _require_reason_from_object(intervention, "run.blocked.intervention_required")
+        if reason.get("details", {}).get("cause") != "missing_pr":
+            raise RuntimeError(f"awaiting_intervention reason mismatch: {intervention}")
+        source_reference = _require_reference(job, "linear_issue")
+        if source_reference.get("external_id") != str(persistence_issue["id"]):
+            raise RuntimeError(f"job linear reference mismatch: {source_reference}")
 
         webhook_events = _wait_for(
             lambda: recorder.find(path="/webhook", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=30,
-            description="runtime_state webhook intervention notification",
+            description="formal_objects webhook intervention notification",
             interval_seconds=0.5,
         )
         _assert_notification_details(
@@ -829,35 +895,26 @@ def _run_recovery_ledger_smoke(
             lambda: recorder.find(path="/slack", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=30,
-            description="runtime_state slack intervention notification",
+            description="formal_objects slack intervention notification",
             interval_seconds=0.5,
         )
-        ledger_payload = _wait_for(
-            lambda: _await_ledger_record(ledger_path, persistence_identifier, status="awaiting_intervention"),
+        session_state_payload = _wait_for(
+            lambda: _await_session_state_object(session_state_path, "job", persistence_identifier, state="intervention_required"),
             process,
             timeout_seconds=15,
-            description="runtime_state awaiting_intervention persisted",
+            description="formal_objects session_state persisted",
             interval_seconds=0.2,
         )
         _assert_ledger_identity(
-            ledger_payload,
+            session_state_payload,
             active_source="linear-main",
             flow_name="implement",
             tracker_project_slug=project_slug,
             workspace_root=str((resources.temp_dir.parent / f"workspaces-{namespace}").resolve()).replace("\\", "/"),
-            ledger_path=str(ledger_path.resolve()).replace("\\", "/"),
+            ledger_path=str(session_state_path.resolve()).replace("\\", "/"),
         )
-        ledger_record = _find_ledger_record(ledger_payload, persistence_identifier, status="awaiting_intervention")
-        if ledger_record is None:
-            raise RuntimeError(f"runtime_state persisted record missing: {ledger_payload}")
-        _assert_source_anchor(
-            ledger_record,
-            "runtime_state.ledger_record",
-            source_kind="linear",
-            source_name="linear-main",
-            source_id=str(persistence_issue["id"]),
-            source_identifier=persistence_identifier,
-        )
+        if _find_session_state_object(session_state_payload, "run", persistence_identifier, state="intervention_required") is None:
+            raise RuntimeError(f"session_state missing run snapshot: {session_state_payload}")
         notification_count_before_restart = recorder.count()
 
         events.close()
@@ -870,24 +927,16 @@ def _run_recovery_ledger_smoke(
             lambda: _await_formal_startup(base_url),
             process,
             timeout_seconds=30,
-            description="runtime_state restart",
+            description="formal_objects restart",
         )
         events = open_events_stream(f"{base_url}/api/v1/events")
-        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_state restart snapshot")
-        restored_state = _wait_for(
-            lambda: _await_runtime_record(base_url, persistence_identifier, status="awaiting_intervention"),
+        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="formal_objects restart snapshot")
+        _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", persistence_identifier, state="intervention_required"),
             process,
             timeout_seconds=60,
-            description="runtime_state restored awaiting_intervention",
-        )
-        restored_record = _require_runtime_record(restored_state, persistence_identifier, status="awaiting_intervention")
-        _assert_source_anchor(
-            restored_record,
-            "runtime_state.restored_record",
-            source_kind="linear",
-            source_name="linear-main",
-            source_id=str(persistence_issue["id"]),
-            source_identifier=persistence_identifier,
+            description="formal_objects restored intervention_required job",
+            interval_seconds=0.5,
         )
         time.sleep(5)
         if recorder.count() != notification_count_before_restart:
@@ -895,7 +944,7 @@ def _run_recovery_ledger_smoke(
                 f"unexpected notification replay after restart: before={notification_count_before_restart}, after={recorder.count()}"
             )
 
-        merge_issue = linear.create_issue(f"{issue_prefix} runtime_state merge {int(time.time())}", context)
+        merge_issue = linear.create_issue(f"{issue_prefix} formal_objects merge {int(time.time())}", context)
         resources.issue_ids.append(str(merge_issue["id"]))
         merge_identifier = str(merge_issue["identifier"])
         branch = _linear_branch_name(namespace, branch_scope, merge_identifier)
@@ -904,33 +953,39 @@ def _run_recovery_ledger_smoke(
             repo_url,
             branch,
             title=f"test: live smoke {merge_identifier}",
-            body="Temporary PR for runtime ledger smoke.",
-            work_root=resources.temp_dir / "runtime-state-pr",
+            body="Temporary PR for formal object smoke.",
+            work_root=resources.temp_dir / "formal-objects-pr",
         )
         resources.pull_request_numbers.append(pr.number)
 
-        merge_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, merge_identifier, status="awaiting_merge") is not None
-                ),
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="formal_objects candidate delivery object_changed",
+        )
+        merge_run = _wait_for(
+            lambda: (
+                current
+                if (current := _find_object_by_source_identifier(base_url, "run", merge_identifier, state="completed")) is not None
+                and current.get("phase") == "publishing"
+                and isinstance(current.get("candidate_delivery"), dict)
+                and current["candidate_delivery"].get("reached") is True
+                else None
             ),
             process,
             timeout_seconds=120,
-            description="runtime_state awaiting_merge via SSE",
+            description="formal_objects candidate delivery run",
+            interval_seconds=0.5,
         )
-        merge_record = _require_runtime_record(merge_state, merge_identifier, status="awaiting_merge")
-        pr_ref = _require_durable_ref(merge_record, "pull_request")
-        if int(pr_ref["number"]) != pr.number:
-            raise RuntimeError(f"runtime_state awaiting_merge pr_number mismatch: {pr_ref['number']} != {pr.number}")
+        pr_ref = _require_reference(merge_run, "github_pull_request")
+        if int(str(pr_ref["external_id"])) != pr.number:
+            raise RuntimeError(f"formal_objects candidate delivery pr mismatch: {pr_ref['external_id']} != {pr.number}")
         _wait_for(
-            lambda: _await_ledger_record(ledger_path, merge_identifier, status="awaiting_merge"),
+            lambda: _await_session_state_object(session_state_path, "run", merge_identifier, state="completed"),
             process,
             timeout_seconds=15,
-            description="runtime_state awaiting_merge persisted",
+            description="formal_objects candidate delivery persisted",
             interval_seconds=0.2,
         )
 
@@ -944,110 +999,144 @@ def _run_recovery_ledger_smoke(
             lambda: _await_formal_startup(base_url),
             process,
             timeout_seconds=30,
-            description="runtime_state second restart",
+            description="formal_objects second restart",
         )
         events = open_events_stream(f"{base_url}/api/v1/events")
-        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_state second snapshot")
-        restored_merge_state = _wait_for(
-            lambda: _await_runtime_record(base_url, merge_identifier, status="awaiting_merge"),
+        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="formal_objects second snapshot")
+        restored_merge = _wait_for(
+            lambda: (
+                current
+                if (current := _find_object_by_source_identifier(base_url, "run", merge_identifier, state="completed")) is not None
+                and current.get("phase") == "publishing"
+                and isinstance(current.get("candidate_delivery"), dict)
+                and current["candidate_delivery"].get("reached") is True
+                else None
+            ),
             process,
             timeout_seconds=60,
-            description="runtime_state restored awaiting_merge",
+            description="formal_objects restored candidate delivery run",
+            interval_seconds=0.5,
         )
-        restored_merge = _require_runtime_record(restored_merge_state, merge_identifier, status="awaiting_merge")
-        restored_pr_ref = _require_durable_ref(restored_merge, "pull_request")
-        if int(restored_pr_ref["number"]) != pr.number:
-            raise RuntimeError(f"runtime_state restored pr_number mismatch: {restored_pr_ref['number']} != {pr.number}")
+        restored_pr_ref = _require_reference(restored_merge, "github_pull_request")
+        if int(str(restored_pr_ref["external_id"])) != pr.number:
+            raise RuntimeError(f"formal_objects restored pr mismatch: {restored_pr_ref['external_id']} != {pr.number}")
 
         merge_pull_request(repo, pr.number)
         resources.pull_request_numbers.remove(pr.number)
-        intervention_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, merge_identifier, status="awaiting_intervention") is not None
-                ),
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="formal_objects merged intervention object_changed",
+        )
+        merge_job = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", merge_identifier, state="intervention_required"),
+            process,
+            timeout_seconds=180,
+            description="formal_objects merged intervention job",
+            interval_seconds=0.5,
+        )
+        merge_run = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "run", merge_identifier, state="intervention_required"),
+            process,
+            timeout_seconds=180,
+            description="formal_objects merged intervention run",
+            interval_seconds=0.5,
+        )
+        intervention = _wait_for(
+            lambda: (
+                related
+                if (related := _find_related_object(base_url, merge_run, relation_type="run.intervention", target_type="intervention")) is not None
+                and related.get("state") == "open"
+                else None
             ),
             process,
             timeout_seconds=180,
-            description="runtime_state merged_pr_source_not_terminal via SSE",
+            description="formal_objects merged open intervention",
+            interval_seconds=0.5,
         )
-        intervention_record = _require_runtime_record(intervention_state, merge_identifier, status="awaiting_intervention")
-        intervention_reason = _require_reason(intervention_record, "record.blocked.awaiting_intervention")
+        intervention_reason = _require_reason_from_object(intervention, "run.blocked.intervention_required")
         if intervention_reason.get("details", {}).get("cause") != "merged_pr_source_not_terminal":
-            raise RuntimeError(f"unexpected runtime_state merge intervention reason: {intervention_reason}")
+            raise RuntimeError(f"unexpected formal_objects merge intervention reason: {intervention_reason}")
         _wait_for(
-            lambda: _await_ledger_record(ledger_path, merge_identifier, status="awaiting_intervention"),
+            lambda: _await_session_state_object(session_state_path, "job", merge_identifier, state="intervention_required"),
             process,
             timeout_seconds=15,
-            description="runtime_state awaiting_intervention persisted after merge",
+            description="formal_objects merged intervention persisted",
             interval_seconds=0.2,
         )
         _wait_for(
             lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=60,
-            description="runtime_state webhook intervention notification after merge",
+            description="formal_objects webhook intervention notification after merge",
             interval_seconds=0.5,
         )
         _wait_for(
             lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=60,
-            description="runtime_state slack intervention notification after merge",
+            description="formal_objects slack intervention notification after merge",
             interval_seconds=0.5,
         )
+        if merge_job.get("state") != "intervention_required":
+            raise RuntimeError(f"merged job state mismatch: {merge_job}")
 
         linear.update_issue_state(str(merge_issue["id"]), context.done_state_id)
         _wait_for(
             lambda: _await_linear_done(linear, str(merge_issue["id"])),
             process,
             timeout_seconds=180,
-            description="runtime_state issue done after external source close",
+            description="formal_objects issue done after external source close",
         )
-        completed_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="serving",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, merge_identifier) is None
-                    and _find_completed_record(payload, merge_identifier) is not None
-                ),
-            ),
+        _wait_for(
+            lambda: _read_sse_event(events, "object_changed"),
+            process,
+            timeout_seconds=60,
+            description="formal_objects completed object_changed",
+        )
+        completed_job = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", merge_identifier, state="completed"),
             process,
             timeout_seconds=180,
-            description="runtime_state completed_window via SSE",
+            description="formal_objects completed job",
+            interval_seconds=0.5,
         )
-        _require_completed_record(completed_state, merge_identifier, outcome="succeeded")
+        completed_outcome = _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "outcome", merge_identifier, state="succeeded"),
+            process,
+            timeout_seconds=180,
+            description="formal_objects completed outcome",
+            interval_seconds=0.5,
+        )
         _wait_for(
-            lambda: _await_ledger_record(ledger_path, merge_identifier, status="completed", outcome="succeeded"),
+            lambda: _await_session_state_object(session_state_path, "outcome", merge_identifier, state="succeeded"),
             process,
             timeout_seconds=15,
-            description="runtime_state completed persisted",
+            description="formal_objects completed persisted",
             interval_seconds=0.2,
         )
         _wait_for(
             lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_completed") or None,
             process,
             timeout_seconds=60,
-            description="runtime_state webhook completed notification",
+            description="formal_objects webhook completed notification",
             interval_seconds=0.5,
         )
         _wait_for(
             lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_completed") or None,
             process,
             timeout_seconds=60,
-            description="runtime_state slack completed notification",
+            description="formal_objects slack completed notification",
             interval_seconds=0.5,
         )
+        if completed_job.get("state") != "completed" or completed_outcome.get("state") != "succeeded":
+            raise RuntimeError(f"completed objects mismatch: job={completed_job}, outcome={completed_outcome}")
 
         linear.update_issue_state(str(persistence_issue["id"]), context.canceled_state_id)
         resources.issue_ids.remove(str(persistence_issue["id"]))
         resources.issue_ids.remove(str(merge_issue["id"]))
-        return f"{persistence_identifier}/awaiting_intervention + {merge_identifier}/awaiting_intervention_after_merge -> completed recovered from ledger"
+        return f"{persistence_identifier}/intervention_required + {merge_identifier}/candidate_delivery_then_intervention -> outcome.succeeded recovered from session_state"
     finally:
         if events is not None:
             events.close()
@@ -1122,29 +1211,27 @@ def _run_notification_degraded_smoke(
             interval_seconds=0.5,
         )
         degraded_state = _wait_for(
-            lambda: _await_state_after_sse(
-                base_url,
-                events,
-                expected_service_mode="degraded",
-                predicate=lambda payload: (
-                    _find_runtime_record(payload, identifier, status="awaiting_intervention") is not None
-                    and _has_reason_code(payload.get("reasons"), "service.degraded.notification_delivery")
-                ),
-            ),
+            lambda: _await_service_mode(base_url, expected_mode="degraded", reason_code="service.degraded.notification_delivery"),
             process,
             timeout_seconds=120,
-            description="notification_degraded SSE -> state",
+            description="notification_degraded state",
+            interval_seconds=0.5,
+        )
+        _wait_for(
+            lambda: _find_object_by_source_identifier(base_url, "job", identifier, state="intervention_required"),
+            process,
+            timeout_seconds=120,
+            description="notification_degraded intervention_required job",
+            interval_seconds=0.5,
         )
         discovery_payload = fetch_json(f"{base_url}/api/v1/discovery")
         _assert_discovery_surface(discovery_payload)
         _assert_service_surface_consistency(discovery_payload, degraded_state)
-        if discovery_payload["service_mode"] != "degraded":
-            raise RuntimeError(f"notification_degraded discovery mode mismatch: {discovery_payload}")
         service_reason = _require_reason_from_list(degraded_state.get("reasons"), "service.degraded.notification_delivery")
         channel_ids = service_reason["details"].get("channel_ids")
         if channel_ids != ["local-slack"]:
             raise RuntimeError(f"notification_degraded channel_ids mismatch: {service_reason}")
-        return f"{identifier} kept serving issue flow while service_mode=degraded(channel_ids={channel_ids})"
+        return f"{identifier} kept serving formal object flow while service_mode=degraded(channel_ids={channel_ids})"
     finally:
         if events is not None:
             events.close()
@@ -1173,7 +1260,7 @@ def _run_unavailable_ledger_smoke(
     try:
         port = allocate_port()
         base_dir = resources.temp_dir / "ledger-unavailable"
-        ledger_path = base_dir / "local" / "runtime-state.json"
+        session_state_path = base_dir / "local" / "runtime-state.json"
         config = SmokeConfig(
             base_dir=base_dir,
             port=port,
@@ -1183,7 +1270,7 @@ def _run_unavailable_ledger_smoke(
             linear_project_slug=project_slug,
             linear_branch_scope=branch_scope,
             codex_command=codex_command,
-            ledger_path=ledger_path,
+            session_state_path=session_state_path,
         )
         write_smoke_config(
             config,
@@ -1202,16 +1289,16 @@ def _run_unavailable_ledger_smoke(
         events = open_events_stream(f"{base_url}/api/v1/events")
         _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="ledger_unavailable snapshot")
         _wait_for(
-            lambda: _load_ledger(ledger_path) if ledger_path.exists() else None,
+            lambda: _load_ledger(session_state_path) if session_state_path.exists() else None,
             process,
             timeout_seconds=10,
             description="ledger_unavailable ledger exists",
             interval_seconds=0.2,
         )
 
-        if ledger_path.exists():
-            ledger_path.unlink()
-        ledger_path.mkdir(parents=True, exist_ok=True)
+        if session_state_path.exists():
+            session_state_path.unlink()
+        session_state_path.mkdir(parents=True, exist_ok=True)
 
         issue = linear.create_issue(f"{issue_prefix} ledger_unavailable {int(time.time())}", context)
         resources.issue_ids.append(str(issue["id"]))
@@ -1226,12 +1313,10 @@ def _run_unavailable_ledger_smoke(
         discovery_payload = fetch_json(f"{base_url}/api/v1/discovery")
         _assert_discovery_surface(discovery_payload)
         _assert_service_surface_consistency(discovery_payload, unavailable_state)
-        if discovery_payload["service_mode"] != "unavailable":
-            raise RuntimeError(f"ledger_unavailable discovery mode mismatch: {discovery_payload}")
         rejected_control = _post_refresh(base_url)
         _assert_control_result(rejected_control, expected_status="rejected")
         _require_reason_from_list(unavailable_state.get("reasons"), "service.unavailable.core_dependency")
-        return f"{issue['identifier']} drove service_mode=unavailable via ledger write failure"
+        return f"{issue['identifier']} drove service_mode=unavailable via session_state write failure"
     finally:
         if events is not None:
             events.close()
@@ -1331,36 +1416,6 @@ def _read_sse_event(events, expected_event: str) -> dict[str, object] | None:
     return payload
 
 
-def _await_state_after_sse(
-    base_url: str,
-    events,
-    *,
-    expected_service_mode: str,
-    predicate: Callable[[dict[str, object]], bool],
-) -> dict[str, object] | None:
-    current = fetch_json(f"{base_url}/api/v1/state")
-    _assert_state_surface(current)
-    if current.get("service_mode") == expected_service_mode and predicate(current):
-        return current
-    if _read_sse_event(events, "state_changed") is None:
-        return None
-    payload = fetch_json(f"{base_url}/api/v1/state")
-    _assert_state_surface(payload)
-    if payload.get("service_mode") != expected_service_mode:
-        return None
-    if not predicate(payload):
-        return None
-    return payload
-
-
-def _await_runtime_record(base_url: str, identifier: str, *, status: str) -> dict[str, object] | None:
-    payload = fetch_json(f"{base_url}/api/v1/state")
-    _assert_state_surface(payload)
-    if _find_runtime_record(payload, identifier, status=status) is None:
-        return None
-    return payload
-
-
 def _await_service_mode(base_url: str, *, expected_mode: str, reason_code: str) -> dict[str, object] | None:
     payload = fetch_json(f"{base_url}/api/v1/state")
     _assert_state_surface(payload)
@@ -1392,38 +1447,64 @@ def _load_ledger(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _await_ledger_record(
+FORMAL_OBJECT_TYPES = {
+    "job",
+    "run",
+    "intervention",
+    "outcome",
+    "artifact",
+    "action",
+    "instance",
+    "reference",
+}
+
+REASON_CATEGORIES = {
+    "action",
+    "api",
+    "capability",
+    "checkpoint",
+    "config",
+    "control",
+    "intervention",
+    "job",
+    "outcome",
+    "record",
+    "reference",
+    "run",
+    "runtime",
+    "security",
+    "service",
+}
+
+SERVICE_MODES = {"serving", "degraded", "unavailable"}
+EVENT_TYPES_WITH_OBJECTS = {"snapshot", "object_changed"}
+
+
+def _await_session_state_object(
     path: Path,
+    object_type: str,
     identifier: str,
     *,
-    status: str,
-    outcome: str | None = None,
+    state: str,
 ) -> dict[str, object] | None:
     if not path.exists() or path.is_dir():
         return None
     payload = _load_ledger(path)
-    _assert_ledger_surface(payload)
-    if _find_ledger_record(payload, identifier, status=status, outcome=outcome) is None:
+    _assert_session_state_surface(payload)
+    if _find_session_state_object(payload, object_type, identifier, state=state) is None:
         return None
     return payload
 
 
 def _assert_discovery_surface(payload: dict[str, object]) -> None:
-    _require_keys(payload, ["api_version", "instance", "source", "service_mode", "recovery_in_progress", "capabilities", "reasons", "limits"], "discovery")
+    _require_keys(payload, ["api_version", "instance", "domain_id", "source", "capabilities"], "discovery")
     if payload["api_version"] != "v1":
         raise RuntimeError(f"discovery api_version mismatch: {payload}")
-    if payload["service_mode"] not in {"serving", "degraded", "unavailable"}:
-        raise RuntimeError(f"discovery service_mode mismatch: {payload}")
     _require_keys(payload["instance"], ["id", "name", "version"], "discovery.instance")
     _require_keys(payload["source"], ["kind", "name"], "discovery.source")
-    capabilities = _require_mapping(payload["capabilities"], "discovery.capabilities")
-    _require_keys(capabilities, ["event_protocol", "control_actions", "notifications", "sources"], "discovery.capabilities")
-    if capabilities["event_protocol"] != "sse":
-        raise RuntimeError(f"discovery event_protocol mismatch: {capabilities}")
-    limits = _require_mapping(payload["limits"], "discovery.limits")
-    if not isinstance(limits.get("completed_window_size"), int):
-        raise RuntimeError(f"discovery completed_window_size missing: {limits}")
-    _assert_reason_list(payload["reasons"], "discovery.reasons")
+    if not str(payload["domain_id"]).strip():
+        raise RuntimeError(f"discovery domain_id missing: {payload}")
+    _assert_static_capability_surface(payload["capabilities"], "discovery.capabilities")
 
 
 def _assert_discovery_source(payload: dict[str, object], *, kind: str, name: str) -> None:
@@ -1433,40 +1514,32 @@ def _assert_discovery_source(payload: dict[str, object], *, kind: str, name: str
 
 
 def _assert_state_surface(payload: dict[str, object]) -> None:
-    _require_keys(payload, ["generated_at", "service_mode", "recovery_in_progress", "reasons", "counts", "records", "completed_window"], "state")
-    for legacy_key in ["recovered_pending", "recovering", "retrying", "alerts", "service", "health", "observations"]:
+    _require_keys(payload, ["generated_at", "service_mode", "recovery_in_progress", "reasons", "instance", "capabilities"], "state")
+    for legacy_key in ["recovered_pending", "recovering", "retrying", "alerts", "service", "health", "observations", "counts", "records", "completed_window", "limits", "source"]:
         if legacy_key in payload:
             raise RuntimeError(f"/api/v1/state still exposes legacy top-level field {legacy_key}")
-    if payload["service_mode"] not in {"serving", "degraded", "unavailable"}:
+    if payload["service_mode"] not in SERVICE_MODES:
         raise RuntimeError(f"state service_mode mismatch: {payload}")
     _assert_reason_list(payload["reasons"], "state.reasons")
-    counts = _require_mapping(payload["counts"], "state.counts")
-    _require_keys(
-        counts,
-        ["total", "active", "retry_scheduled", "awaiting_merge", "awaiting_intervention", "completed"],
-        "state.counts",
-    )
-    for key in ["total", "active", "retry_scheduled", "awaiting_merge", "awaiting_intervention", "completed"]:
-        if not isinstance(counts[key], int):
-            raise RuntimeError(f"state counts.{key} is not int: {counts}")
-    records = _require_list(payload["records"], "state.records")
-    for index, record in enumerate(records):
-        _assert_record_surface(record, f"state.records[{index}]")
-    completed_window = _require_mapping(payload["completed_window"], "state.completed_window")
-    _require_keys(completed_window, ["limit", "records"], "state.completed_window")
-    if not isinstance(completed_window["limit"], int):
-        raise RuntimeError(f"completed_window.limit is not int: {completed_window}")
-    completed_records = _require_list(completed_window["records"], "state.completed_window.records")
-    for index, record in enumerate(completed_records):
-        _assert_record_surface(record, f"state.completed_window.records[{index}]")
+    instance = _require_mapping(payload["instance"], "state.instance")
+    _require_keys(instance, ["id", "name", "version", "role"], "state.instance")
+    if instance["role"] not in {"leader", "standby"}:
+        raise RuntimeError(f"state.instance.role mismatch: {instance}")
+    _assert_available_capability_surface(payload["capabilities"], "state.capabilities")
 
 
-def _assert_ledger_surface(payload: dict[str, object]) -> None:
-    _require_keys(payload, ["version", "identity", "saved_at", "service", "records"], "ledger")
+def _assert_session_state_surface(payload: dict[str, object]) -> None:
+    _require_keys(payload, ["version", "identity", "saved_at", "service", "jobs", "formal_objects"], "session_state")
+    for legacy_key in ["records", "completed_window", "retrying", "recovering", "awaiting_merge", "awaiting_intervention"]:
+        if legacy_key in payload:
+            raise RuntimeError(f"session_state still exposes legacy top-level field {legacy_key}")
     _assert_ledger_identity_shape(payload["identity"])
-    records = _require_list(payload["records"], "ledger.records")
-    for index, record in enumerate(records):
-        _assert_ledger_record_surface(record, f"ledger.records[{index}]")
+    if not isinstance(payload["version"], int):
+        raise RuntimeError(f"session_state.version is not int: {payload}")
+    jobs = _require_list(payload["jobs"], "session_state.jobs")
+    for index, job in enumerate(jobs):
+        _assert_session_state_job_surface(job, f"session_state.jobs[{index}]")
+    _assert_formal_objects_snapshot_surface(payload["formal_objects"], "session_state.formal_objects")
 
 
 def _assert_refresh_contract(base_url: str) -> dict[str, object]:
@@ -1488,122 +1561,271 @@ def _assert_control_result(payload: dict[str, object], *, expected_status: str) 
 
 
 def _assert_event_envelope(payload: dict[str, object], expected_event: str) -> None:
-    _require_keys(payload, ["event_id", "event_type", "timestamp", "service_mode", "record_ids", "reason"], "events")
+    _require_keys(payload, ["event_id", "event_type", "timestamp", "contract_version", "domain_id", "service_mode", "reason"], "events")
     if payload["event_type"] != expected_event:
         raise RuntimeError(f"SSE event_type mismatch: {payload}")
-    if payload["service_mode"] not in {"serving", "degraded", "unavailable"}:
+    if payload["service_mode"] not in SERVICE_MODES:
         raise RuntimeError(f"SSE service_mode mismatch: {payload}")
-    record_ids = _require_list(payload["record_ids"], "events.record_ids")
-    for item in record_ids:
-        if not isinstance(item, str):
-            raise RuntimeError(f"events.record_ids contains non-string: {payload}")
+    if payload.get("contract_version") != "v1":
+        raise RuntimeError(f"SSE contract_version mismatch: {payload}")
+    if not str(payload.get("domain_id", "")).strip():
+        raise RuntimeError(f"SSE domain_id missing: {payload}")
+    if "record_ids" in payload:
+        raise RuntimeError(f"SSE still exposes legacy record_ids: {payload}")
+    if expected_event in EVENT_TYPES_WITH_OBJECTS:
+        objects = _require_list(payload.get("objects"), "events.objects")
+        for index, item in enumerate(objects):
+            _assert_event_object_surface(item, f"events.objects[{index}]")
+    elif "objects" in payload and payload["objects"] is not None:
+        objects = _require_list(payload["objects"], "events.objects")
+        for index, item in enumerate(objects):
+            _assert_event_object_surface(item, f"events.objects[{index}]")
     reason = payload["reason"]
     if reason is not None:
         _assert_reason_surface(_require_mapping(reason, "events.reason"), "events.reason")
 
 
 def _assert_service_surface_consistency(discovery_payload: dict[str, object], state_payload: dict[str, object]) -> None:
-    if discovery_payload.get("service_mode") != state_payload.get("service_mode"):
-        raise RuntimeError(
-            f"discovery/state service_mode mismatch: discovery={discovery_payload.get('service_mode')} state={state_payload.get('service_mode')}"
-        )
-    if discovery_payload.get("reasons") != state_payload.get("reasons"):
-        raise RuntimeError(
-            f"discovery/state reasons mismatch: discovery={discovery_payload.get('reasons')} state={state_payload.get('reasons')}"
-        )
+    discovery_instance = _require_mapping(discovery_payload.get("instance"), "discovery.instance")
+    state_instance = _require_mapping(state_payload.get("instance"), "state.instance")
+    for key in ["id", "name", "version"]:
+        if discovery_instance.get(key) != state_instance.get(key):
+            raise RuntimeError(
+                f"discovery/state instance.{key} mismatch: discovery={discovery_instance.get(key)!r} state={state_instance.get(key)!r}"
+            )
 
 
-def _assert_record_surface(record: object, label: str) -> None:
-    current = _require_mapping(record, label)
-    _require_keys(current, ["record_id", "source_ref", "status", "updated_at", "reason", "observation", "durable_refs", "result"], label)
-    if current["status"] not in {"active", "retry_scheduled", "awaiting_merge", "awaiting_intervention", "completed"}:
-        raise RuntimeError(f"{label} status mismatch: {current}")
-    _assert_source_ref_surface(current["source_ref"], f"{label}.source_ref")
-    _assert_record_identity_anchor(current, label)
-    reason = current["reason"]
-    if reason is not None:
-        _assert_reason_surface(_require_mapping(reason, f"{label}.reason"), f"{label}.reason")
-    observation = current["observation"]
-    if observation is not None:
-        _assert_observation_surface(_require_mapping(observation, f"{label}.observation"), f"{label}.observation")
-    _assert_durable_refs_surface(_require_mapping(current["durable_refs"], f"{label}.durable_refs"), f"{label}.durable_refs")
-    result = current["result"]
-    if result is not None:
-        _assert_result_surface(_require_mapping(result, f"{label}.result"), f"{label}.result")
-
-
-def _assert_ledger_record_surface(record: object, label: str) -> None:
-    current = _require_mapping(record, label)
-    _require_keys(current, ["record_id", "source_ref", "status", "reason", "retry_due_at", "durable_refs", "result", "updated_at"], label)
-    if current["status"] not in {"active", "retry_scheduled", "awaiting_merge", "awaiting_intervention", "completed"}:
-        raise RuntimeError(f"{label} status mismatch: {current}")
-    _assert_source_ref_surface(current["source_ref"], f"{label}.source_ref")
-    _assert_record_identity_anchor(current, label)
-    reason = current["reason"]
-    if reason is not None:
-        _assert_reason_surface(_require_mapping(reason, f"{label}.reason"), f"{label}.reason")
-    _assert_durable_refs_surface(_require_mapping(current["durable_refs"], f"{label}.durable_refs"), f"{label}.durable_refs")
-    result = current["result"]
-    if result is not None:
-        _assert_result_surface(_require_mapping(result, f"{label}.result"), f"{label}.result")
-
-
-def _assert_source_ref_surface(value: object, label: str) -> None:
+def _assert_static_capability_surface(value: object, label: str) -> None:
     payload = _require_mapping(value, label)
-    _require_keys(payload, ["source_kind", "source_name", "source_id", "source_identifier", "url"], label)
+    capabilities = _require_list(payload.get("capabilities"), f"{label}.capabilities")
+    for index, capability in enumerate(capabilities):
+        current = _require_mapping(capability, f"{label}.capabilities[{index}]")
+        _require_keys(current, ["name", "category", "summary", "supported"], f"{label}.capabilities[{index}]")
+        if not isinstance(current["supported"], bool):
+            raise RuntimeError(f"{label}.capabilities[{index}].supported is not bool: {current}")
 
 
-def _sanitize_record_id_token(value: object, *, fallback: str) -> str:
-    token = re.sub(r"[^A-Za-z0-9._-]", "_", str(value).strip()).strip("._-")
-    return token or fallback
+def _assert_available_capability_surface(value: object, label: str) -> None:
+    payload = _require_mapping(value, label)
+    capabilities = _require_list(payload.get("capabilities"), f"{label}.capabilities")
+    for index, capability in enumerate(capabilities):
+        current = _require_mapping(capability, f"{label}.capabilities[{index}]")
+        _require_keys(current, ["name", "category", "summary", "available"], f"{label}.capabilities[{index}]")
+        if not isinstance(current["available"], bool):
+            raise RuntimeError(f"{label}.capabilities[{index}].available is not bool: {current}")
+        if "reasons" in current and current["reasons"] is not None:
+            _assert_reason_list(current["reasons"], f"{label}.capabilities[{index}].reasons")
 
 
-def _expected_record_id(source_ref: object, label: str) -> str:
-    payload = _require_mapping(source_ref, label)
-    return "_".join(
-        [
-            "rec",
-            _sanitize_record_id_token(payload.get("source_kind", ""), fallback="source"),
-            _sanitize_record_id_token(payload.get("source_name", ""), fallback="source"),
-            _sanitize_record_id_token(payload.get("source_id", ""), fallback="id"),
-        ]
-    )
+def _assert_formal_objects_snapshot_surface(value: object, label: str) -> None:
+    payload = _require_mapping(value, label)
+    _require_keys(payload, ["records"], label)
+    records = _require_list(payload["records"], f"{label}.records")
+    for index, item in enumerate(records):
+        current = _require_mapping(item, f"{label}.records[{index}]")
+        _require_keys(current, ["object_type", "object_id", "storage_tier", "lifecycle", "updated_at", "payload"], f"{label}.records[{index}]")
+        object_type = str(current["object_type"]).strip()
+        if object_type not in FORMAL_OBJECT_TYPES:
+            raise RuntimeError(f"{label}.records[{index}].object_type mismatch: {current}")
+        if current["storage_tier"] not in {"hot", "archive"}:
+            raise RuntimeError(f"{label}.records[{index}].storage_tier mismatch: {current}")
+        if current["lifecycle"] not in {"active", "terminated", "invalidated", "archived"}:
+            raise RuntimeError(f"{label}.records[{index}].lifecycle mismatch: {current}")
+        payload_item = _require_mapping(current["payload"], f"{label}.records[{index}].payload")
+        _assert_formal_object_surface(payload_item, f"{label}.records[{index}].payload", expected_object_type=object_type)
+        if payload_item["id"] != current["object_id"]:
+            raise RuntimeError(f"{label}.records[{index}] object_id mismatch: {current}")
 
 
-def _assert_record_identity_anchor(record: dict[str, object], label: str) -> None:
-    record_id = str(record.get("record_id", "")).strip()
-    if not record_id:
-        raise RuntimeError(f"{label}.record_id missing: {record}")
-    expected = _expected_record_id(record.get("source_ref"), f"{label}.source_ref")
-    if record_id != expected:
-        raise RuntimeError(f"{label}.record_id mismatch: {record_id} != {expected}")
+def _assert_session_state_job_surface(value: object, label: str) -> None:
+    payload = _require_mapping(value, label)
+    _require_keys(payload, ["job_id", "updated_at"], label)
+    for forbidden in ["record_id", "source_ref", "durable_refs", "result", "observation", "last_known_issue", "last_known_issue_state"]:
+        if forbidden in payload:
+            raise RuntimeError(f"{label} still exposes legacy canonical field {forbidden}: {payload}")
 
 
-def _assert_source_anchor(
-    record: dict[str, object],
-    label: str,
+def _assert_object_list_response(payload: dict[str, object], object_type: str) -> None:
+    _require_keys(payload, ["object_type", "items"], "objects.list")
+    if payload["object_type"] != object_type:
+        raise RuntimeError(f"object list type mismatch: {payload}")
+    items = _require_list(payload["items"], "objects.list.items")
+    for index, item in enumerate(items):
+        _assert_formal_object_surface(_require_mapping(item, f"objects.list.items[{index}]"), f"objects.list.items[{index}]", expected_object_type=object_type)
+
+
+def _assert_object_query_response(payload: dict[str, object], object_type: str) -> None:
+    _require_keys(payload, ["object_type", "item"], "objects.query")
+    if payload["object_type"] != object_type:
+        raise RuntimeError(f"object query type mismatch: {payload}")
+    _assert_formal_object_surface(_require_mapping(payload["item"], "objects.query.item"), "objects.query.item", expected_object_type=object_type)
+
+
+def _assert_formal_object_surface(value: object, label: str, *, expected_object_type: str | None = None) -> None:
+    payload = _require_mapping(value, label)
+    _require_keys(payload, ["id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at"], label)
+    for forbidden in ["record_id", "source_ref", "durable_refs", "result", "observation", "last_known_issue", "last_known_issue_state"]:
+        if forbidden in payload:
+            raise RuntimeError(f"{label} still exposes legacy field {forbidden}: {payload}")
+    object_type = str(payload["object_type"]).strip()
+    if expected_object_type is not None and object_type != expected_object_type:
+        raise RuntimeError(f"{label}.object_type mismatch: {payload}")
+    if object_type not in FORMAL_OBJECT_TYPES:
+        raise RuntimeError(f"{label}.object_type invalid: {payload}")
+    if payload.get("contract_version") != "v1":
+        raise RuntimeError(f"{label}.contract_version mismatch: {payload}")
+    if payload.get("visibility") not in {"summary", "restricted", "sensitive"}:
+        raise RuntimeError(f"{label}.visibility mismatch: {payload}")
+    _assert_object_context_surface(payload, label)
+    required_by_type = {
+        "job": ["state", "job_type", "action_summary"],
+        "run": ["state", "phase", "attempt"],
+        "intervention": ["state", "template_id", "summary", "required_inputs", "allowed_actions"],
+        "outcome": ["state", "summary", "completed_at"],
+        "artifact": ["state", "kind", "role"],
+        "action": ["state", "type", "summary"],
+        "instance": ["state", "name", "version", "role", "static_capabilities", "available_capabilities"],
+        "reference": ["state", "type", "system", "locator"],
+    }
+    _require_keys(payload, required_by_type[object_type], label)
+    if object_type == "job":
+        action_summary = _require_mapping(payload["action_summary"], f"{label}.action_summary")
+        _require_keys(action_summary, ["has_pending_external_actions", "pending_count"], f"{label}.action_summary")
+    elif object_type == "run":
+        if not isinstance(payload["attempt"], int):
+            raise RuntimeError(f"{label}.attempt is not int: {payload}")
+        if "candidate_delivery" in payload and payload["candidate_delivery"] is not None:
+            candidate = _require_mapping(payload["candidate_delivery"], f"{label}.candidate_delivery")
+            _require_keys(candidate, ["kind", "reached", "reached_at", "summary", "artifact_ids"], f"{label}.candidate_delivery")
+        if "review_gate" in payload and payload["review_gate"] is not None:
+            review_gate = _require_mapping(payload["review_gate"], f"{label}.review_gate")
+            _require_keys(review_gate, ["status", "required", "max_fix_rounds"], f"{label}.review_gate")
+    elif object_type == "instance":
+        _assert_static_capability_surface(payload["static_capabilities"], f"{label}.static_capabilities")
+        _assert_available_capability_surface(payload["available_capabilities"], f"{label}.available_capabilities")
+
+
+def _assert_object_context_surface(payload: dict[str, object], label: str) -> None:
+    if "relations" in payload and payload["relations"] is not None:
+        relations = _require_list(payload["relations"], f"{label}.relations")
+        for index, item in enumerate(relations):
+            relation = _require_mapping(item, f"{label}.relations[{index}]")
+            _require_keys(relation, ["type", "target_id", "target_type"], f"{label}.relations[{index}]")
+    if "references" in payload and payload["references"] is not None:
+        references = _require_list(payload["references"], f"{label}.references")
+        for index, item in enumerate(references):
+            _assert_reference_surface(item, f"{label}.references[{index}]")
+    if "reasons" in payload and payload["reasons"] is not None:
+        _assert_reason_list(payload["reasons"], f"{label}.reasons")
+    if "decision" in payload and payload["decision"] is not None:
+        decision = _require_mapping(payload["decision"], f"{label}.decision")
+        _require_keys(decision, ["decision_code", "category", "recommended_actions"], f"{label}.decision")
+    if "error_code" in payload and payload["error_code"] is not None and not str(payload["error_code"]).strip():
+        raise RuntimeError(f"{label}.error_code is blank: {payload}")
+
+
+def _assert_reference_surface(value: object, label: str) -> None:
+    payload = _require_mapping(value, label)
+    _require_keys(payload, ["id", "object_type", "domain_id", "visibility", "contract_version", "created_at", "updated_at", "state", "type", "system", "locator"], label)
+    if payload["object_type"] != "reference":
+        raise RuntimeError(f"{label}.object_type mismatch: {payload}")
+
+
+def _assert_event_object_surface(value: object, label: str) -> None:
+    payload = _require_mapping(value, label)
+    _require_keys(payload, ["object_type", "object_id"], label)
+    if str(payload["object_type"]).strip() not in FORMAL_OBJECT_TYPES:
+        raise RuntimeError(f"{label}.object_type mismatch: {payload}")
+
+
+def _list_objects(base_url: str, object_type: str) -> list[dict[str, object]]:
+    payload = fetch_json(f"{base_url}/api/v1/objects/{object_type}")
+    _assert_object_list_response(payload, object_type)
+    return [_require_mapping(item, f"objects.list.items[{index}]") for index, item in enumerate(_require_list(payload["items"], "objects.list.items"))]
+
+
+def _get_object(base_url: str, object_type: str, object_id: str) -> dict[str, object]:
+    payload = fetch_json(f"{base_url}/api/v1/objects/{object_type}/{object_id}")
+    _assert_object_query_response(payload, object_type)
+    return _require_mapping(payload["item"], "objects.query.item")
+
+
+def _find_object_by_source_identifier(
+    base_url: str,
+    object_type: str,
+    identifier: str,
     *,
-    source_kind: str,
-    source_name: str,
-    source_id: str,
-    source_identifier: str,
-) -> None:
-    source_ref = _require_mapping(record.get("source_ref"), f"{label}.source_ref")
-    if source_ref.get("source_kind") != source_kind:
-        raise RuntimeError(f"{label}.source_kind mismatch: {source_ref}")
-    if source_ref.get("source_name") != source_name:
-        raise RuntimeError(f"{label}.source_name mismatch: {source_ref}")
-    if source_ref.get("source_id") != source_id:
-        raise RuntimeError(f"{label}.source_id mismatch: {source_ref}")
-    if source_ref.get("source_identifier") != source_identifier:
-        raise RuntimeError(f"{label}.source_identifier mismatch: {source_ref}")
-    _assert_record_identity_anchor(record, label)
+    state: str | None = None,
+) -> dict[str, object] | None:
+    for item in _list_objects(base_url, object_type):
+        if not _object_has_source_identifier(item, identifier):
+            continue
+        if state is not None and item.get("state") != state:
+            continue
+        return item
+    return None
+
+
+def _object_has_source_identifier(item: dict[str, object], identifier: str) -> bool:
+    references = item.get("references")
+    if not isinstance(references, list):
+        return False
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        if reference.get("type") == "linear_issue" and reference.get("locator") == identifier:
+            return True
+    return False
+
+
+def _find_related_object(
+    base_url: str,
+    item: dict[str, object],
+    *,
+    relation_type: str,
+    target_type: str,
+) -> dict[str, object] | None:
+    relations = item.get("relations")
+    if not isinstance(relations, list):
+        return None
+    for relation in relations:
+        if not isinstance(relation, dict):
+            continue
+        if relation.get("type") != relation_type or relation.get("target_type") != target_type:
+            continue
+        target_id = str(relation.get("target_id", "")).strip()
+        if not target_id:
+            continue
+        return _get_object(base_url, target_type, target_id)
+    return None
+
+
+def _find_session_state_object(
+    payload: dict[str, object],
+    object_type: str,
+    identifier: str,
+    *,
+    state: str | None = None,
+) -> dict[str, object] | None:
+    formal_objects = _require_mapping(payload.get("formal_objects"), "session_state.formal_objects")
+    records = _require_list(formal_objects.get("records"), "session_state.formal_objects.records")
+    for record in records:
+        envelope = _require_mapping(record, "session_state.formal_objects.records[]")
+        if envelope.get("object_type") != object_type:
+            continue
+        item = _require_mapping(envelope.get("payload"), "session_state.formal_objects.records[].payload")
+        if not _object_has_source_identifier(item, identifier):
+            continue
+        if state is not None and item.get("state") != state:
+            continue
+        return item
+    return None
 
 
 def _assert_reason_surface(value: object, label: str) -> None:
     payload = _require_mapping(value, label)
     _require_keys(payload, ["reason_code", "category", "details"], label)
-    if payload["category"] not in {"api", "config", "control", "record", "runtime", "service"}:
+    if payload["category"] not in REASON_CATEGORIES:
         raise RuntimeError(f"{label} category mismatch: {payload}")
     if payload["details"] is not None:
         _require_mapping(payload["details"], f"{label}.details")
@@ -1613,37 +1835,6 @@ def _assert_reason_list(value: object, label: str) -> None:
     reasons = _require_list(value, label)
     for index, reason in enumerate(reasons):
         _assert_reason_surface(reason, f"{label}[{index}]")
-
-
-def _assert_observation_surface(value: object, label: str) -> None:
-    payload = _require_mapping(value, label)
-    _require_keys(payload, ["running", "summary", "details"], label)
-    if not isinstance(payload["running"], bool):
-        raise RuntimeError(f"{label}.running is not bool: {payload}")
-    if not isinstance(payload["summary"], str):
-        raise RuntimeError(f"{label}.summary is not string: {payload}")
-    if payload["details"] is not None:
-        _require_mapping(payload["details"], f"{label}.details")
-
-
-def _assert_result_surface(value: object, label: str) -> None:
-    payload = _require_mapping(value, label)
-    _require_keys(payload, ["outcome", "summary", "completed_at", "details"], label)
-    if payload["outcome"] not in {"succeeded", "failed", "abandoned"}:
-        raise RuntimeError(f"{label}.outcome mismatch: {payload}")
-    if not isinstance(payload["summary"], str) or not str(payload["completed_at"]).strip():
-        raise RuntimeError(f"{label} missing summary/completed_at: {payload}")
-    if payload["details"] is not None:
-        _require_mapping(payload["details"], f"{label}.details")
-
-
-def _assert_durable_refs_surface(value: object, label: str) -> None:
-    payload = _require_mapping(value, label)
-    if not str(payload.get("ledger_path", "")).strip():
-        raise RuntimeError(f"{label}.ledger_path missing: {payload}")
-    for key in ["workspace", "branch", "pull_request"]:
-        if key in payload and payload[key] is not None:
-            _require_mapping(payload[key], f"{label}.{key}")
 
 
 def _assert_ledger_identity_shape(value: object) -> None:
@@ -1687,84 +1878,18 @@ def _assert_ledger_identity(
         raise RuntimeError(f"ledger identity SessionStatePath mismatch: {descriptor}")
 
 
-def _find_runtime_record(payload: dict[str, object], identifier: str, status: str | None = None) -> dict[str, object] | None:
-    for record in _require_list(payload.get("records"), "state.records"):
-        if not isinstance(record, dict):
-            continue
-        if _record_identifier(record) != identifier:
-            continue
-        if status is not None and record.get("status") != status:
-            continue
-        return record
-    return None
+def _require_reference(item: dict[str, object], reference_type: str) -> dict[str, object]:
+    references = _require_list(item.get("references"), "object.references")
+    for reference in references:
+        current = _require_mapping(reference, "object.references[]")
+        if current.get("type") == reference_type:
+            _assert_reference_surface(current, "object.references[]")
+            return current
+    raise RuntimeError(f"reference_type {reference_type!r} not found in {item!r}")
 
 
-def _find_completed_record(payload: dict[str, object], identifier: str) -> dict[str, object] | None:
-    completed_window = _require_mapping(payload.get("completed_window"), "state.completed_window")
-    for record in _require_list(completed_window.get("records"), "state.completed_window.records"):
-        if not isinstance(record, dict):
-            continue
-        if _record_identifier(record) == identifier:
-            return record
-    return None
-
-
-def _find_ledger_record(
-    payload: dict[str, object],
-    identifier: str,
-    *,
-    status: str | None = None,
-    outcome: str | None = None,
-) -> dict[str, object] | None:
-    for record in _require_list(payload.get("records"), "ledger.records"):
-        if not isinstance(record, dict):
-            continue
-        if _record_identifier(record) != identifier:
-            continue
-        if status is not None and record.get("status") != status:
-            continue
-        if outcome is not None:
-            result = _require_mapping(record.get("result"), "ledger.record.result")
-            if result.get("outcome") != outcome:
-                continue
-        return record
-    return None
-
-
-def _record_identifier(record: dict[str, object]) -> str:
-    source_ref = _require_mapping(record.get("source_ref"), "record.source_ref")
-    return str(source_ref.get("source_identifier", "")).strip()
-
-
-def _require_runtime_record(payload: dict[str, object], identifier: str, *, status: str) -> dict[str, object]:
-    record = _find_runtime_record(payload, identifier, status=status)
-    if record is None:
-        raise RuntimeError(f"runtime record {identifier!r} with status {status!r} not found: {payload}")
-    return record
-
-
-def _require_completed_record(payload: dict[str, object], identifier: str, *, outcome: str) -> dict[str, object]:
-    record = _find_completed_record(payload, identifier)
-    if record is None:
-        raise RuntimeError(f"completed_window record {identifier!r} not found: {payload}")
-    result = _require_mapping(record.get("result"), "completed_window.record.result")
-    if result.get("outcome") != outcome:
-        raise RuntimeError(f"completed_window outcome mismatch: {record}")
-    return record
-
-
-def _require_durable_ref(record: dict[str, object], key: str) -> dict[str, object]:
-    durable_refs = _require_mapping(record.get("durable_refs"), "record.durable_refs")
-    value = _require_mapping(durable_refs.get(key), f"record.durable_refs.{key}")
-    return value
-
-
-def _require_reason(record: dict[str, object], reason_code: str) -> dict[str, object]:
-    reason = _require_mapping(record.get("reason"), "record.reason")
-    _assert_reason_surface(reason, "record.reason")
-    if reason.get("reason_code") != reason_code:
-        raise RuntimeError(f"reason_code mismatch: {reason}")
-    return reason
+def _require_reason_from_object(item: dict[str, object], reason_code: str) -> dict[str, object]:
+    return _require_reason_from_list(item.get("reasons"), reason_code)
 
 
 def _require_reason_from_list(value: object, reason_code: str) -> dict[str, object]:

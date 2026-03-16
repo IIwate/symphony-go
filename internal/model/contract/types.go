@@ -45,8 +45,6 @@ func (m ServiceMode) IsValid() bool {
 	}
 }
 
-type RecordID string
-
 type SourceKind string
 
 const (

@@ -657,84 +657,6 @@ type LiveSession struct {
 	TurnCount                int
 }
 
-type RetryEntry struct {
-	IssueID       string
-	Identifier    string
-	WorkspacePath string
-	Attempt       int
-	StallCount    int
-	DueAt         time.Time
-	TimerHandle   *time.Timer
-	Error         *string
-	Dispatch      *DispatchContext
-}
-
-type AwaitingMergeEntry struct {
-	Identifier           string
-	State                string
-	WorkspacePath        string
-	Branch               string
-	PRNumber             int
-	PRURL                string
-	PRState              string
-	PRBaseOwner          string
-	PRBaseRepo           string
-	PRHeadOwner          string
-	RetryAttempt         int
-	StallCount           int
-	AwaitingSince        time.Time
-	LastError            *string
-	PostMergeRetryCount  int
-	NextPostMergeRetryAt *time.Time
-}
-
-type AwaitingInterventionEntry struct {
-	Identifier          string
-	WorkspacePath       string
-	Branch              string
-	PRNumber            int
-	PRURL               string
-	PRState             string
-	PRBaseOwner         string
-	PRBaseRepo          string
-	PRHeadOwner         string
-	RetryAttempt        int
-	StallCount          int
-	ObservedAt          time.Time
-	Reason              string
-	ExpectedOutcome     string
-	PreviousBranch      string
-	LastKnownIssueState string
-}
-
-type RecoveryStrategy string
-
-const (
-	RecoveryStrategyContinuationRetry RecoveryStrategy = "continuation_retry"
-	RecoveryStrategyPostRunResume     RecoveryStrategy = "post_run_resume"
-)
-
-type RecoverySource string
-
-const (
-	RecoverySourceRunning   RecoverySource = "running"
-	RecoverySourceRecovered RecoverySource = "recovered"
-	RecoverySourceSucceeded RecoverySource = "succeeded"
-)
-
-type RecoveryEntry struct {
-	Identifier    string
-	WorkspacePath string
-	FinalBranch   string
-	State         string
-	RetryAttempt  int
-	StallCount    int
-	ObservedAt    time.Time
-	Strategy      RecoveryStrategy
-	Source        RecoverySource
-	Dispatch      *DispatchContext
-}
-
 type ProtectedResultOutcome string
 
 const (
@@ -777,48 +699,42 @@ const (
 )
 
 type JobRuntime struct {
-	Object              contract.Job
-	Lifecycle           JobLifecycleState
-	RecordID            contract.RecordID
-	SourceRef           contract.SourceRef
-	Reason              *contract.Reason
-	Observation         *contract.Observation
-	DurableRefs         contract.DurableRefs
-	Result              *contract.Result
-	UpdatedAt           string
-	RetryDueAt          *time.Time
-	RetryAttempt        int
-	StallCount          int
-	LastKnownIssue      *Issue
-	LastKnownIssueState string
-	StartedAt           *time.Time
-	WorkerCancel        context.CancelFunc
-	RetryTimer          *time.Timer
-	Session             LiveSession
-	Dispatch            *DispatchContext
-	NeedsRecovery       bool
-	Run                 *RunState
-	Intervention        *InterventionState
-	Outcome             *contract.Outcome
-	Artifacts           []contract.Artifact
+	Object           contract.Job
+	Lifecycle        JobLifecycleState
+	Reason           *contract.Reason
+	Observation      *contract.Observation
+	UpdatedAt        string
+	WorkspacePath    string
+	SourceState      string
+	PullRequestState string
+	RetryDueAt       *time.Time
+	RetryAttempt     int
+	StallCount       int
+	StartedAt        *time.Time
+	WorkerCancel     context.CancelFunc
+	RetryTimer       *time.Timer
+	Session          LiveSession
+	Dispatch         *DispatchContext
+	NeedsRecovery    bool
+	Run              *RunState
+	Intervention     *InterventionState
+	Outcome          *contract.Outcome
+	Artifacts        []contract.Artifact
 }
 
 type ArchivedJob struct {
-	Object              contract.Job
-	RecordID            contract.RecordID
-	SourceRef           contract.SourceRef
-	Reason              *contract.Reason
-	Observation         *contract.Observation
-	DurableRefs         contract.DurableRefs
-	Result              *contract.Result
-	UpdatedAt           string
-	LastKnownIssue      *Issue
-	LastKnownIssueState string
-	Dispatch            *DispatchContext
-	Run                 *RunState
-	Intervention        *InterventionState
-	Outcome             *contract.Outcome
-	Artifacts           []contract.Artifact
+	Object           contract.Job
+	Reason           *contract.Reason
+	Observation      *contract.Observation
+	UpdatedAt        string
+	WorkspacePath    string
+	SourceState      string
+	PullRequestState string
+	Dispatch         *DispatchContext
+	Run              *RunState
+	Intervention     *InterventionState
+	Outcome          *contract.Outcome
+	Artifacts        []contract.Artifact
 }
 
 type OrchestratorState struct {

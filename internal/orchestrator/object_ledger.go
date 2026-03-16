@@ -849,12 +849,40 @@ func currentInstanceRole(cfg *model.ServiceConfig) contract.InstanceRole {
 	return contract.InstanceRoleLeader
 }
 
+func objectIdentityKeyForRecord(record *model.JobRuntime) string {
+	if record == nil {
+		return "unknown"
+	}
+	if jobID := strings.TrimSpace(record.Object.ID); strings.HasPrefix(jobID, "job-") && len(jobID) > len("job-") {
+		return strings.TrimPrefix(jobID, "job-")
+	}
+	if jobID := strings.TrimSpace(record.Object.ID); jobID != "" {
+		return sanitizeObjectIDToken(jobID, "unknown")
+	}
+	return "unknown"
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func jobIDForRecord(record *model.JobRuntime) string {
-	return "job-" + strings.TrimSpace(string(record.RecordID))
+	if record == nil {
+		return "job-unknown"
+	}
+	if jobID := strings.TrimSpace(record.Object.ID); jobID != "" {
+		return jobID
+	}
+	return "job-" + objectIdentityKeyForRecord(record)
 }
 
 func runIDForRecord(record *model.JobRuntime, attempt int) string {
-	return fmt.Sprintf("run-%s-%d", strings.TrimSpace(string(record.RecordID)), attempt)
+	return fmt.Sprintf("run-%s-%d", objectIdentityKeyForRecord(record), attempt)
 }
 
 func interventionIDForRecord(record *model.JobRuntime) string {
@@ -862,51 +890,48 @@ func interventionIDForRecord(record *model.JobRuntime) string {
 	if record.Run != nil {
 		attempt = record.Run.Attempt
 	}
-	return fmt.Sprintf("intervention-%s-%d", strings.TrimSpace(string(record.RecordID)), attempt)
+	return fmt.Sprintf("intervention-%s-%d", objectIdentityKeyForRecord(record), attempt)
 }
 
 func outcomeIDForRecord(record *model.JobRuntime) string {
-	return "outcome-" + strings.TrimSpace(string(record.RecordID))
+	return "outcome-" + objectIdentityKeyForRecord(record)
 }
 
 func artifactIDForRecord(record *model.JobRuntime, suffix string) string {
-	return fmt.Sprintf("artifact-%s-%s", strings.TrimSpace(string(record.RecordID)), suffix)
+	return fmt.Sprintf("artifact-%s-%s", objectIdentityKeyForRecord(record), suffix)
 }
 
 func sourceClosureActionIDForRecord(record *model.JobRuntime) string {
-	return "action-" + strings.TrimSpace(string(record.RecordID)) + "-source-closure"
+	return "action-" + objectIdentityKeyForRecord(record) + "-source-closure"
 }
 
 func sourceReferenceIDForRecord(record *model.JobRuntime) string {
-	return "ref-" + strings.TrimSpace(string(record.RecordID)) + "-source"
+	return "ref-" + objectIdentityKeyForRecord(record) + "-source"
 }
 
 func branchReferenceIDForRecord(record *model.JobRuntime) string {
-	return "ref-" + strings.TrimSpace(string(record.RecordID)) + "-branch"
+	return "ref-" + objectIdentityKeyForRecord(record) + "-branch"
 }
 
 func pullRequestReferenceIDForRecord(record *model.JobRuntime) string {
-	return "ref-" + strings.TrimSpace(string(record.RecordID)) + "-pr"
+	return "ref-" + objectIdentityKeyForRecord(record) + "-pr"
 }
 
 func runtimeFromArchivedJobForLedger(record model.ArchivedJob) *model.JobRuntime {
 	return &model.JobRuntime{
-		Object:              record.Object,
-		Lifecycle:           model.JobLifecycleCompleted,
-		RecordID:            record.RecordID,
-		SourceRef:           record.SourceRef,
-		Reason:              cloneReason(record.Reason),
-		Observation:         cloneObservation(record.Observation),
-		DurableRefs:         cloneDurableRefs(record.DurableRefs),
-		Result:              cloneResult(record.Result),
-		UpdatedAt:           record.UpdatedAt,
-		LastKnownIssue:      model.CloneIssue(record.LastKnownIssue),
-		LastKnownIssueState: record.LastKnownIssueState,
-		Dispatch:            model.CloneDispatchContext(record.Dispatch),
-		Run:                 model.CloneRunState(record.Run),
-		Intervention:        model.CloneInterventionState(record.Intervention),
-		Outcome:             cloneOutcome(record.Outcome),
-		Artifacts:           cloneArtifacts(record.Artifacts),
+		Object:           record.Object,
+		Lifecycle:        model.JobLifecycleCompleted,
+		Reason:           cloneReason(record.Reason),
+		Observation:      cloneObservation(record.Observation),
+		UpdatedAt:        record.UpdatedAt,
+		WorkspacePath:    record.WorkspacePath,
+		SourceState:      record.SourceState,
+		PullRequestState: record.PullRequestState,
+		Dispatch:         model.CloneDispatchContext(record.Dispatch),
+		Run:              model.CloneRunState(record.Run),
+		Intervention:     model.CloneInterventionState(record.Intervention),
+		Outcome:          cloneOutcome(record.Outcome),
+		Artifacts:        cloneArtifacts(record.Artifacts),
 	}
 }
 
@@ -1060,7 +1085,7 @@ func (o *Orchestrator) jobObjectFromRecord(record *model.JobRuntime, state contr
 	}
 	ctx := contract.ObjectContext{
 		Relations:  relations,
-		References: referencesFromRecord(o, record, updatedAt),
+		References: append([]contract.Reference(nil), record.Object.References...),
 	}
 	if record.Reason != nil {
 		ctx.Reasons = []contract.Reason{*cloneReason(record.Reason)}
@@ -1129,53 +1154,6 @@ func (o *Orchestrator) updateJobActionSummaryLocked(jobID string) {
 	if err := o.objectLedger.UpsertJob(job); err != nil {
 		o.logger.Warn("update job action summary failed", "job_id", job.ID, "error", err.Error())
 	}
-}
-
-func referencesFromRecord(o *Orchestrator, record *model.JobRuntime, updatedAt string) []contract.Reference {
-	if record == nil {
-		return nil
-	}
-	references := []contract.Reference{}
-	baseRef := func(id string) contract.BaseObject {
-		return o.baseObjectLocked(contract.ObjectTypeReference, id, contract.VisibilityLevelRestricted, updatedAt)
-	}
-	sourceRef := record.SourceRef
-	switch sourceRef.SourceKind {
-	case contract.SourceKindLinear:
-		references = append(references, contract.Reference{
-			BaseObject:  baseRef(sourceReferenceIDForRecord(record)),
-			State:       contract.ReferenceStatusActive,
-			Type:        contract.ReferenceTypeLinearIssue,
-			System:      string(sourceRef.SourceKind),
-			Locator:     sourceRef.SourceIdentifier,
-			URL:         sourceRef.URL,
-			ExternalID:  sourceRef.SourceID,
-			DisplayName: sourceRef.SourceIdentifier,
-		})
-	}
-	if branch := record.DurableRefs.Branch; branch != nil && strings.TrimSpace(branch.Name) != "" {
-		references = append(references, contract.Reference{
-			BaseObject:  baseRef(branchReferenceIDForRecord(record)),
-			State:       contract.ReferenceStatusActive,
-			Type:        contract.ReferenceTypeGitBranch,
-			System:      "git",
-			Locator:     branch.Name,
-			DisplayName: branch.Name,
-		})
-	}
-	if pr := record.DurableRefs.PullRequest; pr != nil && strings.TrimSpace(pr.URL) != "" {
-		references = append(references, contract.Reference{
-			BaseObject:  baseRef(pullRequestReferenceIDForRecord(record)),
-			State:       contract.ReferenceStatusActive,
-			Type:        contract.ReferenceTypeGitHubPullRequest,
-			System:      "github",
-			Locator:     pr.URL,
-			URL:         pr.URL,
-			ExternalID:  fmt.Sprintf("%d", pr.Number),
-			DisplayName: fmt.Sprintf("PR #%d", pr.Number),
-		})
-	}
-	return references
 }
 
 func (o *Orchestrator) publishFormalEventsLocked() {
@@ -1269,11 +1247,7 @@ func (o *Orchestrator) requiresSourceClosureAction(record *model.JobRuntime) boo
 	if pr == nil || pr.State != PullRequestStateMerged {
 		return false
 	}
-	sourceState := record.LastKnownIssueState
-	if record.LastKnownIssue != nil {
-		sourceState = record.LastKnownIssue.State
-	}
-	return !o.isTerminalState(sourceState, o.currentConfig())
+	return !o.isTerminalState(strings.TrimSpace(record.SourceState), o.currentConfig())
 }
 
 func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.JobRuntime) {
@@ -1294,16 +1268,9 @@ func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.JobRuntime)
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
 	}
-	sourceIssue := model.CloneIssue(record.LastKnownIssue)
+	sourceIssue := recordSourceIssue(record)
 	if sourceIssue == nil {
-		sourceIssue = &model.Issue{
-			ID:         record.SourceRef.SourceID,
-			Identifier: record.SourceRef.SourceIdentifier,
-			State:      record.LastKnownIssueState,
-		}
-		if url := strings.TrimSpace(record.SourceRef.URL); url != "" {
-			sourceIssue.URL = &url
-		}
+		sourceIssue = &model.Issue{}
 	}
 	action := contract.Action{
 		BaseObject: o.baseObjectLocked(contract.ObjectTypeAction, actionID, contract.VisibilityLevelRestricted, updatedAt),
@@ -1315,7 +1282,7 @@ func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.JobRuntime)
 					"source_identifier": sourceIssue.Identifier,
 				}),
 			},
-			References: referencesFromRecord(o, record, updatedAt),
+			References: append([]contract.Reference(nil), referencesFromFormalObjects(record)...),
 		},
 		State:   contract.ActionStatusQueued,
 		Type:    contract.ActionTypeSourceClosure,
@@ -1422,8 +1389,8 @@ func (o *Orchestrator) artifactsForCompletedRecord(record *model.JobRuntime) []c
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
 	}
-	references := referencesFromRecord(o, record, updatedAt)
-	pr := record.DurableRefs.PullRequest
+	references := append([]contract.Reference(nil), referencesFromFormalObjects(record)...)
+	pr := recordPullRequest(record)
 	switch jobTypeForDispatch(record.Dispatch) {
 	case contract.JobTypeCodeChange:
 		if pr == nil || strings.TrimSpace(pr.URL) == "" {
