@@ -80,6 +80,36 @@ func (f *fakeTracker) CloseSourceIssue(context.Context, model.Issue) tracker.Sou
 	return tracker.SourceClosureResult{Disposition: tracker.SourceClosureDispositionCompleted}
 }
 
+func mustFormalObjectSnapshot(t *testing.T, objects ...any) ObjectLedgerSnapshot {
+	t.Helper()
+	ledger := NewMemoryObjectLedger(ObjectLedgerSnapshot{})
+	for _, item := range objects {
+		var err error
+		switch value := item.(type) {
+		case contract.Job:
+			err = ledger.UpsertJob(value)
+		case contract.Run:
+			err = ledger.UpsertRun(value)
+		case contract.Intervention:
+			err = ledger.UpsertIntervention(value)
+		case contract.Outcome:
+			err = ledger.UpsertOutcome(value)
+		case contract.Artifact:
+			err = ledger.UpsertArtifact(value)
+		case contract.Action:
+			err = ledger.UpsertAction(value)
+		case contract.Reference:
+			err = ledger.UpsertReference(value)
+		default:
+			t.Fatalf("unsupported formal object type %T", item)
+		}
+		if err != nil {
+			t.Fatalf("upsert formal object %T error = %v", item, err)
+		}
+	}
+	return ledger.Snapshot()
+}
+
 type fakeWorkspace struct {
 	root         string
 	cleanupCalls []string
@@ -247,7 +277,7 @@ func prepareQueuedSourceClosureAction(t *testing.T, o *Orchestrator, trackerClie
 		OnMissingPR:     model.CompletionActionIntervention,
 		OnClosedPR:      model.CompletionActionIntervention,
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	o.moveToAwaitingMerge(issue.ID, issue.Identifier, issue.State, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier), "feature/abc-1", 0, 0, &PullRequestInfo{
 		Number:     7,
 		URL:        "https://example.invalid/pr/7",
@@ -416,6 +446,12 @@ func TestReconcileAwaitingMergeCompletesLandChangeAndQueuesSourceClosureAction(t
 	if action.Type != contract.ActionTypeSourceClosure {
 		t.Fatalf("action.Type = %q, want %q", action.Type, contract.ActionTypeSourceClosure)
 	}
+	if len(action.Relations) == 0 || action.Relations[0].Type != contract.RelationTypeActionReference {
+		t.Fatalf("action.Relations = %#v, want action.reference relation", action.Relations)
+	}
+	if _, ok := o.GetObject(contract.ObjectTypeReference, action.Relations[0].TargetID); !ok {
+		t.Fatalf("GetObject(reference, %q) = false, want true", action.Relations[0].TargetID)
+	}
 }
 
 func TestReconcileSourceClosureActionsCompletesLifecycle(t *testing.T) {
@@ -542,7 +578,7 @@ func TestBuildPersistedStateUsesLedgerRecordsAndNoLegacyDumpKeys(t *testing.T) {
 			ArtifactIDs: []string{"art-1"},
 		},
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), dispatch, 1)
 	o.scheduleContinuationLocked(issue.ID, issue.Identifier, 1, ptrString("runner failed"), 1, dispatch)
 	o.rememberCompletedLocked(&model.JobRuntime{
 		Lifecycle: model.JobLifecycleCompleted,
@@ -579,11 +615,21 @@ func TestBuildPersistedStateUsesLedgerRecordsAndNoLegacyDumpKeys(t *testing.T) {
 	if !ok || len(jobs) != 2 {
 		t.Fatalf("jobs = %#v, want 2 entries", payload["jobs"])
 	}
+	firstJob, ok := jobs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("jobs[0] = %#v, want object", jobs[0])
+	}
+	for _, forbidden := range []string{"job", "outcome", "artifacts"} {
+		if _, ok := firstJob[forbidden]; ok {
+			t.Fatalf("jobs[0] still exposes mirrored formal field %q: %#v", forbidden, firstJob)
+		}
+	}
 }
 
 func TestRestorePersistedStateRebuildsRecordIndexesAndArchivedJobs(t *testing.T) {
 	o, _, _ := newTestOrchestrator(t)
 	retryDue := o.now().Add(10 * time.Second).Format(time.RFC3339Nano)
+	updatedAt := o.now().UTC().Format(time.RFC3339Nano)
 	state := durableRuntimeState{
 		Version:  durableStateVersion,
 		Identity: o.currentRuntimeIdentity(),
@@ -593,7 +639,7 @@ func TestRestorePersistedStateRebuildsRecordIndexesAndArchivedJobs(t *testing.T)
 		},
 		Jobs: []durableJobState{
 			{
-				Job:        contract.Job{State: contract.JobStatusRunning},
+				JobID:      "job-1",
 				RecordID:   "rec_linear_linear-main_1",
 				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
 				Reason:     ptrReason(contract.MustReason(contract.ReasonRunContinuationPending, map[string]any{"attempt": 3})),
@@ -601,49 +647,50 @@ func TestRestorePersistedStateRebuildsRecordIndexesAndArchivedJobs(t *testing.T)
 				DurableRefs: contract.DurableRefs{
 					LedgerPath: o.currentConfig().SessionPersistence.File.Path,
 				},
-				Run: &model.RunState{
-					Attempt: 2,
-					State:   contract.RunStatusContinuationPending,
-					Phase:   contract.RunPhaseSummaryBlocked,
+				Run: &durableRunRuntimeState{
+					RunID:  "run-1",
+					Budget: model.RunBudget{ExecutionMS: 100},
 				},
-				UpdatedAt:    o.now().UTC().Format(time.RFC3339Nano),
+				UpdatedAt:    updatedAt,
 				RetryAttempt: 2,
 				StallCount:   1,
 			},
 			{
-				Job:       contract.Job{State: contract.JobStatusRunning},
-				RecordID:  "rec_linear_linear-main_2",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "2", SourceIdentifier: "ABC-2"},
-				Reason:    ptrReason(contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{"pr_number": 42})),
+				JobID:      "job-2",
+				RecordID:   "rec_linear_linear-main_2",
+				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "2", SourceIdentifier: "ABC-2"},
+				Reason:     ptrReason(contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{"pr_number": 42})),
 				DurableRefs: contract.DurableRefs{
 					Branch:      &contract.BranchRef{Name: "feature/abc-2"},
 					PullRequest: &contract.PullRequestRef{Number: 42, URL: "https://github.example/pr/42", State: "open"},
 					LedgerPath:  o.currentConfig().SessionPersistence.File.Path,
 				},
-				Run: &model.RunState{
-					Attempt: 1,
-					State:   contract.RunStatusCompleted,
-					Phase:   contract.RunPhaseSummaryPublishing,
+				Run: &durableRunRuntimeState{
+					RunID: "run-2",
 				},
-				UpdatedAt:    o.now().UTC().Format(time.RFC3339Nano),
+				UpdatedAt:    updatedAt,
 				RetryAttempt: 1,
 			},
 			{
-				Job:       contract.Job{State: contract.JobStatusCompleted},
-				RecordID:  "rec_linear_linear-main_done",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "done", SourceIdentifier: "DONE-1"},
-				Result:    &contract.Result{Outcome: contract.ResultOutcomeSucceeded, Summary: "done", CompletedAt: o.now().UTC().Format(time.RFC3339Nano)},
-				Outcome: &contract.Outcome{
-					State:       contract.OutcomeConclusionSucceeded,
-					Summary:     "done",
-					CompletedAt: o.now().UTC().Format(time.RFC3339Nano),
-				},
+				JobID:      "job-done",
+				RecordID:   "rec_linear_linear-main_done",
+				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "done", SourceIdentifier: "DONE-1"},
+				Result:     &contract.Result{Outcome: contract.ResultOutcomeSucceeded, Summary: "done", CompletedAt: updatedAt},
+				OutcomeID:  "outcome-done",
 				DurableRefs: contract.DurableRefs{
 					LedgerPath: o.currentConfig().SessionPersistence.File.Path,
 				},
-				UpdatedAt: o.now().UTC().Format(time.RFC3339Nano),
+				UpdatedAt: updatedAt,
 			},
 		},
+		FormalObjects: mustFormalObjectSnapshot(t,
+			contract.Job{BaseObject: contract.BaseObject{ID: "job-1", ObjectType: contract.ObjectTypeJob, UpdatedAt: updatedAt}, State: contract.JobStatusRunning, JobType: contract.JobTypeCodeChange},
+			contract.Run{BaseObject: contract.BaseObject{ID: "run-1", ObjectType: contract.ObjectTypeRun, UpdatedAt: updatedAt}, State: contract.RunStatusContinuationPending, Phase: contract.RunPhaseSummaryBlocked, Attempt: 2},
+			contract.Job{BaseObject: contract.BaseObject{ID: "job-2", ObjectType: contract.ObjectTypeJob, UpdatedAt: updatedAt}, State: contract.JobStatusRunning, JobType: contract.JobTypeCodeChange},
+			contract.Run{BaseObject: contract.BaseObject{ID: "run-2", ObjectType: contract.ObjectTypeRun, UpdatedAt: updatedAt}, State: contract.RunStatusCompleted, Phase: contract.RunPhaseSummaryPublishing, Attempt: 1},
+			contract.Job{BaseObject: contract.BaseObject{ID: "job-done", ObjectType: contract.ObjectTypeJob, UpdatedAt: updatedAt}, State: contract.JobStatusCompleted, JobType: contract.JobTypeCodeChange},
+			contract.Outcome{BaseObject: contract.BaseObject{ID: "outcome-done", ObjectType: contract.ObjectTypeOutcome, UpdatedAt: updatedAt}, State: contract.OutcomeConclusionSucceeded, Summary: "done", CompletedAt: updatedAt},
+		),
 	}
 
 	o.restorePersistedStateLocked(&state)
@@ -659,6 +706,10 @@ func TestRestorePersistedStateRebuildsRecordIndexesAndArchivedJobs(t *testing.T)
 	}
 	if o.state.CodexTotals.InputTokens != 11 {
 		t.Fatalf("CodexTotals.InputTokens = %d, want 11", o.state.CodexTotals.InputTokens)
+	}
+	restored := o.state.Jobs["1"]
+	if restored == nil || restored.Object.ID != "job-1" || restored.Run == nil || restored.Run.Object.ID != "run-1" {
+		t.Fatalf("restored runtime = %#v, want hydrated formal job/run ids", restored)
 	}
 }
 
@@ -690,8 +741,9 @@ func TestConservativeRecoveryCanPromoteToAwaitingMerge(t *testing.T) {
 	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
 	record.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
 	record.DurableRefs.Branch = &contract.BranchRef{Name: "feature/abc-1"}
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
-	record.Run.ReviewGate.Status = contract.ReviewGateStatusPassed
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run.Object.ReviewGate.Status = contract.ReviewGateStatusPassed
+	syncRunStateMirrorsFromObject(record.Run)
 	o.prLookup = fakePRLookup{
 		find: func(context.Context, string, string) (*PullRequestInfo, error) {
 			return &PullRequestInfo{Number: 42, URL: "https://github.example/pr/42", State: PullRequestStateOpen, HeadBranch: "feature/abc-1"}, nil
@@ -747,7 +799,7 @@ func TestReconcileAwaitingMergeKeepsPersistedPRWhenRefreshReturnsNil(t *testing.
 	}
 	record := o.ensureRecordLocked(issue)
 	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	o.moveToAwaitingMerge(
 		issue.ID,
 		issue.Identifier,
@@ -844,7 +896,7 @@ func TestScheduleContinuationLockedPropagatesFormalReasonIntoRuntimeAndLedger(t 
 			ArtifactIDs: []string{"art-cont-1"},
 		},
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), dispatch, 1)
 
 	o.scheduleContinuationLocked(issue.ID, issue.Identifier, 1, ptrString("runner failed"), 1, dispatch)
 
@@ -884,7 +936,7 @@ func TestScheduleContinuationLockedRearmDoesNotDuplicateCheckpoint(t *testing.T)
 			Branch:      "runner/demo-scope/abc-1",
 		},
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), dispatch, 1)
 
 	o.scheduleContinuationLocked(issue.ID, issue.Identifier, 1, nil, 0, dispatch)
 	o.scheduleContinuationLocked(issue.ID, issue.Identifier, 1, ptrString("no available orchestrator slots"), 0, dispatch)
@@ -911,7 +963,7 @@ func TestHandleWorkerExitTurnTimeoutSchedulesContinuationWithRecoveryCheckpoint(
 	record.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
 	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
 	record.StartedAt = &startedAt
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	o.reindexRecordLocked(issue.ID, record)
 	o.mu.Unlock()
 
@@ -973,7 +1025,7 @@ func TestHandleWorkerExitHardViolationMovesToIntervention(t *testing.T) {
 	record.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
 	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
 	record.StartedAt = &startedAt
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	o.reindexRecordLocked(issue.ID, record)
 	o.mu.Unlock()
 
@@ -1012,7 +1064,7 @@ func TestHandleWorkerExitFailureCompletesJobWithFailedOutcome(t *testing.T) {
 	record.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
 	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
 	record.StartedAt = &startedAt
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	o.reindexRecordLocked(issue.ID, record)
 	o.mu.Unlock()
 
@@ -1054,7 +1106,7 @@ func TestHandleStalledRunningRecordSchedulesContinuationWithCheckpoint(t *testin
 	record.DurableRefs.Workspace = &contract.WorkspaceRef{Path: filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)}
 	record.Dispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
 	record.StartedAt = &startedAt
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	o.reindexRecordLocked(issue.ID, record)
 	o.mu.Unlock()
 
@@ -1158,7 +1210,7 @@ func TestResumeRecoveredSuccessPathLaunchesReadOnlyReviewer(t *testing.T) {
 		OnMissingPR:     model.CompletionActionIntervention,
 		OnClosedPR:      model.CompletionActionIntervention,
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	record.LastKnownIssue = model.CloneIssue(&issue)
 	record.LastKnownIssueState = issue.State
 	record.NeedsRecovery = true
@@ -1221,7 +1273,7 @@ func TestResumeRecoveredSuccessPathLaunchesReviewerForAnalysis(t *testing.T) {
 		Kind:            model.DispatchKindFresh,
 		ExpectedOutcome: model.CompletionModeNone,
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	record.LastKnownIssue = model.CloneIssue(&issue)
 	record.LastKnownIssueState = issue.State
 	record.NeedsRecovery = true
@@ -1251,8 +1303,163 @@ func TestResumeRecoveredSuccessPathLaunchesReviewerForAnalysis(t *testing.T) {
 	if len(o.state.ArchivedJobs) != 1 || o.state.ArchivedJobs[0].Outcome == nil || o.state.ArchivedJobs[0].Outcome.State != contract.OutcomeConclusionSucceeded {
 		t.Fatalf("archived jobs = %#v, want one completed succeeded record", o.state.ArchivedJobs)
 	}
+	archived := o.state.ArchivedJobs[0]
+	if len(archived.Artifacts) != 1 || archived.Artifacts[0].Kind != contract.ArtifactKindAnalysisReport {
+		t.Fatalf("archived artifacts = %#v, want one analysis report", archived.Artifacts)
+	}
+	outcomeEnvelope, ok := o.GetObject(contract.ObjectTypeOutcome, archived.Outcome.ID)
+	if !ok {
+		t.Fatal("GetObject(outcome) = false, want true")
+	}
+	var outcome contract.Outcome
+	if err := json.Unmarshal(outcomeEnvelope.Payload, &outcome); err != nil {
+		t.Fatalf("Unmarshal(outcome) error = %v", err)
+	}
+	if len(outcome.Relations) != 1 || outcome.Relations[0].Type != contract.RelationTypeOutcomeArtifact || outcome.Relations[0].TargetID != archived.Artifacts[0].ID {
+		t.Fatalf("outcome.Relations = %#v, want outcome.artifact to %q", outcome.Relations, archived.Artifacts[0].ID)
+	}
+	if _, ok := o.GetObject(contract.ObjectTypeArtifact, archived.Artifacts[0].ID); !ok {
+		t.Fatalf("GetObject(artifact, %q) = false, want true", archived.Artifacts[0].ID)
+	}
 	if reviewResult.ReviewStatus != contract.ReviewGateStatusPassed {
 		t.Fatalf("review result = %#v, want passed", reviewResult)
+	}
+}
+
+func TestMoveToAwaitingMergePublishesFormalCandidateArtifactsAndReferences(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	workspacePath := filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)
+	pr := &PullRequestInfo{
+		Number:     12,
+		URL:        "https://example.test/pr/12",
+		State:      PullRequestStateOpen,
+		HeadBranch: "runner/demo-scope/abc-1",
+	}
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Lifecycle = model.JobLifecycleActive
+	record.Observation = &contract.Observation{Running: true, Summary: "publishing pr"}
+	record.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
+	record.DurableRefs.Branch = &contract.BranchRef{Name: pr.HeadBranch}
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeCodeChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = issue.State
+	o.reindexRecordLocked(issue.ID, record)
+	o.mu.Unlock()
+
+	o.moveToAwaitingMerge(issue.ID, issue.Identifier, issue.State, workspacePath, pr.HeadBranch, 0, 0, pr, nil)
+
+	current := o.candidateDeliveryForIssueLocked(issue.ID)
+	if current == nil || current.Run == nil {
+		t.Fatal("candidate delivery record missing")
+	}
+	runEnvelope, ok := o.GetObject(contract.ObjectTypeRun, runIDForRecord(current, current.Run.Attempt))
+	if !ok {
+		t.Fatal("GetObject(run) = false, want true")
+	}
+	var run contract.Run
+	if err := json.Unmarshal(runEnvelope.Payload, &run); err != nil {
+		t.Fatalf("Unmarshal(run) error = %v", err)
+	}
+	wantArtifactID := artifactIDForRecord(current, "pull-request")
+	if run.CandidateDelivery == nil || len(run.CandidateDelivery.ArtifactIDs) != 1 || run.CandidateDelivery.ArtifactIDs[0] != wantArtifactID {
+		t.Fatalf("run.CandidateDelivery = %#v, want artifact %q", run.CandidateDelivery, wantArtifactID)
+	}
+	if len(run.Checkpoints) == 0 || len(run.Checkpoints[0].ReferenceIDs) != 1 || run.Checkpoints[0].ReferenceIDs[0] != pullRequestReferenceIDForRecord(current) {
+		t.Fatalf("run.Checkpoints = %#v, want PR reference id", run.Checkpoints)
+	}
+	artifactEnvelope, ok := o.GetObject(contract.ObjectTypeArtifact, wantArtifactID)
+	if !ok {
+		t.Fatalf("GetObject(artifact, %q) = false, want true", wantArtifactID)
+	}
+	var artifact contract.Artifact
+	if err := json.Unmarshal(artifactEnvelope.Payload, &artifact); err != nil {
+		t.Fatalf("Unmarshal(artifact) error = %v", err)
+	}
+	if artifact.Kind != contract.ArtifactKindPullRequest {
+		t.Fatalf("artifact.Kind = %q, want %q", artifact.Kind, contract.ArtifactKindPullRequest)
+	}
+	if _, ok := o.GetObject(contract.ObjectTypeReference, pullRequestReferenceIDForRecord(current)); !ok {
+		t.Fatalf("GetObject(reference, %q) = false, want true", pullRequestReferenceIDForRecord(current))
+	}
+}
+
+func TestFormalObjectsPublishRecoveryCheckpointArtifactsAndReferences(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	workspacePath := filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier)
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Lifecycle = model.JobLifecycleActive
+	record.Observation = &contract.Observation{Running: false, Summary: "checkpoint captured"}
+	record.DurableRefs.Workspace = &contract.WorkspaceRef{Path: workspacePath}
+	record.DurableRefs.Branch = &contract.BranchRef{Name: "runner/demo-scope/abc-1"}
+	record.DurableRefs.PullRequest = &contract.PullRequestRef{Number: 12, URL: "https://example.test/pr/12", State: "open"}
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeCodeChange,
+		Kind:            model.DispatchKindContinuation,
+		ExpectedOutcome: model.CompletionModePullRequest,
+	}
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run.State = contract.RunStatusContinuationPending
+	record.Run.Recovery = &model.RecoveryCheckpoint{
+		ArtifactID:    "artifact-rec-1-recovery",
+		PatchPath:     filepath.Join(t.TempDir(), "recovery.patch"),
+		WorkspacePath: workspacePath,
+		Checkpoint: contract.Checkpoint{
+			Type:         contract.CheckpointTypeRecovery,
+			Summary:      "saved recovery",
+			CapturedAt:   o.now().UTC().Format(time.RFC3339Nano),
+			Stage:        contract.RunPhaseSummaryBlocked,
+			ArtifactIDs:  []string{"artifact-rec-1-recovery"},
+			ReferenceIDs: []string{sourceReferenceIDForRecord(record), branchReferenceIDForRecord(record), pullRequestReferenceIDForRecord(record)},
+			BaseSHA:      "abc123",
+			Branch:       "runner/demo-scope/abc-1",
+		},
+	}
+	o.setRunContinuationPending(record, record.Run.Recovery)
+	record.LastKnownIssue = model.CloneIssue(&issue)
+	record.LastKnownIssueState = issue.State
+	o.reindexRecordLocked(issue.ID, record)
+	o.commitStateLocked(true)
+	o.mu.Unlock()
+
+	runEnvelope, ok := o.GetObject(contract.ObjectTypeRun, runIDForRecord(record, record.Run.Attempt))
+	if !ok {
+		t.Fatal("GetObject(run) = false, want true")
+	}
+	var run contract.Run
+	if err := json.Unmarshal(runEnvelope.Payload, &run); err != nil {
+		t.Fatalf("Unmarshal(run) error = %v", err)
+	}
+	if len(run.Checkpoints) == 0 || len(run.Checkpoints[0].ReferenceIDs) != 3 {
+		t.Fatalf("run.Checkpoints = %#v, want recovery checkpoint with reference ids", run.Checkpoints)
+	}
+	artifactEnvelope, ok := o.GetObject(contract.ObjectTypeArtifact, "artifact-rec-1-recovery")
+	if !ok {
+		t.Fatal("GetObject(recovery artifact) = false, want true")
+	}
+	var artifact contract.Artifact
+	if err := json.Unmarshal(artifactEnvelope.Payload, &artifact); err != nil {
+		t.Fatalf("Unmarshal(recovery artifact) error = %v", err)
+	}
+	if artifact.Kind != contract.ArtifactKindPatchBundle {
+		t.Fatalf("artifact.Kind = %q, want %q", artifact.Kind, contract.ArtifactKindPatchBundle)
+	}
+	if _, ok := o.GetObject(contract.ObjectTypeReference, sourceReferenceIDForRecord(record)); !ok {
+		t.Fatalf("GetObject(reference, %q) = false, want true", sourceReferenceIDForRecord(record))
 	}
 }
 
@@ -1278,8 +1485,9 @@ func TestReviewFixRoundsLimitMovesToIntervention(t *testing.T) {
 		OnMissingPR:     model.CompletionActionIntervention,
 		OnClosedPR:      model.CompletionActionIntervention,
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
-	record.Run.ReviewGate.Status = contract.ReviewGateStatusReviewing
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run.Object.ReviewGate.Status = contract.ReviewGateStatusReviewing
+	syncRunStateMirrorsFromObject(record.Run)
 	record.LastKnownIssue = model.CloneIssue(&issue)
 	record.LastKnownIssueState = issue.State
 	startedAt := o.now().Add(-time.Second)
@@ -1354,10 +1562,10 @@ func TestMoveToAwaitingInterventionBuildsFormalHandoff(t *testing.T) {
 		OnMissingPR:     model.CompletionActionIntervention,
 		OnClosedPR:      model.CompletionActionIntervention,
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	record.Run.ReviewSummary = "review blocked"
 	record.Run.ReviewFindings = []model.ReviewFinding{{Code: "review.issue", Summary: "needs explicit human direction"}}
-	record.Run.Checkpoints = append(record.Run.Checkpoints, contract.Checkpoint{
+	record.Run.Object.Checkpoints = append(record.Run.Object.Checkpoints, contract.Checkpoint{
 		Type:        contract.CheckpointTypeBusiness,
 		Summary:     "draft PR ready",
 		CapturedAt:  o.now().UTC().Format(time.RFC3339Nano),
@@ -1365,6 +1573,7 @@ func TestMoveToAwaitingInterventionBuildsFormalHandoff(t *testing.T) {
 		ArtifactIDs: []string{"pr-12"},
 		Branch:      "runner/demo-scope/abc-1",
 	})
+	syncRunStateMirrorsFromObject(record.Run)
 	o.reindexRecordLocked(issue.ID, record)
 	o.mu.Unlock()
 
@@ -1425,7 +1634,7 @@ func TestResumeInterventionStartsNewRunWithRecoveryContextOnly(t *testing.T) {
 			Findings: []model.ReviewFinding{{Code: "stale", Summary: "should not carry over"}},
 		},
 	}
-	record.Run = ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
 	record.Run.ReviewGate.FixRoundsUsed = 2
 	record.Run.Recovery = &model.RecoveryCheckpoint{
 		ArtifactID:    "art-1",
@@ -1443,7 +1652,13 @@ func TestResumeInterventionStartsNewRunWithRecoveryContextOnly(t *testing.T) {
 	record.Session = model.LiveSession{TurnCount: 7, LastCodexMessage: "stale"}
 	record.Intervention = &model.InterventionState{
 		Object: contract.Intervention{
+			BaseObject: contract.BaseObject{
+				ID: interventionIDForRecord(record),
+			},
 			State: contract.InterventionStatusOpen,
+		},
+		Handoff: model.InterventionHandoff{
+			Checkpoint: &record.Run.Recovery.Checkpoint,
 		},
 	}
 	record.LastKnownIssue = model.CloneIssue(&issue)
@@ -1451,7 +1666,7 @@ func TestResumeInterventionStartsNewRunWithRecoveryContextOnly(t *testing.T) {
 	o.reindexRecordLocked(issue.ID, record)
 	o.mu.Unlock()
 
-	o.resumeIntervention(context.Background(), issue, contract.InterventionResolution{
+	o.resumeIntervention(context.Background(), record.Intervention.Object.ID, issue, contract.InterventionResolution{
 		Action:         contract.ControlActionResolveIntervention,
 		ProvidedInputs: map[string]any{"resolution": "revise_scope"},
 		ResolvedAt:     o.now().UTC().Format(time.RFC3339Nano),
@@ -1460,6 +1675,9 @@ func TestResumeInterventionStartsNewRunWithRecoveryContextOnly(t *testing.T) {
 	current := o.state.Jobs[issue.ID]
 	if current == nil || current.Run == nil {
 		t.Fatal("run missing after intervention resume")
+	}
+	if current == record {
+		t.Fatal("resume reused prior runtime container, want fresh runtime skeleton")
 	}
 	if current.Run.Attempt != 2 {
 		t.Fatalf("run attempt = %d, want 2", current.Run.Attempt)
@@ -1516,15 +1734,18 @@ func TestFileLedgerStoreRoundTrip(t *testing.T) {
 		Service:  durableServiceMetadata{},
 		Jobs: []durableJobState{
 			{
-				Job:       contract.Job{State: contract.JobStatusRunning},
-				RecordID:  "rec_linear_linear-main_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				JobID:      "job-1",
+				RecordID:   "rec_linear_linear-main_1",
+				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
+				UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 				DurableRefs: contract.DurableRefs{
 					LedgerPath: cfg.File.Path,
 				},
 			},
 		},
+		FormalObjects: mustFormalObjectSnapshot(t,
+			contract.Job{BaseObject: contract.BaseObject{ID: "job-1", ObjectType: contract.ObjectTypeJob, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, State: contract.JobStatusRunning, JobType: contract.JobTypeCodeChange},
+		),
 	}
 	store.Schedule(state, true)
 	select {
@@ -1551,13 +1772,18 @@ func TestWriteDurableRuntimeStateRoundTripJSON(t *testing.T) {
 		SavedAt: time.Now().UTC(),
 		Jobs: []durableJobState{
 			{
-				Job:       contract.Job{State: contract.JobStatusCompleted},
-				RecordID:  "rec_linear_linear-main_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
-				Result:    &contract.Result{Outcome: contract.ResultOutcomeSucceeded, Summary: "done", CompletedAt: time.Now().UTC().Format(time.RFC3339Nano)},
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				JobID:      "job-1",
+				RecordID:   "rec_linear_linear-main_1",
+				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
+				Result:     &contract.Result{Outcome: contract.ResultOutcomeSucceeded, Summary: "done", CompletedAt: time.Now().UTC().Format(time.RFC3339Nano)},
+				OutcomeID:  "outcome-1",
+				UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 			},
 		},
+		FormalObjects: mustFormalObjectSnapshot(t,
+			contract.Job{BaseObject: contract.BaseObject{ID: "job-1", ObjectType: contract.ObjectTypeJob, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, State: contract.JobStatusCompleted, JobType: contract.JobTypeCodeChange},
+			contract.Outcome{BaseObject: contract.BaseObject{ID: "outcome-1", ObjectType: contract.ObjectTypeOutcome, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, State: contract.OutcomeConclusionSucceeded, Summary: "done", CompletedAt: time.Now().UTC().Format(time.RFC3339Nano)},
+		),
 	}
 	if err := writeDurableRuntimeState(path, state, true); err != nil {
 		t.Fatalf("writeDurableRuntimeState() error = %v", err)
@@ -1578,24 +1804,30 @@ func TestWriteDurableRuntimeStateOverwritesExistingFile(t *testing.T) {
 		SavedAt: time.Now().UTC(),
 		Jobs: []durableJobState{
 			{
-				Job:       contract.Job{State: contract.JobStatusInterventionRequired},
-				RecordID:  "rec_linear_linear-main_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				JobID:      "job-1",
+				RecordID:   "rec_linear_linear-main_1",
+				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "1", SourceIdentifier: "ABC-1"},
+				UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 			},
 		},
+		FormalObjects: mustFormalObjectSnapshot(t,
+			contract.Job{BaseObject: contract.BaseObject{ID: "job-1", ObjectType: contract.ObjectTypeJob, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, State: contract.JobStatusInterventionRequired, JobType: contract.JobTypeCodeChange},
+		),
 	}
 	updated := durableRuntimeState{
 		Version: durableStateVersion,
 		SavedAt: time.Now().UTC(),
 		Jobs: []durableJobState{
 			{
-				Job:       contract.Job{State: contract.JobStatusRunning},
-				RecordID:  "rec_linear_linear-main_2",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "2", SourceIdentifier: "ABC-2"},
-				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				JobID:      "job-2",
+				RecordID:   "rec_linear_linear-main_2",
+				SourceRef:  contract.SourceRef{SourceKind: contract.SourceKindLinear, SourceName: "linear-main", SourceID: "2", SourceIdentifier: "ABC-2"},
+				UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 			},
 		},
+		FormalObjects: mustFormalObjectSnapshot(t,
+			contract.Job{BaseObject: contract.BaseObject{ID: "job-2", ObjectType: contract.ObjectTypeJob, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}, State: contract.JobStatusRunning, JobType: contract.JobTypeCodeChange},
+		),
 	}
 
 	if err := writeDurableRuntimeState(path, initial, true); err != nil {

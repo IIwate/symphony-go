@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	durableStateVersion             = 5
+	durableStateVersion             = 6
 	sessionPersistenceWriteFailCode = "session_persistence_write_failed"
 	stateStoreDrainTimeout          = 5 * time.Second
 	initialStateStoreRetryDelay     = time.Second
@@ -70,26 +70,40 @@ type durableServiceMetadata struct {
 	TokenTotal model.TokenTotals `json:"token_total"`
 }
 
+type durableRunRuntimeState struct {
+	RunID          string                 `json:"run_id,omitempty"`
+	ReviewSummary  string                 `json:"review_summary,omitempty"`
+	ReviewFindings []model.ReviewFinding  `json:"review_findings,omitempty"`
+	Budget         model.RunBudget        `json:"budget,omitempty"`
+	Usage          model.RunBudgetUsage   `json:"usage,omitempty"`
+	Recovery       *model.RecoveryCheckpoint `json:"recovery,omitempty"`
+}
+
+type durableInterventionRuntimeState struct {
+	InterventionID string                   `json:"intervention_id,omitempty"`
+	Handoff        model.InterventionHandoff `json:"handoff,omitempty"`
+}
+
 type durableJobState struct {
-	Job                 contract.Job             `json:"job"`
-	RecordID            contract.RecordID        `json:"record_id"`
-	SourceRef           contract.SourceRef       `json:"source_ref"`
-	Reason              *contract.Reason         `json:"reason,omitempty"`
-	Observation         *contract.Observation    `json:"observation,omitempty"`
-	DurableRefs         contract.DurableRefs     `json:"durable_refs"`
-	Result              *contract.Result         `json:"result,omitempty"`
-	UpdatedAt           string                   `json:"updated_at,omitempty"`
-	LastKnownIssue      *model.Issue             `json:"last_known_issue,omitempty"`
-	LastKnownIssueState string                   `json:"last_known_issue_state,omitempty"`
-	RetryDueAt          *string                  `json:"retry_due_at,omitempty"`
-	RetryAttempt        int                      `json:"retry_attempt,omitempty"`
-	StallCount          int                      `json:"stall_count,omitempty"`
-	NeedsRecovery       bool                     `json:"needs_recovery,omitempty"`
-	Dispatch            *durableDispatchContext  `json:"dispatch,omitempty"`
-	Run                 *model.RunState          `json:"run,omitempty"`
-	Intervention        *model.InterventionState `json:"intervention,omitempty"`
-	Outcome             *contract.Outcome        `json:"outcome,omitempty"`
-	Artifacts           []contract.Artifact      `json:"artifacts,omitempty"`
+	JobID               string                           `json:"job_id"`
+	RecordID            contract.RecordID                `json:"record_id"`
+	SourceRef           contract.SourceRef               `json:"source_ref"`
+	Reason              *contract.Reason                 `json:"reason,omitempty"`
+	Observation         *contract.Observation            `json:"observation,omitempty"`
+	DurableRefs         contract.DurableRefs             `json:"durable_refs"`
+	Result              *contract.Result                 `json:"result,omitempty"`
+	UpdatedAt           string                           `json:"updated_at,omitempty"`
+	LastKnownIssue      *model.Issue                     `json:"last_known_issue,omitempty"`
+	LastKnownIssueState string                           `json:"last_known_issue_state,omitempty"`
+	RetryDueAt          *string                          `json:"retry_due_at,omitempty"`
+	RetryAttempt        int                              `json:"retry_attempt,omitempty"`
+	StallCount          int                              `json:"stall_count,omitempty"`
+	NeedsRecovery       bool                             `json:"needs_recovery,omitempty"`
+	Dispatch            *durableDispatchContext          `json:"dispatch,omitempty"`
+	Run                 *durableRunRuntimeState          `json:"run,omitempty"`
+	Intervention        *durableInterventionRuntimeState `json:"intervention,omitempty"`
+	OutcomeID           string                           `json:"outcome_id,omitempty"`
+	ArtifactIDs         []string                         `json:"artifact_ids,omitempty"`
 }
 
 type scheduledDurableState struct {
@@ -609,6 +623,7 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 	for _, record := range o.state.ArchivedJobs {
 		state.Jobs = append(state.Jobs, o.durableJobStateFromArchived(record))
 	}
+	o.ensureObjectLedgerLocked()
 	if o.objectLedger != nil {
 		state.FormalObjects = o.objectLedger.Snapshot()
 	}
@@ -623,7 +638,7 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 
 func (o *Orchestrator) durableJobStateFromRuntime(record *model.JobRuntime) durableJobState {
 	item := durableJobState{
-		Job:                 o.jobObjectFromRecord(record, jobStateFromRecord(record)),
+		JobID:               strings.TrimSpace(record.Object.ID),
 		RecordID:            record.RecordID,
 		SourceRef:           record.SourceRef,
 		Reason:              cloneReason(record.Reason),
@@ -637,19 +652,23 @@ func (o *Orchestrator) durableJobStateFromRuntime(record *model.JobRuntime) dura
 		StallCount:          record.StallCount,
 		NeedsRecovery:       record.NeedsRecovery || isRecordRunning(record),
 		Dispatch:            durableDispatchFromModel(record.Dispatch),
-		Run:                 model.CloneRunState(record.Run),
-		Intervention:        model.CloneInterventionState(record.Intervention),
-		Outcome:             cloneOutcome(record.Outcome),
-		Artifacts:           cloneArtifacts(record.Artifacts),
+		Run:                 durableRunRuntimeFromModel(record.Run),
+		Intervention:        durableInterventionRuntimeFromModel(record.Intervention),
+	}
+	if record.Outcome != nil {
+		item.OutcomeID = strings.TrimSpace(record.Outcome.ID)
+	}
+	if len(record.Artifacts) > 0 {
+		item.ArtifactIDs = make([]string, 0, len(record.Artifacts))
+		for _, artifact := range record.Artifacts {
+			if id := strings.TrimSpace(artifact.ID); id != "" {
+				item.ArtifactIDs = append(item.ArtifactIDs, id)
+			}
+		}
 	}
 	if record.RetryDueAt != nil {
 		value := record.RetryDueAt.UTC().Format(time.RFC3339Nano)
 		item.RetryDueAt = &value
-	}
-	if record.Outcome != nil {
-		outcome := o.outcomeObjectFromRecord(record, o.artifactsForCompletedRecord(record))
-		item.Outcome = cloneOutcome(&outcome)
-		item.Artifacts = cloneArtifacts(o.artifactsForCompletedRecord(record))
 	}
 	return item
 }
@@ -676,10 +695,32 @@ func (o *Orchestrator) durableJobStateFromArchived(record model.ArchivedJob) dur
 	return o.durableJobStateFromRuntime(runtime)
 }
 
-func runtimeFromDurableJob(item durableJobState) *model.JobRuntime {
+func durableRunRuntimeFromModel(value *model.RunState) *durableRunRuntimeState {
+	if value == nil {
+		return nil
+	}
+	return &durableRunRuntimeState{
+		RunID:          strings.TrimSpace(value.Object.ID),
+		ReviewSummary:  value.ReviewSummary,
+		ReviewFindings: cloneRuntimeReviewFindings(value.ReviewFindings),
+		Budget:         value.Budget,
+		Usage:          value.Usage,
+		Recovery:       model.CloneRecoveryCheckpoint(value.Recovery),
+	}
+}
+
+func durableInterventionRuntimeFromModel(value *model.InterventionState) *durableInterventionRuntimeState {
+	if value == nil {
+		return nil
+	}
+	return &durableInterventionRuntimeState{
+		InterventionID: strings.TrimSpace(value.Object.ID),
+		Handoff:        cloneRuntimeInterventionHandoff(value.Handoff),
+	}
+}
+
+func (o *Orchestrator) runtimeFromDurableJob(item durableJobState) *model.JobRuntime {
 	record := &model.JobRuntime{
-		Object:              item.Job,
-		Lifecycle:           deriveLifecycleFromDurableJob(item),
 		RecordID:            item.RecordID,
 		SourceRef:           item.SourceRef,
 		Reason:              cloneReason(item.Reason),
@@ -693,30 +734,68 @@ func runtimeFromDurableJob(item durableJobState) *model.JobRuntime {
 		StallCount:          item.StallCount,
 		NeedsRecovery:       item.NeedsRecovery,
 		Dispatch:            durableDispatchToModel(item.Dispatch),
-		Run:                 model.CloneRunState(item.Run),
-		Intervention:        model.CloneInterventionState(item.Intervention),
-		Outcome:             cloneOutcome(item.Outcome),
-		Artifacts:           cloneArtifacts(item.Artifacts),
+	}
+	if job, ok := o.jobObjectByIDLocked(item.JobID); ok {
+		record.Object = job
+	}
+	if item.Run != nil {
+		runState := &model.RunState{
+			ReviewSummary:  item.Run.ReviewSummary,
+			ReviewFindings: cloneRuntimeReviewFindings(item.Run.ReviewFindings),
+			Budget:         item.Run.Budget,
+			Usage:          item.Run.Usage,
+			Recovery:       model.CloneRecoveryCheckpoint(item.Run.Recovery),
+		}
+		if run, ok := o.runObjectByIDLocked(item.Run.RunID); ok {
+			runState.Object = run
+		}
+		syncRunStateMirrorsFromObject(runState)
+		record.Run = runState
+	}
+	if item.Intervention != nil {
+		interventionState := &model.InterventionState{
+			Handoff: cloneRuntimeInterventionHandoff(item.Intervention.Handoff),
+		}
+		if intervention, ok := o.interventionObjectByIDLocked(item.Intervention.InterventionID); ok {
+			interventionState.Object = intervention
+		}
+		record.Intervention = interventionState
+	}
+	if item.OutcomeID != "" {
+		if outcome, ok := o.outcomeObjectByIDLocked(item.OutcomeID); ok {
+			record.Outcome = &outcome
+		}
+	}
+	if len(item.ArtifactIDs) > 0 {
+		record.Artifacts = make([]contract.Artifact, 0, len(item.ArtifactIDs))
+		for _, artifactID := range item.ArtifactIDs {
+			if artifact, ok := o.artifactObjectByIDLocked(artifactID); ok {
+				record.Artifacts = append(record.Artifacts, artifact)
+			}
+		}
 	}
 	if item.RetryDueAt != nil {
 		if dueAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*item.RetryDueAt)); err == nil {
 			record.RetryDueAt = &dueAt
 		}
 	}
+	record.Lifecycle = deriveLifecycleFromRuntime(record)
 	return record
 }
 
-func deriveLifecycleFromDurableJob(item durableJobState) model.JobLifecycleState {
+func deriveLifecycleFromRuntime(record *model.JobRuntime) model.JobLifecycleState {
 	switch {
-	case item.Outcome != nil || item.Job.State.IsTerminal():
+	case record == nil:
+		return model.JobLifecycleActive
+	case record.Outcome != nil || record.Object.State.IsTerminal():
 		return model.JobLifecycleCompleted
-	case item.Intervention != nil && item.Intervention.Object.State == contract.InterventionStatusOpen:
+	case record.Intervention != nil && record.Intervention.Object.State == contract.InterventionStatusOpen:
 		return model.JobLifecycleAwaitingIntervention
-	case item.Run != nil && item.Run.State == contract.RunStatusContinuationPending:
+	case record.Run != nil && record.Run.State == contract.RunStatusContinuationPending:
 		return model.JobLifecycleRetryScheduled
-	case item.Run != nil && item.Run.State == contract.RunStatusCompleted && item.DurableRefs.PullRequest != nil:
+	case record.Run != nil && record.Run.State == contract.RunStatusCompleted && record.DurableRefs.PullRequest != nil:
 		return model.JobLifecycleAwaitingMerge
-	case item.Reason != nil && (item.Reason.ReasonCode == contract.ReasonRecordBlockedAwaitingIntervention || item.Reason.ReasonCode == contract.ReasonRecordBlockedRecoveryUncertain):
+	case record.Reason != nil && (record.Reason.ReasonCode == contract.ReasonRecordBlockedAwaitingIntervention || record.Reason.ReasonCode == contract.ReasonRecordBlockedRecoveryUncertain):
 		return model.JobLifecycleAwaitingIntervention
 	default:
 		return model.JobLifecycleActive
@@ -735,9 +814,10 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 	o.candidateDeliveryJobs = map[string]*model.JobRuntime{}
 	o.interventionJobs = map[string]*model.JobRuntime{}
 	o.state.ArchivedJobs = nil
+	o.restoreObjectLedgerSnapshotLocked(state.FormalObjects)
 
 	for _, item := range state.Jobs {
-		record := runtimeFromDurableJob(item)
+		record := o.runtimeFromDurableJob(item)
 		issueID := strings.TrimSpace(item.SourceRef.SourceID)
 		if issueID == "" {
 			continue
@@ -758,7 +838,6 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 		o.state.Jobs[issueID] = record
 	}
 	o.rebuildRuntimeIndexesLocked()
-	o.restoreObjectLedgerSnapshotLocked(state.FormalObjects)
 }
 
 func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
@@ -862,11 +941,11 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 
 	if entry.Run != nil {
 		if decision.Disposition == DispositionAwaitingMerge {
-			markRunCandidateDelivery(entry, decision.PR)
+			o.markRunCandidateDelivery(entry, decision.PR)
 		} else if decision.Disposition == DispositionCompleted {
 			switch jobTypeForDispatch(entry.Dispatch) {
 			case contract.JobTypeAnalysis, contract.JobTypeDiagnostic:
-				markRunCandidateDelivery(entry, nil)
+				o.markRunCandidateDelivery(entry, nil)
 			}
 		}
 		if entry.Run.CandidateDelivery != nil && entry.Run.CandidateDelivery.Reached && entry.Run.ReviewGate != nil &&
@@ -897,7 +976,7 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 			current.Run = model.CloneRunState(entry.Run)
 			current.LastKnownIssue = model.CloneIssue(reviewIssue)
 			current.LastKnownIssueState = issueState
-			openRunReviewGate(current)
+			o.openRunReviewGate(current)
 			o.setRecordStatusLocked(current, model.JobLifecycleActive, nil, &contract.Observation{
 				Running: true,
 				Summary: "review in progress",
@@ -1065,10 +1144,9 @@ func cloneDurableRuntimeState(state durableRuntimeState) durableRuntimeState {
 		cloned.Result = cloneResult(item.Result)
 		cloned.LastKnownIssue = model.CloneIssue(item.LastKnownIssue)
 		cloned.Dispatch = cloneDurableDispatchContext(item.Dispatch)
-		cloned.Run = model.CloneRunState(item.Run)
-		cloned.Intervention = model.CloneInterventionState(item.Intervention)
-		cloned.Outcome = cloneOutcome(item.Outcome)
-		cloned.Artifacts = cloneArtifacts(item.Artifacts)
+		cloned.Run = cloneDurableRunRuntimeState(item.Run)
+		cloned.Intervention = cloneDurableInterventionRuntimeState(item.Intervention)
+		cloned.ArtifactIDs = append([]string(nil), item.ArtifactIDs...)
 		if item.RetryDueAt != nil {
 			value := strings.TrimSpace(*item.RetryDueAt)
 			cloned.RetryDueAt = &value
@@ -1077,6 +1155,51 @@ func cloneDurableRuntimeState(state durableRuntimeState) durableRuntimeState {
 	}
 	copyState.FormalObjects = cloneObjectLedgerSnapshot(state.FormalObjects)
 	return copyState
+}
+
+func cloneDurableRunRuntimeState(value *durableRunRuntimeState) *durableRunRuntimeState {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.ReviewFindings = cloneRuntimeReviewFindings(value.ReviewFindings)
+	copyValue.Recovery = model.CloneRecoveryCheckpoint(value.Recovery)
+	return &copyValue
+}
+
+func cloneDurableInterventionRuntimeState(value *durableInterventionRuntimeState) *durableInterventionRuntimeState {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Handoff = cloneRuntimeInterventionHandoff(value.Handoff)
+	return &copyValue
+}
+
+func cloneRuntimeReviewFindings(value []model.ReviewFinding) []model.ReviewFinding {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make([]model.ReviewFinding, len(value))
+	copy(result, value)
+	return result
+}
+
+func cloneRuntimeInterventionHandoff(value model.InterventionHandoff) model.InterventionHandoff {
+	copyValue := value
+	copyValue.Reason = cloneReason(value.Reason)
+	copyValue.Decision = cloneDecision(value.Decision)
+	if value.Checkpoint != nil {
+		checkpoint := *value.Checkpoint
+		checkpoint.ArtifactIDs = append([]string(nil), value.Checkpoint.ArtifactIDs...)
+		checkpoint.ReferenceIDs = append([]string(nil), value.Checkpoint.ReferenceIDs...)
+		checkpoint.Reason = cloneReason(value.Checkpoint.Reason)
+		copyValue.Checkpoint = &checkpoint
+	}
+	copyValue.ReviewFindings = cloneRuntimeReviewFindings(value.ReviewFindings)
+	copyValue.RecommendedActions = append([]contract.DecisionAction(nil), value.RecommendedActions...)
+	copyValue.RequiredInputs = cloneInterventionTemplateInputs(value.RequiredInputs)
+	return copyValue
 }
 
 func cloneOutcome(value *contract.Outcome) *contract.Outcome {

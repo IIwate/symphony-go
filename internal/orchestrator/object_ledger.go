@@ -67,6 +67,7 @@ type ObjectLedger interface {
 	UpsertArtifact(contract.Artifact) error
 	UpsertAction(contract.Action) error
 	UpsertInstance(contract.Instance) error
+	UpsertReference(contract.Reference) error
 	Archive(contract.ObjectType, string, string) error
 	Invalidate(contract.ObjectType, string, string) error
 	Terminate(contract.ObjectType, string, string) error
@@ -149,6 +150,12 @@ func (l *fileObjectLedger) UpsertInstance(value contract.Instance) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
 func (l *memoryObjectLedger) UpsertInstance(value contract.Instance) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
+func (l *fileObjectLedger) UpsertReference(value contract.Reference) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
+func (l *memoryObjectLedger) UpsertReference(value contract.Reference) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
 
@@ -435,6 +442,72 @@ func (o *Orchestrator) GetObject(objectType contract.ObjectType, id string) (Obj
 	return o.objectLedger.Get(objectType, strings.TrimSpace(id))
 }
 
+func decodeObjectEnvelope[T any](envelope ObjectEnvelope) (T, bool) {
+	var payload T
+	if len(envelope.Payload) == 0 {
+		return payload, false
+	}
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		return payload, false
+	}
+	return payload, true
+}
+
+func (o *Orchestrator) jobObjectByIDLocked(jobID string) (contract.Job, bool) {
+	if o.objectLedger == nil || strings.TrimSpace(jobID) == "" {
+		return contract.Job{}, false
+	}
+	envelope, ok := o.objectLedger.Get(contract.ObjectTypeJob, strings.TrimSpace(jobID))
+	if !ok {
+		return contract.Job{}, false
+	}
+	return decodeObjectEnvelope[contract.Job](envelope)
+}
+
+func (o *Orchestrator) runObjectByIDLocked(runID string) (contract.Run, bool) {
+	if o.objectLedger == nil || strings.TrimSpace(runID) == "" {
+		return contract.Run{}, false
+	}
+	envelope, ok := o.objectLedger.Get(contract.ObjectTypeRun, strings.TrimSpace(runID))
+	if !ok {
+		return contract.Run{}, false
+	}
+	return decodeObjectEnvelope[contract.Run](envelope)
+}
+
+func (o *Orchestrator) interventionObjectByIDLocked(interventionID string) (contract.Intervention, bool) {
+	if o.objectLedger == nil || strings.TrimSpace(interventionID) == "" {
+		return contract.Intervention{}, false
+	}
+	envelope, ok := o.objectLedger.Get(contract.ObjectTypeIntervention, strings.TrimSpace(interventionID))
+	if !ok {
+		return contract.Intervention{}, false
+	}
+	return decodeObjectEnvelope[contract.Intervention](envelope)
+}
+
+func (o *Orchestrator) outcomeObjectByIDLocked(outcomeID string) (contract.Outcome, bool) {
+	if o.objectLedger == nil || strings.TrimSpace(outcomeID) == "" {
+		return contract.Outcome{}, false
+	}
+	envelope, ok := o.objectLedger.Get(contract.ObjectTypeOutcome, strings.TrimSpace(outcomeID))
+	if !ok {
+		return contract.Outcome{}, false
+	}
+	return decodeObjectEnvelope[contract.Outcome](envelope)
+}
+
+func (o *Orchestrator) artifactObjectByIDLocked(artifactID string) (contract.Artifact, bool) {
+	if o.objectLedger == nil || strings.TrimSpace(artifactID) == "" {
+		return contract.Artifact{}, false
+	}
+	envelope, ok := o.objectLedger.Get(contract.ObjectTypeArtifact, strings.TrimSpace(artifactID))
+	if !ok {
+		return contract.Artifact{}, false
+	}
+	return decodeObjectEnvelope[contract.Artifact](envelope)
+}
+
 func (o *Orchestrator) ListObjects(objectType contract.ObjectType) []ObjectEnvelope {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -577,12 +650,6 @@ func (o *Orchestrator) syncFormalObjectsLocked() {
 		return
 	}
 	o.upsertInstanceObjectLocked()
-	for _, record := range o.state.Jobs {
-		if record == nil {
-			continue
-		}
-		o.syncRecordFormalObjectsLocked(record)
-	}
 	jobs := map[string]struct{}{}
 	for _, actionState := range o.sourceClosureActions {
 		if actionState == nil {
@@ -598,24 +665,104 @@ func (o *Orchestrator) syncFormalObjectsLocked() {
 	}
 }
 
-func (o *Orchestrator) syncRecordFormalObjectsLocked(record *model.JobRuntime) {
+func (o *Orchestrator) loadJobObjectLocked(record *model.JobRuntime) contract.Job {
+	if record == nil {
+		return contract.Job{}
+	}
+	o.ensureObjectLedgerLocked()
+	jobID := strings.TrimSpace(record.Object.ID)
+	if jobID == "" {
+		jobID = jobIDForRecord(record)
+	}
+	if job, ok := o.jobObjectByIDLocked(jobID); ok {
+		record.Object = job
+		return job
+	}
+	job := o.jobObjectFromRecord(record, contract.JobStatusQueued)
+	record.Object = job
+	return job
+}
+
+func (o *Orchestrator) storeJobObjectLocked(record *model.JobRuntime, job contract.Job) {
+	o.ensureObjectLedgerLocked()
 	if record == nil || o.objectLedger == nil {
 		return
 	}
-	job := o.jobObjectFromRecord(record, jobStateFromRecord(record))
+	if strings.TrimSpace(job.ID) == "" {
+		return
+	}
+	o.upsertReferencesLocked(job.References)
 	if err := o.objectLedger.UpsertJob(job); err != nil {
 		o.logger.Warn("upsert job object failed", "job_id", job.ID, "error", err.Error())
 	}
-	if record.Run != nil {
-		run := o.runObjectFromRecord(record, nil)
-		if err := o.objectLedger.UpsertRun(run); err != nil {
-			o.logger.Warn("upsert run object failed", "run_id", run.ID, "error", err.Error())
-		}
+	record.Object = job
+	o.updateJobActionSummaryLocked(job.ID)
+}
+
+func (o *Orchestrator) mutateJobObjectLocked(record *model.JobRuntime, mutate func(*contract.Job)) {
+	if record == nil {
+		return
 	}
-	if record.Intervention != nil {
-		intervention := o.interventionObjectFromRecord(record)
-		if err := o.objectLedger.UpsertIntervention(intervention); err != nil {
-			o.logger.Warn("upsert intervention object failed", "intervention_id", intervention.ID, "error", err.Error())
+	job := o.loadJobObjectLocked(record)
+	if mutate != nil {
+		mutate(&job)
+	}
+	o.storeJobObjectLocked(record, job)
+}
+
+func (o *Orchestrator) persistRunObjectLocked(record *model.JobRuntime) {
+	o.ensureObjectLedgerLocked()
+	if record == nil || record.Run == nil || o.objectLedger == nil {
+		return
+	}
+	run := record.Run.Object
+	if strings.TrimSpace(run.ID) == "" {
+		return
+	}
+	o.upsertReferencesLocked(run.References)
+	if err := o.objectLedger.UpsertRun(run); err != nil {
+		o.logger.Warn("upsert run object failed", "run_id", run.ID, "error", err.Error())
+	}
+}
+
+func (o *Orchestrator) persistInterventionObjectLocked(record *model.JobRuntime) {
+	o.ensureObjectLedgerLocked()
+	if record == nil || record.Intervention == nil || o.objectLedger == nil {
+		return
+	}
+	intervention := record.Intervention.Object
+	if strings.TrimSpace(intervention.ID) == "" {
+		return
+	}
+	o.upsertReferencesLocked(intervention.References)
+	if err := o.objectLedger.UpsertIntervention(intervention); err != nil {
+		o.logger.Warn("upsert intervention object failed", "intervention_id", intervention.ID, "error", err.Error())
+	}
+}
+
+func (o *Orchestrator) persistOutcomeObjectLocked(record *model.JobRuntime) {
+	o.ensureObjectLedgerLocked()
+	if record == nil || record.Outcome == nil || o.objectLedger == nil {
+		return
+	}
+	o.upsertReferencesLocked(record.Outcome.References)
+	if err := o.objectLedger.UpsertOutcome(*record.Outcome); err != nil {
+		o.logger.Warn("upsert outcome object failed", "outcome_id", record.Outcome.ID, "error", err.Error())
+	}
+}
+
+func (o *Orchestrator) persistArtifactObjectsLocked(record *model.JobRuntime) {
+	o.ensureObjectLedgerLocked()
+	if record == nil || o.objectLedger == nil {
+		return
+	}
+	for _, artifact := range record.Artifacts {
+		if strings.TrimSpace(artifact.ID) == "" {
+			continue
+		}
+		o.upsertReferencesLocked(artifact.References)
+		if err := o.objectLedger.UpsertArtifact(artifact); err != nil {
+			o.logger.Warn("upsert artifact failed", "artifact_id", artifact.ID, "error", err.Error())
 		}
 	}
 }
@@ -730,6 +877,39 @@ func sourceClosureActionIDForRecord(record *model.JobRuntime) string {
 	return "action-" + strings.TrimSpace(string(record.RecordID)) + "-source-closure"
 }
 
+func sourceReferenceIDForRecord(record *model.JobRuntime) string {
+	return "ref-" + strings.TrimSpace(string(record.RecordID)) + "-source"
+}
+
+func branchReferenceIDForRecord(record *model.JobRuntime) string {
+	return "ref-" + strings.TrimSpace(string(record.RecordID)) + "-branch"
+}
+
+func pullRequestReferenceIDForRecord(record *model.JobRuntime) string {
+	return "ref-" + strings.TrimSpace(string(record.RecordID)) + "-pr"
+}
+
+func runtimeFromArchivedJobForLedger(record model.ArchivedJob) *model.JobRuntime {
+	return &model.JobRuntime{
+		Object:              record.Object,
+		Lifecycle:           model.JobLifecycleCompleted,
+		RecordID:            record.RecordID,
+		SourceRef:           record.SourceRef,
+		Reason:              cloneReason(record.Reason),
+		Observation:         cloneObservation(record.Observation),
+		DurableRefs:         cloneDurableRefs(record.DurableRefs),
+		Result:              cloneResult(record.Result),
+		UpdatedAt:           record.UpdatedAt,
+		LastKnownIssue:      model.CloneIssue(record.LastKnownIssue),
+		LastKnownIssueState: record.LastKnownIssueState,
+		Dispatch:            model.CloneDispatchContext(record.Dispatch),
+		Run:                 model.CloneRunState(record.Run),
+		Intervention:        model.CloneInterventionState(record.Intervention),
+		Outcome:             cloneOutcome(record.Outcome),
+		Artifacts:           cloneArtifacts(record.Artifacts),
+	}
+}
+
 func (o *Orchestrator) baseObjectLocked(objectType contract.ObjectType, id string, visibility contract.VisibilityLevel, updatedAt string) contract.BaseObject {
 	createdAt := updatedAt
 	if o.objectLedger != nil {
@@ -769,7 +949,7 @@ func jobStateFromRecord(record *model.JobRuntime) contract.JobStatus {
 		return jobStateFromOutcomeConclusion(record.Outcome.State)
 	case record.Intervention != nil && record.Intervention.Object.State == contract.InterventionStatusOpen:
 		return contract.JobStatusInterventionRequired
-	case record.Run != nil && record.Run.State == contract.RunStatusQueued:
+	case record.Run != nil && record.Run.Object.State == contract.RunStatusQueued:
 		return contract.JobStatusQueued
 	default:
 		return contract.JobStatusRunning
@@ -819,18 +999,49 @@ func outcomeConclusionFromResult(outcome contract.ResultOutcome) contract.Outcom
 	}
 }
 
-func (o *Orchestrator) actionSummaryForJobLocked(jobID string) contract.ActionSummary {
-	summary := contract.ActionSummary{}
-	for _, actionState := range o.sourceClosureActions {
-		if actionState == nil || actionState.JobID != jobID {
+func (o *Orchestrator) upsertReferencesLocked(references []contract.Reference) {
+	if o.objectLedger == nil {
+		return
+	}
+	for _, reference := range references {
+		if err := o.objectLedger.UpsertReference(reference); err != nil {
+			o.logger.Warn("upsert reference object failed", "reference_id", reference.ID, "error", err.Error())
+		}
+	}
+}
+
+func (o *Orchestrator) actionObjectsForJobLocked(jobID string) []contract.Action {
+	if o.objectLedger == nil || strings.TrimSpace(jobID) == "" {
+		return nil
+	}
+	snapshot := o.objectLedger.Snapshot()
+	actions := make([]contract.Action, 0, len(snapshot.Records))
+	for _, item := range snapshot.Records {
+		if item.ObjectType != contract.ObjectTypeAction {
 			continue
 		}
-		if actionState.Action.State != contract.ActionStatusExternalPending {
+		var action contract.Action
+		if err := json.Unmarshal(item.Payload, &action); err != nil {
+			continue
+		}
+		state, ok := sourceClosureActionStateFromAction(action)
+		if !ok || state.JobID != jobID {
+			continue
+		}
+		actions = append(actions, action)
+	}
+	return actions
+}
+
+func (o *Orchestrator) actionSummaryForJobLocked(jobID string) contract.ActionSummary {
+	summary := contract.ActionSummary{}
+	for _, action := range o.actionObjectsForJobLocked(jobID) {
+		if action.State != contract.ActionStatusExternalPending {
 			continue
 		}
 		summary.HasPendingExternalActions = true
 		summary.PendingCount++
-		summary.PendingTypes = append(summary.PendingTypes, actionState.Action.Type)
+		summary.PendingTypes = append(summary.PendingTypes, action.Type)
 	}
 	return summary
 }
@@ -844,11 +1055,8 @@ func (o *Orchestrator) jobObjectFromRecord(record *model.JobRuntime, state contr
 	if record.Run != nil {
 		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeJobRun, TargetID: runIDForRecord(record, record.Run.Attempt), TargetType: contract.ObjectTypeRun})
 	}
-	for _, actionState := range o.sourceClosureActions {
-		if actionState == nil || actionState.JobID != jobIDForRecord(record) {
-			continue
-		}
-		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeJobAction, TargetID: actionState.Action.ID, TargetType: contract.ObjectTypeAction})
+	for _, action := range o.actionObjectsForJobLocked(jobIDForRecord(record)) {
+		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeJobAction, TargetID: action.ID, TargetType: contract.ObjectTypeAction})
 	}
 	ctx := contract.ObjectContext{
 		Relations:  relations,
@@ -866,57 +1074,29 @@ func (o *Orchestrator) jobObjectFromRecord(record *model.JobRuntime, state contr
 	}
 }
 
-func (o *Orchestrator) runObjectFromRecord(record *model.JobRuntime, outcome *contract.Outcome) contract.Run {
-	runState := model.CloneRunState(record.Run)
-	updatedAt := strings.TrimSpace(record.UpdatedAt)
-	if updatedAt == "" {
-		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
-	}
-	ctx := contract.ObjectContext{
-		References: referencesFromRecord(o, record, updatedAt),
-		ErrorCode:  runState.ErrorCode,
-	}
-	if runState.Reason != nil {
-		ctx.Reasons = []contract.Reason{*cloneReason(runState.Reason)}
-	}
-	if runState.Decision != nil {
-		decisionCopy := *runState.Decision
-		ctx.Decision = &decisionCopy
-	}
-	if record.Intervention != nil {
-		ctx.Relations = append(ctx.Relations, contract.ObjectRelation{Type: contract.RelationTypeRunIntervention, TargetID: interventionIDForRecord(record), TargetType: contract.ObjectTypeIntervention})
-	}
-	if outcome != nil {
-		ctx.Relations = append(ctx.Relations, contract.ObjectRelation{Type: contract.RelationTypeRunOutcome, TargetID: outcome.ID, TargetType: contract.ObjectTypeOutcome})
-	}
-	return contract.Run{
-		BaseObject:        o.baseObjectLocked(contract.ObjectTypeRun, runIDForRecord(record, runState.Attempt), contract.VisibilityLevelRestricted, updatedAt),
-		ObjectContext:     ctx,
-		State:             runState.State,
-		Phase:             runState.Phase,
-		Attempt:           runState.Attempt,
-		CandidateDelivery: runState.CandidateDelivery,
-		ReviewGate:        runState.ReviewGate,
-		Checkpoints:       append([]contract.Checkpoint(nil), runState.Checkpoints...),
-	}
-}
-
-func (o *Orchestrator) interventionObjectFromRecord(record *model.JobRuntime) contract.Intervention {
-	intervention := model.CloneInterventionState(record.Intervention).Object
-	updatedAt := strings.TrimSpace(record.UpdatedAt)
-	if updatedAt == "" {
-		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
-	}
-	intervention.BaseObject = o.baseObjectLocked(contract.ObjectTypeIntervention, interventionIDForRecord(record), contract.VisibilityLevelRestricted, updatedAt)
-	intervention.References = referencesFromRecord(o, record, updatedAt)
-	return intervention
-}
-
 func (o *Orchestrator) upsertSourceClosureActionLocked(state *sourceClosureActionState) {
 	if state == nil || o.objectLedger == nil {
 		return
 	}
-	if err := o.objectLedger.UpsertAction(state.Action); err != nil {
+	action := state.Action
+	o.upsertReferencesLocked(action.References)
+	relations := make([]contract.ObjectRelation, 0, len(action.Relations)+len(action.References))
+	for _, relation := range action.Relations {
+		if relation.Type == contract.RelationTypeActionReference {
+			continue
+		}
+		relations = append(relations, relation)
+	}
+	for _, reference := range action.References {
+		relations = append(relations, contract.ObjectRelation{
+			Type:       contract.RelationTypeActionReference,
+			TargetID:   reference.ID,
+			TargetType: contract.ObjectTypeReference,
+		})
+	}
+	action.Relations = relations
+	state.Action = action
+	if err := o.objectLedger.UpsertAction(action); err != nil {
 		o.logger.Warn("upsert action object failed", "action_id", state.Action.ID, "error", err.Error())
 	}
 }
@@ -942,11 +1122,8 @@ func (o *Orchestrator) updateJobActionSummaryLocked(jobID string) {
 		}
 		relations = append(relations, relation)
 	}
-	for _, actionState := range o.sourceClosureActions {
-		if actionState == nil || actionState.JobID != jobID {
-			continue
-		}
-		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeJobAction, TargetID: actionState.Action.ID, TargetType: contract.ObjectTypeAction})
+	for _, action := range o.actionObjectsForJobLocked(jobID) {
+		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeJobAction, TargetID: action.ID, TargetType: contract.ObjectTypeAction})
 	}
 	job.Relations = relations
 	if err := o.objectLedger.UpsertJob(job); err != nil {
@@ -966,7 +1143,7 @@ func referencesFromRecord(o *Orchestrator, record *model.JobRuntime, updatedAt s
 	switch sourceRef.SourceKind {
 	case contract.SourceKindLinear:
 		references = append(references, contract.Reference{
-			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.RecordID)) + "-source"),
+			BaseObject:  baseRef(sourceReferenceIDForRecord(record)),
 			State:       contract.ReferenceStatusActive,
 			Type:        contract.ReferenceTypeLinearIssue,
 			System:      string(sourceRef.SourceKind),
@@ -978,7 +1155,7 @@ func referencesFromRecord(o *Orchestrator, record *model.JobRuntime, updatedAt s
 	}
 	if branch := record.DurableRefs.Branch; branch != nil && strings.TrimSpace(branch.Name) != "" {
 		references = append(references, contract.Reference{
-			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.RecordID)) + "-branch"),
+			BaseObject:  baseRef(branchReferenceIDForRecord(record)),
 			State:       contract.ReferenceStatusActive,
 			Type:        contract.ReferenceTypeGitBranch,
 			System:      "git",
@@ -988,7 +1165,7 @@ func referencesFromRecord(o *Orchestrator, record *model.JobRuntime, updatedAt s
 	}
 	if pr := record.DurableRefs.PullRequest; pr != nil && strings.TrimSpace(pr.URL) != "" {
 		references = append(references, contract.Reference{
-			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.RecordID)) + "-pr"),
+			BaseObject:  baseRef(pullRequestReferenceIDForRecord(record)),
 			State:       contract.ReferenceStatusActive,
 			Type:        contract.ReferenceTypeGitHubPullRequest,
 			System:      "github",
@@ -1079,42 +1256,6 @@ func (o *Orchestrator) broadcastEventLocked(event contract.EventEnvelope) {
 			close(subscriber)
 		}
 	}
-}
-
-func (o *Orchestrator) persistCompletionObjectsLocked(record *model.JobRuntime) {
-	if record == nil || o.objectLedger == nil || record.Outcome == nil {
-		return
-	}
-	if record.Intervention != nil {
-		intervention := o.interventionObjectFromRecord(record)
-		if err := o.objectLedger.UpsertIntervention(intervention); err != nil {
-			o.logger.Warn("upsert final intervention object failed", "intervention_id", intervention.ID, "error", err.Error())
-		}
-	}
-	if record.Run != nil {
-		outcome := o.outcomeObjectFromRecord(record, nil)
-		run := o.runObjectFromRecord(record, &outcome)
-		if err := o.objectLedger.UpsertRun(run); err != nil {
-			o.logger.Warn("upsert final run object failed", "run_id", run.ID, "error", err.Error())
-		}
-	}
-	if o.requiresSourceClosureAction(record) {
-		o.ensureSourceClosureActionLocked(record)
-	}
-	job := o.jobObjectFromRecord(record, jobStateFromOutcomeConclusion(record.Outcome.State))
-	if err := o.objectLedger.UpsertJob(job); err != nil {
-		o.logger.Warn("upsert final job object failed", "job_id", job.ID, "error", err.Error())
-	}
-	outcome := o.outcomeObjectFromRecord(record, o.artifactsForCompletedRecord(record))
-	if err := o.objectLedger.UpsertOutcome(outcome); err != nil {
-		o.logger.Warn("upsert outcome object failed", "outcome_id", outcome.ID, "error", err.Error())
-	}
-	for _, artifact := range o.artifactsForCompletedRecord(record) {
-		if err := o.objectLedger.UpsertArtifact(artifact); err != nil {
-			o.logger.Warn("upsert artifact object failed", "artifact_id", artifact.ID, "error", err.Error())
-		}
-	}
-	o.updateJobActionSummaryLocked(job.ID)
 }
 
 func (o *Orchestrator) requiresSourceClosureAction(record *model.JobRuntime) bool {
@@ -1267,22 +1408,6 @@ func (o *Orchestrator) reconcileSourceClosureActions(ctx context.Context) {
 	}
 }
 
-func (o *Orchestrator) outcomeObjectFromRecord(record *model.JobRuntime, artifacts []contract.Artifact) contract.Outcome {
-	if record == nil || record.Outcome == nil {
-		return contract.Outcome{}
-	}
-	outcomeCopy := *record.Outcome
-	outcomeCopy.Relations = append([]contract.ObjectRelation(nil), outcomeCopy.Relations...)
-	outcomeCopy.References = append([]contract.Reference(nil), outcomeCopy.References...)
-	if len(artifacts) > 0 {
-		outcomeCopy.Relations = make([]contract.ObjectRelation, 0, len(artifacts))
-		for _, artifact := range artifacts {
-			outcomeCopy.Relations = append(outcomeCopy.Relations, contract.ObjectRelation{Type: contract.RelationTypeOutcomeArtifact, TargetID: artifact.ID, TargetType: contract.ObjectTypeArtifact})
-		}
-	}
-	return outcomeCopy
-}
-
 func (o *Orchestrator) artifactsForCompletedRecord(record *model.JobRuntime) []contract.Artifact {
 	if record == nil {
 		return nil
@@ -1334,6 +1459,26 @@ func (o *Orchestrator) artifactsForCompletedRecord(record *model.JobRuntime) []c
 				Kind:          contract.ArtifactKindMergeResult,
 				Role:          contract.ArtifactRoleSupporting,
 				Locator:       pr.URL,
+			},
+		}
+	case contract.JobTypeAnalysis:
+		return []contract.Artifact{
+			{
+				BaseObject:    o.baseObjectLocked(contract.ObjectTypeArtifact, artifactIDForRecord(record, "analysis-report"), contract.VisibilityLevelRestricted, updatedAt),
+				ObjectContext: contract.ObjectContext{References: references},
+				State:         contract.ArtifactStatusAvailable,
+				Kind:          contract.ArtifactKindAnalysisReport,
+				Role:          contract.ArtifactRolePrimary,
+			},
+		}
+	case contract.JobTypeDiagnostic:
+		return []contract.Artifact{
+			{
+				BaseObject:    o.baseObjectLocked(contract.ObjectTypeArtifact, artifactIDForRecord(record, "diagnostic-report"), contract.VisibilityLevelRestricted, updatedAt),
+				ObjectContext: contract.ObjectContext{References: references},
+				State:         contract.ArtifactStatusAvailable,
+				Kind:          contract.ArtifactKindDiagnosticReport,
+				Role:          contract.ArtifactRolePrimary,
 			},
 		}
 	default:

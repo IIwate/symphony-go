@@ -631,7 +631,7 @@ defaults:
 `, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
 	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	writeFile(t, statePath, fmt.Sprintf(`{
-  "version": 5,
+  "version": 6,
   "identity": {
     "compatibility": {
       "profile": "",

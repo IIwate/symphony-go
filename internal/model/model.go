@@ -178,6 +178,7 @@ type RecoveryCheckpoint struct {
 }
 
 type RunState struct {
+	Object            contract.Run                `json:"object"`
 	Attempt           int                         `json:"attempt"`
 	State             contract.RunStatus          `json:"state"`
 	Phase             contract.RunPhaseSummary    `json:"phase"`
@@ -215,6 +216,18 @@ func CloneRunState(value *RunState) *RunState {
 	copyValue.Reason = cloneContractReason(value.Reason)
 	copyValue.Decision = cloneContractDecision(value.Decision)
 	copyValue.Recovery = CloneRecoveryCheckpoint(value.Recovery)
+	copyValue.Object = value.Object
+	copyValue.Object.Relations = append([]contract.ObjectRelation(nil), value.Object.Relations...)
+	copyValue.Object.References = append([]contract.Reference(nil), value.Object.References...)
+	if len(value.Object.Reasons) > 0 {
+		copyValue.Object.Reasons = make([]contract.Reason, 0, len(value.Object.Reasons))
+		for _, reason := range value.Object.Reasons {
+			cloned := reason
+			cloned.Details = cloneDetails(reason.Details)
+			copyValue.Object.Reasons = append(copyValue.Object.Reasons, cloned)
+		}
+	}
+	copyValue.Object.Decision = cloneContractDecision(value.Object.Decision)
 	return &copyValue
 }
 

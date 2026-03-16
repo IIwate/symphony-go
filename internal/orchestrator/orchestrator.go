@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -184,38 +185,38 @@ type Orchestrator struct {
 
 	state model.OrchestratorState
 
-	mu                          sync.RWMutex
-	snapshot                    Snapshot
-	started                     bool
-	subscribers                 map[int]chan Snapshot
-	nextSubscriberID            int
-	eventSubscribers            map[int]chan contract.EventEnvelope
-	nextEventSubscriberID       int
-	healthAlerts           map[string]AlertSnapshot
-	notificationHealth     map[string]*NotificationChannelHealthSnapshot
-	persistenceHealth      PersistenceHealthSnapshot
-	activeRuns             map[string]*model.JobRuntime
-	continuationRuns       map[string]*model.JobRuntime
-	candidateDeliveryJobs  map[string]*model.JobRuntime
-	interventionJobs       map[string]*model.JobRuntime
-	pendingCleanup         map[string]string
-	pendingRecovery        map[string]uint64
-	pendingLaunch          map[string]uint64
-	pendingActions         map[uint64][]func()
-	maxCompleted           int
-	startedAt              time.Time
-	serviceVersion         string
-	extensionsReady        bool
-	eventSeq               uint64
-	notifierGeneration     uint64
+	mu                        sync.RWMutex
+	snapshot                  Snapshot
+	started                   bool
+	subscribers               map[int]chan Snapshot
+	nextSubscriberID          int
+	eventSubscribers          map[int]chan contract.EventEnvelope
+	nextEventSubscriberID     int
+	healthAlerts              map[string]AlertSnapshot
+	notificationHealth        map[string]*NotificationChannelHealthSnapshot
+	persistenceHealth         PersistenceHealthSnapshot
+	activeRuns                map[string]*model.JobRuntime
+	continuationRuns          map[string]*model.JobRuntime
+	candidateDeliveryJobs     map[string]*model.JobRuntime
+	interventionJobs          map[string]*model.JobRuntime
+	pendingCleanup            map[string]string
+	pendingRecovery           map[string]uint64
+	pendingLaunch             map[string]uint64
+	pendingActions            map[uint64][]func()
+	maxCompleted              int
+	startedAt                 time.Time
+	serviceVersion            string
+	extensionsReady           bool
+	eventSeq                  uint64
+	notifierGeneration        uint64
 	lastPersistedStateVersion uint64
-	lastPersistedState     *durableRuntimeState
-	lastEventSnapshot      Snapshot
-	lastEventObjects       map[string]ObjectEnvelope
-	eventStateInitialized  bool
-	objectLedger           ObjectLedger
-	objectLedgerRestored   bool
-	sourceClosureActions   map[string]*sourceClosureActionState
+	lastPersistedState        *durableRuntimeState
+	lastEventSnapshot         Snapshot
+	lastEventObjects          map[string]ObjectEnvelope
+	eventStateInitialized     bool
+	objectLedger              ObjectLedger
+	objectLedgerRestored      bool
+	sourceClosureActions      map[string]*sourceClosureActionState
 }
 
 var BuildVersion = "dev"
@@ -255,8 +256,8 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 			Jobs:             map[string]*model.JobRuntime{},
 			ProtectedResults: map[string]*model.ProtectedResultEntry{},
 		},
-		subscribers:                 map[int]chan Snapshot{},
-		eventSubscribers:            map[int]chan contract.EventEnvelope{},
+		subscribers:           map[int]chan Snapshot{},
+		eventSubscribers:      map[int]chan contract.EventEnvelope{},
 		healthAlerts:          healthAlerts,
 		notificationHealth:    map[string]*NotificationChannelHealthSnapshot{},
 		activeRuns:            map[string]*model.JobRuntime{},
@@ -510,30 +511,43 @@ func continuationArtifactID(record *model.JobRuntime, attempt int) string {
 	return fmt.Sprintf("art-%s-recovery-%d", recordID, attempt)
 }
 
-func ensureRunState(record *model.JobRuntime, cfg *model.ServiceConfig, dispatch *model.DispatchContext, attempt int) *model.RunState {
+func (o *Orchestrator) ensureRunState(record *model.JobRuntime, cfg *model.ServiceConfig, dispatch *model.DispatchContext, attempt int) *model.RunState {
 	if record == nil {
 		return nil
 	}
 	if record.Run != nil && record.Run.Attempt == attempt && dispatch != nil && dispatch.ReviewFeedback != nil {
-		record.Run.State = contract.RunStatusRunning
-		record.Run.Phase = contract.RunPhaseSummaryPreparing
-		record.Run.Reason = nil
-		record.Run.Decision = nil
-		record.Run.ErrorCode = ""
+		record.Run.Object.State = contract.RunStatusRunning
+		record.Run.Object.Phase = contract.RunPhaseSummaryPreparing
+		record.Run.Object.Reasons = nil
+		record.Run.Object.Decision = nil
+		record.Run.Object.ErrorCode = ""
 		record.Run.ReviewSummary = dispatch.ReviewFeedback.Summary
 		record.Run.ReviewFindings = append([]model.ReviewFinding(nil), dispatch.ReviewFeedback.Findings...)
+		o.updateRunObjectLinksLocked(record)
+		syncRunStateMirrorsFromObject(record.Run)
 		return record.Run
 	}
+	updatedAt := ""
+	if record != nil {
+		updatedAt = strings.TrimSpace(record.UpdatedAt)
+	}
+	if updatedAt == "" {
+		updatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	state := &model.RunState{
-		Attempt:     attempt,
-		State:       contract.RunStatusRunning,
-		Phase:       contract.RunPhaseSummaryPreparing,
 		Budget:      runBudgetForConfig(cfg),
 		Recovery:    model.CloneRecoveryCheckpoint(nil),
 		Checkpoints: nil,
+		Object: contract.Run{
+			BaseObject:    o.baseObjectLocked(contract.ObjectTypeRun, runIDForRecord(record, attempt), contract.VisibilityLevelRestricted, updatedAt),
+			ObjectContext: contract.ObjectContext{References: referencesFromRecord(o, record, updatedAt)},
+			State:         contract.RunStatusRunning,
+			Phase:         contract.RunPhaseSummaryPreparing,
+			Attempt:       attempt,
+		},
 	}
 	if definition, ok := jobTypeDefinitionForDispatch(dispatch); ok && definition.ReviewGate.Required {
-		state.ReviewGate = &contract.ReviewGate{
+		state.Object.ReviewGate = &contract.ReviewGate{
 			ReviewGatePolicy: definition.ReviewGate,
 			Status:           contract.ReviewGateStatusPending,
 		}
@@ -542,14 +556,78 @@ func ensureRunState(record *model.JobRuntime, cfg *model.ServiceConfig, dispatch
 		state.Recovery = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
 	}
 	record.Run = state
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(state)
+	o.updateJobRunRelationLocked(record)
+	o.updateJobAggregateLocked(record)
 	return state
 }
 
-func updateRunPhase(record *model.JobRuntime, phase contract.RunPhaseSummary) {
+func syncRunStateMirrorsFromObject(state *model.RunState) {
+	if state == nil {
+		return
+	}
+	state.Attempt = state.Object.Attempt
+	state.State = state.Object.State
+	state.Phase = state.Object.Phase
+	if state.Object.CandidateDelivery != nil {
+		candidate := *state.Object.CandidateDelivery
+		candidate.ArtifactIDs = append([]string(nil), state.Object.CandidateDelivery.ArtifactIDs...)
+		state.CandidateDelivery = &candidate
+	} else {
+		state.CandidateDelivery = nil
+	}
+	if state.Object.ReviewGate != nil {
+		reviewGate := *state.Object.ReviewGate
+		state.ReviewGate = &reviewGate
+	} else {
+		state.ReviewGate = nil
+	}
+	state.Checkpoints = append([]contract.Checkpoint(nil), state.Object.Checkpoints...)
+	if len(state.Object.Reasons) > 0 {
+		reason := state.Object.Reasons[0]
+		state.Reason = contractReasonPtr(reason)
+	} else {
+		state.Reason = nil
+	}
+	if state.Object.Decision != nil {
+		decision := *state.Object.Decision
+		state.Decision = &decision
+	} else {
+		state.Decision = nil
+	}
+	state.ErrorCode = state.Object.ErrorCode
+}
+
+func (o *Orchestrator) updateRunObjectLinksLocked(record *model.JobRuntime) {
 	if record == nil || record.Run == nil {
 		return
 	}
-	record.Run.Phase = phase
+	updatedAt := strings.TrimSpace(record.UpdatedAt)
+	if updatedAt == "" {
+		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
+	}
+	record.Run.Object.UpdatedAt = updatedAt
+	record.Run.Object.References = referencesFromRecord(o, record, updatedAt)
+	relations := make([]contract.ObjectRelation, 0, 2)
+	if record.Intervention != nil && strings.TrimSpace(record.Intervention.Object.ID) != "" {
+		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeRunIntervention, TargetID: record.Intervention.Object.ID, TargetType: contract.ObjectTypeIntervention})
+	}
+	if record.Outcome != nil && strings.TrimSpace(record.Outcome.ID) != "" {
+		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeRunOutcome, TargetID: record.Outcome.ID, TargetType: contract.ObjectTypeOutcome})
+	}
+	record.Run.Object.Relations = relations
+	o.persistRunObjectLocked(record)
+}
+
+func (o *Orchestrator) updateRunPhase(record *model.JobRuntime, phase contract.RunPhaseSummary) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	record.Run.Object.Phase = phase
+	record.Run.Object.UpdatedAt = record.UpdatedAt
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(record.Run)
 }
 
 func updateRunUsage(record *model.JobRuntime, executionMS int) {
@@ -568,7 +646,7 @@ func updateRunReviewUsage(record *model.JobRuntime, reviewMS int) {
 	record.Run.Usage.TotalMS += reviewMS
 }
 
-func setRunContinuationPending(record *model.JobRuntime, checkpoint *model.RecoveryCheckpoint) {
+func (o *Orchestrator) setRunContinuationPending(record *model.JobRuntime, checkpoint *model.RecoveryCheckpoint) {
 	if record == nil || record.Run == nil {
 		return
 	}
@@ -580,21 +658,27 @@ func setRunContinuationPending(record *model.JobRuntime, checkpoint *model.Recov
 			checkpointID = checkpoint.Checkpoint.ArtifactIDs[0]
 		}
 	}
-	record.Run.State = contract.RunStatusContinuationPending
-	record.Run.Phase = contract.RunPhaseSummaryBlocked
+	record.Run.Object.State = contract.RunStatusContinuationPending
+	record.Run.Object.Phase = contract.RunPhaseSummaryBlocked
 	record.Run.Recovery = model.CloneRecoveryCheckpoint(checkpoint)
-	record.Run.Decision = contractDecisionPtr(contract.MustDecision(contract.DecisionStartContinuationRun, map[string]any{
+	record.Run.Object.Decision = contractDecisionPtr(contract.MustDecision(contract.DecisionStartContinuationRun, map[string]any{
 		"checkpoint_id": checkpointID,
 	}))
-	record.Run.ErrorCode = ""
+	record.Run.Object.ErrorCode = ""
 	if checkpoint != nil {
 		if !runHasCheckpoint(record.Run, checkpoint.Checkpoint) {
-			record.Run.Checkpoints = append(record.Run.Checkpoints, checkpoint.Checkpoint)
+			record.Run.Object.Checkpoints = append(record.Run.Object.Checkpoints, checkpoint.Checkpoint)
 		}
-		record.Run.Reason = contractReasonPtr(contract.MustReason(contract.ReasonRunContinuationPending, map[string]any{
+		record.Run.Object.Reasons = []contract.Reason{contract.MustReason(contract.ReasonRunContinuationPending, map[string]any{
 			"checkpoint_id": checkpointID,
-		}))
+		})}
+		if artifact := o.recoveryArtifactForCheckpoint(record, checkpoint); artifact != nil {
+			upsertArtifactsOnRecord(record, *artifact)
+		}
 	}
+	o.persistArtifactObjectsLocked(record)
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(record.Run)
 }
 
 func runHasCheckpoint(run *model.RunState, candidate contract.Checkpoint) bool {
@@ -616,18 +700,145 @@ func runHasCheckpoint(run *model.RunState, candidate contract.Checkpoint) bool {
 	return false
 }
 
-func setRunIntervention(record *model.JobRuntime, reason contract.Reason, decision contract.Decision, errorCode contract.ErrorCode) {
+func (o *Orchestrator) setRunIntervention(record *model.JobRuntime, reason contract.Reason, decision contract.Decision, errorCode contract.ErrorCode) {
 	if record == nil || record.Run == nil {
 		return
 	}
-	record.Run.State = contract.RunStatusInterventionRequired
-	record.Run.Phase = contract.RunPhaseSummaryBlocked
-	record.Run.Reason = contractReasonPtr(reason)
-	record.Run.Decision = contractDecisionPtr(decision)
-	record.Run.ErrorCode = errorCode
+	record.Run.Object.State = contract.RunStatusInterventionRequired
+	record.Run.Object.Phase = contract.RunPhaseSummaryBlocked
+	record.Run.Object.Reasons = []contract.Reason{reason}
+	record.Run.Object.Decision = contractDecisionPtr(decision)
+	record.Run.Object.ErrorCode = errorCode
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(record.Run)
 }
 
-func markRunCandidateDelivery(record *model.JobRuntime, pr *PullRequestInfo) {
+func candidateArtifactIDsForRecord(record *model.JobRuntime, definition contract.JobTypeDefinition, pr *PullRequestInfo) []string {
+	if record == nil {
+		return nil
+	}
+	switch definition.Type {
+	case contract.JobTypeCodeChange:
+		if pr == nil {
+			return nil
+		}
+		return []string{artifactIDForRecord(record, "pull-request")}
+	case contract.JobTypeAnalysis:
+		return []string{artifactIDForRecord(record, "analysis-report")}
+	case contract.JobTypeDiagnostic:
+		return []string{artifactIDForRecord(record, "diagnostic-report")}
+	default:
+		return nil
+	}
+}
+
+func checkpointReferenceIDsForRecord(record *model.JobRuntime, pr *PullRequestInfo) []string {
+	if record == nil {
+		return nil
+	}
+	if pr == nil {
+		return nil
+	}
+	return []string{pullRequestReferenceIDForRecord(record)}
+}
+
+func referencesForCheckpoint(record *model.JobRuntime) []string {
+	if record == nil {
+		return nil
+	}
+	ids := []string{}
+	if record.SourceRef.SourceKind == contract.SourceKindLinear && strings.TrimSpace(record.SourceRef.SourceID) != "" {
+		ids = append(ids, sourceReferenceIDForRecord(record))
+	}
+	if branch := record.DurableRefs.Branch; branch != nil && strings.TrimSpace(branch.Name) != "" {
+		ids = append(ids, branchReferenceIDForRecord(record))
+	}
+	if pr := record.DurableRefs.PullRequest; pr != nil && strings.TrimSpace(pr.URL) != "" {
+		ids = append(ids, pullRequestReferenceIDForRecord(record))
+	}
+	return ids
+}
+
+func upsertArtifactsOnRecord(record *model.JobRuntime, artifacts ...contract.Artifact) {
+	if record == nil || len(artifacts) == 0 {
+		return
+	}
+	current := make([]contract.Artifact, 0, len(record.Artifacts)+len(artifacts))
+	index := map[string]int{}
+	for _, artifact := range record.Artifacts {
+		current = append(current, artifact)
+		index[artifact.ID] = len(current) - 1
+	}
+	for _, artifact := range artifacts {
+		if strings.TrimSpace(artifact.ID) == "" {
+			continue
+		}
+		if existing, ok := index[artifact.ID]; ok {
+			current[existing] = artifact
+			continue
+		}
+		index[artifact.ID] = len(current)
+		current = append(current, artifact)
+	}
+	record.Artifacts = current
+}
+
+func (o *Orchestrator) candidateArtifactsForRecord(record *model.JobRuntime, definition contract.JobTypeDefinition, pr *PullRequestInfo) []contract.Artifact {
+	if record == nil {
+		return nil
+	}
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	references := referencesFromRecord(o, record, updatedAt)
+	switch definition.Type {
+	case contract.JobTypeCodeChange:
+		if pr == nil || strings.TrimSpace(pr.URL) == "" {
+			return nil
+		}
+		return []contract.Artifact{{
+			BaseObject:    o.baseObjectLocked(contract.ObjectTypeArtifact, artifactIDForRecord(record, "pull-request"), contract.VisibilityLevelRestricted, updatedAt),
+			ObjectContext: contract.ObjectContext{References: references},
+			State:         contract.ArtifactStatusAvailable,
+			Kind:          contract.ArtifactKindPullRequest,
+			Role:          contract.ArtifactRolePrimary,
+			Locator:       pr.URL,
+		}}
+	case contract.JobTypeAnalysis:
+		return []contract.Artifact{{
+			BaseObject:    o.baseObjectLocked(contract.ObjectTypeArtifact, artifactIDForRecord(record, "analysis-report"), contract.VisibilityLevelRestricted, updatedAt),
+			ObjectContext: contract.ObjectContext{References: references},
+			State:         contract.ArtifactStatusAvailable,
+			Kind:          contract.ArtifactKindAnalysisReport,
+			Role:          contract.ArtifactRolePrimary,
+		}}
+	case contract.JobTypeDiagnostic:
+		return []contract.Artifact{{
+			BaseObject:    o.baseObjectLocked(contract.ObjectTypeArtifact, artifactIDForRecord(record, "diagnostic-report"), contract.VisibilityLevelRestricted, updatedAt),
+			ObjectContext: contract.ObjectContext{References: references},
+			State:         contract.ArtifactStatusAvailable,
+			Kind:          contract.ArtifactKindDiagnosticReport,
+			Role:          contract.ArtifactRolePrimary,
+		}}
+	default:
+		return nil
+	}
+}
+
+func (o *Orchestrator) recoveryArtifactForCheckpoint(record *model.JobRuntime, checkpoint *model.RecoveryCheckpoint) *contract.Artifact {
+	if record == nil || checkpoint == nil || strings.TrimSpace(checkpoint.ArtifactID) == "" {
+		return nil
+	}
+	updatedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	return &contract.Artifact{
+		BaseObject:    o.baseObjectLocked(contract.ObjectTypeArtifact, checkpoint.ArtifactID, contract.VisibilityLevelRestricted, updatedAt),
+		ObjectContext: contract.ObjectContext{References: referencesFromRecord(o, record, updatedAt)},
+		State:         contract.ArtifactStatusAvailable,
+		Kind:          contract.ArtifactKindPatchBundle,
+		Role:          contract.ArtifactRoleSupporting,
+		Locator:       checkpoint.PatchPath,
+	}
+}
+
+func (o *Orchestrator) markRunCandidateDelivery(record *model.JobRuntime, pr *PullRequestInfo) {
 	if record == nil || record.Run == nil {
 		return
 	}
@@ -635,19 +846,13 @@ func markRunCandidateDelivery(record *model.JobRuntime, pr *PullRequestInfo) {
 	if !ok {
 		return
 	}
-	artifactIDs := []string{}
-	switch definition.Type {
-	case contract.JobTypeCodeChange, contract.JobTypeLandChange:
-		if pr == nil {
-			return
-		}
-		artifactIDs = append(artifactIDs, fmt.Sprintf("pr-%d", pr.Number))
-	case contract.JobTypeAnalysis:
-		artifactIDs = append(artifactIDs, fmt.Sprintf("art-%s-analysis-%d", record.RecordID, currentAttempt(record)))
-	case contract.JobTypeDiagnostic:
-		artifactIDs = append(artifactIDs, fmt.Sprintf("art-%s-diagnostic-%d", record.RecordID, currentAttempt(record)))
+	if (definition.Type == contract.JobTypeCodeChange || definition.Type == contract.JobTypeLandChange) && pr == nil {
+		return
 	}
-	record.Run.CandidateDelivery = &contract.CandidateDelivery{
+	artifactIDs := candidateArtifactIDsForRecord(record, definition, pr)
+	referenceIDs := checkpointReferenceIDsForRecord(record, pr)
+	upsertArtifactsOnRecord(record, o.candidateArtifactsForRecord(record, definition, pr)...)
+	record.Run.Object.CandidateDelivery = &contract.CandidateDelivery{
 		Kind:        definition.CandidateDelivery.Kind,
 		Reached:     true,
 		ReachedAt:   time.Now().UTC().Format(time.RFC3339Nano),
@@ -658,72 +863,82 @@ func markRunCandidateDelivery(record *model.JobRuntime, pr *PullRequestInfo) {
 		"record_id": record.RecordID,
 	}
 	checkpoint := contract.Checkpoint{
-		Type:        contract.CheckpointTypeBusiness,
-		Summary:     definition.BusinessCheckpoint.Summary,
-		CapturedAt:  time.Now().UTC().Format(time.RFC3339Nano),
-		Stage:       contract.RunPhaseSummaryPublishing,
-		ArtifactIDs: artifactIDs,
+		Type:         contract.CheckpointTypeBusiness,
+		Summary:      definition.BusinessCheckpoint.Summary,
+		CapturedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		Stage:        contract.RunPhaseSummaryPublishing,
+		ArtifactIDs:  artifactIDs,
+		ReferenceIDs: referenceIDs,
 	}
 	if pr != nil {
 		checkpoint.Branch = pr.HeadBranch
 		checkpointReasonDetails["pr_number"] = pr.Number
 	}
 	checkpoint.Reason = contractReasonPtr(contract.MustReason(contract.ReasonCheckpointBusinessCaptured, checkpointReasonDetails))
-	record.Run.Checkpoints = append(record.Run.Checkpoints, checkpoint)
+	record.Run.Object.Checkpoints = append(record.Run.Object.Checkpoints, checkpoint)
+	o.persistArtifactObjectsLocked(record)
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(record.Run)
 }
 
-func openRunReviewGate(record *model.JobRuntime) {
+func (o *Orchestrator) openRunReviewGate(record *model.JobRuntime) {
 	if record == nil || record.Run == nil {
 		return
 	}
-	if record.Run.ReviewGate == nil {
+	if record.Run.Object.ReviewGate == nil {
 		if definition, ok := jobTypeDefinitionForDispatch(record.Dispatch); ok && definition.ReviewGate.Required {
-			record.Run.ReviewGate = &contract.ReviewGate{
+			record.Run.Object.ReviewGate = &contract.ReviewGate{
 				ReviewGatePolicy: definition.ReviewGate,
 				Status:           contract.ReviewGateStatusPending,
 			}
 		}
 	}
-	if record.Run.ReviewGate == nil {
+	if record.Run.Object.ReviewGate == nil {
 		return
 	}
-	record.Run.ReviewGate.Status = contract.ReviewGateStatusReviewing
-	record.Run.Reason = contractReasonPtr(contract.MustReason(contract.ReasonRunReviewGateCandidateReady, map[string]any{
+	record.Run.Object.ReviewGate.Status = contract.ReviewGateStatusReviewing
+	record.Run.Object.Reasons = []contract.Reason{contract.MustReason(contract.ReasonRunReviewGateCandidateReady, map[string]any{
+		"record_id": record.RecordID,
+	})}
+	record.Run.Object.Decision = contractDecisionPtr(contract.MustDecision(contract.DecisionOpenReviewGate, map[string]any{
 		"record_id": record.RecordID,
 	}))
-	record.Run.Decision = contractDecisionPtr(contract.MustDecision(contract.DecisionOpenReviewGate, map[string]any{
-		"record_id": record.RecordID,
-	}))
-	record.Run.ErrorCode = ""
+	record.Run.Object.ErrorCode = ""
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(record.Run)
 }
 
-func markRunReviewPassed(record *model.JobRuntime, summary string) {
+func (o *Orchestrator) markRunReviewPassed(record *model.JobRuntime, summary string) {
 	if record == nil || record.Run == nil {
 		return
 	}
-	if record.Run.ReviewGate != nil {
-		record.Run.ReviewGate.Status = contract.ReviewGateStatusPassed
+	if record.Run.Object.ReviewGate != nil {
+		record.Run.Object.ReviewGate.Status = contract.ReviewGateStatusPassed
 	}
 	record.Run.ReviewSummary = strings.TrimSpace(summary)
 	record.Run.ReviewFindings = nil
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(record.Run)
 }
 
-func markRunReviewChangesRequested(record *model.JobRuntime, summary string, findings []model.ReviewFinding) {
+func (o *Orchestrator) markRunReviewChangesRequested(record *model.JobRuntime, summary string, findings []model.ReviewFinding) {
 	if record == nil || record.Run == nil {
 		return
 	}
-	if record.Run.ReviewGate != nil {
-		record.Run.ReviewGate.Status = contract.ReviewGateStatusChangesRequested
+	if record.Run.Object.ReviewGate != nil {
+		record.Run.Object.ReviewGate.Status = contract.ReviewGateStatusChangesRequested
 	}
 	record.Run.ReviewSummary = strings.TrimSpace(summary)
 	record.Run.ReviewFindings = append([]model.ReviewFinding(nil), findings...)
+	o.updateRunObjectLinksLocked(record)
+	syncRunStateMirrorsFromObject(record.Run)
 }
 
 func latestRunCheckpoint(record *model.JobRuntime) *contract.Checkpoint {
-	if record == nil || record.Run == nil || len(record.Run.Checkpoints) == 0 {
+	if record == nil || record.Run == nil || len(record.Run.Object.Checkpoints) == 0 {
 		return nil
 	}
-	checkpoint := record.Run.Checkpoints[len(record.Run.Checkpoints)-1]
+	checkpoint := record.Run.Object.Checkpoints[len(record.Run.Object.Checkpoints)-1]
 	return &checkpoint
 }
 
@@ -825,7 +1040,7 @@ func isRecordRunning(record *model.JobRuntime) bool {
 	return record != nil &&
 		jobStateFromRecord(record) == contract.JobStatusRunning &&
 		record.Run != nil &&
-		record.Run.State == contract.RunStatusRunning &&
+		record.Run.Object.State == contract.RunStatusRunning &&
 		record.Observation != nil &&
 		record.Observation.Running
 }
@@ -834,14 +1049,14 @@ func isContinuationPending(record *model.JobRuntime) bool {
 	return record != nil &&
 		jobStateFromRecord(record) == contract.JobStatusRunning &&
 		record.Run != nil &&
-		record.Run.State == contract.RunStatusContinuationPending
+		record.Run.Object.State == contract.RunStatusContinuationPending
 }
 
 func isAwaitingMerge(record *model.JobRuntime) bool {
 	return record != nil &&
 		jobStateFromRecord(record) == contract.JobStatusRunning &&
 		record.Run != nil &&
-		record.Run.State == contract.RunStatusCompleted &&
+		record.Run.Object.State == contract.RunStatusCompleted &&
 		record.Outcome == nil &&
 		record.Intervention == nil &&
 		record.DurableRefs.PullRequest != nil
@@ -866,7 +1081,9 @@ func (o *Orchestrator) jobRuntimeFromIssue(issue model.Issue, ledgerPath string)
 		LastKnownIssue:      model.CloneIssue(&issue),
 		LastKnownIssueState: strings.TrimSpace(issue.State),
 	}
-	record.Object = o.jobObjectFromRecord(record, contract.JobStatusQueued)
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		*job = o.jobObjectFromRecord(record, contract.JobStatusQueued)
+	})
 	return record
 }
 
@@ -883,6 +1100,9 @@ func (o *Orchestrator) ensureRecordLocked(issue model.Issue) *model.JobRuntime {
 	record.SourceRef = sourceRefForIssue(sourceKind, sourceName, &issue)
 	record.RecordID = recordIDForIssue(sourceKind, sourceName, &issue)
 	record.DurableRefs.LedgerPath = ledgerPathForConfig(o.currentConfig())
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.References = referencesFromRecord(o, record, record.UpdatedAt)
+	})
 	return record
 }
 
@@ -892,26 +1112,66 @@ func (o *Orchestrator) setRecordObservationLocked(record *model.JobRuntime, obse
 	}
 	record.Observation = cloneObservation(observation)
 	record.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.UpdatedAt = record.UpdatedAt
+	})
 }
 
 func (o *Orchestrator) setRecordReasonLocked(record *model.JobRuntime, reason *contract.Reason) {
 	if record == nil {
 		return
 	}
-	record.Reason = cloneReason(reason)
 	record.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.UpdatedAt = record.UpdatedAt
+		if reason != nil {
+			job.Reasons = []contract.Reason{*cloneReason(reason)}
+		} else {
+			job.Reasons = nil
+		}
+	})
+	if len(record.Object.Reasons) > 0 {
+		record.Reason = cloneReason(&record.Object.Reasons[0])
+	} else {
+		record.Reason = nil
+	}
+}
+
+func jobStatusForLifecycle(status model.JobLifecycleState) contract.JobStatus {
+	switch status {
+	case model.JobLifecycleAwaitingIntervention:
+		return contract.JobStatusInterventionRequired
+	default:
+		return contract.JobStatusRunning
+	}
 }
 
 func (o *Orchestrator) setRecordStatusLocked(record *model.JobRuntime, status model.JobLifecycleState, reason *contract.Reason, observation *contract.Observation) {
 	if record == nil {
 		return
 	}
-	record.Lifecycle = status
-	record.Reason = cloneReason(reason)
 	record.Observation = cloneObservation(observation)
 	record.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
 	if status != model.JobLifecycleRetryScheduled {
 		record.RetryDueAt = nil
+	}
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.UpdatedAt = record.UpdatedAt
+		job.State = jobStatusForLifecycle(status)
+		if job.JobType == "" {
+			job.JobType = jobTypeForDispatch(record.Dispatch)
+		}
+		if reason != nil {
+			job.Reasons = []contract.Reason{*cloneReason(reason)}
+		} else {
+			job.Reasons = nil
+		}
+	})
+	record.Lifecycle = status
+	if len(record.Object.Reasons) > 0 {
+		record.Reason = cloneReason(&record.Object.Reasons[0])
+	} else {
+		record.Reason = nil
 	}
 }
 
@@ -925,7 +1185,34 @@ func (o *Orchestrator) removeRecordLocked(issueID string) *model.JobRuntime {
 func (o *Orchestrator) reindexRecordLocked(issueID string, record *model.JobRuntime) {
 	_ = issueID
 	_ = record
+	o.updateJobAggregateLocked(record)
 	o.rebuildRuntimeIndexesLocked()
+}
+
+func (o *Orchestrator) updateJobRunRelationLocked(record *model.JobRuntime) {
+	if record == nil || record.Run == nil {
+		return
+	}
+	runID := strings.TrimSpace(record.Run.Object.ID)
+	if runID == "" {
+		return
+	}
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		relations := make([]contract.ObjectRelation, 0, len(job.Relations))
+		for _, relation := range job.Relations {
+			if relation.Type == contract.RelationTypeJobRun {
+				continue
+			}
+			relations = append(relations, relation)
+		}
+		relations = append([]contract.ObjectRelation{{
+			Type:       contract.RelationTypeJobRun,
+			TargetID:   runID,
+			TargetType: contract.ObjectTypeRun,
+		}}, relations...)
+		job.Relations = relations
+		job.UpdatedAt = record.UpdatedAt
+	})
 }
 
 func runIndexKey(record *model.JobRuntime) string {
@@ -944,7 +1231,6 @@ func (o *Orchestrator) rebuildRuntimeIndexesLocked() {
 		if record == nil {
 			continue
 		}
-		o.refreshJobObjectLocked(record)
 		switch {
 		case isRecordRunning(record):
 			if key := runIndexKey(record); key != "" {
@@ -962,11 +1248,28 @@ func (o *Orchestrator) rebuildRuntimeIndexesLocked() {
 	}
 }
 
-func (o *Orchestrator) refreshJobObjectLocked(record *model.JobRuntime) {
+func (o *Orchestrator) updateJobAggregateLocked(record *model.JobRuntime) {
 	if record == nil {
 		return
 	}
-	record.Object = o.jobObjectFromRecord(record, jobStateFromRecord(record))
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.UpdatedAt = record.UpdatedAt
+		if job.JobType == "" {
+			job.JobType = jobTypeForDispatch(record.Dispatch)
+		}
+		job.ActionSummary = o.actionSummaryForJobLocked(job.ID)
+		relations := make([]contract.ObjectRelation, 0, len(job.Relations)+len(o.actionObjectsForJobLocked(job.ID)))
+		for _, relation := range job.Relations {
+			if relation.Type == contract.RelationTypeJobAction {
+				continue
+			}
+			relations = append(relations, relation)
+		}
+		for _, action := range o.actionObjectsForJobLocked(job.ID) {
+			relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeJobAction, TargetID: action.ID, TargetType: contract.ObjectTypeAction})
+		}
+		job.Relations = relations
+	})
 }
 
 func (o *Orchestrator) activeRunForIssueLocked(issueID string) *model.JobRuntime {
@@ -996,6 +1299,23 @@ func (o *Orchestrator) candidateDeliveryForIssueLocked(issueID string) *model.Jo
 func (o *Orchestrator) interventionForIssueLocked(issueID string) *model.JobRuntime {
 	record := o.state.Jobs[issueID]
 	if isAwaitingIntervention(record) {
+		return record
+	}
+	return nil
+}
+
+func (o *Orchestrator) recordByInterventionIDLocked(interventionID string) *model.JobRuntime {
+	id := strings.TrimSpace(interventionID)
+	if id == "" {
+		return nil
+	}
+	for _, record := range o.state.Jobs {
+		if record == nil || record.Intervention == nil {
+			continue
+		}
+		if strings.TrimSpace(record.Intervention.Object.ID) != id {
+			continue
+		}
 		return record
 	}
 	return nil
@@ -1431,6 +1751,10 @@ func (o *Orchestrator) dispatchEligibleIssues(ctx context.Context, candidates []
 }
 
 func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, attempt *int) {
+	o.launchRunForRecord(ctx, issue, nil, attempt, nil)
+}
+
+func (o *Orchestrator) launchRunForRecord(ctx context.Context, issue model.Issue, existing *model.JobRuntime, attempt *int, preparedDispatch *model.DispatchContext) {
 	o.mu.RLock()
 	protected := o.isProtectedLocked()
 	o.mu.RUnlock()
@@ -1452,8 +1776,16 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 	}
 	stallCount := 0
 	var dispatch *model.DispatchContext
-	record := o.ensureRecordLocked(issue)
-	if isContinuationPending(record) {
+	record := existing
+	if record == nil {
+		record = o.ensureRecordLocked(issue)
+	} else {
+		o.ensureRecordIdentityLocked(record, issue.ID, issue.Identifier)
+		o.state.Jobs[issue.ID] = record
+	}
+	if preparedDispatch != nil {
+		dispatch = model.CloneDispatchContext(preparedDispatch)
+	} else if isContinuationPending(record) {
 		stallCount = record.StallCount
 		if record.RetryTimer != nil {
 			record.RetryTimer.Stop()
@@ -1484,7 +1816,7 @@ func (o *Orchestrator) dispatchIssue(ctx context.Context, issue model.Issue, att
 	record.Dispatch = model.CloneDispatchContext(dispatch)
 	record.Session = model.LiveSession{}
 	record.NeedsRecovery = false
-	record.Run = ensureRunState(record, o.currentConfig(), dispatch, attemptCountFromRetry(normalizedAttempt))
+	record.Run = o.ensureRunState(record, o.currentConfig(), dispatch, attemptCountFromRetry(normalizedAttempt))
 	record.Outcome = nil
 	record.LastKnownIssue = model.CloneIssue(&issue)
 	record.LastKnownIssueState = strings.TrimSpace(issue.State)
@@ -1678,12 +2010,12 @@ func reviewBudgetForConfig(cfg *model.ServiceConfig) int {
 func buildReviewPrompt(issue model.Issue, record *model.JobRuntime) string {
 	definition, _ := jobTypeDefinitionForDispatch(record.Dispatch)
 	candidateSummary := ""
-	if record != nil && record.Run != nil && record.Run.CandidateDelivery != nil {
-		candidateSummary = strings.TrimSpace(record.Run.CandidateDelivery.Summary)
+	if record != nil && record.Run != nil && record.Run.Object.CandidateDelivery != nil {
+		candidateSummary = strings.TrimSpace(record.Run.Object.CandidateDelivery.Summary)
 	}
 	artifactList := ""
-	if record != nil && record.Run != nil && record.Run.CandidateDelivery != nil && len(record.Run.CandidateDelivery.ArtifactIDs) > 0 {
-		artifactList = strings.Join(record.Run.CandidateDelivery.ArtifactIDs, ", ")
+	if record != nil && record.Run != nil && record.Run.Object.CandidateDelivery != nil && len(record.Run.Object.CandidateDelivery.ArtifactIDs) > 0 {
+		artifactList = strings.Join(record.Run.Object.CandidateDelivery.ArtifactIDs, ", ")
 	}
 	pr := recordPullRequest(record)
 	lines := []string{
@@ -1924,6 +2256,77 @@ func dispatchStringPtr(value string) *string {
 	return &copyValue
 }
 
+func intPtr(value int) *int {
+	copyValue := value
+	return &copyValue
+}
+
+func branchFromFormalReferences(references []contract.Reference) string {
+	for _, reference := range references {
+		if reference.Type == contract.ReferenceTypeGitBranch {
+			return strings.TrimSpace(reference.Locator)
+		}
+	}
+	return ""
+}
+
+func pullRequestContextFromFormalReferences(references []contract.Reference) *model.PRContext {
+	for _, reference := range references {
+		if reference.Type != contract.ReferenceTypeGitHubPullRequest {
+			continue
+		}
+		number, _ := strconv.Atoi(strings.TrimSpace(reference.ExternalID))
+		return &model.PRContext{
+			Number: number,
+			URL:    strings.TrimSpace(reference.URL),
+			State:  "",
+		}
+	}
+	return nil
+}
+
+func recoveryCheckpointFromIntervention(record *model.JobRuntime) *model.RecoveryCheckpoint {
+	if record == nil || record.Intervention == nil || record.Intervention.Handoff.Checkpoint == nil {
+		return nil
+	}
+	checkpoint := *record.Intervention.Handoff.Checkpoint
+	checkpoint.ArtifactIDs = append([]string(nil), checkpoint.ArtifactIDs...)
+	checkpoint.ReferenceIDs = append([]string(nil), checkpoint.ReferenceIDs...)
+	if checkpoint.Reason != nil {
+		clonedReason := *checkpoint.Reason
+		if len(checkpoint.Reason.Details) > 0 {
+			clonedReason.Details = map[string]any{}
+			for key, value := range checkpoint.Reason.Details {
+				clonedReason.Details[key] = value
+			}
+		}
+		checkpoint.Reason = &clonedReason
+	}
+	artifactID := ""
+	if len(checkpoint.ArtifactIDs) > 0 {
+		artifactID = strings.TrimSpace(checkpoint.ArtifactIDs[0])
+	}
+	patchPath := ""
+	if artifactID != "" {
+		for _, artifact := range record.Artifacts {
+			if artifact.ID == artifactID {
+				patchPath = strings.TrimSpace(artifact.Locator)
+				break
+			}
+		}
+	}
+	workspacePath := ""
+	if record.DurableRefs.Workspace != nil {
+		workspacePath = strings.TrimSpace(record.DurableRefs.Workspace.Path)
+	}
+	return &model.RecoveryCheckpoint{
+		ArtifactID:    artifactID,
+		PatchPath:     patchPath,
+		WorkspacePath: workspacePath,
+		Checkpoint:    checkpoint,
+	}
+}
+
 func pullRequestContext(pr *PullRequestInfo) *model.PRContext {
 	if pr == nil {
 		return nil
@@ -2051,14 +2454,15 @@ done < <(git ls-files --others --exclude-standard)`
 		checkpointReason.Details["cause"] = reason.ReasonCode
 	}
 	checkpoint := contract.Checkpoint{
-		Type:        contract.CheckpointTypeRecovery,
-		Summary:     "已记录可续跑的恢复 checkpoint。",
-		CapturedAt:  o.now().UTC().Format(time.RFC3339Nano),
-		Stage:       stage,
-		ArtifactIDs: []string{artifactID},
-		BaseSHA:     baseSHA,
-		Branch:      strings.TrimSpace(branch),
-		Reason:      contractReasonPtr(checkpointReason),
+		Type:         contract.CheckpointTypeRecovery,
+		Summary:      "已记录可续跑的恢复 checkpoint。",
+		CapturedAt:   o.now().UTC().Format(time.RFC3339Nano),
+		Stage:        stage,
+		ArtifactIDs:  []string{artifactID},
+		ReferenceIDs: referencesForCheckpoint(record),
+		BaseSHA:      baseSHA,
+		Branch:       strings.TrimSpace(branch),
+		Reason:       contractReasonPtr(checkpointReason),
 	}
 	return &model.RecoveryCheckpoint{
 		ArtifactID:    artifactID,
@@ -2191,7 +2595,7 @@ func decisionForMissingPullRequest(contract model.CompletionContract, branch str
 
 func (o *Orchestrator) handleReviewWorkerExit(result WorkerResult, entry *model.JobRuntime, identifier string, workspacePath string, dispatch *model.DispatchContext, issueState string) {
 	updateRunReviewUsage(entry, int(o.now().UTC().Sub(result.StartedAt).Milliseconds()))
-	updateRunPhase(entry, contract.RunPhaseSummaryVerifying)
+	o.updateRunPhase(entry, contract.RunPhaseSummaryVerifying)
 	expectedOutcome := normalizeCompletionContract(o.currentWorkflow().Completion).Mode
 	if dispatch != nil && dispatch.ExpectedOutcome != "" {
 		expectedOutcome = dispatch.ExpectedOutcome
@@ -2204,7 +2608,7 @@ func (o *Orchestrator) handleReviewWorkerExit(result WorkerResult, entry *model.
 
 	switch result.ReviewStatus {
 	case contract.ReviewGateStatusPassed:
-		markRunReviewPassed(entry, result.ReviewSummary)
+		o.markRunReviewPassed(entry, result.ReviewSummary)
 		if entry.Dispatch != nil {
 			entry.Dispatch.ReviewFeedback = nil
 		}
@@ -2219,17 +2623,19 @@ func (o *Orchestrator) handleReviewWorkerExit(result WorkerResult, entry *model.
 		_ = o.resumeRecoveredSuccessPath(o.runtimeContext(), result.IssueID, snapshot, issueState)
 		return
 	case contract.ReviewGateStatusChangesRequested:
-		if entry.Run != nil && entry.Run.ReviewGate != nil && entry.Run.ReviewGate.FixRoundsUsed >= entry.Run.ReviewGate.MaxFixRounds {
-			if entry.Run.ReviewGate != nil {
-				entry.Run.ReviewGate.Status = contract.ReviewGateStatusInterventionRequired
+		if entry.Run != nil && entry.Run.Object.ReviewGate != nil && entry.Run.Object.ReviewGate.FixRoundsUsed >= entry.Run.Object.ReviewGate.MaxFixRounds {
+			if entry.Run.Object.ReviewGate != nil {
+				entry.Run.Object.ReviewGate.Status = contract.ReviewGateStatusInterventionRequired
+				syncRunStateMirrorsFromObject(entry.Run)
 			}
 			o.mu.Unlock()
 			o.moveToAwaitingIntervention(result.IssueID, identifier, workspacePath, recordBranch(entry), entry.RetryAttempt, entry.StallCount, expectedOutcome, string(contract.ReasonRunReviewGateFixLimitReached), issueState, recordPullRequest(entry))
 			return
 		}
-		markRunReviewChangesRequested(entry, result.ReviewSummary, result.ReviewFindings)
-		if entry.Run != nil && entry.Run.ReviewGate != nil {
-			entry.Run.ReviewGate.FixRoundsUsed++
+		o.markRunReviewChangesRequested(entry, result.ReviewSummary, result.ReviewFindings)
+		if entry.Run != nil && entry.Run.Object.ReviewGate != nil {
+			entry.Run.Object.ReviewGate.FixRoundsUsed++
+			syncRunStateMirrorsFromObject(entry.Run)
 		}
 		nextDispatch := model.CloneDispatchContext(dispatch)
 		if nextDispatch == nil {
@@ -2315,7 +2721,7 @@ func (o *Orchestrator) handleWorkerExit(result WorkerResult) {
 		return
 	}
 	updateRunUsage(entry, int(o.now().UTC().Sub(result.StartedAt).Milliseconds()))
-	updateRunPhase(entry, runPhaseSummaryForModelPhase(result.Phase))
+	o.updateRunPhase(entry, runPhaseSummaryForModelPhase(result.Phase))
 
 	if result.Err != nil {
 		if hardViolation, ok := model.AsHardViolation(result.Err); ok {
@@ -2454,7 +2860,7 @@ func (o *Orchestrator) handleCodexUpdate(update CodexUpdate) {
 			"turn_count": entry.Session.TurnCount,
 		},
 	}
-	updateRunPhase(entry, contract.RunPhaseSummaryExecuting)
+	o.updateRunPhase(entry, contract.RunPhaseSummaryExecuting)
 	o.setRecordObservationLocked(entry, observation)
 	o.reindexRecordLocked(update.IssueID, entry)
 	o.commitStateLocked(false)
@@ -2581,7 +2987,7 @@ func (o *Orchestrator) handleStalledRunningRecord(ctx context.Context, issueID s
 	}
 	entry.WorkerCancel = nil
 	entry.StartedAt = nil
-	updateRunPhase(entry, contract.RunPhaseSummaryBlocked)
+	o.updateRunPhase(entry, contract.RunPhaseSummaryBlocked)
 	o.setRecordObservationLocked(entry, &contract.Observation{
 		Running: false,
 		Summary: "capturing recovery checkpoint after stall",
@@ -3174,7 +3580,7 @@ func (o *Orchestrator) scheduleContinuationLocked(issueID string, identifier str
 		if retryDispatch.RecoveryCheckpoint.PatchPath != "" {
 			reasonDetails["patch_path"] = retryDispatch.RecoveryCheckpoint.PatchPath
 		}
-		setRunContinuationPending(record, retryDispatch.RecoveryCheckpoint)
+		o.setRunContinuationPending(record, retryDispatch.RecoveryCheckpoint)
 	}
 	o.setRecordStatusLocked(record, model.JobLifecycleRetryScheduled, &contract.Reason{
 		ReasonCode: contract.ReasonRunContinuationPending,
@@ -3553,10 +3959,15 @@ func (o *Orchestrator) moveToAwaitingMerge(issueID string, identifier string, is
 		Running: false,
 		Summary: "awaiting pull request merge",
 	})
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.References = referencesFromRecord(o, record, record.UpdatedAt)
+	})
 	if record.Run != nil {
-		markRunCandidateDelivery(record, pr)
-		record.Run.State = contract.RunStatusCompleted
-		record.Run.Phase = contract.RunPhaseSummaryPublishing
+		o.markRunCandidateDelivery(record, pr)
+		record.Run.Object.State = contract.RunStatusCompleted
+		record.Run.Object.Phase = contract.RunPhaseSummaryPublishing
+		o.updateRunObjectLinksLocked(record)
+		syncRunStateMirrorsFromObject(record.Run)
 	}
 	o.reindexRecordLocked(issueID, record)
 	delete(o.pendingRecovery, issueID)
@@ -3632,7 +4043,7 @@ func buildInterventionState(cfg *model.ServiceConfig, now time.Time, record *mod
 		},
 	}
 	if record.Run != nil {
-		state.Handoff.Phase = record.Run.Phase
+		state.Handoff.Phase = record.Run.Object.Phase
 		state.Handoff.ReviewSummary = strings.TrimSpace(record.Run.ReviewSummary)
 		state.Handoff.ReviewFindings = append([]model.ReviewFinding(nil), record.Run.ReviewFindings...)
 		if checkpoint := latestRunCheckpoint(record); checkpoint != nil {
@@ -3705,6 +4116,9 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 		Running: false,
 		Summary: "awaiting external intervention",
 	})
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.References = referencesFromRecord(o, record, record.UpdatedAt)
+	})
 	if record.Run != nil {
 		runReasonCode := contract.ReasonRunBlockedInterventionRequired
 		runDecisionCode := contract.DecisionResumeAfterIntervention
@@ -3717,8 +4131,10 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 			runReasonCode = contract.ReasonRunReviewGateFixLimitReached
 			runDecisionCode = contract.DecisionResumeAfterIntervention
 			runErrorCode = contract.ErrorReviewGateBlocked
-			if record.Run.ReviewGate != nil {
-				record.Run.ReviewGate.Status = contract.ReviewGateStatusInterventionRequired
+			if record.Run.Object.ReviewGate != nil {
+				record.Run.Object.ReviewGate.Status = contract.ReviewGateStatusInterventionRequired
+				o.updateRunObjectLinksLocked(record)
+				syncRunStateMirrorsFromObject(record.Run)
 			}
 		}
 		runReason := contract.MustReason(runReasonCode, map[string]any{
@@ -3729,8 +4145,10 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 			"record_id": record.RecordID,
 			"cause":     reason,
 		})
-		setRunIntervention(record, runReason, runDecision, runErrorCode)
+		o.setRunIntervention(record, runReason, runDecision, runErrorCode)
 		record.Intervention = buildInterventionState(o.currentConfig(), o.now().UTC(), record, runReason, runDecision, runErrorCode)
+		o.persistInterventionObjectLocked(record)
+		o.updateRunObjectLinksLocked(record)
 	} else {
 		record.Intervention = buildInterventionState(o.currentConfig(), o.now().UTC(), record, contract.MustReason(contract.ReasonRunBlockedInterventionRequired, map[string]any{
 			"record_id": record.RecordID,
@@ -3739,6 +4157,7 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 			"record_id": record.RecordID,
 			"cause":     reason,
 		}), contract.ErrorAPIInterventionConflict)
+		o.persistInterventionObjectLocked(record)
 	}
 	o.reindexRecordLocked(issueID, record)
 	delete(o.pendingRecovery, issueID)
@@ -3755,31 +4174,26 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	}
 }
 
-func (o *Orchestrator) resumeIntervention(ctx context.Context, issue model.Issue, resolution contract.InterventionResolution) {
+func (o *Orchestrator) resumeIntervention(ctx context.Context, interventionID string, issue model.Issue, resolution contract.InterventionResolution) {
 	o.mu.Lock()
-	record := o.interventionForIssueLocked(issue.ID)
+	record := o.recordByInterventionIDLocked(interventionID)
 	if record == nil {
 		o.mu.Unlock()
 		return
 	}
 	baseDispatch := freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
-	if record.Dispatch != nil {
-		baseDispatch.JobType = record.Dispatch.JobType
-		baseDispatch.ExpectedOutcome = record.Dispatch.ExpectedOutcome
-		baseDispatch.OnMissingPR = record.Dispatch.OnMissingPR
-		baseDispatch.OnClosedPR = record.Dispatch.OnClosedPR
-	}
+	baseDispatch.JobType = record.Object.JobType
 	baseDispatch.Kind = model.DispatchKindInterventionRetry
-	if strings.TrimSpace(recordBranch(record)) != "" {
-		baseDispatch.PreviousBranch = dispatchStringPtr(recordBranch(record))
+	formalReferences := record.Object.References
+	if record.Run != nil && len(record.Run.Object.References) > 0 {
+		formalReferences = record.Run.Object.References
 	}
-	baseDispatch.PreviousPR = pullRequestContext(recordPullRequest(record))
-	if strings.TrimSpace(record.LastKnownIssueState) != "" {
-		baseDispatch.PreviousIssueState = dispatchStringPtr(record.LastKnownIssueState)
+	baseDispatch.PreviousBranch = dispatchStringPtr(branchFromFormalReferences(formalReferences))
+	baseDispatch.PreviousPR = pullRequestContextFromFormalReferences(formalReferences)
+	if strings.TrimSpace(issue.State) != "" {
+		baseDispatch.PreviousIssueState = dispatchStringPtr(issue.State)
 	}
-	if record.Run != nil && record.Run.Recovery != nil {
-		baseDispatch.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(record.Run.Recovery)
-	}
+	baseDispatch.RecoveryCheckpoint = recoveryCheckpointFromIntervention(record)
 	if record.Intervention != nil {
 		record.Intervention.Object.State = contract.InterventionStatusResolved
 		resolutionCopy := resolution
@@ -3802,10 +4216,25 @@ func (o *Orchestrator) resumeIntervention(ctx context.Context, issue model.Issue
 		}
 		record.Intervention.Object.Resolution = &resolutionCopy
 	}
-	record.Dispatch = model.CloneDispatchContext(baseDispatch)
-	nextAttempt := record.RetryAttempt + 1
+	o.persistInterventionObjectLocked(record)
+	nextRecord := cloneJobRuntime(record)
+	nextRecord.Dispatch = model.CloneDispatchContext(baseDispatch)
+	nextRecord.Run = nil
+	nextRecord.Session = model.LiveSession{}
+	nextRecord.WorkerCancel = nil
+	nextRecord.RetryTimer = nil
+	nextRecord.StartedAt = nil
+	nextRecord.NeedsRecovery = false
+	nextRecord.RetryDueAt = nil
+	nextRecord.Outcome = nil
+	o.state.Jobs[issue.ID] = nextRecord
+	o.reindexRecordLocked(issue.ID, nextRecord)
+	nextAttempt := currentAttempt(record)
+	if nextAttempt < 1 {
+		nextAttempt = 1
+	}
 	o.mu.Unlock()
-	o.dispatchIssue(ctx, issue, &nextAttempt)
+	o.launchRunForRecord(ctx, issue, nextRecord, intPtr(nextAttempt), baseDispatch)
 }
 
 func (o *Orchestrator) lookupPullRequestByHeadBranch(ctx context.Context, workspacePath string, headBranch string) (*PullRequestInfo, error) {
@@ -3894,15 +4323,17 @@ func (o *Orchestrator) completeIssueWithOutcome(ctx context.Context, issueID str
 	}
 	completedAt := o.now().UTC().Format(time.RFC3339Nano)
 	if record.Run != nil {
-		record.Run.State = runStatusFromResultOutcome(outcome)
+		record.Run.Object.State = runStatusFromResultOutcome(outcome)
 		if outcome == contract.ResultOutcomeSucceeded {
-			record.Run.Phase = contract.RunPhaseSummaryPublishing
+			record.Run.Object.Phase = contract.RunPhaseSummaryPublishing
 		} else {
-			record.Run.Phase = contract.RunPhaseSummaryBlocked
+			record.Run.Object.Phase = contract.RunPhaseSummaryBlocked
 		}
-		record.Run.Reason = nil
-		record.Run.Decision = nil
-		record.Run.ErrorCode = ""
+		record.Run.Object.Reasons = nil
+		record.Run.Object.Decision = nil
+		record.Run.Object.ErrorCode = ""
+		o.updateRunObjectLinksLocked(record)
+		syncRunStateMirrorsFromObject(record.Run)
 	}
 	outcomeObject := contract.Outcome{
 		BaseObject: o.baseObjectLocked(contract.ObjectTypeOutcome, outcomeIDForRecord(record), contract.VisibilityLevelRestricted, completedAt),
@@ -3915,11 +4346,21 @@ func (o *Orchestrator) completeIssueWithOutcome(ctx context.Context, issueID str
 	}
 	record.Outcome = &outcomeObject
 	record.Result = nil
-	record.Artifacts = o.artifactsForCompletedRecord(record)
-	record.Outcome = contractOutcomePtr(contractOutcomeWithArtifacts(*record.Outcome, record.Artifacts))
+	upsertArtifactsOnRecord(record, o.artifactsForCompletedRecord(record)...)
+	o.persistArtifactObjectsLocked(record)
+	record.Outcome = contractOutcomePtr(contractOutcomeWithArtifacts(*record.Outcome, o.artifactsForCompletedRecord(record)))
+	o.persistOutcomeObjectLocked(record)
+	o.updateRunObjectLinksLocked(record)
 	record.UpdatedAt = completedAt
-	o.refreshJobObjectLocked(record)
-	o.persistCompletionObjectsLocked(record)
+	o.mutateJobObjectLocked(record, func(job *contract.Job) {
+		job.State = jobStateFromOutcome(outcome)
+		job.Reasons = nil
+		job.References = referencesFromRecord(o, record, completedAt)
+	})
+	if o.requiresSourceClosureAction(record) {
+		o.ensureSourceClosureActionLocked(record)
+	}
+	o.updateJobAggregateLocked(record)
 	o.rememberCompletedLocked(record)
 	version := o.commitStateLocked(true)
 	event := o.newIssueCompletedEvent(issueID, identifier)
@@ -4045,8 +4486,8 @@ func contractOutcomeWithArtifacts(outcome contract.Outcome, artifacts []contract
 	copyOutcome.Relations = make([]contract.ObjectRelation, 0, len(artifacts))
 	for _, artifact := range artifacts {
 		copyOutcome.Relations = append(copyOutcome.Relations, contract.ObjectRelation{
-			Type:      contract.RelationTypeOutcomeArtifact,
-			TargetID:  artifact.ID,
+			Type:       contract.RelationTypeOutcomeArtifact,
+			TargetID:   artifact.ID,
 			TargetType: contract.ObjectTypeArtifact,
 		})
 	}
