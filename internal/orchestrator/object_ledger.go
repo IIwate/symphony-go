@@ -765,10 +765,12 @@ func jobStateFromRecord(record *model.JobRuntime) contract.JobStatus {
 		return contract.JobStatusQueued
 	}
 	switch {
-	case record.Result != nil:
-		return jobStateFromOutcome(record.Result.Outcome)
-	case record.Lifecycle == model.JobLifecycleAwaitingIntervention:
+	case record.Outcome != nil:
+		return jobStateFromOutcomeConclusion(record.Outcome.State)
+	case record.Intervention != nil && record.Intervention.Object.State == contract.InterventionStatusOpen:
 		return contract.JobStatusInterventionRequired
+	case record.Run != nil && record.Run.State == contract.RunStatusQueued:
+		return contract.JobStatusQueued
 	default:
 		return contract.JobStatusRunning
 	}
@@ -781,6 +783,23 @@ func jobStateFromOutcome(outcome contract.ResultOutcome) contract.JobStatus {
 	case contract.ResultOutcomeFailed:
 		return contract.JobStatusFailed
 	case contract.ResultOutcomeAbandoned:
+		return contract.JobStatusAbandoned
+	default:
+		return contract.JobStatusCompleted
+	}
+}
+
+func jobStateFromOutcomeConclusion(outcome contract.OutcomeConclusion) contract.JobStatus {
+	switch outcome {
+	case contract.OutcomeConclusionSucceeded:
+		return contract.JobStatusCompleted
+	case contract.OutcomeConclusionFailed:
+		return contract.JobStatusFailed
+	case contract.OutcomeConclusionCanceled:
+		return contract.JobStatusCanceled
+	case contract.OutcomeConclusionRejected:
+		return contract.JobStatusRejected
+	case contract.OutcomeConclusionAbandoned:
 		return contract.JobStatusAbandoned
 	default:
 		return contract.JobStatusCompleted
@@ -1063,7 +1082,7 @@ func (o *Orchestrator) broadcastEventLocked(event contract.EventEnvelope) {
 }
 
 func (o *Orchestrator) persistCompletionObjectsLocked(record *model.JobRuntime) {
-	if record == nil || o.objectLedger == nil || record.Result == nil {
+	if record == nil || o.objectLedger == nil || record.Outcome == nil {
 		return
 	}
 	if record.Intervention != nil {
@@ -1082,7 +1101,7 @@ func (o *Orchestrator) persistCompletionObjectsLocked(record *model.JobRuntime) 
 	if o.requiresSourceClosureAction(record) {
 		o.ensureSourceClosureActionLocked(record)
 	}
-	job := o.jobObjectFromRecord(record, jobStateFromOutcome(record.Result.Outcome))
+	job := o.jobObjectFromRecord(record, jobStateFromOutcomeConclusion(record.Outcome.State))
 	if err := o.objectLedger.UpsertJob(job); err != nil {
 		o.logger.Warn("upsert final job object failed", "job_id", job.ID, "error", err.Error())
 	}
@@ -1124,7 +1143,10 @@ func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.JobRuntime)
 	if _, ok := o.sourceClosureActions[actionID]; ok {
 		return
 	}
-	updatedAt := strings.TrimSpace(record.Result.CompletedAt)
+	updatedAt := ""
+	if record.Outcome != nil {
+		updatedAt = strings.TrimSpace(record.Outcome.CompletedAt)
+	}
 	if updatedAt == "" {
 		updatedAt = strings.TrimSpace(record.UpdatedAt)
 	}
@@ -1246,34 +1268,29 @@ func (o *Orchestrator) reconcileSourceClosureActions(ctx context.Context) {
 }
 
 func (o *Orchestrator) outcomeObjectFromRecord(record *model.JobRuntime, artifacts []contract.Artifact) contract.Outcome {
-	updatedAt := strings.TrimSpace(record.Result.CompletedAt)
-	if updatedAt == "" {
-		updatedAt = strings.TrimSpace(record.UpdatedAt)
+	if record == nil || record.Outcome == nil {
+		return contract.Outcome{}
 	}
-	if updatedAt == "" {
-		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
+	outcomeCopy := *record.Outcome
+	outcomeCopy.Relations = append([]contract.ObjectRelation(nil), outcomeCopy.Relations...)
+	outcomeCopy.References = append([]contract.Reference(nil), outcomeCopy.References...)
+	if len(artifacts) > 0 {
+		outcomeCopy.Relations = make([]contract.ObjectRelation, 0, len(artifacts))
+		for _, artifact := range artifacts {
+			outcomeCopy.Relations = append(outcomeCopy.Relations, contract.ObjectRelation{Type: contract.RelationTypeOutcomeArtifact, TargetID: artifact.ID, TargetType: contract.ObjectTypeArtifact})
+		}
 	}
-	relations := make([]contract.ObjectRelation, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		relations = append(relations, contract.ObjectRelation{Type: contract.RelationTypeOutcomeArtifact, TargetID: artifact.ID, TargetType: contract.ObjectTypeArtifact})
-	}
-	return contract.Outcome{
-		BaseObject: o.baseObjectLocked(contract.ObjectTypeOutcome, outcomeIDForRecord(record), contract.VisibilityLevelRestricted, updatedAt),
-		ObjectContext: contract.ObjectContext{
-			Relations:  relations,
-			References: referencesFromRecord(o, record, updatedAt),
-		},
-		State:       outcomeConclusionFromResult(record.Result.Outcome),
-		Summary:     record.Result.Summary,
-		CompletedAt: record.Result.CompletedAt,
-	}
+	return outcomeCopy
 }
 
 func (o *Orchestrator) artifactsForCompletedRecord(record *model.JobRuntime) []contract.Artifact {
 	if record == nil {
 		return nil
 	}
-	updatedAt := strings.TrimSpace(record.Result.CompletedAt)
+	updatedAt := ""
+	if record.Outcome != nil {
+		updatedAt = strings.TrimSpace(record.Outcome.CompletedAt)
+	}
 	if updatedAt == "" {
 		updatedAt = strings.TrimSpace(record.UpdatedAt)
 	}

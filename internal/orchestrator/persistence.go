@@ -646,7 +646,7 @@ func (o *Orchestrator) durableJobStateFromRuntime(record *model.JobRuntime) dura
 		value := record.RetryDueAt.UTC().Format(time.RFC3339Nano)
 		item.RetryDueAt = &value
 	}
-	if record.Result != nil {
+	if record.Outcome != nil {
 		outcome := o.outcomeObjectFromRecord(record, o.artifactsForCompletedRecord(record))
 		item.Outcome = cloneOutcome(&outcome)
 		item.Artifacts = cloneArtifacts(o.artifactsForCompletedRecord(record))
@@ -708,20 +708,16 @@ func runtimeFromDurableJob(item durableJobState) *model.JobRuntime {
 
 func deriveLifecycleFromDurableJob(item durableJobState) model.JobLifecycleState {
 	switch {
-	case item.Result != nil:
+	case item.Outcome != nil || item.Job.State.IsTerminal():
 		return model.JobLifecycleCompleted
 	case item.Intervention != nil && item.Intervention.Object.State == contract.InterventionStatusOpen:
 		return model.JobLifecycleAwaitingIntervention
-	case item.RetryDueAt != nil:
+	case item.Run != nil && item.Run.State == contract.RunStatusContinuationPending:
 		return model.JobLifecycleRetryScheduled
-	case item.Reason != nil && item.Reason.ReasonCode == contract.ReasonRecordBlockedAwaitingMerge:
+	case item.Run != nil && item.Run.State == contract.RunStatusCompleted && item.DurableRefs.PullRequest != nil:
 		return model.JobLifecycleAwaitingMerge
 	case item.Reason != nil && (item.Reason.ReasonCode == contract.ReasonRecordBlockedAwaitingIntervention || item.Reason.ReasonCode == contract.ReasonRecordBlockedRecoveryUncertain):
 		return model.JobLifecycleAwaitingIntervention
-	case item.Reason != nil && item.Reason.ReasonCode == contract.ReasonRecordBlockedRetryScheduled:
-		return model.JobLifecycleRetryScheduled
-	case item.DurableRefs.PullRequest != nil:
-		return model.JobLifecycleAwaitingMerge
 	default:
 		return model.JobLifecycleActive
 	}
@@ -734,10 +730,10 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 
 	o.state.CodexTotals = state.Service.TokenTotal
 	o.state.Jobs = map[string]*model.JobRuntime{}
-	o.runningRecords = map[string]*model.JobRuntime{}
-	o.retryRecords = map[string]*model.JobRuntime{}
-	o.awaitingMergeRecords = map[string]*model.JobRuntime{}
-	o.awaitingInterventionRecords = map[string]*model.JobRuntime{}
+	o.activeRuns = map[string]*model.JobRuntime{}
+	o.continuationRuns = map[string]*model.JobRuntime{}
+	o.candidateDeliveryJobs = map[string]*model.JobRuntime{}
+	o.interventionJobs = map[string]*model.JobRuntime{}
 	o.state.ArchivedJobs = nil
 
 	for _, item := range state.Jobs {
@@ -746,22 +742,22 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 		if issueID == "" {
 			continue
 		}
-		if record.Result != nil {
+		if record.Outcome != nil || record.Object.State.IsTerminal() {
 			o.rememberCompletedLocked(record)
 			continue
 		}
-		if record.Lifecycle == model.JobLifecycleActive {
+		if record.Run != nil && record.Run.State == contract.RunStatusRunning {
 			record.Observation = &contract.Observation{
 				Running: false,
 				Summary: "restored from ledger; awaiting recovery evaluation",
 			}
 		}
-		if record.Lifecycle == model.JobLifecycleRetryScheduled && record.RetryDueAt != nil {
-			record.RetryTimer = o.newRetryTimer(issueID, *record.RetryDueAt)
+		if record.Run != nil && record.Run.State == contract.RunStatusContinuationPending && record.RetryDueAt != nil {
+			record.RetryTimer = o.newContinuationTimer(issueID, *record.RetryDueAt)
 		}
 		o.state.Jobs[issueID] = record
-		o.reindexRecordLocked(issueID, record)
 	}
+	o.rebuildRuntimeIndexesLocked()
 	o.restoreObjectLedgerSnapshotLocked(state.FormalObjects)
 }
 
@@ -770,7 +766,7 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 	protected := o.isProtectedLocked()
 	pending := make(map[string]*model.JobRuntime)
 	for issueID, record := range o.state.Jobs {
-		if record == nil || record.Lifecycle != model.JobLifecycleActive || !record.NeedsRecovery {
+		if record == nil || jobStateFromRecord(record) != contract.JobStatusRunning || !record.NeedsRecovery {
 			continue
 		}
 		if _, waiting := o.pendingRecovery[issueID]; waiting {
@@ -844,7 +840,7 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 	o.mu.Lock()
 	remaining := false
 	for _, record := range o.state.Jobs {
-		if record != nil && record.Lifecycle == model.JobLifecycleActive && record.NeedsRecovery {
+		if record != nil && jobStateFromRecord(record) == contract.JobStatusRunning && record.NeedsRecovery {
 			remaining = true
 			break
 		}
@@ -965,7 +961,7 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 			if nextAttempt <= 0 {
 				nextAttempt = 1
 			}
-			o.scheduleRetryLocked(issueID, recordIdentifier(entry), nextAttempt, nil, true, entry.StallCount, retryDispatch)
+			o.scheduleContinuationLocked(issueID, recordIdentifier(entry), nextAttempt, nil, entry.StallCount, retryDispatch)
 			o.commitStateLocked(true)
 		}
 		o.mu.Unlock()
@@ -976,14 +972,14 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 	return nil
 }
 
-func (o *Orchestrator) newRetryTimer(issueID string, dueAt time.Time) *time.Timer {
+func (o *Orchestrator) newContinuationTimer(issueID string, dueAt time.Time) *time.Timer {
 	delay := dueAt.Sub(o.now().UTC())
 	if delay < 0 {
 		delay = 0
 	}
 	return time.AfterFunc(delay, func() {
 		select {
-		case o.retryFireCh <- issueID:
+		case o.continuationCh <- issueID:
 		default:
 		}
 	})
@@ -1049,10 +1045,8 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.persistenceHealth.ConsecutiveFailures++
 	clear(o.pendingRecovery)
 	clear(o.pendingActions)
-	for issueID := range o.pendingLaunch {
-		delete(o.runningRecords, issueID)
-	}
 	clear(o.pendingLaunch)
+	o.rebuildRuntimeIndexesLocked()
 	if o.stateStore != nil {
 		o.stateStore.Disable()
 	}
