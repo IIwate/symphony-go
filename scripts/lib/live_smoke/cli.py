@@ -1294,6 +1294,16 @@ FORMAL_OBJECT_TYPES = {
     "reference",
 }
 
+QUERYABLE_OBJECT_TYPES = {
+    "job",
+    "run",
+    "intervention",
+    "outcome",
+    "artifact",
+    "action",
+    "instance",
+}
+
 REASON_CATEGORIES = {
     "action",
     "api",
@@ -1485,6 +1495,8 @@ def _assert_object_list_response(payload: dict[str, object], object_type: str) -
     _require_keys(payload, ["object_type", "items"], "objects.list")
     if payload["object_type"] != object_type:
         raise RuntimeError(f"object list type mismatch: {payload}")
+    if object_type not in QUERYABLE_OBJECT_TYPES:
+        raise RuntimeError(f"object list still exposes non-queryable formal type: {payload}")
     items = _require_list(payload["items"], "objects.list.items")
     for index, item in enumerate(items):
         _assert_formal_object_surface(_require_mapping(item, f"objects.list.items[{index}]"), f"objects.list.items[{index}]", expected_object_type=object_type)
@@ -1494,6 +1506,8 @@ def _assert_object_query_response(payload: dict[str, object], object_type: str) 
     _require_keys(payload, ["object_type", "item"], "objects.query")
     if payload["object_type"] != object_type:
         raise RuntimeError(f"object query type mismatch: {payload}")
+    if object_type not in QUERYABLE_OBJECT_TYPES:
+        raise RuntimeError(f"object query still exposes non-queryable formal type: {payload}")
     _assert_formal_object_surface(_require_mapping(payload["item"], "objects.query.item"), "objects.query.item", expected_object_type=object_type)
 
 

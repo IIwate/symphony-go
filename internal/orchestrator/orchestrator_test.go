@@ -123,6 +123,17 @@ func mustFormalObjectSnapshot(t *testing.T, objects ...any) ObjectLedgerSnapshot
 	return ledger.Snapshot()
 }
 
+func mustGetLedgerObject(t *testing.T, o *Orchestrator, objectType contract.ObjectType, id string) (ObjectEnvelope, bool) {
+	t.Helper()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ensureObjectLedgerLocked()
+	if o.objectLedger == nil {
+		t.Fatal("objectLedger = nil, want initialized ledger")
+	}
+	return o.objectLedger.Get(objectType, id)
+}
+
 func testReferenceBase(id string, updatedAt string) contract.BaseObject {
 	return contract.BaseObject{
 		ID:              id,
@@ -536,8 +547,11 @@ func TestReconcileAwaitingMergeCompletesLandChangeAndQueuesSourceClosureAction(t
 	if len(action.Relations) == 0 || action.Relations[0].Type != contract.RelationTypeActionReference {
 		t.Fatalf("action.Relations = %#v, want action.reference relation", action.Relations)
 	}
-	if _, ok := o.GetObject(contract.ObjectTypeReference, action.Relations[0].TargetID); !ok {
-		t.Fatalf("GetObject(reference, %q) = false, want true", action.Relations[0].TargetID)
+	if _, ok := o.GetObject(contract.ObjectTypeReference, action.Relations[0].TargetID); ok {
+		t.Fatalf("GetObject(reference, %q) = true, want false for public query surface", action.Relations[0].TargetID)
+	}
+	if _, ok := mustGetLedgerObject(t, o, contract.ObjectTypeReference, action.Relations[0].TargetID); !ok {
+		t.Fatalf("objectLedger.Get(reference, %q) = false, want true", action.Relations[0].TargetID)
 	}
 }
 
@@ -1872,8 +1886,11 @@ func TestMoveToAwaitingMergePublishesFormalCandidateArtifactsAndReferences(t *te
 	if artifact.Kind != contract.ArtifactKindPullRequest {
 		t.Fatalf("artifact.Kind = %q, want %q", artifact.Kind, contract.ArtifactKindPullRequest)
 	}
-	if _, ok := o.GetObject(contract.ObjectTypeReference, pullRequestReferenceIDForRecord(current)); !ok {
-		t.Fatalf("GetObject(reference, %q) = false, want true", pullRequestReferenceIDForRecord(current))
+	if _, ok := o.GetObject(contract.ObjectTypeReference, pullRequestReferenceIDForRecord(current)); ok {
+		t.Fatalf("GetObject(reference, %q) = true, want false for public query surface", pullRequestReferenceIDForRecord(current))
+	}
+	if _, ok := mustGetLedgerObject(t, o, contract.ObjectTypeReference, pullRequestReferenceIDForRecord(current)); !ok {
+		t.Fatalf("objectLedger.Get(reference, %q) = false, want true", pullRequestReferenceIDForRecord(current))
 	}
 }
 
@@ -1940,8 +1957,11 @@ func TestFormalObjectsPublishRecoveryCheckpointArtifactsAndReferences(t *testing
 	if artifact.Kind != contract.ArtifactKindPatchBundle {
 		t.Fatalf("artifact.Kind = %q, want %q", artifact.Kind, contract.ArtifactKindPatchBundle)
 	}
-	if _, ok := o.GetObject(contract.ObjectTypeReference, sourceReferenceIDForRecord(record)); !ok {
-		t.Fatalf("GetObject(reference, %q) = false, want true", sourceReferenceIDForRecord(record))
+	if _, ok := o.GetObject(contract.ObjectTypeReference, sourceReferenceIDForRecord(record)); ok {
+		t.Fatalf("GetObject(reference, %q) = true, want false for public query surface", sourceReferenceIDForRecord(record))
+	}
+	if _, ok := mustGetLedgerObject(t, o, contract.ObjectTypeReference, sourceReferenceIDForRecord(record)); !ok {
+		t.Fatalf("objectLedger.Get(reference, %q) = false, want true", sourceReferenceIDForRecord(record))
 	}
 }
 

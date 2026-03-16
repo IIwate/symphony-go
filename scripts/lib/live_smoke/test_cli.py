@@ -134,6 +134,22 @@ class LiveSmokeCliContractTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             cli._assert_event_envelope(payload, "object_changed")
 
+    def test_object_query_surface_rejects_reference_type(self) -> None:
+        payload = {
+            "object_type": "reference",
+            "item": _linear_reference("ABC-1", external_id="linear-id"),
+        }
+        with self.assertRaises(RuntimeError):
+            cli._assert_object_query_response(payload, "reference")
+
+    def test_object_list_surface_rejects_reason_type(self) -> None:
+        payload = {
+            "object_type": "reason",
+            "items": [],
+        }
+        with self.assertRaises(RuntimeError):
+            cli._assert_object_list_response(payload, "reason")
+
     def test_session_state_surface_uses_formal_objects_snapshot(self) -> None:
         payload = {
             "version": 6,

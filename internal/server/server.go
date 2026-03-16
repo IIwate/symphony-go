@@ -125,8 +125,8 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 			return
 		}
 		objectType := contract.ObjectType(parts[0])
-		if !objectType.IsValid() {
-			writeError(w, http.StatusBadRequest, contract.ErrorAPIInvalidRequest, "invalid object type", logger, map[string]any{"object_type": parts[0]})
+		if !objectType.IsValid() || !objectType.SupportsObjectQuery() {
+			writeError(w, http.StatusBadRequest, contract.ErrorAPIInvalidRequest, "unsupported object query type", logger, map[string]any{"object_type": parts[0]})
 			return
 		}
 		if len(parts) == 1 {

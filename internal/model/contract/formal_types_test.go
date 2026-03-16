@@ -230,6 +230,31 @@ func TestReasonDecisionAndErrorDescriptorsAreStructured(t *testing.T) {
 	}
 }
 
+func TestObjectQuerySurfaceTypesStayWithinFormalBoundary(t *testing.T) {
+	for _, objectType := range []ObjectType{
+		ObjectTypeJob,
+		ObjectTypeRun,
+		ObjectTypeIntervention,
+		ObjectTypeOutcome,
+		ObjectTypeArtifact,
+		ObjectTypeAction,
+		ObjectTypeInstance,
+	} {
+		if !objectType.SupportsObjectQuery() {
+			t.Fatalf("ObjectType(%q).SupportsObjectQuery() = false, want true", objectType)
+		}
+	}
+	for _, objectType := range []ObjectType{
+		ObjectTypeReference,
+		ObjectTypeReason,
+		ObjectTypeDecision,
+	} {
+		if objectType.SupportsObjectQuery() {
+			t.Fatalf("ObjectType(%q).SupportsObjectQuery() = true, want false", objectType)
+		}
+	}
+}
+
 func TestVisibilityExtensionsAndSensitivityRulesValidate(t *testing.T) {
 	rule := SensitiveFieldRule{
 		FieldPath:         "job.references[0].external_id",

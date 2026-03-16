@@ -30,6 +30,15 @@ func (t ObjectType) IsValid() bool {
 	}
 }
 
+func (t ObjectType) SupportsObjectQuery() bool {
+	switch t {
+	case ObjectTypeJob, ObjectTypeRun, ObjectTypeIntervention, ObjectTypeOutcome, ObjectTypeArtifact, ObjectTypeAction, ObjectTypeInstance:
+		return true
+	default:
+		return false
+	}
+}
+
 type VisibilityLevel string
 
 const (

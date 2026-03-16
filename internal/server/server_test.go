@@ -249,6 +249,25 @@ func TestObjectQueryEndpointsSupportFormalObjects(t *testing.T) {
 	}
 }
 
+func TestObjectQueryEndpointsRejectNonQueryableFormalTypes(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
+	handler := NewHandler(runtime, nil)
+
+	for _, path := range []string{
+		"/api/v1/objects/reference",
+		"/api/v1/objects/reference/ref-1",
+		"/api/v1/objects/reason",
+		"/api/v1/objects/decision",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("GET %s status = %d, want %d", path, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
 func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
 	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 	srv := httptest.NewServer(NewHandler(runtime, nil))

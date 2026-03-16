@@ -435,6 +435,9 @@ func (o *Orchestrator) restoreObjectLedgerSnapshotLocked(snapshot ObjectLedgerSn
 func (o *Orchestrator) GetObject(objectType contract.ObjectType, id string) (ObjectEnvelope, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if !objectType.SupportsObjectQuery() {
+		return ObjectEnvelope{}, false
+	}
 	o.ensureObjectLedgerLocked()
 	if o.objectLedger == nil {
 		return ObjectEnvelope{}, false
@@ -511,6 +514,9 @@ func (o *Orchestrator) artifactObjectByIDLocked(artifactID string) (contract.Art
 func (o *Orchestrator) ListObjects(objectType contract.ObjectType) []ObjectEnvelope {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if !objectType.SupportsObjectQuery() {
+		return nil
+	}
 	o.ensureObjectLedgerLocked()
 	if o.objectLedger == nil {
 		return nil
