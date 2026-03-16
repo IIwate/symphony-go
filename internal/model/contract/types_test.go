@@ -63,65 +63,31 @@ func TestReasonAndErrorDescriptorsAreStructured(t *testing.T) {
 }
 
 func TestDiscoveryStateAndControlContractsMarshalStableFields(t *testing.T) {
-	record := IssueRuntimeRecord{
-		RecordID: "rec_linear_linear-main_linear-123",
-		SourceRef: SourceRef{
-			SourceKind:       SourceKindLinear,
-			SourceName:       "linear-main",
-			SourceID:         "linear-123",
-			SourceIdentifier: "ENG-123",
-			URL:              "https://linear.app/example/issue/ENG-123",
-		},
-		Status:    IssueStatusAwaitingIntervention,
-		UpdatedAt: "2026-03-14T00:00:00Z",
-		Reason: &Reason{
-			ReasonCode: ReasonRecordBlockedRecoveryUncertain,
-			Category:   CategoryRecord,
-			Details:    map[string]any{"step": "restore"},
-		},
-		Observation: &Observation{
-			Running: false,
-			Summary: "恢复后未确认 runner 状态",
-			Details: map[string]any{"runner_seen": false},
-		},
-		DurableRefs: DurableRefs{
-			Workspace:  &WorkspaceRef{Path: "H:/workspaces/ENG-123"},
-			Branch:     &BranchRef{Name: "feature/eng-123"},
-			LedgerPath: "automation/local/runtime-ledger.json",
-		},
-		Result: nil,
-	}
-
 	discovery := DiscoveryDocument{
-		APIVersion:         APIVersionV1,
-		Instance:           InstanceDocument{ID: "instance-a", Name: "symphony", Version: "dev"},
-		Source:             SourceDocument{Kind: SourceKindLinear, Name: "linear-main"},
-		ServiceMode:        ServiceModeDegraded,
-		RecoveryInProgress: true,
-		Capabilities: CapabilityDocument{
-			EventProtocol:  "sse",
-			ControlActions: []ControlAction{ControlActionRefresh},
-			Notifications:  []string{"webhook", "slack"},
-			Sources:        []SourceKind{SourceKindLinear},
+		APIVersion: APIVersionV1,
+		Instance:   InstanceDocument{ID: "instance-a", Name: "symphony", Version: "dev"},
+		DomainID:   "default",
+		Source:     SourceDocument{Kind: SourceKindLinear, Name: "linear-main"},
+		Capabilities: StaticCapabilitySet{
+			Capabilities: []StaticCapability{
+				{Name: CapabilityStreamEvents, Category: CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Supported: true},
+				{Name: CapabilityQueryObjects, Category: CapabilityCategoryQuery, Summary: "支持正式对象查询。", Supported: true},
+			},
 		},
-		Reasons: []Reason{MustReason(ReasonServiceRecoveryInProgress, map[string]any{"phase": "restore"})},
-		Limits:  LimitDocument{CompletedWindowSize: 100},
 	}
 	state := ServiceStateSnapshot{
 		GeneratedAt:        "2026-03-14T00:00:00Z",
 		ServiceMode:        ServiceModeDegraded,
 		RecoveryInProgress: true,
 		Reasons:            []Reason{MustReason(ReasonServiceRecoveryInProgress, map[string]any{"phase": "restore"})},
-		Counts: StateCounts{
-			Total:                1,
-			Active:               0,
-			RetryScheduled:       0,
-			AwaitingMerge:        0,
-			AwaitingIntervention: 1,
-			Completed:            0,
+		Instance:           InstanceStateSummary{ID: "instance-a", Name: "symphony", Version: "dev", Role: InstanceRoleLeader},
+		Leader:             &LeaderHint{ID: "instance-a", Name: "symphony", URL: "http://127.0.0.1:8080"},
+		Capabilities: AvailableCapabilitySet{
+			Capabilities: []AvailableCapability{
+				{Name: CapabilityStreamEvents, Category: CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Available: true},
+				{Name: CapabilitySourceClosure, Category: CapabilityCategorySource, Summary: "支持 SourceClosureAction 收口外部来源。", Available: false, Reasons: []Reason{MustReason(ReasonCapabilityCurrentlyUnavailable, map[string]any{"capability": string(CapabilitySourceClosure)})}},
+			},
 		},
-		Records:         []IssueRuntimeRecord{record},
-		CompletedWindow: CompletedWindow{Limit: 100, Records: nil},
 	}
 	control := ControlResult{
 		Action:              ControlActionRefresh,
@@ -131,8 +97,8 @@ func TestDiscoveryStateAndControlContractsMarshalStableFields(t *testing.T) {
 		Timestamp:           "2026-03-14T00:00:01Z",
 	}
 
-	assertJSONHasKeys(t, discovery, []string{"api_version", "instance", "source", "service_mode", "recovery_in_progress", "capabilities", "reasons", "limits"})
-	assertJSONHasKeys(t, state, []string{"generated_at", "service_mode", "recovery_in_progress", "reasons", "counts", "records", "completed_window"})
+	assertJSONHasKeys(t, discovery, []string{"api_version", "instance", "domain_id", "source", "capabilities"})
+	assertJSONHasKeys(t, state, []string{"generated_at", "service_mode", "recovery_in_progress", "reasons", "instance", "leader", "capabilities"})
 	assertJSONHasKeys(t, control, []string{"action", "status", "reason", "recommended_next_step", "timestamp"})
 }
 
@@ -155,16 +121,18 @@ func TestLedgerAndEventContractsMarshalStableFields(t *testing.T) {
 		UpdatedAt:   "2026-03-14T00:00:00Z",
 	}
 	event := EventEnvelope{
-		EventID:     "evt-1",
-		EventType:   EventTypeStateChanged,
-		Timestamp:   "2026-03-14T00:00:02Z",
-		ServiceMode: ServiceModeServing,
-		RecordIDs:   []RecordID{"rec_linear_linear-main_linear-123"},
-		Reason:      ptrReason(MustReason(ReasonRecordBlockedAwaitingMerge, map[string]any{"record_id": "rec_linear_linear-main_linear-123"})),
+		EventID:         "evt-1",
+		EventType:       EventTypeServiceStateChanged,
+		Timestamp:       "2026-03-14T00:00:02Z",
+		ContractVersion: APIVersionV1,
+		DomainID:        "default",
+		ServiceMode:     ServiceModeServing,
+		Objects:         []EventObject{{ObjectType: ObjectTypeAction, ObjectID: "act-1", State: string(ActionStatusExternalPending), Visibility: VisibilityLevelRestricted}},
+		Reason:          ptrReason(MustReason(ReasonActionExternalPending, map[string]any{"action_type": string(ActionTypeSourceClosure)})),
 	}
 
 	assertJSONHasKeys(t, ledger, []string{"record_id", "source_ref", "status", "reason", "retry_due_at", "durable_refs", "result", "updated_at"})
-	assertJSONHasKeys(t, event, []string{"event_id", "event_type", "timestamp", "service_mode", "record_ids", "reason"})
+	assertJSONHasKeys(t, event, []string{"event_id", "event_type", "timestamp", "contract_version", "domain_id", "service_mode", "objects", "reason"})
 	assertJSONHasKeys(t, ledger.SourceRef, []string{"source_kind", "source_name", "source_id", "source_identifier", "url"})
 }
 

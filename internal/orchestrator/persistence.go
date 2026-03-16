@@ -564,8 +564,10 @@ func (o *Orchestrator) scheduleStatePersistLocked(critical bool) uint64 {
 }
 
 func (o *Orchestrator) commitStateLocked(critical bool) uint64 {
+	o.syncFormalObjectsLocked()
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
+	o.publishFormalEventsLocked()
 	if o.isProtectedLocked() {
 		return 0
 	}
@@ -573,8 +575,10 @@ func (o *Orchestrator) commitStateLocked(critical bool) uint64 {
 }
 
 func (o *Orchestrator) publishViewLocked() {
+	o.syncFormalObjectsLocked()
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
+	o.publishFormalEventsLocked()
 }
 
 func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {

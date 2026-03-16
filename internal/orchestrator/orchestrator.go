@@ -148,6 +148,12 @@ type RuntimeIdentity struct {
 	Descriptor    RuntimeDescriptor
 }
 
+type sourceClosureActionState struct {
+	Action      contract.Action
+	SourceIssue model.Issue
+	JobID       string
+}
+
 type Orchestrator struct {
 	tracker             tracker.Client
 	workspace           workspace.Manager
@@ -184,6 +190,8 @@ type Orchestrator struct {
 	started                     bool
 	subscribers                 map[int]chan Snapshot
 	nextSubscriberID            int
+	eventSubscribers            map[int]chan contract.EventEnvelope
+	nextEventSubscriberID       int
 	healthAlerts                map[string]AlertSnapshot
 	notificationHealth          map[string]*NotificationChannelHealthSnapshot
 	persistenceHealth           PersistenceHealthSnapshot
@@ -203,6 +211,12 @@ type Orchestrator struct {
 	notifierGeneration          uint64
 	lastPersistedStateVersion   uint64
 	lastPersistedState          *durableRuntimeState
+	lastEventSnapshot           Snapshot
+	lastEventObjects            map[string]ObjectEnvelope
+	eventStateInitialized       bool
+	objectLedger                ObjectLedger
+	objectLedgerRestored        bool
+	sourceClosureActions        map[string]*sourceClosureActionState
 }
 
 var BuildVersion = "dev"
@@ -243,6 +257,7 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 			ProtectedResults: map[string]*model.ProtectedResultEntry{},
 		},
 		subscribers:                 map[int]chan Snapshot{},
+		eventSubscribers:            map[int]chan contract.EventEnvelope{},
 		healthAlerts:                healthAlerts,
 		notificationHealth:          map[string]*NotificationChannelHealthSnapshot{},
 		runningRecords:              map[string]*model.IssueRecord{},
@@ -256,6 +271,8 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 		maxCompleted:                defaultMaxCompletedEntries,
 		startedAt:                   time.Now().UTC(),
 		serviceVersion:              BuildVersion,
+		lastEventObjects:            map[string]ObjectEnvelope{},
+		sourceClosureActions:        map[string]*sourceClosureActionState{},
 	}
 	o.prLookup = newGitHubPRLookup()
 	o.captureCheckpointFn = o.captureRecoveryCheckpoint
@@ -906,6 +923,12 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 	o.mu.Unlock()
 
 	o.startupCleanup(ctx)
+	o.mu.Lock()
+	o.syncFormalObjectsLocked()
+	o.refreshSnapshotLocked()
+	o.publishSnapshotLocked()
+	o.publishFormalEventsLocked()
+	o.mu.Unlock()
 
 	go func() {
 		defer close(o.doneCh)
@@ -1109,34 +1132,38 @@ func (o *Orchestrator) Discovery() DiscoveryDocument {
 	defer o.mu.Unlock()
 
 	o.refreshSnapshotLocked()
-	snapshot := o.snapshot
 	identity := o.currentRuntimeIdentity()
 	sourceKind := discoverySourceKind(identity)
 	sourceName := discoverySourceName(identity)
+	cfg := o.currentConfig()
+	instanceName := "symphony"
+	domainID := ""
+	capabilities := contract.StaticCapabilitySet{}
+	apiVersion := contract.APIVersionV1
+	if cfg != nil {
+		if strings.TrimSpace(cfg.ServiceInstanceName) != "" {
+			instanceName = strings.TrimSpace(cfg.ServiceInstanceName)
+		}
+		domainID = strings.TrimSpace(cfg.DomainID)
+		capabilities = cfg.CapabilityContract.Static
+		if cfg.ServiceContractVersion != "" {
+			apiVersion = cfg.ServiceContractVersion
+		}
+	}
 
 	return contract.DiscoveryDocument{
-		APIVersion: contract.APIVersionV1,
+		APIVersion: apiVersion,
 		Instance: contract.InstanceDocument{
 			ID:      discoveryInstanceID(identity),
-			Name:    "symphony",
+			Name:    instanceName,
 			Version: o.serviceVersion,
 		},
+		DomainID: domainID,
 		Source: contract.SourceDocument{
 			Kind: sourceKind,
 			Name: sourceName,
 		},
-		ServiceMode:        snapshot.ServiceMode,
-		RecoveryInProgress: snapshot.RecoveryInProgress,
-		Capabilities: contract.CapabilityDocument{
-			EventProtocol:  "sse",
-			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
-			Notifications:  notificationCapabilityKinds(o.currentConfig()),
-			Sources:        discoveryCapabilitySources(sourceKind),
-		},
-		Reasons: cloneServiceReasons(snapshot.Reasons),
-		Limits: contract.LimitDocument{
-			CompletedWindowSize: o.maxCompleted,
-		},
+		Capabilities: capabilities,
 	}
 }
 
@@ -1185,6 +1212,23 @@ func (o *Orchestrator) tick(ctx context.Context) {
 }
 
 func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
+	cfg := o.currentConfig()
+	if cfg.LeaderRequired && currentInstanceRole(cfg) != contract.InstanceRoleLeader {
+		o.mu.Lock()
+		if o.isProtectedLocked() {
+			o.refreshSnapshotLocked()
+			o.publishSnapshotLocked()
+			o.publishFormalEventsLocked()
+			o.mu.Unlock()
+			return
+		}
+		o.refreshSnapshotLocked()
+		o.publishSnapshotLocked()
+		o.publishFormalEventsLocked()
+		o.mu.Unlock()
+		return
+	}
+
 	o.mu.Lock()
 	if o.isProtectedLocked() {
 		o.refreshSnapshotLocked()
@@ -1198,8 +1242,7 @@ func (o *Orchestrator) tickWithMode(ctx context.Context, allowDispatch bool) {
 	o.reconcileRecovering(ctx)
 	o.reconcileAwaitingMerge(ctx)
 	o.reconcileAwaitingIntervention(ctx)
-
-	cfg := o.currentConfig()
+	o.reconcileSourceClosureActions(ctx)
 	if err := config.ValidateForDispatch(cfg); err != nil {
 		o.logger.Warn("dispatch preflight failed", "error", err.Error())
 		o.mu.Lock()
@@ -1976,6 +2019,14 @@ func (o *Orchestrator) classifySuccessfulRun(ctx context.Context, workspacePath 
 			FinalBranch:     branch,
 		}, nil
 	case PullRequestStateMerged:
+		if jobType == contract.JobTypeLandChange {
+			return &SuccessfulRunDecision{
+				Disposition:     DispositionCompleted,
+				ExpectedOutcome: completion.Mode,
+				PR:              clonePullRequestInfo(pr),
+				FinalBranch:     branch,
+			}, nil
+		}
 		if o.isTerminalState(issueState, o.currentConfig()) {
 			return &SuccessfulRunDecision{
 				Disposition:     DispositionCompleted,
@@ -2625,6 +2676,21 @@ func (o *Orchestrator) reconcileAwaitingMerge(ctx context.Context) {
 			if !ok {
 				continue
 			}
+			if jobTypeForDispatch(entry.Dispatch) == contract.JobTypeLandChange {
+				o.mu.Lock()
+				current := o.awaitingMergeRecords[issueID]
+				if current != nil {
+					current.Runtime.DurableRefs.PullRequest = &contract.PullRequestRef{
+						Number: pr.Number,
+						URL:    pr.URL,
+						State:  string(pr.State),
+					}
+					current.LastKnownIssueState = issue.State
+				}
+				o.mu.Unlock()
+				o.completeSuccessfulIssue(ctx, issueID, recordIdentifier(entry))
+				continue
+			}
 			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonMergedPRNotTerminal), issue.State, pr)
 		case PullRequestStateClosed:
 			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, model.CompletionModePullRequest, string(model.ContinuationReasonClosedUnmergedPR), entry.LastKnownIssueState, pr)
@@ -3098,47 +3164,23 @@ func (o *Orchestrator) applyCurrentConfigLocked() {
 
 func (o *Orchestrator) refreshSnapshotLocked() {
 	now := o.now().UTC()
-	records := make([]contract.IssueRuntimeRecord, 0, len(o.state.Records))
-	for _, entry := range o.state.Records {
-		if entry == nil {
-			continue
-		}
-		records = append(records, cloneRuntimeRecord(entry.Runtime))
-	}
-	sort.SliceStable(records, func(i int, j int) bool {
-		if records[i].SourceRef.SourceIdentifier != records[j].SourceRef.SourceIdentifier {
-			return records[i].SourceRef.SourceIdentifier < records[j].SourceRef.SourceIdentifier
-		}
-		return records[i].RecordID < records[j].RecordID
-	})
-
-	completed := cloneCompletedWindow(o.state.CompletedWindow)
-	if completed == nil {
-		completed = []contract.IssueRuntimeRecord{}
-	}
-
-	counts := contract.StateCounts{
-		Total:     len(records),
-		Completed: len(completed),
-	}
-	for _, record := range records {
-		switch record.Status {
-		case contract.IssueStatusActive:
-			counts.Active++
-		case contract.IssueStatusRetryScheduled:
-			counts.RetryScheduled++
-		case contract.IssueStatusAwaitingMerge:
-			counts.AwaitingMerge++
-		case contract.IssueStatusAwaitingIntervention:
-			counts.AwaitingIntervention++
-		case contract.IssueStatusCompleted:
-			counts.Completed++
-		}
-	}
-
 	serviceMode, recoveryInProgress, reasons := o.publicServiceStateLocked()
 	if reasons == nil {
 		reasons = []contract.Reason{}
+	}
+	cfg := o.currentConfig()
+	instanceName := "symphony"
+	leaderHint := (*contract.LeaderHint)(nil)
+	role := contract.InstanceRoleLeader
+	if cfg != nil {
+		if strings.TrimSpace(cfg.ServiceInstanceName) != "" {
+			instanceName = strings.TrimSpace(cfg.ServiceInstanceName)
+		}
+		role = currentInstanceRole(cfg)
+		if role == contract.InstanceRoleStandby && cfg.LeaderHint != nil {
+			copyHint := *cfg.LeaderHint
+			leaderHint = &copyHint
+		}
 	}
 
 	o.snapshot = contract.ServiceStateSnapshot{
@@ -3146,12 +3188,14 @@ func (o *Orchestrator) refreshSnapshotLocked() {
 		ServiceMode:        serviceMode,
 		RecoveryInProgress: recoveryInProgress,
 		Reasons:            reasons,
-		Counts:             counts,
-		Records:            records,
-		CompletedWindow: contract.CompletedWindow{
-			Limit:   o.maxCompleted,
-			Records: completed,
+		Instance: contract.InstanceStateSummary{
+			ID:      discoveryInstanceID(o.currentRuntimeIdentity()),
+			Name:    instanceName,
+			Version: o.serviceVersion,
+			Role:    role,
 		},
+		Leader:       leaderHint,
+		Capabilities: o.currentAvailableCapabilitiesLocked(),
 	}
 }
 
@@ -3745,7 +3789,14 @@ func (o *Orchestrator) lookupAwaitingMergePullRequest(ctx context.Context, works
 }
 
 func (o *Orchestrator) completeSuccessfulIssue(ctx context.Context, issueID string, identifier string) {
-	o.completeIssueWithOutcome(ctx, issueID, identifier, contract.ResultOutcomeSucceeded, "issue reached a terminal state")
+	summary := "issue reached a terminal state"
+	o.mu.RLock()
+	record := o.state.Records[issueID]
+	if record != nil && jobTypeForDispatch(record.Dispatch) == contract.JobTypeLandChange {
+		summary = "target pull request merged"
+	}
+	o.mu.RUnlock()
+	o.completeIssueWithOutcome(ctx, issueID, identifier, contract.ResultOutcomeSucceeded, summary)
 }
 
 func (o *Orchestrator) completeAbandonedIssue(ctx context.Context, issueID string, identifier string, summary string) {
@@ -3783,6 +3834,7 @@ func (o *Orchestrator) completeIssueWithOutcome(ctx context.Context, issueID str
 		},
 	}
 	record.Runtime.UpdatedAt = o.now().UTC().Format(time.RFC3339Nano)
+	o.persistCompletionObjectsLocked(record)
 	o.rememberCompletedLocked(cloneRuntimeRecord(record.Runtime))
 	version := o.commitStateLocked(true)
 	event := o.newIssueCompletedEvent(issueID, identifier)

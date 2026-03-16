@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -13,8 +14,8 @@ import (
 	"symphony-go/internal/orchestrator"
 )
 
-func TestDiscoveryEndpointReturnsFormalContract(t *testing.T) {
-	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+func TestDiscoveryEndpointReturnsStaticContract(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 	handler := NewHandler(runtime, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery", nil)
@@ -32,50 +33,22 @@ func TestDiscoveryEndpointReturnsFormalContract(t *testing.T) {
 	if payload.APIVersion != contract.APIVersionV1 {
 		t.Fatalf("api_version = %q, want %q", payload.APIVersion, contract.APIVersionV1)
 	}
+	if payload.DomainID != "default" {
+		t.Fatalf("domain_id = %q, want default", payload.DomainID)
+	}
 	if payload.Instance.Name != "symphony" {
 		t.Fatalf("instance.name = %q, want symphony", payload.Instance.Name)
 	}
 	if payload.Source.Kind != contract.SourceKindGitHubIssues {
 		t.Fatalf("source.kind = %q, want %q", payload.Source.Kind, contract.SourceKindGitHubIssues)
 	}
-	if payload.Capabilities.EventProtocol != "sse" {
-		t.Fatalf("event_protocol = %q, want sse", payload.Capabilities.EventProtocol)
-	}
-	if len(payload.Capabilities.ControlActions) != 1 || payload.Capabilities.ControlActions[0] != contract.ControlActionRefresh {
-		t.Fatalf("control_actions = %#v, want [refresh]", payload.Capabilities.ControlActions)
-	}
-	if payload.Limits.CompletedWindowSize != 100 {
-		t.Fatalf("completed_window_size = %d, want 100", payload.Limits.CompletedWindowSize)
+	if len(payload.Capabilities.Capabilities) != 2 {
+		t.Fatalf("len(capabilities) = %d, want 2", len(payload.Capabilities.Capabilities))
 	}
 }
 
-func TestDiscoveryEndpointSerializesReasonsAsArray(t *testing.T) {
-	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
-	handler := NewHandler(runtime, nil)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/discovery", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("Unmarshal() error = %v", err)
-	}
-	reasons, ok := payload["reasons"].([]any)
-	if !ok {
-		t.Fatalf("reasons json type = %T, want []any", payload["reasons"])
-	}
-	if len(reasons) != 0 {
-		t.Fatalf("reasons = %#v, want empty array", reasons)
-	}
-}
-
-func TestStateEndpointReturnsFormalSnapshot(t *testing.T) {
-	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+func TestStateEndpointReturnsCurrentCapabilitiesAndRole(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 	handler := NewHandler(runtime, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
@@ -93,20 +66,17 @@ func TestStateEndpointReturnsFormalSnapshot(t *testing.T) {
 	if payload.ServiceMode != contract.ServiceModeServing {
 		t.Fatalf("service_mode = %q, want %q", payload.ServiceMode, contract.ServiceModeServing)
 	}
-	if payload.Counts.Total != 1 || payload.Counts.Active != 1 || payload.Counts.Completed != 1 {
-		t.Fatalf("counts = %#v, want total=1 active=1 completed=1", payload.Counts)
+	if payload.Instance.Role != contract.InstanceRoleLeader {
+		t.Fatalf("instance.role = %q, want %q", payload.Instance.Role, contract.InstanceRoleLeader)
 	}
-	if len(payload.Records) != 1 || payload.Records[0].RecordID != "rec_github_issues_github-main_1" {
-		t.Fatalf("records = %#v, want rec_github_issues_github-main_1", payload.Records)
-	}
-	if len(payload.CompletedWindow.Records) != 1 || payload.CompletedWindow.Records[0].RecordID != "rec_github_issues_github-main_done" {
-		t.Fatalf("completed_window = %#v, want rec_github_issues_github-main_done", payload.CompletedWindow)
+	if len(payload.Capabilities.Capabilities) != 2 {
+		t.Fatalf("len(capabilities) = %d, want 2", len(payload.Capabilities.Capabilities))
 	}
 }
 
-func TestRefreshEndpointReturnsControlResult(t *testing.T) {
+func TestRefreshEndpointReturnsControlResultForLeader(t *testing.T) {
 	t.Run("accepted", func(t *testing.T) {
-		runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+		runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 		handler := NewHandler(runtime, nil)
 
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/control/refresh", nil)
@@ -129,10 +99,10 @@ func TestRefreshEndpointReturnsControlResult(t *testing.T) {
 	})
 
 	t.Run("rejected", func(t *testing.T) {
+		runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 		reason := contract.MustReason(contract.ReasonControlRefreshRejectedServiceMode, map[string]any{
 			"service_mode": contract.ServiceModeUnavailable,
 		})
-		runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
 		runtime.refreshResult = contract.ControlResult{
 			Action:              contract.ControlActionRefresh,
 			Status:              contract.ControlStatusRejected,
@@ -157,17 +127,73 @@ func TestRefreshEndpointReturnsControlResult(t *testing.T) {
 			t.Fatalf("status = %q, want %q", payload.Status, contract.ControlStatusRejected)
 		}
 	})
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/control/refresh", nil)
+func TestRefreshEndpointRejectsStandbyWrites(t *testing.T) {
+	state := sampleSnapshot()
+	state.Instance.Role = contract.InstanceRoleStandby
+	state.Leader = &contract.LeaderHint{ID: "leader-a", Name: "symphony-leader", URL: "http://127.0.0.1:9090"}
+
+	runtime := newFakeRuntime(sampleDiscovery(), state, sampleObjects())
+	handler := NewHandler(runtime, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/control/refresh", nil)
 	rec := httptest.NewRecorder()
-	NewHandler(newFakeRuntime(sampleDiscovery(), sampleSnapshot()), nil).ServeHTTP(rec, req)
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("GET status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	var payload contract.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if payload.ErrorCode != contract.ErrorAPILeaderRequired {
+		t.Fatalf("error_code = %q, want %q", payload.ErrorCode, contract.ErrorAPILeaderRequired)
+	}
+}
+
+func TestObjectQueryEndpointsSupportFormalObjects(t *testing.T) {
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
+	handler := NewHandler(runtime, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/objects/action/act-1", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET action status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var item contract.ObjectQueryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil {
+		t.Fatalf("Unmarshal(action) error = %v", err)
+	}
+	var action contract.Action
+	if err := json.Unmarshal(item.Item, &action); err != nil {
+		t.Fatalf("Unmarshal(action item) error = %v", err)
+	}
+	if action.Type != contract.ActionTypeSourceClosure {
+		t.Fatalf("action.type = %q, want %q", action.Type, contract.ActionTypeSourceClosure)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/objects/action", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LIST action status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var list contract.ObjectListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("Unmarshal(list) error = %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(list.Items))
 	}
 }
 
 func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
-	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 	srv := httptest.NewServer(NewHandler(runtime, nil))
 	defer srv.Close()
 
@@ -186,46 +212,38 @@ func TestEventsEndpointStreamsFormalEnvelopes(t *testing.T) {
 	if err := json.Unmarshal([]byte(first.Data), &firstEnvelope); err != nil {
 		t.Fatalf("Unmarshal(first) error = %v", err)
 	}
-	if firstEnvelope.EventType != contract.EventTypeSnapshot {
-		t.Fatalf("first payload event_type = %q, want %q", firstEnvelope.EventType, contract.EventTypeSnapshot)
+	if firstEnvelope.ContractVersion != contract.APIVersionV1 {
+		t.Fatalf("contract_version = %q, want %q", firstEnvelope.ContractVersion, contract.APIVersionV1)
 	}
-	if len(firstEnvelope.RecordIDs) != 2 {
-		t.Fatalf("first record_ids = %#v, want 2 ids", firstEnvelope.RecordIDs)
+	if len(firstEnvelope.Objects) != 2 {
+		t.Fatalf("len(objects) = %d, want 2", len(firstEnvelope.Objects))
 	}
 
-	next := sampleSnapshot()
-	next.ServiceMode = contract.ServiceModeDegraded
-	next.Reasons = []contract.Reason{contract.MustReason(contract.ReasonServiceDegradedNotificationDelivery, map[string]any{
-		"channel_ids": []string{"ops"},
-	})}
-	next.Records[0].Status = contract.IssueStatusAwaitingMerge
-	next.Records[0].Reason = ptrReason(contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{
-		"record_id": "rec_github_issues_github-main_1",
-	}))
-	next.Records[0].UpdatedAt = "2026-03-14T00:00:05Z"
-	runtime.publish(next)
+	runtime.publishEvent(contract.EventEnvelope{
+		EventID:         "evt-2",
+		EventType:       contract.EventTypeObjectChanged,
+		Timestamp:       "2026-03-14T00:00:05Z",
+		ContractVersion: contract.APIVersionV1,
+		DomainID:        "default",
+		ServiceMode:     contract.ServiceModeServing,
+		Objects:         []contract.EventObject{{ObjectType: contract.ObjectTypeAction, ObjectID: "act-1", State: string(contract.ActionStatusCompleted), Visibility: contract.VisibilityLevelRestricted}},
+	})
 
 	second := readSSEEvent(t, reader)
-	if second.Event != string(contract.EventTypeStateChanged) {
-		t.Fatalf("second event = %q, want %q", second.Event, contract.EventTypeStateChanged)
+	if second.Event != string(contract.EventTypeObjectChanged) {
+		t.Fatalf("second event = %q, want %q", second.Event, contract.EventTypeObjectChanged)
 	}
 	var secondEnvelope contract.EventEnvelope
 	if err := json.Unmarshal([]byte(second.Data), &secondEnvelope); err != nil {
 		t.Fatalf("Unmarshal(second) error = %v", err)
 	}
-	if secondEnvelope.ServiceMode != contract.ServiceModeDegraded {
-		t.Fatalf("service_mode = %q, want %q", secondEnvelope.ServiceMode, contract.ServiceModeDegraded)
-	}
-	if len(secondEnvelope.RecordIDs) == 0 || secondEnvelope.RecordIDs[0] != "rec_github_issues_github-main_1" {
-		t.Fatalf("record_ids = %#v, want rec_github_issues_github-main_1", secondEnvelope.RecordIDs)
-	}
-	if secondEnvelope.Reason == nil || secondEnvelope.Reason.ReasonCode != contract.ReasonServiceDegradedNotificationDelivery {
-		t.Fatalf("reason = %#v, want %q", secondEnvelope.Reason, contract.ReasonServiceDegradedNotificationDelivery)
+	if len(secondEnvelope.Objects) != 1 || secondEnvelope.Objects[0].ObjectID != "act-1" {
+		t.Fatalf("objects = %#v, want act-1", secondEnvelope.Objects)
 	}
 }
 
 func TestEventsEndpointWithoutFlusherReturnsServiceUnavailable(t *testing.T) {
-	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 	handler := NewHandler(runtime, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
@@ -239,7 +257,7 @@ func TestEventsEndpointWithoutFlusherReturnsServiceUnavailable(t *testing.T) {
 }
 
 func TestUnknownRouteReturnsStructuredNotFound(t *testing.T) {
-	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot())
+	runtime := newFakeRuntime(sampleDiscovery(), sampleSnapshot(), sampleObjects())
 	handler := NewHandler(runtime, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -264,13 +282,18 @@ type fakeRuntime struct {
 	snapshot      orchestrator.Snapshot
 	refreshResult contract.ControlResult
 	nextID        int
-	subscribers   map[int]chan orchestrator.Snapshot
+	subscribers   map[int]chan contract.EventEnvelope
+	objects       map[string]orchestrator.ObjectEnvelope
 }
 
-func newFakeRuntime(discovery orchestrator.DiscoveryDocument, snapshot orchestrator.Snapshot) *fakeRuntime {
+func newFakeRuntime(discovery orchestrator.DiscoveryDocument, snapshot orchestrator.Snapshot, objects []orchestrator.ObjectEnvelope) *fakeRuntime {
 	reason := contract.MustReason(contract.ReasonControlRefreshAccepted, map[string]any{
 		"service_mode": contract.ServiceModeServing,
 	})
+	store := make(map[string]orchestrator.ObjectEnvelope, len(objects))
+	for _, item := range objects {
+		store[string(item.ObjectType)+"/"+item.ObjectID] = item
+	}
 	return &fakeRuntime{
 		discovery: discovery,
 		snapshot:  snapshot,
@@ -281,7 +304,8 @@ func newFakeRuntime(discovery orchestrator.DiscoveryDocument, snapshot orchestra
 			RecommendedNextStep: "等待 SSE 通知后回读 /api/v1/state",
 			Timestamp:           "2026-03-14T00:00:02Z",
 		},
-		subscribers: map[int]chan orchestrator.Snapshot{},
+		subscribers: map[int]chan contract.EventEnvelope{},
+		objects:     store,
 	}
 }
 
@@ -303,15 +327,15 @@ func (f *fakeRuntime) RequestRefresh() orchestrator.RefreshRequestResult {
 	return f.refreshResult
 }
 
-func (f *fakeRuntime) SubscribeSnapshots(_ int) (<-chan orchestrator.Snapshot, func()) {
-	ch := make(chan orchestrator.Snapshot, 8)
+func (f *fakeRuntime) SubscribeEvents(_ int) (<-chan contract.EventEnvelope, func()) {
+	ch := make(chan contract.EventEnvelope, 8)
 	f.mu.Lock()
 	id := f.nextID
 	f.nextID++
 	f.subscribers[id] = ch
-	snapshot := f.snapshot
+	event := sampleSnapshotEvent(f.snapshot, f.sortedObjectsLocked())
 	f.mu.Unlock()
-	ch <- snapshot
+	ch <- event
 	return ch, func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -322,17 +346,50 @@ func (f *fakeRuntime) SubscribeSnapshots(_ int) (<-chan orchestrator.Snapshot, f
 	}
 }
 
-func (f *fakeRuntime) publish(snapshot orchestrator.Snapshot) {
+func (f *fakeRuntime) GetObject(objectType contract.ObjectType, id string) (orchestrator.ObjectEnvelope, bool) {
 	f.mu.Lock()
-	f.snapshot = snapshot
-	subscribers := make([]chan orchestrator.Snapshot, 0, len(f.subscribers))
+	defer f.mu.Unlock()
+	item, ok := f.objects[string(objectType)+"/"+id]
+	return item, ok
+}
+
+func (f *fakeRuntime) ListObjects(objectType contract.ObjectType) []orchestrator.ObjectEnvelope {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	items := make([]orchestrator.ObjectEnvelope, 0, len(f.objects))
+	for _, item := range f.objects {
+		if item.ObjectType == objectType {
+			items = append(items, item)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ObjectID < items[j].ObjectID })
+	return items
+}
+
+func (f *fakeRuntime) publishEvent(event contract.EventEnvelope) {
+	f.mu.Lock()
+	subscribers := make([]chan contract.EventEnvelope, 0, len(f.subscribers))
 	for _, ch := range f.subscribers {
 		subscribers = append(subscribers, ch)
 	}
 	f.mu.Unlock()
 	for _, ch := range subscribers {
-		ch <- snapshot
+		ch <- event
 	}
+}
+
+func (f *fakeRuntime) sortedObjectsLocked() []orchestrator.ObjectEnvelope {
+	items := make([]orchestrator.ObjectEnvelope, 0, len(f.objects))
+	for _, item := range f.objects {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].ObjectType != items[j].ObjectType {
+			return items[i].ObjectType < items[j].ObjectType
+		}
+		return items[i].ObjectID < items[j].ObjectID
+	})
+	return items
 }
 
 type sseMessage struct {
@@ -377,21 +434,16 @@ func sampleDiscovery() orchestrator.DiscoveryDocument {
 			Name:    "symphony",
 			Version: "dev",
 		},
+		DomainID: "default",
 		Source: contract.SourceDocument{
 			Kind: contract.SourceKindGitHubIssues,
 			Name: "github-main",
 		},
-		ServiceMode:        contract.ServiceModeServing,
-		RecoveryInProgress: false,
-		Capabilities: contract.CapabilityDocument{
-			EventProtocol:  "sse",
-			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
-			Notifications:  []string{"slack", "webhook"},
-			Sources:        []contract.SourceKind{contract.SourceKindGitHubIssues},
-		},
-		Reasons: []contract.Reason{},
-		Limits: contract.LimitDocument{
-			CompletedWindowSize: 100,
+		Capabilities: contract.StaticCapabilitySet{
+			Capabilities: []contract.StaticCapability{
+				{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Supported: true},
+				{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Supported: true},
+			},
 		},
 	}
 }
@@ -402,52 +454,88 @@ func sampleSnapshot() orchestrator.Snapshot {
 		ServiceMode:        contract.ServiceModeServing,
 		RecoveryInProgress: false,
 		Reasons:            []contract.Reason{},
-		Counts: contract.StateCounts{
-			Total:     1,
-			Active:    1,
-			Completed: 1,
+		Instance: contract.InstanceStateSummary{
+			ID:      "automation",
+			Name:    "symphony",
+			Version: "dev",
+			Role:    contract.InstanceRoleLeader,
 		},
-		Records: []contract.IssueRuntimeRecord{
-			{
-				RecordID:  "rec_github_issues_github-main_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceName: "github-main", SourceID: "1", SourceIdentifier: "GH-1", URL: "https://github.example/issues/1"},
-				Status:    contract.IssueStatusActive,
-				UpdatedAt: "2026-03-14T00:00:00Z",
-				Observation: &contract.Observation{
-					Running: true,
-					Summary: "agent run in progress",
-					Details: map[string]any{"runner": "codex"},
-				},
-				DurableRefs: contract.DurableRefs{
-					Workspace:  &contract.WorkspaceRef{Path: "/tmp/abc-1"},
-					Branch:     &contract.BranchRef{Name: "feature/abc-1"},
-					LedgerPath: "automation/local/runtime-ledger.json",
-				},
-			},
-		},
-		CompletedWindow: contract.CompletedWindow{
-			Limit: 100,
-			Records: []contract.IssueRuntimeRecord{
-				{
-					RecordID:  "rec_github_issues_github-main_done",
-					SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceName: "github-main", SourceID: "done", SourceIdentifier: "GH-2"},
-					Status:    contract.IssueStatusCompleted,
-					UpdatedAt: "2026-03-14T00:00:01Z",
-					DurableRefs: contract.DurableRefs{
-						LedgerPath: "automation/local/runtime-ledger.json",
-					},
-					Result: &contract.Result{
-						Outcome:     contract.ResultOutcomeSucceeded,
-						Summary:     "completed",
-						CompletedAt: "2026-03-14T00:00:01Z",
-						Details:     map[string]any{"record_id": "rec_github_issues_github-main_done"},
-					},
-				},
+		Capabilities: contract.AvailableCapabilitySet{
+			Capabilities: []contract.AvailableCapability{
+				{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Available: true},
+				{Name: contract.CapabilityServiceRefresh, Category: contract.CapabilityCategoryControl, Summary: "支持服务级 refresh 控制。", Available: true},
 			},
 		},
 	}
 }
 
-func ptrReason(reason contract.Reason) *contract.Reason {
-	return &reason
+func sampleObjects() []orchestrator.ObjectEnvelope {
+	action := contract.Action{
+		BaseObject: contract.BaseObject{
+			ID:              "act-1",
+			ObjectType:      contract.ObjectTypeAction,
+			DomainID:        "default",
+			Visibility:      contract.VisibilityLevelRestricted,
+			ContractVersion: contract.APIVersionV1,
+			CreatedAt:       "2026-03-14T00:00:00Z",
+			UpdatedAt:       "2026-03-14T00:00:01Z",
+		},
+		State:   contract.ActionStatusExternalPending,
+		Type:    contract.ActionTypeSourceClosure,
+		Summary: "等待外部来源关闭。",
+	}
+	instance := contract.Instance{
+		BaseObject: contract.BaseObject{
+			ID:              "automation",
+			ObjectType:      contract.ObjectTypeInstance,
+			DomainID:        "default",
+			Visibility:      contract.VisibilityLevelSummary,
+			ContractVersion: contract.APIVersionV1,
+			CreatedAt:       "2026-03-14T00:00:00Z",
+			UpdatedAt:       "2026-03-14T00:00:01Z",
+		},
+		State:   contract.ServiceModeServing,
+		Name:    "symphony",
+		Version: "dev",
+		Role:    contract.InstanceRoleLeader,
+	}
+	return []orchestrator.ObjectEnvelope{
+		mustEnvelope(action),
+		mustEnvelope(instance),
+	}
+}
+
+func sampleSnapshotEvent(snapshot orchestrator.Snapshot, objects []orchestrator.ObjectEnvelope) contract.EventEnvelope {
+	items := make([]contract.EventObject, 0, len(objects))
+	for _, item := range objects {
+		items = append(items, contract.EventObject{
+			ObjectType: item.ObjectType,
+			ObjectID:   item.ObjectID,
+			Visibility: contract.VisibilityLevelRestricted,
+		})
+	}
+	return contract.EventEnvelope{
+		EventID:         "evt-1",
+		EventType:       contract.EventTypeSnapshot,
+		Timestamp:       snapshot.GeneratedAt,
+		ContractVersion: contract.APIVersionV1,
+		DomainID:        "default",
+		ServiceMode:     snapshot.ServiceMode,
+		Objects:         items,
+	}
+}
+
+func mustEnvelope(value any) orchestrator.ObjectEnvelope {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	switch object := value.(type) {
+	case contract.Action:
+		return orchestrator.ObjectEnvelope{ObjectType: object.ObjectType, ObjectID: object.ID, Payload: raw}
+	case contract.Instance:
+		return orchestrator.ObjectEnvelope{ObjectType: object.ObjectType, ObjectID: object.ID, Payload: raw}
+	default:
+		panic("unsupported object type")
+	}
 }

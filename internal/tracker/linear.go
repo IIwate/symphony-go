@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/model/contract"
 )
 
 const defaultPageSize = 50
@@ -90,10 +92,60 @@ const issueStatesByIDsQuery = `query IssueStatesByIDs($ids: [ID!]!, $after: Stri
   }
 }`
 
+const sourceClosureIssueQuery = `query SourceClosureIssue($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    url
+    state { name }
+    team {
+      states {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+  }
+}`
+
+const sourceClosureMutation = `mutation SourceClosureIssueUpdate($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) {
+    success
+    issue {
+      id
+      state { name }
+    }
+  }
+}`
+
 type Client interface {
 	FetchCandidateIssues(ctx context.Context) ([]model.Issue, error)
 	FetchIssuesByStates(ctx context.Context, states []string) ([]model.Issue, error)
 	FetchIssueStatesByIDs(ctx context.Context, ids []string) ([]model.Issue, error)
+	SourceClosureAvailability(ctx context.Context) SourceClosureAvailability
+	CloseSourceIssue(ctx context.Context, issue model.Issue) SourceClosureResult
+}
+
+type SourceClosureAvailability struct {
+	Supported bool
+	Available bool
+	Reasons   []contract.Reason
+}
+
+type SourceClosureDisposition string
+
+const (
+	SourceClosureDispositionCompleted            SourceClosureDisposition = "completed"
+	SourceClosureDispositionExternalPending      SourceClosureDisposition = "external_pending"
+	SourceClosureDispositionInterventionRequired SourceClosureDisposition = "intervention_required"
+)
+
+type SourceClosureResult struct {
+	Disposition SourceClosureDisposition
+	Reason      *contract.Reason
+	Decision    *contract.Decision
+	ErrorCode   contract.ErrorCode
 }
 
 type LinearClient struct {
@@ -172,6 +224,66 @@ func (c *LinearClient) FetchIssueStatesByIDs(ctx context.Context, ids []string) 
 	return c.fetchIssues(ctx, issueStatesByIDsQuery, map[string]any{
 		"ids": ids,
 	})
+}
+
+func (c *LinearClient) SourceClosureAvailability(_ context.Context) SourceClosureAvailability {
+	cfg := c.currentConfig()
+	if cfg == nil || model.NormalizeState(cfg.TrackerKind) != "linear" {
+		return SourceClosureAvailability{
+			Supported: false,
+			Available: false,
+			Reasons: []contract.Reason{
+				contract.MustReason(contract.ReasonCapabilityStaticUnsupported, map[string]any{
+					"capability":   string(contract.CapabilitySourceClosure),
+					"tracker_kind": "",
+				}),
+			},
+		}
+	}
+	if strings.TrimSpace(cfg.TrackerAPIKey) == "" || strings.TrimSpace(cfg.TrackerEndpoint) == "" || len(cfg.TerminalStates) == 0 {
+		details := map[string]any{
+			"capability":   string(contract.CapabilitySourceClosure),
+			"tracker_kind": cfg.TrackerKind,
+		}
+		if strings.TrimSpace(cfg.TrackerAPIKey) == "" {
+			details["missing"] = "tracker_api_key"
+		} else if strings.TrimSpace(cfg.TrackerEndpoint) == "" {
+			details["missing"] = "tracker_endpoint"
+		} else {
+			details["missing"] = "terminal_states"
+		}
+		return SourceClosureAvailability{
+			Supported: true,
+			Available: false,
+			Reasons: []contract.Reason{
+				contract.MustReason(contract.ReasonCapabilityCurrentlyUnavailable, details),
+			},
+		}
+	}
+	return SourceClosureAvailability{Supported: true, Available: true, Reasons: []contract.Reason{}}
+}
+
+func (c *LinearClient) CloseSourceIssue(ctx context.Context, issue model.Issue) SourceClosureResult {
+	availability := c.SourceClosureAvailability(ctx)
+	if !availability.Supported {
+		return sourceClosureExternalPendingResult(issue, "source_adapter_unsupported", nil, false)
+	}
+	if !availability.Available {
+		return sourceClosureExternalPendingResult(issue, "source_adapter_unavailable", availability.Reasons, true)
+	}
+	targetStateID, targetStateName, currentState, alreadyTerminal, err := c.resolveSourceClosureTarget(ctx, issue.ID)
+	if err != nil {
+		return classifySourceClosureError(issue, err)
+	}
+	if alreadyTerminal {
+		return SourceClosureResult{Disposition: SourceClosureDispositionCompleted}
+	}
+	if err := c.applySourceClosureTarget(ctx, issue.ID, targetStateID); err != nil {
+		return classifySourceClosureError(issue, err)
+	}
+	_ = targetStateName
+	_ = currentState
+	return SourceClosureResult{Disposition: SourceClosureDispositionCompleted}
 }
 
 func (c *LinearClient) fetchIssues(ctx context.Context, query string, baseVariables map[string]any) ([]model.Issue, error) {
@@ -260,6 +372,137 @@ func (c *LinearClient) requestIssues(ctx context.Context, query string, variable
 	}
 
 	return payload.Issues, nil
+}
+
+func (c *LinearClient) resolveSourceClosureTarget(ctx context.Context, issueID string) (string, string, string, bool, error) {
+	rawPayload, err := c.executeGraphQL(ctx, sourceClosureIssueQuery, map[string]any{"id": issueID})
+	if err != nil {
+		return "", "", "", false, err
+	}
+	var payload sourceClosureIssuePayload
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return "", "", "", false, model.NewTrackerError(model.ErrLinearUnknownPayload, "decode source closure issue payload", err)
+	}
+	if payload.Issue == nil {
+		return "", "", "", false, model.NewTrackerError(model.ErrLinearUnknownPayload, "source closure issue payload is missing", nil)
+	}
+	currentState := strings.TrimSpace(payload.Issue.State.Name)
+	cfg := c.currentConfig()
+	terminalIndex := map[string]int{}
+	for index, name := range cfg.TerminalStates {
+		terminalIndex[model.NormalizeState(name)] = index
+	}
+	if _, ok := terminalIndex[model.NormalizeState(currentState)]; ok {
+		return "", "", currentState, true, nil
+	}
+	if payload.Issue.Team == nil {
+		return "", "", currentState, false, model.NewTrackerError(model.ErrLinearUnknownPayload, "source closure issue team is missing", nil)
+	}
+	candidates := map[string]teamStateNode{}
+	for _, node := range payload.Issue.Team.States.Nodes {
+		candidates[model.NormalizeState(node.Name)] = node
+	}
+	for _, name := range cfg.TerminalStates {
+		if candidate, ok := candidates[model.NormalizeState(name)]; ok && strings.TrimSpace(candidate.ID) != "" {
+			return candidate.ID, candidate.Name, currentState, false, nil
+		}
+	}
+	return "", "", currentState, false, model.NewTrackerError(model.ErrLinearUnknownPayload, "configured terminal state is not available for issue team", nil)
+}
+
+func (c *LinearClient) applySourceClosureTarget(ctx context.Context, issueID string, stateID string) error {
+	rawPayload, err := c.executeGraphQL(ctx, sourceClosureMutation, map[string]any{
+		"id":      issueID,
+		"stateId": stateID,
+	})
+	if err != nil {
+		return err
+	}
+	var payload sourceClosureMutationPayload
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return model.NewTrackerError(model.ErrLinearUnknownPayload, "decode source closure mutation payload", err)
+	}
+	if payload.IssueUpdate == nil {
+		return model.NewTrackerError(model.ErrLinearUnknownPayload, "source closure mutation payload is missing", nil)
+	}
+	if !payload.IssueUpdate.Success {
+		return model.NewTrackerError(model.ErrLinearGraphQLErrors, "Linear issueUpdate returned success=false", nil)
+	}
+	return nil
+}
+
+func classifySourceClosureError(issue model.Issue, err error) SourceClosureResult {
+	if err == nil {
+		return SourceClosureResult{Disposition: SourceClosureDispositionCompleted}
+	}
+	lower := strings.ToLower(err.Error())
+	if errorsIsTracker(err, model.ErrLinearAPIRequest) || errorsIsTracker(err, model.ErrLinearAPIStatus) {
+		return sourceClosureExternalPendingResult(issue, "temporary_unavailable", nil, true)
+	}
+	if errorsIsTracker(err, model.ErrLinearGraphQLErrors) {
+		if strings.Contains(lower, "forbidden") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "permission") || strings.Contains(lower, "access denied") {
+			return sourceClosureInterventionResult(issue, "permission_conflict", err)
+		}
+		return sourceClosureInterventionResult(issue, "semantic_conflict", err)
+	}
+	if errorsIsTracker(err, model.ErrLinearUnknownPayload) {
+		return sourceClosureInterventionResult(issue, "semantic_conflict", err)
+	}
+	return sourceClosureExternalPendingResult(issue, "temporary_unavailable", nil, true)
+}
+
+func sourceClosureExternalPendingResult(issue model.Issue, cause string, capabilityReasons []contract.Reason, retryable bool) SourceClosureResult {
+	details := map[string]any{
+		"cause":     cause,
+		"source_id": issue.ID,
+	}
+	if issue.Identifier != "" {
+		details["source_identifier"] = issue.Identifier
+	}
+	reason := contract.MustReason(contract.ReasonActionExternalPending, details)
+	var decision *contract.Decision
+	if retryable {
+		retryDecision := contract.MustDecision(contract.DecisionRetrySourceClosure, map[string]any{
+			"source_id": issue.ID,
+			"cause":     cause,
+		})
+		decision = &retryDecision
+	}
+	if len(capabilityReasons) > 0 {
+		reason.Details["capability_reasons"] = capabilityReasons
+	}
+	return SourceClosureResult{
+		Disposition: SourceClosureDispositionExternalPending,
+		Reason:      &reason,
+		Decision:    decision,
+		ErrorCode:   contract.ErrorSourceClosureUnavailable,
+	}
+}
+
+func sourceClosureInterventionResult(issue model.Issue, cause string, err error) SourceClosureResult {
+	details := map[string]any{
+		"cause":     cause,
+		"source_id": issue.ID,
+	}
+	if issue.Identifier != "" {
+		details["source_identifier"] = issue.Identifier
+	}
+	if err != nil {
+		details["error"] = err.Error()
+	}
+	reason := contract.MustReason(contract.ReasonActionInterventionRequired, details)
+	return SourceClosureResult{
+		Disposition: SourceClosureDispositionInterventionRequired,
+		Reason:      &reason,
+		ErrorCode:   contract.ErrorSourceClosureConflict,
+	}
+}
+
+func errorsIsTracker(err error, target *model.TrackerError) bool {
+	if err == nil || target == nil {
+		return false
+	}
+	return errors.Is(err, target)
 }
 
 func cloneVariables(source map[string]any) map[string]any {
@@ -511,4 +754,37 @@ type childIssueNode struct {
 	ID         string   `json:"id"`
 	Identifier string   `json:"identifier"`
 	State      nameNode `json:"state"`
+}
+
+type sourceClosureIssuePayload struct {
+	Issue *sourceClosureIssueNode `json:"issue"`
+}
+
+type sourceClosureIssueNode struct {
+	ID         string                 `json:"id"`
+	Identifier string                 `json:"identifier"`
+	URL        string                 `json:"url"`
+	State      nameNode               `json:"state"`
+	Team       *sourceClosureTeamNode `json:"team"`
+}
+
+type sourceClosureTeamNode struct {
+	States sourceClosureStateConnection `json:"states"`
+}
+
+type sourceClosureStateConnection struct {
+	Nodes []teamStateNode `json:"nodes"`
+}
+
+type teamStateNode struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type sourceClosureMutationPayload struct {
+	IssueUpdate *sourceClosureMutationResult `json:"issueUpdate"`
+}
+
+type sourceClosureMutationResult struct {
+	Success bool `json:"success"`
 }

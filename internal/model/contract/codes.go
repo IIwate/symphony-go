@@ -43,6 +43,7 @@ const (
 	ReasonRunHardViolationDetected            ReasonCode = "run.hard_violation_detected"
 	ReasonActionSourceClosurePending          ReasonCode = "action.source_closure.pending"
 	ReasonActionExternalPending               ReasonCode = "action.external_pending"
+	ReasonActionInterventionRequired          ReasonCode = "action.intervention_required"
 	ReasonInterventionInputRequired           ReasonCode = "intervention.input.required"
 )
 
@@ -76,6 +77,7 @@ const (
 	ErrorCheckpointInvalid         ErrorCode = "checkpoint.invalid"
 	ErrorReviewGateBlocked         ErrorCode = "review_gate.blocked"
 	ErrorSourceClosureUnavailable  ErrorCode = "action.source_closure.unavailable"
+	ErrorSourceClosureConflict     ErrorCode = "action.source_closure.conflict"
 	ErrorRunHardViolationDetected  ErrorCode = "run.hard_violation_detected"
 	ErrorAuthUnauthorized          ErrorCode = "auth.unauthorized"
 	ErrorAuthForbidden             ErrorCode = "auth.forbidden"
@@ -107,6 +109,7 @@ var reasonDescriptors = map[ReasonCode]ReasonDescriptor{
 	ReasonRunHardViolationDetected:            {Category: CategoryRun, Summary: "检测到硬违规，当前 Run 必须立即转入人工介入。", Visibility: VisibilityLevelRestricted},
 	ReasonActionSourceClosurePending:          {Category: CategoryAction, Summary: "主 Job 已完成，等待 SourceClosureAction 收口外部来源。", Visibility: VisibilityLevelRestricted},
 	ReasonActionExternalPending:               {Category: CategoryAction, Summary: "外部能力暂不可用，Action 进入 external_pending。", Visibility: VisibilityLevelSummary},
+	ReasonActionInterventionRequired:          {Category: CategoryAction, Summary: "SourceClosureAction 发生权限或语义冲突，需要人工介入。", Visibility: VisibilityLevelRestricted},
 	ReasonInterventionInputRequired:           {Category: CategoryIntervention, Summary: "人工介入缺少必需的结构化输入。", Visibility: VisibilityLevelRestricted},
 }
 
@@ -216,6 +219,7 @@ var errorDescriptors = map[ErrorCode]ErrorDescriptor{
 	ErrorCheckpointInvalid:         {Category: CategoryCheckpoint, Retryable: false},
 	ErrorReviewGateBlocked:         {Category: CategoryRun, Retryable: false},
 	ErrorSourceClosureUnavailable:  {Category: CategoryAction, Retryable: true},
+	ErrorSourceClosureConflict:     {Category: CategoryAction, Retryable: false},
 	ErrorRunHardViolationDetected:  {Category: CategoryRun, Retryable: false},
 	ErrorAuthUnauthorized:          {Category: CategorySecurity, Retryable: false},
 	ErrorAuthForbidden:             {Category: CategorySecurity, Retryable: false},

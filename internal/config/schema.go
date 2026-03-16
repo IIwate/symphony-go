@@ -56,6 +56,8 @@ type SecretContract struct {
 type ServiceContract struct {
 	ContractVersion contract.APIVersion
 	InstanceName    string
+	Role            contract.InstanceRole
+	LeaderHint      *contract.LeaderHint
 	ServerHost      string
 	ServerPort      *int
 	Notifications   NotificationContract
@@ -199,6 +201,7 @@ func ParseWorkflowContract(def *model.WorkflowDefinition) (WorkflowContract, err
 		Service: ServiceContract{
 			ContractVersion: contract.APIVersion(getString(serviceMap, "contract_version", string(contract.APIVersionV1))),
 			InstanceName:    strings.TrimSpace(getString(serviceMap, "instance_name", "symphony")),
+			Role:            contract.InstanceRole(strings.TrimSpace(getString(serviceMap, "role", string(contract.InstanceRoleLeader)))),
 			ServerHost:      "127.0.0.1",
 		},
 		Domain: DomainContract{
@@ -266,6 +269,9 @@ func ParseWorkflowContract(def *model.WorkflowDefinition) (WorkflowContract, err
 		return WorkflowContract{}, err
 	}
 	contractConfig.Service.Notifications = notificationsContract
+	if leaderHint := parseLeaderHint(getMap(serviceMap, "leader_hint")); leaderHint != nil {
+		contractConfig.Service.LeaderHint = leaderHint
+	}
 	if host := strings.TrimSpace(getString(getMap(serviceMap, "server"), "host", "")); host != "" {
 		contractConfig.Service.ServerHost = host
 	}
@@ -389,6 +395,18 @@ func ParseWorkflowContract(def *model.WorkflowDefinition) (WorkflowContract, err
 		return WorkflowContract{}, err
 	}
 	return contractConfig, nil
+}
+
+func parseLeaderHint(source map[string]any) *contract.LeaderHint {
+	hint := &contract.LeaderHint{
+		ID:   strings.TrimSpace(getString(source, "id", "")),
+		Name: strings.TrimSpace(getString(source, "name", "")),
+		URL:  strings.TrimSpace(getString(source, "url", "")),
+	}
+	if hint.ID == "" && hint.Name == "" && hint.URL == "" {
+		return nil
+	}
+	return hint
 }
 
 func parseNotificationsContract(source map[string]any) (NotificationContract, error) {
@@ -607,6 +625,14 @@ func validateWorkflowContract(cfg WorkflowContract) error {
 	if cfg.Service.InstanceName == "" {
 		return model.NewWorkflowError(model.ErrWorkflowParseError, "service.instance_name is required", nil)
 	}
+	if !cfg.Service.Role.IsValid() {
+		return model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("service.role %q is unsupported", cfg.Service.Role), nil)
+	}
+	if cfg.Service.Role == contract.InstanceRoleStandby && cfg.Auth.LeaderRequired {
+		if cfg.Service.LeaderHint == nil || (strings.TrimSpace(cfg.Service.LeaderHint.ID) == "" && strings.TrimSpace(cfg.Service.LeaderHint.Name) == "" && strings.TrimSpace(cfg.Service.LeaderHint.URL) == "") {
+			return model.NewWorkflowError(model.ErrWorkflowParseError, "service.leader_hint is required when service.role=standby", nil)
+		}
+	}
 	if cfg.Domain.ID == "" {
 		return model.NewWorkflowError(model.ErrWorkflowParseError, "domain.id is required", nil)
 	}
@@ -742,10 +768,11 @@ func validateNotificationContract(cfg WorkflowContract, providers map[string]str
 
 func buildCapabilityContract(cfg WorkflowContract) contract.CapabilityContract {
 	static := []contract.StaticCapability{
-		{Name: contract.CapabilitySubmitJob, Category: contract.CapabilityCategoryControl, Summary: "支持异步提交正式 Job。", Supported: true},
+		{Name: contract.CapabilitySubmitJob, Category: contract.CapabilityCategoryControl, Summary: "支持异步提交正式 Job。", Supported: false},
 		{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Supported: true},
 		{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Supported: true},
 		{Name: contract.CapabilityServiceRefresh, Category: contract.CapabilityCategoryControl, Summary: "支持服务级 refresh 控制。", Supported: true},
+		{Name: contract.CapabilitySourceClosure, Category: contract.CapabilityCategorySource, Summary: "支持 SourceClosureAction 收口外部来源。", Supported: cfg.Source.Kind == "linear"},
 		{Name: contract.CapabilityCodexExecutor, Category: contract.CapabilityCategoryExecutor, Summary: "执行后端为 Codex。", Supported: cfg.Execution.BackendKind == "codex"},
 		{Name: contract.CapabilityFileLedger, Category: contract.CapabilityCategoryStorage, Summary: "文件型对象账本仅用于开发/测试/单机实验。", Supported: cfg.Persistence.BackendKind == PersistenceBackendKindFile},
 		{Name: contract.CapabilityRelationalLedger, Category: contract.CapabilityCategoryStorage, Summary: "事务型数据库是生产级官方后端方向。", Supported: cfg.Persistence.BackendKind == PersistenceBackendKindRelational},

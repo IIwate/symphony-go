@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/model/contract"
 	"symphony-go/internal/secret"
 )
 
@@ -66,6 +67,13 @@ func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error
 	cfg.CodexStallTimeoutMS = contractConfig.Execution.Codex.StallTimeoutMS
 	cfg.ServerHost = contractConfig.Service.ServerHost
 	cfg.ServerPort = cloneIntPtr(contractConfig.Service.ServerPort)
+	cfg.ServiceContractVersion = contractConfig.Service.ContractVersion
+	cfg.ServiceInstanceName = contractConfig.Service.InstanceName
+	cfg.CapabilityContract = contractConfig.Capabilities
+	cfg.LeaderRequired = contractConfig.Auth.LeaderRequired
+	cfg.TransparentForwarding = contractConfig.Auth.TransparentForwarding
+	cfg.InstanceRole = contractConfig.Service.Role
+	cfg.LeaderHint = cloneLeaderHint(contractConfig.Service.LeaderHint)
 	cfg.SessionPersistence.Enabled = contractConfig.Persistence.BackendKind == PersistenceBackendKindFile
 	if cfg.SessionPersistence.Enabled {
 		cfg.SessionPersistence.Kind = model.SessionPersistenceKindFile
@@ -188,6 +196,11 @@ func defaultServiceConfig() *model.ServiceConfig {
 		CodexReadTimeoutMS:               5000,
 		CodexStallTimeoutMS:              300000,
 		ServerHost:                       "127.0.0.1",
+		ServiceContractVersion:           contract.APIVersionV1,
+		ServiceInstanceName:              "symphony",
+		LeaderRequired:                   true,
+		TransparentForwarding:            false,
+		InstanceRole:                     contract.InstanceRoleLeader,
 		SessionPersistence: model.SessionPersistenceConfig{
 			Kind: model.SessionPersistenceKindFile,
 			File: model.SessionPersistenceFileConfig{
@@ -206,6 +219,14 @@ func defaultServiceConfig() *model.ServiceConfig {
 			},
 		},
 	}
+}
+
+func cloneLeaderHint(value *contract.LeaderHint) *contract.LeaderHint {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
 }
 
 func resolveNotificationConfig(contractConfig WorkflowContract) model.NotificationsConfig {

@@ -1096,6 +1096,12 @@ func (fakeTrackerClient) FetchIssuesByStates(context.Context, []string) ([]model
 func (fakeTrackerClient) FetchIssueStatesByIDs(context.Context, []string) ([]model.Issue, error) {
 	return nil, nil
 }
+func (fakeTrackerClient) SourceClosureAvailability(context.Context) tracker.SourceClosureAvailability {
+	return tracker.SourceClosureAvailability{Supported: true, Available: true}
+}
+func (fakeTrackerClient) CloseSourceIssue(context.Context, model.Issue) tracker.SourceClosureResult {
+	return tracker.SourceClosureResult{Disposition: tracker.SourceClosureDispositionCompleted}
+}
 
 type fakeWorkspaceManager struct{}
 
@@ -1118,7 +1124,8 @@ type fakeOrchestrator struct {
 	discovery      orchestrator.DiscoveryDocument
 	snapshot       orchestrator.Snapshot
 	nextID         int
-	subscribers    map[int]chan orchestrator.Snapshot
+	subscribers    map[int]chan contract.EventEnvelope
+	objects        map[string]orchestrator.ObjectEnvelope
 }
 
 func (f *fakeOrchestrator) Start(ctx context.Context) error {
@@ -1172,18 +1179,25 @@ func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot {
 	defer f.mu.Unlock()
 	return f.snapshot
 }
-func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func()) {
+func (f *fakeOrchestrator) SubscribeEvents(buffer int) (<-chan contract.EventEnvelope, func()) {
 	f.mu.Lock()
 	if f.subscribers == nil {
-		f.subscribers = map[int]chan orchestrator.Snapshot{}
+		f.subscribers = map[int]chan contract.EventEnvelope{}
 	}
-	ch := make(chan orchestrator.Snapshot, max(1, buffer))
+	ch := make(chan contract.EventEnvelope, max(1, buffer))
 	id := f.nextID
 	f.nextID++
 	f.subscribers[id] = ch
-	snapshot := f.snapshot
+	event := contract.EventEnvelope{
+		EventID:         "evt-1",
+		EventType:       contract.EventTypeSnapshot,
+		Timestamp:       f.snapshot.GeneratedAt,
+		ContractVersion: contract.APIVersionV1,
+		DomainID:        f.discovery.DomainID,
+		ServiceMode:     f.snapshot.ServiceMode,
+	}
 	f.mu.Unlock()
-	ch <- snapshot
+	ch <- event
 	return ch, func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -1194,16 +1208,53 @@ func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.S
 	}
 }
 
+func (f *fakeOrchestrator) GetObject(objectType contract.ObjectType, id string) (orchestrator.ObjectEnvelope, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.objects == nil {
+		return orchestrator.ObjectEnvelope{}, false
+	}
+	item, ok := f.objects[string(objectType)+"/"+id]
+	return item, ok
+}
+
+func (f *fakeOrchestrator) ListObjects(objectType contract.ObjectType) []orchestrator.ObjectEnvelope {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	items := make([]orchestrator.ObjectEnvelope, 0)
+	for _, item := range f.objects {
+		if item.ObjectType == objectType {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
 func (f *fakeOrchestrator) publish(snapshot orchestrator.Snapshot) {
 	f.mu.Lock()
 	f.snapshot = snapshot
-	subscribers := make([]chan orchestrator.Snapshot, 0, len(f.subscribers))
+	subscribers := make([]chan contract.EventEnvelope, 0, len(f.subscribers))
 	for _, ch := range f.subscribers {
 		subscribers = append(subscribers, ch)
 	}
 	f.mu.Unlock()
+	event := contract.EventEnvelope{
+		EventID:         "evt-2",
+		EventType:       contract.EventTypeServiceStateChanged,
+		Timestamp:       snapshot.GeneratedAt,
+		ContractVersion: contract.APIVersionV1,
+		DomainID:        f.discovery.DomainID,
+		ServiceMode:     snapshot.ServiceMode,
+		Reason: func() *contract.Reason {
+			if len(snapshot.Reasons) == 0 {
+				return nil
+			}
+			reason := snapshot.Reasons[0]
+			return &reason
+		}(),
+	}
 	for _, ch := range subscribers {
-		ch <- snapshot
+		ch <- event
 	}
 }
 

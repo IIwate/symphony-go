@@ -15,14 +15,17 @@ import (
 	"symphony-go/internal/agent"
 	"symphony-go/internal/model"
 	"symphony-go/internal/model/contract"
+	"symphony-go/internal/tracker"
 	"symphony-go/internal/workspace"
 )
 
 type fakeTracker struct {
-	candidates []model.Issue
-	issuesByID map[string]model.Issue
-	fetchErr   error
-	fetchCalls int
+	candidates                []model.Issue
+	issuesByID                map[string]model.Issue
+	fetchErr                  error
+	fetchCalls                int
+	sourceClosureAvailability tracker.SourceClosureAvailability
+	closeSourceResult         tracker.SourceClosureResult
 }
 
 func (f *fakeTracker) FetchCandidateIssues(context.Context) ([]model.Issue, error) {
@@ -61,6 +64,20 @@ func (f *fakeTracker) FetchIssueStatesByIDs(_ context.Context, ids []string) ([]
 		}
 	}
 	return result, nil
+}
+
+func (f *fakeTracker) SourceClosureAvailability(context.Context) tracker.SourceClosureAvailability {
+	if f.sourceClosureAvailability.Supported || f.sourceClosureAvailability.Available || len(f.sourceClosureAvailability.Reasons) > 0 {
+		return f.sourceClosureAvailability
+	}
+	return tracker.SourceClosureAvailability{Supported: true, Available: true}
+}
+
+func (f *fakeTracker) CloseSourceIssue(context.Context, model.Issue) tracker.SourceClosureResult {
+	if f.closeSourceResult.Disposition != "" {
+		return f.closeSourceResult
+	}
+	return tracker.SourceClosureResult{Disposition: tracker.SourceClosureDispositionCompleted}
 }
 
 type fakeWorkspace struct {
@@ -127,6 +144,25 @@ func newTestConfig(t *testing.T) *model.ServiceConfig {
 		RunExecutionBudgetMS:       1000,
 		RunReviewFixBudgetMS:       0,
 		CodexCommand:               "codex app-server",
+		DomainID:                   "default",
+		ServiceContractVersion:     contract.APIVersionV1,
+		ServiceInstanceName:        "symphony",
+		LeaderRequired:             true,
+		InstanceRole:               contract.InstanceRoleLeader,
+		CapabilityContract: contract.CapabilityContract{
+			Static: contract.StaticCapabilitySet{
+				Capabilities: []contract.StaticCapability{
+					{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Supported: true},
+					{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Supported: true},
+				},
+			},
+			Available: contract.AvailableCapabilitySet{
+				Capabilities: []contract.AvailableCapability{
+					{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Available: true},
+					{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Available: true},
+				},
+			},
+		},
 		SessionPersistence: model.SessionPersistenceConfig{
 			Enabled: true,
 			Kind:    model.SessionPersistenceKindFile,
@@ -163,6 +199,13 @@ func newTestOrchestrator(t *testing.T) (*Orchestrator, *fakeTracker, *fakeWorksp
 	}
 	o := NewOrchestrator(trackerClient, workspaceManager, fakeRunner{}, func() *model.ServiceConfig { return cfg }, newTestWorkflow, func() RuntimeIdentity { return identity }, logger)
 	o.now = func() time.Time { return time.Date(2026, 3, 14, 10, 0, 0, 0, time.UTC) }
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if o.stateStore != nil {
+			_ = o.stateStore.Close(ctx)
+		}
+	})
 	return o, trackerClient, workspaceManager
 }
 
@@ -181,6 +224,42 @@ func ptrString(value string) *string {
 	return &value
 }
 
+func prepareQueuedSourceClosureAction(t *testing.T, o *Orchestrator, trackerClient *fakeTracker, issue model.Issue) *sourceClosureActionState {
+	t.Helper()
+	trackerClient.issuesByID[issue.ID] = issue
+	o.prLookup = fakePRLookup{
+		refresh: func(context.Context, string, *PullRequestInfo) (*PullRequestInfo, error) {
+			return &PullRequestInfo{
+				Number:     7,
+				URL:        "https://example.invalid/pr/7",
+				State:      PullRequestStateMerged,
+				HeadBranch: "feature/abc-1",
+				BaseOwner:  "acme",
+				BaseRepo:   "repo",
+				HeadOwner:  "acme",
+			}, nil
+		},
+	}
+	o.moveToAwaitingMerge(issue.ID, issue.Identifier, issue.State, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier), "feature/abc-1", 0, 0, &PullRequestInfo{
+		Number:     7,
+		URL:        "https://example.invalid/pr/7",
+		State:      PullRequestStateOpen,
+		HeadBranch: "feature/abc-1",
+	}, nil)
+	o.state.Records[issue.ID].Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeLandChange,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
+	o.reconcileAwaitingMerge(context.Background())
+	for _, item := range o.sourceClosureActions {
+		return item
+	}
+	t.Fatal("queued source closure action was not created")
+	return nil
+}
+
 func assertUnavailableServiceSurface(
 	t *testing.T,
 	discovery contract.DiscoveryDocument,
@@ -188,14 +267,11 @@ func assertUnavailableServiceSurface(
 	wantComponent string,
 ) {
 	t.Helper()
-	if discovery.ServiceMode != contract.ServiceModeUnavailable {
-		t.Fatalf("discovery service_mode = %q, want %q", discovery.ServiceMode, contract.ServiceModeUnavailable)
-	}
 	if snapshot.ServiceMode != contract.ServiceModeUnavailable {
 		t.Fatalf("snapshot service_mode = %q, want %q", snapshot.ServiceMode, contract.ServiceModeUnavailable)
 	}
-	if !reflect.DeepEqual(discovery.Reasons, snapshot.Reasons) {
-		t.Fatalf("discovery/state reasons mismatch: discovery=%#v state=%#v", discovery.Reasons, snapshot.Reasons)
+	if discovery.DomainID != "default" {
+		t.Fatalf("discovery.domain_id = %q, want default", discovery.DomainID)
 	}
 	if len(snapshot.Reasons) != 1 {
 		t.Fatalf("snapshot reasons = %#v, want 1 reason", snapshot.Reasons)
@@ -268,8 +344,8 @@ func TestDiscoveryUsesRuntimeSourceIdentity(t *testing.T) {
 	if discovery.Source.Name != "github-main" {
 		t.Fatalf("discovery source.name = %q, want github-main", discovery.Source.Name)
 	}
-	if len(discovery.Capabilities.Sources) != 1 || discovery.Capabilities.Sources[0] != contract.SourceKindGitHubIssues {
-		t.Fatalf("discovery capabilities.sources = %#v, want [%q]", discovery.Capabilities.Sources, contract.SourceKindGitHubIssues)
+	if len(discovery.Capabilities.Capabilities) == 0 {
+		t.Fatal("discovery capabilities must not be empty")
 	}
 }
 
@@ -309,52 +385,104 @@ func TestRunOnceTrackerUnreachableExposesUnavailableServiceSurface(t *testing.T)
 	}
 }
 
-func TestReconcileAwaitingMergeMovesMergedPRWithoutTerminalSourceToAwaitingIntervention(t *testing.T) {
+func TestReconcileAwaitingMergeCompletesLandChangeAndQueuesSourceClosureAction(t *testing.T) {
 	o, trackerClient, _ := newTestOrchestrator(t)
 	issue := newIssue("1", "ABC-1", "Todo")
-	trackerClient.issuesByID[issue.ID] = issue
-	o.prLookup = fakePRLookup{
-		refresh: func(context.Context, string, *PullRequestInfo) (*PullRequestInfo, error) {
-			return &PullRequestInfo{
-				Number:     7,
-				URL:        "https://example.invalid/pr/7",
-				State:      PullRequestStateMerged,
-				HeadBranch: "feature/abc-1",
-				BaseOwner:  "acme",
-				BaseRepo:   "repo",
-				HeadOwner:  "acme",
-			}, nil
-		},
+	actionState := prepareQueuedSourceClosureAction(t, o, trackerClient, issue)
+
+	if len(o.state.CompletedWindow) != 1 {
+		t.Fatalf("completed_window = %#v, want 1 completed record", o.state.CompletedWindow)
+	}
+	record := o.state.CompletedWindow[0]
+	if record.Result == nil || record.Result.Outcome != contract.ResultOutcomeSucceeded {
+		t.Fatalf("result = %#v, want succeeded", record.Result)
+	}
+	if len(o.sourceClosureActions) != 1 {
+		t.Fatalf("len(sourceClosureActions) = %d, want 1", len(o.sourceClosureActions))
+	}
+	if actionState == nil || actionState.Action.State != contract.ActionStatusQueued {
+		t.Fatalf("action_state = %#v, want queued source closure action", actionState)
+	}
+	envelope, ok := o.GetObject(contract.ObjectTypeAction, actionState.Action.ID)
+	if !ok {
+		t.Fatal("GetObject(action) = false, want true")
+	}
+	var action contract.Action
+	if err := json.Unmarshal(envelope.Payload, &action); err != nil {
+		t.Fatalf("Unmarshal(action) error = %v", err)
+	}
+	if action.Type != contract.ActionTypeSourceClosure {
+		t.Fatalf("action.Type = %q, want %q", action.Type, contract.ActionTypeSourceClosure)
+	}
+}
+
+func TestReconcileSourceClosureActionsCompletesLifecycle(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "Todo")
+	actionState := prepareQueuedSourceClosureAction(t, o, trackerClient, issue)
+
+	o.reconcileSourceClosureActions(context.Background())
+
+	if got := o.sourceClosureActions[actionState.Action.ID].Action.State; got != contract.ActionStatusCompleted {
+		t.Fatalf("action state = %q, want %q", got, contract.ActionStatusCompleted)
+	}
+	envelope, ok := o.GetObject(contract.ObjectTypeAction, actionState.Action.ID)
+	if !ok {
+		t.Fatal("GetObject(action) = false, want true")
+	}
+	var action contract.Action
+	if err := json.Unmarshal(envelope.Payload, &action); err != nil {
+		t.Fatalf("Unmarshal(action) error = %v", err)
+	}
+	if action.State != contract.ActionStatusCompleted {
+		t.Fatalf("action.State = %q, want %q", action.State, contract.ActionStatusCompleted)
+	}
+}
+
+func TestReconcileSourceClosureActionsTransitionsToExternalPending(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "Todo")
+	actionState := prepareQueuedSourceClosureAction(t, o, trackerClient, issue)
+	reason := contract.MustReason(contract.ReasonActionExternalPending, map[string]any{"cause": "source_adapter_unavailable"})
+	trackerClient.closeSourceResult = tracker.SourceClosureResult{
+		Disposition: tracker.SourceClosureDispositionExternalPending,
+		Reason:      &reason,
+		ErrorCode:   contract.ErrorSourceClosureUnavailable,
 	}
 
-	o.moveToAwaitingMerge(issue.ID, issue.Identifier, issue.State, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier), "feature/abc-1", 0, 0, &PullRequestInfo{
-		Number:     7,
-		URL:        "https://example.invalid/pr/7",
-		State:      PullRequestStateOpen,
-		HeadBranch: "feature/abc-1",
-	}, nil)
+	o.reconcileSourceClosureActions(context.Background())
 
-	o.reconcileAwaitingMerge(context.Background())
+	if got := o.sourceClosureActions[actionState.Action.ID].Action.State; got != contract.ActionStatusExternalPending {
+		t.Fatalf("action state = %q, want %q", got, contract.ActionStatusExternalPending)
+	}
+	jobEnvelope, ok := o.GetObject(contract.ObjectTypeJob, actionState.JobID)
+	if !ok {
+		t.Fatal("GetObject(job) = false, want true")
+	}
+	var job contract.Job
+	if err := json.Unmarshal(jobEnvelope.Payload, &job); err != nil {
+		t.Fatalf("Unmarshal(job) error = %v", err)
+	}
+	if !job.ActionSummary.HasPendingExternalActions || job.ActionSummary.PendingCount != 1 {
+		t.Fatalf("job.ActionSummary = %#v, want one pending external action", job.ActionSummary)
+	}
+}
 
-	snapshot := o.Snapshot()
-	if len(snapshot.Records) != 1 {
-		t.Fatalf("records = %#v, want 1 record", snapshot.Records)
+func TestReconcileSourceClosureActionsSplitsPermissionConflictsToIntervention(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "Todo")
+	actionState := prepareQueuedSourceClosureAction(t, o, trackerClient, issue)
+	reason := contract.MustReason(contract.ReasonActionInterventionRequired, map[string]any{"cause": "permission_conflict"})
+	trackerClient.closeSourceResult = tracker.SourceClosureResult{
+		Disposition: tracker.SourceClosureDispositionInterventionRequired,
+		Reason:      &reason,
+		ErrorCode:   contract.ErrorSourceClosureConflict,
 	}
-	record := snapshot.Records[0]
-	if record.Status != contract.IssueStatusAwaitingIntervention {
-		t.Fatalf("status = %q, want %q", record.Status, contract.IssueStatusAwaitingIntervention)
-	}
-	if record.Reason == nil || record.Reason.ReasonCode != contract.ReasonRecordBlockedAwaitingIntervention {
-		t.Fatalf("reason = %#v, want %q", record.Reason, contract.ReasonRecordBlockedAwaitingIntervention)
-	}
-	if got := record.Reason.Details["cause"]; got != string(model.ContinuationReasonMergedPRNotTerminal) {
-		t.Fatalf("reason.details[cause] = %v, want %q", got, model.ContinuationReasonMergedPRNotTerminal)
-	}
-	if got := record.Reason.Details["source_state"]; got != "Todo" {
-		t.Fatalf("reason.details[source_state] = %v, want Todo", got)
-	}
-	if record.DurableRefs.PullRequest == nil || record.DurableRefs.PullRequest.State != string(PullRequestStateMerged) {
-		t.Fatalf("pull_request = %#v, want merged ref", record.DurableRefs.PullRequest)
+
+	o.reconcileSourceClosureActions(context.Background())
+
+	if got := o.sourceClosureActions[actionState.Action.ID].Action.State; got != contract.ActionStatusInterventionRequired {
+		t.Fatalf("action state = %q, want %q", got, contract.ActionStatusInterventionRequired)
 	}
 }
 

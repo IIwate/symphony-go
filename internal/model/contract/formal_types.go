@@ -225,6 +225,7 @@ const (
 	CapabilityStreamEvents        CapabilityName = "stream_events"
 	CapabilityQueryObjects        CapabilityName = "query_objects"
 	CapabilityServiceRefresh      CapabilityName = "service_refresh"
+	CapabilitySourceClosure       CapabilityName = "source_closure"
 	CapabilityDirectJobSource     CapabilityName = "direct_job_source"
 	CapabilityLinearSource        CapabilityName = "linear_source"
 	CapabilityCodexExecutor       CapabilityName = "codex_executor"
@@ -237,7 +238,7 @@ const (
 
 func (c CapabilityName) IsValid() bool {
 	switch c {
-	case CapabilitySubmitJob, CapabilityStreamEvents, CapabilityQueryObjects, CapabilityServiceRefresh, CapabilityDirectJobSource, CapabilityLinearSource, CapabilityCodexExecutor, CapabilityRelationalLedger, CapabilityFileLedger, CapabilityIdentityAuth, CapabilityDomainAccessControl, CapabilityActionAuthorization:
+	case CapabilitySubmitJob, CapabilityStreamEvents, CapabilityQueryObjects, CapabilityServiceRefresh, CapabilitySourceClosure, CapabilityDirectJobSource, CapabilityLinearSource, CapabilityCodexExecutor, CapabilityRelationalLedger, CapabilityFileLedger, CapabilityIdentityAuth, CapabilityDomainAccessControl, CapabilityActionAuthorization:
 		return true
 	default:
 		return false

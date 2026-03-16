@@ -460,6 +460,13 @@ type ServiceConfig struct {
 	CodexStallTimeoutMS              int
 	ServerHost                       string
 	ServerPort                       *int
+	ServiceContractVersion           contract.APIVersion
+	ServiceInstanceName              string
+	CapabilityContract               contract.CapabilityContract
+	LeaderRequired                   bool
+	TransparentForwarding            bool
+	InstanceRole                     contract.InstanceRole
+	LeaderHint                       *contract.LeaderHint
 	SessionPersistence               SessionPersistenceConfig
 	Notifications                    NotificationsConfig
 }
