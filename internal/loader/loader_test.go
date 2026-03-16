@@ -182,18 +182,9 @@ execution:
 job_policy:
   dispatch_flow: implement
 `,
-		FlowYAML: `prompt: prompts/implement.md.liquid
-hooks:
-  before_run: hooks/before_run.sh
-  before_run_continuation: hooks/before_run.sh
-  after_run: null
-completion:
-  mode: pull_request
-  on_missing_pr: intervention
-  on_closed_pr: continue
-`,
+		FlowYAML: "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: hooks/before_run.py\n  before_run_continuation: hooks/before_run.py\n  after_run: null\ncompletion:\n  mode: pull_request\n  on_missing_pr: intervention\n  on_closed_pr: continue\n",
 		Hooks: map[string]string{
-			"before_run.sh": "echo before-run\n",
+			"before_run.py": "print('before-run')\n",
 		},
 	})
 
@@ -215,11 +206,11 @@ completion:
 	if got := getMapValue(workflowDef.Config, "source_adapter")["project_slug"]; got != "demo" {
 		t.Fatalf("source_adapter.project_slug = %v, want demo", got)
 	}
-	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run"]; got != "echo before-run" {
-		t.Fatalf("execution.hooks.before_run = %v, want echo before-run", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run"]; got != filepath.Join(root, "hooks", "before_run.py") {
+		t.Fatalf("execution.hooks.before_run = %v, want resolved hook path", got)
 	}
-	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run_continuation"]; got != "echo before-run" {
-		t.Fatalf("execution.hooks.before_run_continuation = %v, want echo before-run", got)
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run_continuation"]; got != filepath.Join(root, "hooks", "before_run.py") {
+		t.Fatalf("execution.hooks.before_run_continuation = %v, want resolved hook path", got)
 	}
 	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["timeout_ms"]; got != 12345 {
 		t.Fatalf("execution.hooks.timeout_ms = %v, want 12345", got)
@@ -338,7 +329,7 @@ func TestResolveActiveWorkflowHookPathEscape(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		FlowYAML: `prompt: prompts/implement.md.liquid
 hooks:
-  before_run: ../outside.sh
+  before_run: ../outside.py
 `,
 	})
 
@@ -355,12 +346,12 @@ func TestResolveActiveWorkflowHookPathEscapeViaSymlink(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		FlowYAML: `prompt: prompts/implement.md.liquid
 hooks:
-  before_run: hooks/link.sh
+  before_run: hooks/link.py
 `,
 	})
-	outsidePath := filepath.Join(t.TempDir(), "outside.sh")
-	writeLoaderFile(t, outsidePath, "echo outside\n")
-	linkPath := filepath.Join(root, "hooks", "link.sh")
+	outsidePath := filepath.Join(t.TempDir(), "outside.py")
+	writeLoaderFile(t, outsidePath, "print('outside')\n")
+	linkPath := filepath.Join(root, "hooks", "link.py")
 	if err := os.Remove(linkPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Remove(%q) error = %v", linkPath, err)
 	}
@@ -378,7 +369,7 @@ hooks:
 }
 
 func TestResolveActiveWorkflowTreatsSingleLineHookWithSlashAsInlineScript(t *testing.T) {
-	script := "git remote set-url origin https://example.test/repo.git"
+	script := `print("example/repo")`
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		FlowYAML: "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: " + script + "\n",
 	})
@@ -400,12 +391,12 @@ func TestResolveActiveWorkflowRejectsHookSymlinkEscape(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
 		FlowYAML: `prompt: prompts/implement.md.liquid
 hooks:
-  before_run: hooks/before_run.sh
+  before_run: hooks/before_run.py
 `,
 	})
-	outsidePath := filepath.Join(t.TempDir(), "outside.sh")
-	writeLoaderFile(t, outsidePath, "echo outside\n")
-	linkPath := filepath.Join(root, "hooks", "before_run.sh")
+	outsidePath := filepath.Join(t.TempDir(), "outside.py")
+	writeLoaderFile(t, outsidePath, "print('outside')\n")
+	linkPath := filepath.Join(root, "hooks", "before_run.py")
 	if err := os.Symlink(outsidePath, linkPath); err != nil {
 		t.Skipf("Symlink() unsupported on this host: %v", err)
 	}
@@ -421,7 +412,7 @@ hooks:
 
 func TestResolveActiveWorkflowTreatsInlineHookWithSlashAsScript(t *testing.T) {
 	root := writeLoaderFixture(t, loaderFixtureOptions{
-		FlowYAML: "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: \"git remote set-url origin https://example.test/repo.git\"\n",
+		FlowYAML: "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: \"print('https://example.test/repo.git')\"\n",
 	})
 
 	def, err := Load(root, "")
@@ -432,7 +423,7 @@ func TestResolveActiveWorkflowTreatsInlineHookWithSlashAsScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveActiveWorkflow() error = %v", err)
 	}
-	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run"]; got != "git remote set-url origin https://example.test/repo.git" {
+	if got := getMapValue(getMapValue(workflowDef.Config, "execution"), "hooks")["before_run"]; got != "print('https://example.test/repo.git')" {
 		t.Fatalf("execution.hooks.before_run = %v, want inline hook script", got)
 	}
 }

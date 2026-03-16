@@ -185,8 +185,8 @@ terminal_states:
     (config.base_dir / "flows" / "implement.yaml").write_text(
         """prompt: prompts/implement.md.liquid
 hooks:
-  before_run: hooks/before_run.sh
-  before_run_continuation: hooks/before_run_continuation.sh
+  before_run: hooks/before_run.py
+  before_run_continuation: hooks/before_run_continuation.py
 completion:
   mode: pull_request
   on_missing_pr: intervention
@@ -195,27 +195,69 @@ completion:
         encoding="utf-8",
     )
     (config.base_dir / "prompts" / "implement.md.liquid").write_text(prompt_text + "\n", encoding="utf-8")
-    (config.base_dir / "hooks" / "before_run.sh").write_text(
-        """set -euo pipefail
+    (config.base_dir / "hooks" / "before_run.py").write_text(
+        """from __future__ import annotations
 
-repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"
-find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-git clone --depth 1 "$repo_url" .
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def main() -> None:
+    repo_url = os.environ["SYMPHONY_GIT_REPO_URL"]
+    root = Path.cwd()
+    for child in root.iterdir():
+        remove_path(child)
+    subprocess.run(["git", "clone", "--depth", "1", repo_url, "."], check=True)
+
+
+if __name__ == "__main__":
+    main()
 """,
         encoding="utf-8",
     )
-    (config.base_dir / "hooks" / "before_run_continuation.sh").write_text(
-        """set -euo pipefail
+    (config.base_dir / "hooks" / "before_run_continuation.py").write_text(
+        """from __future__ import annotations
 
-if [[ ! -d .git ]]; then
-  repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"
-  find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-  git clone --depth 1 "$repo_url" .
-  exit 0
-fi
+import os
+from pathlib import Path
+import shutil
+import subprocess
 
-git status --short
-git fetch --all --prune || true
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def clone_repo(root: Path) -> None:
+    repo_url = os.environ["SYMPHONY_GIT_REPO_URL"]
+    for child in root.iterdir():
+        remove_path(child)
+    subprocess.run(["git", "clone", "--depth", "1", repo_url, "."], check=True)
+
+
+def main() -> None:
+    root = Path.cwd()
+    if not (root / ".git").is_dir():
+        clone_repo(root)
+        return
+    subprocess.run(["git", "status", "--short"], check=True)
+    subprocess.run(["git", "fetch", "--all", "--prune"], check=False)
+
+
+if __name__ == "__main__":
+    main()
 """,
         encoding="utf-8",
     )
@@ -356,7 +398,7 @@ terminal_states: ["Closed", "Done"]
         encoding="utf-8",
     )
     (base_dir / "flows" / "implement.yaml").write_text(
-        'prompt: prompts/implement.md.liquid\nhooks:\n  before_run: "git remote set-url origin https://example.test/repo.git"\n',
+        'prompt: prompts/implement.md.liquid\nhooks:\n  before_run: "print(\'https://example.test/repo.git\')"\n',
         encoding="utf-8",
     )
     (base_dir / "prompts" / "implement.md.liquid").write_text("inline hook smoke\n", encoding="utf-8")
@@ -420,7 +462,7 @@ terminal_states: ["Closed", "Done"]
         encoding="utf-8",
     )
     (base_dir / "flows" / "implement.yaml").write_text(
-        "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: hooks/link.sh\n",
+        "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: hooks/link.py\n",
         encoding="utf-8",
     )
     (base_dir / "prompts" / "implement.md.liquid").write_text("symlink smoke\n", encoding="utf-8")
@@ -428,10 +470,10 @@ terminal_states: ["Closed", "Done"]
         f"LINEAR_API_KEY={linear_api_key}\nLINEAR_PROJECT_SLUG={linear_project_slug}\nLINEAR_BRANCH_SCOPE={linear_branch_scope}\n",
         encoding="utf-8",
     )
-    outside = base_dir.parent / "outside.sh"
-    outside.write_text("echo outside\n", encoding="utf-8")
+    outside = base_dir.parent / "outside.py"
+    outside.write_text("print('outside')\n", encoding="utf-8")
     try:
-        (base_dir / "hooks" / "link.sh").symlink_to(outside)
+        (base_dir / "hooks" / "link.py").symlink_to(outside)
         return True
     except OSError:
         return False

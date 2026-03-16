@@ -32,6 +32,9 @@ class SymphonyConfigWriterTest(unittest.TestCase):
 
             project_yaml = (base_dir / "project.yaml").read_text(encoding="utf-8")
             source_yaml = (base_dir / "sources" / "linear-main.yaml").read_text(encoding="utf-8")
+            flow_yaml = (base_dir / "flows" / "implement.yaml").read_text(encoding="utf-8")
+            before_run_hook = (base_dir / "hooks" / "before_run.py").read_text(encoding="utf-8")
+            continuation_hook = (base_dir / "hooks" / "before_run_continuation.py").read_text(encoding="utf-8")
 
             self.assertIn("service:\n", project_yaml)
             self.assertIn("  notifications:\n", project_yaml)
@@ -44,6 +47,10 @@ class SymphonyConfigWriterTest(unittest.TestCase):
             self.assertNotIn("runtime:\n", project_yaml)
             self.assertNotIn("selection:\n", project_yaml)
             self.assertNotIn("incoming_webhook_url:", project_yaml)
+            self.assertIn("before_run: hooks/before_run.py\n", flow_yaml)
+            self.assertIn("before_run_continuation: hooks/before_run_continuation.py\n", flow_yaml)
+            self.assertIn('os.environ["SYMPHONY_GIT_REPO_URL"]', before_run_hook)
+            self.assertIn('subprocess.run(["git", "fetch", "--all", "--prune"], check=False)', continuation_hook)
 
             self.assertIn("credentials:\n", source_yaml)
             self.assertIn("api_key_ref:\n", source_yaml)

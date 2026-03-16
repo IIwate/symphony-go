@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -156,6 +158,57 @@ func TestDiagnoseConfigDetectsMissingHookEnvOnFormalConfig(t *testing.T) {
 	cfg.TrackerProjectSlug = "demo"
 	cfg.WorkspaceLinearBranchScope = "demo-scope"
 	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?required}"`)
+
+	diagnosis := DiagnoseConfig(cfg, workflow, def)
+	if len(diagnosis.MissingSecrets) != 1 {
+		t.Fatalf("len(MissingSecrets) = %d, want 1", len(diagnosis.MissingSecrets))
+	}
+	if diagnosis.MissingSecrets[0].EnvVar != "SYMPHONY_GIT_REPO_URL" {
+		t.Fatalf("MissingSecrets[0].EnvVar = %q, want SYMPHONY_GIT_REPO_URL", diagnosis.MissingSecrets[0].EnvVar)
+	}
+	if diagnosis.MissingSecrets[0].Source != "hooks.before_run" {
+		t.Fatalf("MissingSecrets[0].Source = %q, want hooks.before_run", diagnosis.MissingSecrets[0].Source)
+	}
+}
+
+func TestDiagnoseConfigDetectsMissingEnvFromPythonHookFile(t *testing.T) {
+	originalResolver := secret.DefaultResolver
+	secret.DefaultResolver = func(key string) (string, bool) {
+		if key == "LINEAR_API_KEY" {
+			return "present", true
+		}
+		return "", false
+	}
+	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
+
+	hookPath := filepath.Join(t.TempDir(), "before_run.py")
+	if err := os.WriteFile(hookPath, []byte("import os\nrepo_url = os.environ[\"SYMPHONY_GIT_REPO_URL\"]\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	workflow := &model.WorkflowDefinition{Config: validWorkflowConfigMap()}
+	def := &model.AutomationDefinition{
+		Selection: model.AutomationSelection{EnabledSources: []string{"linear-main"}},
+		Sources: map[string]*model.SourceDefinition{
+			"linear-main": {
+				Name: "linear-main",
+				Raw: map[string]any{
+					"credentials": map[string]any{
+						"api_key_ref": map[string]any{
+							"kind": "env",
+							"name": "LINEAR_API_KEY",
+						},
+					},
+				},
+			},
+		},
+	}
+	cfg := defaultServiceConfig()
+	cfg.TrackerKind = "linear"
+	cfg.TrackerAPIKey = "key"
+	cfg.TrackerProjectSlug = "demo"
+	cfg.WorkspaceLinearBranchScope = "demo-scope"
+	cfg.HookBeforeRun = stringPointer(hookPath)
 
 	diagnosis := DiagnoseConfig(cfg, workflow, def)
 	if len(diagnosis.MissingSecrets) != 1 {

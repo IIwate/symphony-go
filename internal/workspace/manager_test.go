@@ -243,8 +243,9 @@ func TestPrepareForRunUnhealthyContinuationWorkspaceAppliesRecoveryCheckpoint(t 
 func TestPrepareForRunHealthyContinuationWorkspaceSkipsRecoveryCheckpointApply(t *testing.T) {
 	patchBody := "diff --git a/a.txt b/a.txt\n"
 	runner := &fakeRunner{stdoutByScript: map[string]string{
-		"git rev-parse HEAD":  "abc123\n",
-		recoveryPatchScript(): patchBody,
+		"git rev-parse HEAD": "abc123\n",
+		"git diff --binary --no-color --no-ext-diff HEAD -- .": patchBody,
+		"git ls-files --others --exclude-standard":             "",
 	}}
 	manager := newTestManager(t, runner)
 	workspacePath := filepath.Join(manager.currentConfig().WorkspaceRoot, "ABC-1")
@@ -705,8 +706,8 @@ func TestPrepareForRunUsesRepoLocalGitIdentity(t *testing.T) {
 			"git for-each-ref refs/heads --format='%(refname:short)'":                "main\n",
 			"git ls-remote --heads origin":                                           "",
 			"git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37"): "",
-			"git config --local --get user.name 2>/dev/null || true":                 "repo-user\n",
-			"git config --local --get user.email 2>/dev/null || true":                "repo-user@example.com\n",
+			"git config --local --get user.name":                                     "repo-user\n",
+			"git config --local --get user.email":                                    "repo-user@example.com\n",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -807,6 +808,43 @@ func TestFinalizeRunAndCleanupIgnoreBestEffortHooks(t *testing.T) {
 	}
 }
 
+func TestHookFilePathRecognizesAbsolutePythonHook(t *testing.T) {
+	hookPath := filepath.Join(t.TempDir(), "before_run.py")
+	if err := os.WriteFile(hookPath, []byte("print('ok')\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got, ok := hookFilePath(hookPath)
+	if !ok {
+		t.Fatal("hookFilePath() ok = false, want true")
+	}
+	if got != hookPath {
+		t.Fatalf("hookFilePath() = %q, want %q", got, hookPath)
+	}
+	if _, ok := hookFilePath("hooks/before_run.py"); ok {
+		t.Fatal("hookFilePath(relative) ok = true, want false")
+	}
+}
+
+func TestShellRunnerRunsPythonHookFile(t *testing.T) {
+	workdir := t.TempDir()
+	hookPath := filepath.Join(workdir, "before_run.py")
+	if err := os.WriteFile(hookPath, []byte("import os\nprint(os.environ['HOOK_TEST'])\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	stdout, stderr, err := (ShellRunner{}).Run(context.Background(), workdir, hookPath, map[string]string{"HOOK_TEST": "python-ok"})
+	if err != nil {
+		if strings.Contains(err.Error(), "python interpreter not found") {
+			t.Skipf("python interpreter unavailable: %v", err)
+		}
+		t.Fatalf("ShellRunner.Run() error = %v, stderr=%q", err, stderr)
+	}
+	if !strings.Contains(stdout, "python-ok") {
+		t.Fatalf("stdout = %q, want python-ok", stdout)
+	}
+}
+
 func newTestManager(t *testing.T, runner HookRunner) *LocalManager {
 	t.Helper()
 
@@ -860,6 +898,16 @@ func (f *fakeRunner) Run(ctx context.Context, _ string, script string, env map[s
 	return "", "", nil
 }
 
+func (f *fakeRunner) RunCommand(ctx context.Context, _ string, argv []string, env map[string]string) (string, string, int, error) {
+	script := fakeCommandString(argv)
+	stdout, stderr, err := f.Run(ctx, "", script, env)
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+	}
+	return stdout, stderr, exitCode, err
+}
+
 func (f *fakeRunner) callCount(script string) int {
 	count := 0
 	for _, item := range f.calledScripts {
@@ -890,4 +938,36 @@ func intPtr(value int) *int {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func fakeCommandString(argv []string) string {
+	if len(argv) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(argv))
+	for _, arg := range argv {
+		parts = append(parts, fakeCommandArg(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func fakeCommandArg(arg string) string {
+	if strings.TrimSpace(arg) == "" {
+		return "''"
+	}
+	if strings.HasPrefix(arg, "--format=") {
+		return "--format=" + bashSingleQuote(strings.TrimPrefix(arg, "--format="))
+	}
+	safe := true
+	for _, r := range arg {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._=-", r) {
+			continue
+		}
+		safe = false
+		break
+	}
+	if safe {
+		return arg
+	}
+	return bashSingleQuote(arg)
 }

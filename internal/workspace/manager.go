@@ -11,14 +11,15 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"symphony-go/internal/model"
-	"symphony-go/internal/shell"
 )
 
 type Manager interface {
@@ -28,6 +29,10 @@ type Manager interface {
 
 type HookRunner interface {
 	Run(ctx context.Context, dir string, script string, env map[string]string) (string, string, error)
+}
+
+type structuredCommandRunner interface {
+	RunCommand(ctx context.Context, dir string, argv []string, env map[string]string) (string, string, int, error)
 }
 
 type LocalManager struct {
@@ -156,13 +161,6 @@ func recoveryCheckpointForWorkspace(workspace *model.Workspace) *model.RecoveryC
 	return workspace.Dispatch.RecoveryCheckpoint
 }
 
-func recoveryPatchScript() string {
-	return `git diff --binary --no-color --no-ext-diff HEAD -- .
-while IFS= read -r file; do
-  git diff --binary --no-color --no-ext-diff --no-index -- /dev/null "$file" || true
-done < <(git ls-files --others --exclude-standard)`
-}
-
 func (m *LocalManager) ensureRecoveryWorkspace(ctx context.Context, workspace *model.Workspace) (bool, error) {
 	checkpoint := recoveryCheckpointForWorkspace(workspace)
 	if checkpoint == nil || workspace == nil {
@@ -208,7 +206,7 @@ func (m *LocalManager) workspaceHealthy(ctx context.Context, workspacePath strin
 	if strings.TrimSpace(checkpoint.Checkpoint.BaseSHA) == "" {
 		return true, nil
 	}
-	stdout, _, err := m.runCommand(ctx, workspacePath, "git rev-parse HEAD")
+	stdout, _, err := m.runCommand(ctx, workspacePath, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return false, nil
 	}
@@ -226,7 +224,7 @@ func (m *LocalManager) workspaceHealthy(ctx context.Context, workspacePath strin
 	if len(patchBody) == 0 {
 		return true, nil
 	}
-	currentPatch, _, err := m.runCommand(ctx, workspacePath, recoveryPatchScript())
+	currentPatch, err := m.buildRecoveryPatch(ctx, workspacePath)
 	if err != nil {
 		return false, nil
 	}
@@ -249,10 +247,36 @@ func (m *LocalManager) applyRecoveryCheckpoint(ctx context.Context, workspace *m
 		return nil
 	}
 	normalizedPatch := strings.ReplaceAll(patchPath, "\\", "/")
-	if _, _, err := m.runCommand(ctx, workspace.Path, fmt.Sprintf("git apply --3way --whitespace=nowarn %s", bashSingleQuote(normalizedPatch))); err != nil {
+	if _, _, err := m.runCommand(ctx, workspace.Path, "git", "apply", "--3way", "--whitespace=nowarn", normalizedPatch); err != nil {
 		return model.NewWorkspaceError(model.ErrWorkspaceHookFailed, fmt.Sprintf("apply recovery checkpoint %q", patchPath), err)
 	}
 	return nil
+}
+
+func (m *LocalManager) buildRecoveryPatch(ctx context.Context, workspacePath string) (string, error) {
+	trackedPatch, stderr, err := m.runCommand(ctx, workspacePath, "git", "diff", "--binary", "--no-color", "--no-ext-diff", "HEAD", "--", ".")
+	if err != nil {
+		return "", model.NewWorkspaceError(model.ErrWorkspaceHookFailed, fmt.Sprintf("build tracked recovery patch: %s", strings.TrimSpace(stderr)), err)
+	}
+	untrackedOutput, stderr, err := m.runCommand(ctx, workspacePath, "git", "ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		return "", model.NewWorkspaceError(model.ErrWorkspaceHookFailed, fmt.Sprintf("list untracked recovery files: %s", strings.TrimSpace(stderr)), err)
+	}
+
+	var patch strings.Builder
+	patch.WriteString(trackedPatch)
+	for _, line := range strings.Split(strings.ReplaceAll(untrackedOutput, "\r\n", "\n"), "\n") {
+		file := strings.TrimSpace(line)
+		if file == "" {
+			continue
+		}
+		diffStdout, diffStderr, exitCode, diffErr := m.runCommandResult(ctx, workspacePath, "git", "diff", "--binary", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", file)
+		if diffErr != nil && exitCode != 1 {
+			return "", model.NewWorkspaceError(model.ErrWorkspaceHookFailed, fmt.Sprintf("build untracked recovery patch for %q: %s", file, strings.TrimSpace(diffStderr)), diffErr)
+		}
+		patch.WriteString(diffStdout)
+	}
+	return patch.String(), nil
 }
 
 func (m *LocalManager) FinalizeRun(ctx context.Context, workspace *model.Workspace) {
@@ -328,7 +352,7 @@ func (m *LocalManager) ensureWorkBranch(ctx context.Context, workspace *model.Wo
 
 	cfg := m.currentConfig()
 	issueShort := shortenIssueIdentifierForTracker(cfg, identifier)
-	currentBranch, stderr, err := m.runCommand(ctx, workspace.Path, "git branch --show-current")
+	currentBranch, stderr, err := m.runCommand(ctx, workspace.Path, "git", "branch", "--show-current")
 	if err != nil {
 		return model.NewWorkspaceError(model.ErrWorkspaceHookFailed, fmt.Sprintf("detect current branch: %s", strings.TrimSpace(stderr)), err)
 	}
@@ -353,16 +377,17 @@ func (m *LocalManager) ensureWorkBranch(ctx context.Context, workspace *model.Wo
 		}
 		return nil
 	case "local":
-		_, stderr, err = m.runCommand(ctx, workspace.Path, "git switch "+bashSingleQuote(branchName))
+		_, stderr, err = m.runCommand(ctx, workspace.Path, "git", "switch", branchName)
 	case "remote":
-		_, stderr, err = m.runCommand(ctx, workspace.Path, "git fetch origin "+bashSingleQuote("+refs/heads/"+branchName+":refs/remotes/origin/"+branchName))
+		refspec := "+refs/heads/" + branchName + ":refs/remotes/origin/" + branchName
+		_, stderr, err = m.runCommand(ctx, workspace.Path, "git", "fetch", "origin", refspec)
 		if err == nil {
-			_, stderr, err = m.runCommand(ctx, workspace.Path, "git switch -c "+bashSingleQuote(branchName)+" "+bashSingleQuote("refs/remotes/origin/"+branchName))
+			_, stderr, err = m.runCommand(ctx, workspace.Path, "git", "switch", "-c", branchName, "refs/remotes/origin/"+branchName)
 		}
 	case "recreate":
-		_, stderr, err = m.runCommand(ctx, workspace.Path, "git switch -c "+bashSingleQuote(branchName))
+		_, stderr, err = m.runCommand(ctx, workspace.Path, "git", "switch", "-c", branchName)
 	case "create":
-		_, stderr, err = m.runCommand(ctx, workspace.Path, "git switch -c "+bashSingleQuote(branchName))
+		_, stderr, err = m.runCommand(ctx, workspace.Path, "git", "switch", "-c", branchName)
 	default:
 		return model.NewWorkspaceError(model.ErrWorkspaceHookFailed, fmt.Sprintf("unsupported branch action %q", action), nil)
 	}
@@ -446,10 +471,10 @@ func (m *LocalManager) resolveCommitIdentity(ctx context.Context, workspacePath 
 		m.logger.Warn("workspace git author config is incomplete; falling back", "source", "explicit_config")
 	}
 
-	if name, email, ok := m.gitConfigIdentity(ctx, workspacePath, "repo_local", "git config --local --get user.name 2>/dev/null || true", "git config --local --get user.email 2>/dev/null || true"); ok {
+	if name, email, ok := m.gitConfigIdentity(ctx, workspacePath, "repo_local", []string{"git", "config", "--local", "--get", "user.name"}, []string{"git", "config", "--local", "--get", "user.email"}); ok {
 		return name, email
 	}
-	if name, email, ok := m.gitConfigIdentity(ctx, workspacePath, "global", "git config --global --get user.name 2>/dev/null || true", "git config --global --get user.email 2>/dev/null || true"); ok {
+	if name, email, ok := m.gitConfigIdentity(ctx, workspacePath, "global", []string{"git", "config", "--global", "--get", "user.name"}, []string{"git", "config", "--global", "--get", "user.email"}); ok {
 		return name, email
 	}
 
@@ -461,13 +486,13 @@ func (m *LocalManager) resolveCommitIdentity(ctx context.Context, workspacePath 
 	return "symphony-runner", fallbackNamespace + "@symphony.invalid"
 }
 
-func (m *LocalManager) gitConfigIdentity(ctx context.Context, workspacePath string, source string, nameScript string, emailScript string) (string, string, bool) {
-	name, _, err := m.runCommand(ctx, workspacePath, nameScript)
+func (m *LocalManager) gitConfigIdentity(ctx context.Context, workspacePath string, source string, nameCommand []string, emailCommand []string) (string, string, bool) {
+	name, _, err := m.runCommand(ctx, workspacePath, nameCommand...)
 	if err != nil {
 		m.logger.Warn("read git author name failed", "source", source, "error", err.Error())
 		return "", "", false
 	}
-	email, _, err := m.runCommand(ctx, workspacePath, emailScript)
+	email, _, err := m.runCommand(ctx, workspacePath, emailCommand...)
 	if err != nil {
 		m.logger.Warn("read git author email failed", "source", source, "error", err.Error())
 		return "", "", false
@@ -818,7 +843,7 @@ func isDigits(value string) bool {
 }
 
 func (m *LocalManager) listLocalBranches(ctx context.Context, dir string) (map[string]struct{}, string, error) {
-	stdout, stderr, err := m.runCommand(ctx, dir, "git for-each-ref refs/heads --format='%(refname:short)'")
+	stdout, stderr, err := m.runCommand(ctx, dir, "git", "for-each-ref", "refs/heads", "--format=%(refname:short)")
 	if err != nil {
 		return nil, stderr, err
 	}
@@ -834,7 +859,7 @@ func (m *LocalManager) listLocalBranches(ctx context.Context, dir string) (map[s
 }
 
 func (m *LocalManager) listRemoteBranches(ctx context.Context, dir string) (map[string]struct{}, string, error) {
-	stdout, stderr, err := m.runCommand(ctx, dir, "git ls-remote --heads origin")
+	stdout, stderr, err := m.runCommand(ctx, dir, "git", "ls-remote", "--heads", "origin")
 	if err != nil {
 		return nil, stderr, err
 	}
@@ -856,15 +881,24 @@ func (m *LocalManager) listRemoteBranches(ctx context.Context, dir string) (map[
 	return branches, stderr, nil
 }
 
-func (m *LocalManager) runCommand(ctx context.Context, dir string, script string) (string, string, error) {
+func (m *LocalManager) runCommand(ctx context.Context, dir string, argv ...string) (string, string, error) {
+	stdout, stderr, _, err := m.runCommandResult(ctx, dir, argv...)
+	return stdout, stderr, err
+}
+
+func (m *LocalManager) runCommandResult(ctx context.Context, dir string, argv ...string) (string, string, int, error) {
 	cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(m.currentConfig().HookTimeoutMS)*time.Millisecond)
 	defer cancel()
 
-	stdout, stderr, err := m.runner.Run(cmdCtx, dir, script, nil)
-	if cmdCtx.Err() != nil {
-		return stdout, stderr, cmdCtx.Err()
+	runner, ok := m.runner.(structuredCommandRunner)
+	if !ok {
+		return "", "", -1, fmt.Errorf("workspace runner does not support structured commands")
 	}
-	return stdout, stderr, err
+	stdout, stderr, exitCode, err := runner.RunCommand(cmdCtx, dir, argv, nil)
+	if cmdCtx.Err() != nil {
+		return stdout, stderr, exitCode, cmdCtx.Err()
+	}
+	return stdout, stderr, exitCode, err
 }
 
 func (m *LocalManager) runFatalHook(ctx context.Context, dir string, hookName string, script string, env map[string]string) error {
@@ -1021,7 +1055,7 @@ func (m *LocalManager) workspaceRoot() string {
 type ShellRunner struct{}
 
 func (ShellRunner) Run(ctx context.Context, dir string, script string, env map[string]string) (string, string, error) {
-	cmd, err := shell.BashCommand(ctx, dir, script)
+	cmd, err := shellCommand(ctx, dir, script)
 	if err != nil {
 		return "", "", err
 	}
@@ -1036,6 +1070,108 @@ func (ShellRunner) Run(ctx context.Context, dir string, script string, env map[s
 
 	err = cmd.Run()
 	return stdout.String(), stderr.String(), err
+}
+
+func (ShellRunner) RunCommand(ctx context.Context, dir string, argv []string, env map[string]string) (string, string, int, error) {
+	cmd, err := execCommand(ctx, dir, argv)
+	if err != nil {
+		return "", "", -1, err
+	}
+	if len(env) > 0 {
+		cmd.Env = mergeProcessEnv(os.Environ(), env)
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	return stdout.String(), stderr.String(), exitCode, err
+}
+
+func shellCommand(ctx context.Context, dir string, script string) (*exec.Cmd, error) {
+	if hookPath, ok := hookFilePath(script); ok {
+		return hookFileCommand(ctx, dir, hookPath)
+	}
+	return inlinePythonCommand(ctx, dir, script)
+}
+
+func hookFilePath(script string) (string, bool) {
+	trimmed := strings.TrimSpace(script)
+	if trimmed == "" || !filepath.IsAbs(trimmed) {
+		return "", false
+	}
+	info, err := os.Stat(trimmed)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	if strings.EqualFold(filepath.Ext(trimmed), ".py") {
+		return trimmed, true
+	}
+	return "", false
+}
+
+func hookFileCommand(ctx context.Context, dir string, scriptPath string) (*exec.Cmd, error) {
+	if !strings.EqualFold(filepath.Ext(scriptPath), ".py") {
+		return nil, fmt.Errorf("unsupported hook file extension %q", filepath.Ext(scriptPath))
+	}
+	pythonPath, err := resolvePythonPath()
+	if err != nil {
+		return nil, err
+	}
+	args := []string{scriptPath}
+	if strings.EqualFold(filepath.Base(pythonPath), "py") || strings.EqualFold(filepath.Base(pythonPath), "py.exe") {
+		args = append([]string{"-3"}, args...)
+	}
+	cmd := exec.CommandContext(ctx, pythonPath, args...)
+	cmd.Dir = dir
+	return cmd, nil
+}
+
+func resolvePythonPath() (string, error) {
+	candidates := []string{"python3", "python"}
+	if runtime.GOOS == "windows" {
+		candidates = []string{"py", "python"}
+	}
+	for _, candidate := range candidates {
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("python interpreter not found")
+}
+
+func inlinePythonCommand(ctx context.Context, dir string, script string) (*exec.Cmd, error) {
+	pythonPath, err := resolvePythonPath()
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"-c", script}
+	if strings.EqualFold(filepath.Base(pythonPath), "py") || strings.EqualFold(filepath.Base(pythonPath), "py.exe") {
+		args = append([]string{"-3"}, args...)
+	}
+	cmd := exec.CommandContext(ctx, pythonPath, args...)
+	cmd.Dir = dir
+	return cmd, nil
+}
+
+func execCommand(ctx context.Context, dir string, argv []string) (*exec.Cmd, error) {
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("command argv is empty")
+	}
+	if strings.TrimSpace(argv[0]) == "" {
+		return nil, fmt.Errorf("command argv[0] is empty")
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
+	return cmd, nil
 }
 
 func mergeProcessEnv(base []string, overrides map[string]string) []string {

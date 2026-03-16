@@ -342,13 +342,9 @@ func collectHookEnvRefs(cfg *model.ServiceConfig) []requiredEnvRef {
 			continue
 		}
 
-		matches := requiredHookEnvPattern.FindAllStringSubmatch(*hook.script, -1)
-		for _, match := range matches {
-			if len(match) != 2 {
-				continue
-			}
+		for _, envName := range requiredHookEnvNames(*hook.script) {
 			refs = append(refs, requiredEnvRef{
-				EnvVar: match[1],
+				EnvVar: envName,
 				Source: "hooks." + hook.name,
 			})
 		}

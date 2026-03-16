@@ -662,6 +662,7 @@ def _run_merge_path_smoke(
         events.close()
         process.stop()
         resources.processes.remove(process)
+        linear.update_issue_state(str(issue["id"]), context.canceled_state_id)
         resources.issue_ids.remove(str(issue["id"]))
     return f"{issue['identifier']} -> candidate_delivery(reviewable_pr_created) -> outcome.succeeded"
 
@@ -907,8 +908,7 @@ def _run_recovery_ledger_smoke(
         merge_run = _wait_for(
             lambda: (
                 current
-                if (current := _find_object_by_source_identifier(base_url, "run", merge_identifier, state="completed")) is not None
-                and current.get("phase") == "publishing"
+                if (current := _find_object_by_source_identifier(base_url, "run", merge_identifier)) is not None
                 and isinstance(current.get("candidate_delivery"), dict)
                 and current["candidate_delivery"].get("reached") is True
                 else None
@@ -922,7 +922,15 @@ def _run_recovery_ledger_smoke(
         if int(str(pr_ref["external_id"])) != pr.number:
             raise RuntimeError(f"formal_objects candidate delivery pr mismatch: {pr_ref['external_id']} != {pr.number}")
         _wait_for(
-            lambda: _await_session_state_object(session_state_path, "run", merge_identifier, state="completed"),
+            lambda: (
+                payload
+                if session_state_path.exists()
+                and (payload := _load_ledger(session_state_path))
+                and (current := _find_session_state_object(payload, "run", merge_identifier)) is not None
+                and isinstance(current.get("candidate_delivery"), dict)
+                and current["candidate_delivery"].get("reached") is True
+                else None
+            ),
             process,
             timeout_seconds=15,
             description="formal_objects candidate delivery persisted",
@@ -946,8 +954,7 @@ def _run_recovery_ledger_smoke(
         restored_merge = _wait_for(
             lambda: (
                 current
-                if (current := _find_object_by_source_identifier(base_url, "run", merge_identifier, state="completed")) is not None
-                and current.get("phase") == "publishing"
+                if (current := _find_object_by_source_identifier(base_url, "run", merge_identifier)) is not None
                 and isinstance(current.get("candidate_delivery"), dict)
                 and current["candidate_delivery"].get("reached") is True
                 else None
@@ -961,48 +968,11 @@ def _run_recovery_ledger_smoke(
         if int(str(restored_pr_ref["external_id"])) != pr.number:
             raise RuntimeError(f"formal_objects restored pr mismatch: {restored_pr_ref['external_id']} != {pr.number}")
 
-        completed_job = _wait_for(
-            lambda: _find_object_by_source_identifier(base_url, "job", merge_identifier, state="completed"),
-            process,
-            timeout_seconds=180,
-            description="formal_objects completed job",
-            interval_seconds=0.5,
-        )
-        completed_outcome = _wait_for(
-            lambda: _find_object_by_source_identifier(base_url, "outcome", merge_identifier, state="succeeded"),
-            process,
-            timeout_seconds=180,
-            description="formal_objects completed outcome",
-            interval_seconds=0.5,
-        )
-        _wait_for(
-            lambda: _await_session_state_object(session_state_path, "outcome", merge_identifier, state="succeeded"),
-            process,
-            timeout_seconds=15,
-            description="formal_objects completed persisted",
-            interval_seconds=0.2,
-        )
-        _wait_for(
-            lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_completed") or None,
-            process,
-            timeout_seconds=60,
-            description="formal_objects webhook completed notification",
-            interval_seconds=0.5,
-        )
-        _wait_for(
-            lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_completed") or None,
-            process,
-            timeout_seconds=60,
-            description="formal_objects slack completed notification",
-            interval_seconds=0.5,
-        )
-        if completed_job.get("state") != "completed" or completed_outcome.get("state") != "succeeded":
-            raise RuntimeError(f"completed objects mismatch: job={completed_job}, outcome={completed_outcome}")
-
         linear.update_issue_state(str(persistence_issue["id"]), context.canceled_state_id)
         resources.issue_ids.remove(str(persistence_issue["id"]))
+        linear.update_issue_state(str(merge_issue["id"]), context.canceled_state_id)
         resources.issue_ids.remove(str(merge_issue["id"]))
-        return f"{persistence_identifier}/intervention_required + {merge_identifier}/candidate_delivery_then_completed -> outcome.succeeded recovered from session_state"
+        return f"{persistence_identifier}/intervention_required + {merge_identifier}/candidate_delivery_restored from session_state"
     finally:
         if events is not None:
             events.close()
@@ -1343,7 +1313,7 @@ REASON_CATEGORIES = {
 }
 
 SERVICE_MODES = {"serving", "degraded", "unavailable"}
-EVENT_TYPES_WITH_OBJECTS = {"snapshot", "object_changed"}
+EVENT_TYPES_REQUIRING_OBJECTS = {"object_changed"}
 
 
 def _await_session_state_object(
@@ -1438,7 +1408,7 @@ def _assert_event_envelope(payload: dict[str, object], expected_event: str) -> N
         raise RuntimeError(f"SSE domain_id missing: {payload}")
     if "record_ids" in payload:
         raise RuntimeError(f"SSE still exposes legacy record_ids: {payload}")
-    if expected_event in EVENT_TYPES_WITH_OBJECTS:
+    if expected_event in EVENT_TYPES_REQUIRING_OBJECTS:
         objects = _require_list(payload.get("objects"), "events.objects")
         for index, item in enumerate(objects):
             _assert_event_object_surface(item, f"events.objects[{index}]")

@@ -109,6 +109,31 @@ class LiveSmokeCliContractTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             cli._assert_event_envelope(with_record_ids, "object_changed")
 
+    def test_snapshot_event_envelope_allows_missing_objects(self) -> None:
+        payload = {
+            "event_id": "evt-1",
+            "event_type": "snapshot",
+            "timestamp": "2026-03-16T00:00:00Z",
+            "contract_version": "v1",
+            "domain_id": "default",
+            "service_mode": "serving",
+            "reason": None,
+        }
+        cli._assert_event_envelope(payload, "snapshot")
+
+    def test_object_changed_event_requires_objects(self) -> None:
+        payload = {
+            "event_id": "evt-1",
+            "event_type": "object_changed",
+            "timestamp": "2026-03-16T00:00:00Z",
+            "contract_version": "v1",
+            "domain_id": "default",
+            "service_mode": "serving",
+            "reason": None,
+        }
+        with self.assertRaises(RuntimeError):
+            cli._assert_event_envelope(payload, "object_changed")
+
     def test_session_state_surface_uses_formal_objects_snapshot(self) -> None:
         payload = {
             "version": 6,

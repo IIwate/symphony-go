@@ -29,6 +29,18 @@ type fakeTracker struct {
 	closeSourceResult         tracker.SourceClosureResult
 }
 
+type recordingNotifier struct {
+	events []model.RuntimeEvent
+}
+
+func (n *recordingNotifier) Emit(event model.RuntimeEvent) {
+	n.events = append(n.events, event)
+}
+
+func (n *recordingNotifier) Close(context.Context) error {
+	return nil
+}
+
 func (f *fakeTracker) FetchCandidateIssues(context.Context) ([]model.Issue, error) {
 	f.fetchCalls++
 	if f.fetchErr != nil {
@@ -1643,6 +1655,86 @@ func TestResumeRecoveredSuccessPathLaunchesReadOnlyReviewer(t *testing.T) {
 	}
 }
 
+func TestParseReviewOutputExtractsValidJSONFromMixedText(t *testing.T) {
+	raw := strings.Join([]string{
+		"Return exactly one JSON object and nothing else.",
+		`{"status":"passed|changes_requested","summary":"short summary","findings":[{"code":"short_code","summary":"what must be fixed"}]}`,
+		`{"status":"changes_requested","summary":"needs one fix","findings":[{"code":"review.issue","summary":"fix the failing review item"}]}`,
+	}, "\n")
+
+	status, summary, findings, err := parseReviewOutput(raw)
+	if err != nil {
+		t.Fatalf("parseReviewOutput() error = %v", err)
+	}
+	if status != contract.ReviewGateStatusChangesRequested {
+		t.Fatalf("status = %q, want %q", status, contract.ReviewGateStatusChangesRequested)
+	}
+	if summary != "needs one fix" {
+		t.Fatalf("summary = %q, want %q", summary, "needs one fix")
+	}
+	if len(findings) != 1 || findings[0].Code != "review.issue" {
+		t.Fatalf("findings = %#v, want review.issue", findings)
+	}
+}
+
+func TestResumeRecoveredSuccessPathReviewerAcceptsFragmentedJSON(t *testing.T) {
+	o, trackerClient, _ := newTestOrchestrator(t)
+	issue := newIssue("1", "ABC-1", "In Progress")
+	trackerClient.issuesByID[issue.ID] = issue
+	o.gitBranchFn = func(context.Context, string) (string, error) {
+		return "runner/demo-scope/abc-1", nil
+	}
+	o.prLookup = fakePRLookup{
+		find: func(context.Context, string, string) (*PullRequestInfo, error) {
+			return &PullRequestInfo{
+				Number:     18,
+				URL:        "https://example.test/pr/18",
+				State:      PullRequestStateOpen,
+				HeadBranch: "runner/demo-scope/abc-1",
+			}, nil
+		},
+	}
+	o.runner = fakeRunner{runFn: func(_ context.Context, params agent.RunParams) error {
+		if params.OnAssistantText != nil {
+			params.OnAssistantText(`{"status":"passed","sum`)
+			params.OnAssistantText(`mary":"review passed","findings":[]}`)
+		}
+		return nil
+	}}
+
+	o.mu.Lock()
+	record := o.ensureRecordLocked(issue)
+	record.Lifecycle = model.JobLifecycleActive
+	record.Observation = &contract.Observation{Running: false, Summary: "awaiting recovery"}
+	setTestWorkspacePath(record, filepath.Join(o.currentConfig().WorkspaceRoot, issue.Identifier))
+	setTestBranchReference(record, "runner/demo-scope/abc-1", o.now().UTC().Format(time.RFC3339Nano))
+	record.Dispatch = &model.DispatchContext{
+		JobType:         contract.JobTypeCodeChange,
+		Kind:            model.DispatchKindFresh,
+		ExpectedOutcome: model.CompletionModePullRequest,
+		OnMissingPR:     model.CompletionActionIntervention,
+		OnClosedPR:      model.CompletionActionIntervention,
+	}
+	record.Run = o.ensureRunState(record, o.currentConfig(), record.Dispatch, 1)
+	record.SourceState = issue.State
+	record.NeedsRecovery = true
+	o.reindexRecordLocked(issue.ID, record)
+	snapshot := cloneJobRuntime(record)
+	o.mu.Unlock()
+
+	if err := o.resumeRecoveredSuccessPath(context.Background(), issue.ID, snapshot, issue.State); err != nil {
+		t.Fatalf("resumeRecoveredSuccessPath() error = %v", err)
+	}
+
+	reviewResult := takeWorkerResult(t, o)
+	if reviewResult.Err != nil {
+		t.Fatalf("reviewResult.Err = %v, want nil", reviewResult.Err)
+	}
+	if reviewResult.ReviewStatus != contract.ReviewGateStatusPassed {
+		t.Fatalf("reviewResult.ReviewStatus = %q, want %q", reviewResult.ReviewStatus, contract.ReviewGateStatusPassed)
+	}
+}
+
 func TestResumeRecoveredSuccessPathLaunchesReviewerForAnalysis(t *testing.T) {
 	o, trackerClient, _ := newTestOrchestrator(t)
 	issue := newIssue("1", "ABC-1", "In Progress")
@@ -2248,6 +2340,59 @@ func TestWriteDurableRuntimeStateOverwritesExistingFile(t *testing.T) {
 	}
 	if len(loaded.Jobs) != 1 || loaded.Jobs[0].JobID != "job-2" {
 		t.Fatalf("loaded jobs = %#v, want overwritten job-2", loaded.Jobs)
+	}
+}
+
+func TestBuildPersistedStateIncludesNotificationFingerprints(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+
+	o.mu.Lock()
+	o.emittedNotificationKeys["issue_completed|issue-1"] = struct{}{}
+	o.emittedNotificationKeys["issue_intervention_required|issue-1|1|missing_pr"] = struct{}{}
+	state := o.buildPersistedStateLocked()
+	o.mu.Unlock()
+
+	if len(state.Service.NotificationFingerprints) != 2 {
+		t.Fatalf("notification fingerprints = %#v, want 2", state.Service.NotificationFingerprints)
+	}
+	got := map[string]struct{}{}
+	for _, item := range state.Service.NotificationFingerprints {
+		got[item] = struct{}{}
+	}
+	for _, want := range []string{"issue_completed|issue-1", "issue_intervention_required|issue-1|1|missing_pr"} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("notification fingerprints = %#v, want %q", state.Service.NotificationFingerprints, want)
+		}
+	}
+}
+
+func TestRestorePersistedStateSkipsDuplicateNotifications(t *testing.T) {
+	o, _, _ := newTestOrchestrator(t)
+	recorded := &recordingNotifier{}
+	event := o.newIssueInterventionRequiredEvent("issue-1", "ABC-1", "branch/demo", "missing_pr", model.CompletionModePullRequest, 0, nil)
+	fingerprint := notificationFingerprint(event)
+	state := durableRuntimeState{
+		Version:       durableStateVersion,
+		Identity:      o.currentRuntimeIdentity(),
+		SavedAt:       o.now().UTC(),
+		Service:       durableServiceMetadata{NotificationFingerprints: []string{fingerprint}},
+		FormalObjects: mustFormalObjectSnapshot(t),
+	}
+
+	o.mu.Lock()
+	o.restorePersistedStateLocked(&state)
+	o.notifier = recorded
+	o.mu.Unlock()
+
+	o.emitNotification(event)
+	if len(recorded.events) != 0 {
+		t.Fatalf("recorded events = %#v, want no replay for persisted fingerprint", recorded.events)
+	}
+
+	freshEvent := o.newIssueInterventionRequiredEvent("issue-1", "ABC-1", "branch/demo", "missing_pr", model.CompletionModePullRequest, 1, nil)
+	o.emitNotification(freshEvent)
+	if len(recorded.events) != 1 {
+		t.Fatalf("recorded events = %#v, want one fresh intervention notification", recorded.events)
 	}
 }
 

@@ -233,6 +233,80 @@ func TestRunnerCollectsAssistantTextFragments(t *testing.T) {
 	}
 }
 
+func TestRunnerIgnoresUserPromptWhenCollectingAssistantTextFragments(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "codex/event/user_message", "params": map[string]any{"message": map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Review only"},
+			},
+		}}}),
+		jsonLine(map[string]any{"method": "item/completed", "params": map[string]any{"item": map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": `{"status":"passed","summary":"ok"}`},
+			},
+		}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	texts := make([]string, 0, 1)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Review candidate"},
+		WorkspacePath: `C:\\work\\ABC-1`,
+		RawPrompt:     "Review only",
+		OnAssistantText: func(text string) {
+			texts = append(texts, text)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(texts) != 1 {
+		t.Fatalf("assistant texts count = %d, want 1: %#v", len(texts), texts)
+	}
+	if strings.Contains(texts[0], "Review only") || !strings.Contains(texts[0], `"status":"passed"`) {
+		t.Fatalf("assistant texts = %#v, want only assistant reviewer JSON", texts)
+	}
+}
+
+func TestRunnerCollectsAssistantTextFromAgentMessage(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "codex/event/agent_message", "params": map[string]any{"msg": map[string]any{
+			"type":    "agent_message",
+			"phase":   "final_answer",
+			"message": `{"status":"passed","summary":"ok","findings":[]}`,
+		}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	texts := make([]string, 0, 1)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Review candidate"},
+		WorkspacePath: `C:\\work\\ABC-1`,
+		RawPrompt:     "Review only",
+		OnAssistantText: func(text string) {
+			texts = append(texts, text)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], `"status":"passed"`) {
+		t.Fatalf("assistant texts = %#v, want assistant agent_message JSON", texts)
+	}
+}
+
 func TestRunnerRejectsOutOfScopeLinearGraphQLAsHardViolation(t *testing.T) {
 	factory := &fakeProcessFactory{process: newFakeProcess([]string{
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),

@@ -331,7 +331,7 @@ func (l *gitHubPRLookup) lookupByNumberGHAPI(ctx context.Context, workspacePath 
 }
 
 func defaultGHAPIPulls(ctx context.Context, workspacePath string, endpoint string) (string, error) {
-	stdout, stderr, err := runBashOutputWithTimeout(ctx, workspacePath, "gh api --method GET "+bashSingleQuote(endpoint), 30*time.Second)
+	stdout, stderr, err := commandOutputWithTimeout(ctx, workspacePath, 30*time.Second, []string{"gh", "api", "--method", "GET", endpoint})
 	if err != nil {
 		return "", fmt.Errorf("gh api: %w: %s", err, strings.TrimSpace(stderr))
 	}
@@ -339,7 +339,7 @@ func defaultGHAPIPulls(ctx context.Context, workspacePath string, endpoint strin
 }
 
 func defaultGitHubRemoteURLs(ctx context.Context, workspacePath string) (map[string]string, error) {
-	stdout, stderr, err := runBashOutput(ctx, workspacePath, "git remote -v")
+	stdout, stderr, err := gitOutput(ctx, workspacePath, "remote", "-v")
 	if err != nil {
 		return nil, fmt.Errorf("git remote -v: %w: %s", err, strings.TrimSpace(stderr))
 	}

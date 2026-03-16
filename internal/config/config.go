@@ -15,8 +15,9 @@ import (
 )
 
 var (
-	envValuePattern        = regexp.MustCompile(`^\$(\w+)$`)
-	requiredHookEnvPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\:\?[^}]*\}`)
+	envValuePattern              = regexp.MustCompile(`^\$(\w+)$`)
+	requiredHookEnvPattern       = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\:\?[^}]*\}`)
+	requiredHookPythonEnvPattern = regexp.MustCompile(`os\.environ\[['"]([A-Za-z_][A-Za-z0-9_]*)['"]\]`)
 )
 
 func NewFromWorkflow(def *model.WorkflowDefinition) (*model.ServiceConfig, error) {
@@ -705,12 +706,7 @@ func runtimeEventFamilySet() map[model.RuntimeEventFamily]struct{} {
 
 func validateRequiredHookEnvs(cfg *model.ServiceConfig) error {
 	for hookName, script := range requiredHookScripts(cfg) {
-		matches := requiredHookEnvPattern.FindAllStringSubmatch(script, -1)
-		for _, match := range matches {
-			if len(match) != 2 {
-				continue
-			}
-			envName := match[1]
+		for _, envName := range requiredHookEnvNames(script) {
 			value, ok := secret.DefaultResolver(envName)
 			if ok && strings.TrimSpace(value) != "" {
 				continue
@@ -724,6 +720,57 @@ func validateRequiredHookEnvs(cfg *model.ServiceConfig) error {
 	}
 
 	return nil
+}
+
+func requiredHookEnvNames(script string) []string {
+	content := hookScriptSource(script)
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	result := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, pattern := range []*regexp.Regexp{requiredHookEnvPattern, requiredHookPythonEnvPattern} {
+		matches := pattern.FindAllStringSubmatch(content, -1)
+		for _, match := range matches {
+			if len(match) != 2 {
+				continue
+			}
+			envName := match[1]
+			if _, exists := seen[envName]; exists {
+				continue
+			}
+			seen[envName] = struct{}{}
+			result = append(result, envName)
+		}
+	}
+	return result
+}
+
+func hookScriptSource(script string) string {
+	trimmed := strings.TrimSpace(script)
+	if trimmed == "" {
+		return ""
+	}
+	if !hookFilePath(trimmed) {
+		return trimmed
+	}
+	content, err := os.ReadFile(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	return string(content)
+}
+
+func hookFilePath(value string) bool {
+	if !filepath.IsAbs(value) {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(value)) {
+	case ".py":
+		return true
+	default:
+		return false
+	}
 }
 
 func requiredHookScripts(cfg *model.ServiceConfig) map[string]string {

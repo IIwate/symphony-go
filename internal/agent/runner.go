@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"symphony-go/internal/shell"
 	"time"
 	"unicode"
 
@@ -508,18 +507,24 @@ func collectAssistantText(dst *[]string, seen map[string]struct{}, value any, as
 			nextAssistant = true
 		}
 		if itemType, ok := typed["type"].(string); ok {
-			normalized := strings.ToLower(strings.TrimSpace(itemType))
-			if normalized == "message" || normalized == "output_text" || normalized == "text" {
+			switch strings.ToLower(strings.TrimSpace(itemType)) {
+			case "agent_message":
 				nextAssistant = true
 			}
 		}
 		if text, ok := typed["text"].(string); ok && nextAssistant {
 			appendAssistantFragment(dst, seen, text)
 		}
+		if message, ok := typed["message"].(string); ok && nextAssistant {
+			appendAssistantFragment(dst, seen, message)
+		}
 		if delta, ok := typed["delta"].(string); ok && nextAssistant {
 			appendAssistantFragment(dst, seen, delta)
 		}
-		for _, key := range []string{"item", "message", "content", "output", "response"} {
+		if lastAgentMessage, ok := typed["last_agent_message"].(string); ok && nextAssistant {
+			appendAssistantFragment(dst, seen, lastAgentMessage)
+		}
+		for _, key := range []string{"item", "message", "content", "output", "response", "msg"} {
 			if nested, ok := typed[key]; ok {
 				collectAssistantText(dst, seen, nested, nextAssistant)
 			}
@@ -1226,7 +1231,7 @@ func runPhaseForEvent(event string) string {
 type execProcessFactory struct{}
 
 func (execProcessFactory) StartProcess(ctx context.Context, cwd string, command string, env map[string]string) (Process, error) {
-	cmd, err := shell.BashCommand(ctx, cwd, command)
+	cmd, err := commandFromString(ctx, cwd, command)
 	if err != nil {
 		return nil, err
 	}

@@ -68,7 +68,8 @@ type durableDispatchContext struct {
 }
 
 type durableServiceMetadata struct {
-	TokenTotal model.TokenTotals `json:"token_total"`
+	TokenTotal               model.TokenTotals `json:"token_total"`
+	NotificationFingerprints []string          `json:"notification_fingerprints,omitempty"`
 }
 
 type durableRunRuntimeState struct {
@@ -608,7 +609,10 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 		Version:  durableStateVersion,
 		Identity: o.currentRuntimeIdentity(),
 		SavedAt:  o.now().UTC(),
-		Service:  durableServiceMetadata{TokenTotal: o.state.CodexTotals},
+		Service: durableServiceMetadata{
+			TokenTotal:               o.state.CodexTotals,
+			NotificationFingerprints: durableNotificationFingerprints(o.emittedNotificationKeys),
+		},
 	}
 	for _, record := range o.state.Jobs {
 		if record == nil {
@@ -887,6 +891,7 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 	}
 
 	o.state.CodexTotals = state.Service.TokenTotal
+	o.emittedNotificationKeys = notificationFingerprintSet(state.Service.NotificationFingerprints)
 	o.state.Jobs = map[string]*model.JobRuntime{}
 	o.activeRuns = map[string]*model.JobRuntime{}
 	o.continuationRuns = map[string]*model.JobRuntime{}
@@ -1215,6 +1220,7 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 
 func cloneDurableRuntimeState(state durableRuntimeState) durableRuntimeState {
 	copyState := state
+	copyState.Service.NotificationFingerprints = append([]string(nil), state.Service.NotificationFingerprints...)
 	copyState.Jobs = make([]durableJobState, 0, len(state.Jobs))
 	for _, item := range state.Jobs {
 		cloned := item
@@ -1231,6 +1237,34 @@ func cloneDurableRuntimeState(state durableRuntimeState) durableRuntimeState {
 	}
 	copyState.FormalObjects = cloneObjectLedgerSnapshot(state.FormalObjects)
 	return copyState
+}
+
+func durableNotificationFingerprints(values map[string]struct{}) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func notificationFingerprintSet(values []string) map[string]struct{} {
+	result := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		result[value] = struct{}{}
+	}
+	return result
 }
 
 func cloneDurableRunRuntimeState(value *durableRunRuntimeState) *durableRunRuntimeState {

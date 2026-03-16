@@ -389,7 +389,10 @@ func resolveHookValue(rootDir string, value any) (any, error) {
 		if err != nil {
 			return nil, model.NewWorkflowError(model.ErrMissingWorkflowFile, fmt.Sprintf("read hook file %q", resolvedPath), err)
 		}
-		return strings.TrimSpace(string(content)), nil
+		if strings.TrimSpace(string(content)) == "" {
+			return nil, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("hook file %q is empty", resolvedPath), nil)
+		}
+		return resolvedPath, nil
 	}
 	return text, nil
 }
@@ -406,7 +409,12 @@ func isHookFileReference(value string) bool {
 	if !strings.Contains(normalized, "/") {
 		return false
 	}
-	return strings.EqualFold(path.Ext(normalized), ".sh")
+	switch strings.ToLower(path.Ext(normalized)) {
+	case ".py":
+		return true
+	default:
+		return false
+	}
 }
 
 func readPromptTemplate(rootDir string, reference string) (string, error) {

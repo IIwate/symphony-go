@@ -358,7 +358,42 @@ func (o *Orchestrator) emitNotificationLocked(event model.RuntimeEvent) {
 	if o.notifier == nil {
 		return
 	}
+	if key := notificationFingerprint(event); key != "" {
+		if _, ok := o.emittedNotificationKeys[key]; ok {
+			return
+		}
+		o.emittedNotificationKeys[key] = struct{}{}
+	}
 	o.notifier.Emit(event)
+}
+
+func notificationFingerprint(event model.RuntimeEvent) string {
+	issueID := ""
+	if event.Subject != nil {
+		issueID = strings.TrimSpace(event.Subject.IssueID)
+	}
+	switch event.Type {
+	case model.NotificationEventIssueCompleted, model.NotificationEventIssueFailed:
+		if issueID == "" {
+			return ""
+		}
+		return fmt.Sprintf("%s|%s", event.Type, issueID)
+	case model.NotificationEventIssueInterventionRequired:
+		if issueID == "" {
+			return ""
+		}
+		attemptCount := 0
+		reason := ""
+		if event.Dispatch != nil {
+			attemptCount = event.Dispatch.AttemptCount
+			if event.Dispatch.ContinuationReason != nil {
+				reason = strings.TrimSpace(*event.Dispatch.ContinuationReason)
+			}
+		}
+		return fmt.Sprintf("%s|%s|%d|%s", event.Type, issueID, attemptCount, reason)
+	default:
+		return ""
+	}
 }
 
 func notificationQueueOverflowCode(channelID string) string {
@@ -619,7 +654,7 @@ func (o *Orchestrator) newIssueCompletedEvent(issueID string, identifier string)
 	}
 }
 
-func (o *Orchestrator) newIssueInterventionRequiredEvent(issueID string, identifier string, branch string, reason string, expectedOutcome model.CompletionMode, pr *PullRequestInfo) model.RuntimeEvent {
+func (o *Orchestrator) newIssueInterventionRequiredEvent(issueID string, identifier string, branch string, reason string, expectedOutcome model.CompletionMode, attempt int, pr *PullRequestInfo) model.RuntimeEvent {
 	return model.RuntimeEvent{
 		Version:    runtimeEventVersion,
 		EventID:    o.nextEventID(),
@@ -631,6 +666,7 @@ func (o *Orchestrator) newIssueInterventionRequiredEvent(issueID string, identif
 		Summary:    fmt.Sprintf("issue %s requires manual intervention", identifier),
 		Subject:    eventSubject(issueID, identifier, ""),
 		Dispatch: &model.RuntimeEventDispatch{
+			AttemptCount:       attemptCountFromRetry(attempt),
 			ExpectedOutcome:    string(expectedOutcome),
 			ContinuationReason: optionalError(reason),
 		},

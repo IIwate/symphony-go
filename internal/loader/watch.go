@@ -234,7 +234,7 @@ func matchesWatchedPath(rootDir string, activeProfile string, eventPath string) 
 	case strings.HasPrefix(relativePath, "policies/"):
 		return matchesDirectoryFile(relativePath, "policies", ".yaml")
 	case strings.HasPrefix(relativePath, "hooks/"):
-		return matchesDirectoryFile(relativePath, "hooks", ".sh")
+		return matchesDirectoryFile(relativePath, "hooks", ".py")
 	default:
 		return false
 	}

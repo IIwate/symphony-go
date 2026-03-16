@@ -20,7 +20,6 @@ import (
 	"symphony-go/internal/config"
 	"symphony-go/internal/model"
 	"symphony-go/internal/model/contract"
-	"symphony-go/internal/shell"
 	"symphony-go/internal/tracker"
 	"symphony-go/internal/workflow"
 	"symphony-go/internal/workspace"
@@ -194,6 +193,7 @@ type Orchestrator struct {
 	nextEventSubscriberID     int
 	healthAlerts              map[string]AlertSnapshot
 	notificationHealth        map[string]*NotificationChannelHealthSnapshot
+	emittedNotificationKeys   map[string]struct{}
 	persistenceHealth         PersistenceHealthSnapshot
 	activeRuns                map[string]*model.JobRuntime
 	continuationRuns          map[string]*model.JobRuntime
@@ -256,23 +256,24 @@ func NewOrchestrator(trackerClient tracker.Client, workspaceManager workspace.Ma
 			Jobs:             map[string]*model.JobRuntime{},
 			ProtectedResults: map[string]*model.ProtectedResultEntry{},
 		},
-		subscribers:           map[int]chan Snapshot{},
-		eventSubscribers:      map[int]chan contract.EventEnvelope{},
-		healthAlerts:          healthAlerts,
-		notificationHealth:    map[string]*NotificationChannelHealthSnapshot{},
-		activeRuns:            map[string]*model.JobRuntime{},
-		continuationRuns:      map[string]*model.JobRuntime{},
-		candidateDeliveryJobs: map[string]*model.JobRuntime{},
-		interventionJobs:      map[string]*model.JobRuntime{},
-		pendingCleanup:        map[string]string{},
-		pendingRecovery:       map[string]uint64{},
-		pendingLaunch:         map[string]uint64{},
-		pendingActions:        map[uint64][]func(){},
-		maxCompleted:          defaultMaxCompletedEntries,
-		startedAt:             time.Now().UTC(),
-		serviceVersion:        BuildVersion,
-		lastEventObjects:      map[string]ObjectEnvelope{},
-		sourceClosureActions:  map[string]*sourceClosureActionState{},
+		subscribers:             map[int]chan Snapshot{},
+		eventSubscribers:        map[int]chan contract.EventEnvelope{},
+		healthAlerts:            healthAlerts,
+		notificationHealth:      map[string]*NotificationChannelHealthSnapshot{},
+		emittedNotificationKeys: map[string]struct{}{},
+		activeRuns:              map[string]*model.JobRuntime{},
+		continuationRuns:        map[string]*model.JobRuntime{},
+		candidateDeliveryJobs:   map[string]*model.JobRuntime{},
+		interventionJobs:        map[string]*model.JobRuntime{},
+		pendingCleanup:          map[string]string{},
+		pendingRecovery:         map[string]uint64{},
+		pendingLaunch:           map[string]uint64{},
+		pendingActions:          map[uint64][]func(){},
+		maxCompleted:            defaultMaxCompletedEntries,
+		startedAt:               time.Now().UTC(),
+		serviceVersion:          BuildVersion,
+		lastEventObjects:        map[string]ObjectEnvelope{},
+		sourceClosureActions:    map[string]*sourceClosureActionState{},
 	}
 	o.prLookup = newGitHubPRLookup()
 	o.captureCheckpointFn = o.captureRecoveryCheckpoint
@@ -2131,6 +2132,7 @@ func buildReviewPrompt(issue model.Issue, record *model.JobRuntime) string {
 	}
 	lines = append(lines,
 		"Return exactly one JSON object and nothing else.",
+		"Do not wrap the JSON in markdown fences. Do not repeat the schema. Do not add commentary before or after the JSON.",
 		`{"status":"passed|changes_requested","summary":"short summary","findings":[{"code":"short_code","summary":"what must be fixed"}]}`,
 	)
 	return strings.Join(lines, "\n")
@@ -2150,23 +2152,59 @@ func parseReviewOutput(raw string) (contract.ReviewGateStatus, string, []model.R
 		body = strings.TrimSuffix(strings.TrimSpace(body), "```")
 		body = strings.TrimSpace(body)
 	}
-	start := strings.Index(body, "{")
-	end := strings.LastIndex(body, "}")
-	if start < 0 || end < start {
-		return "", "", nil, fmt.Errorf("reviewer output does not contain a JSON object")
+	if body == "" {
+		return "", "", nil, fmt.Errorf("reviewer output is empty")
 	}
-	body = body[start : end+1]
-	var payload reviewResponsePayload
-	if err := json.Unmarshal([]byte(body), &payload); err != nil {
-		return "", "", nil, err
+	var firstErr error
+	for _, candidate := range reviewResponseCandidates(body) {
+		var payload reviewResponsePayload
+		if err := json.Unmarshal([]byte(candidate), &payload); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		status := contract.ReviewGateStatus(strings.TrimSpace(payload.Status))
+		switch status {
+		case contract.ReviewGateStatusPassed, contract.ReviewGateStatusChangesRequested:
+			return status, strings.TrimSpace(payload.Summary), append([]model.ReviewFinding(nil), payload.Findings...), nil
+		default:
+			if firstErr == nil {
+				firstErr = fmt.Errorf("unsupported review status %q", payload.Status)
+			}
+		}
 	}
-	status := contract.ReviewGateStatus(strings.TrimSpace(payload.Status))
-	switch status {
-	case contract.ReviewGateStatusPassed, contract.ReviewGateStatusChangesRequested:
-	default:
-		return "", "", nil, fmt.Errorf("unsupported review status %q", payload.Status)
+	if firstErr != nil {
+		return "", "", nil, firstErr
 	}
-	return status, strings.TrimSpace(payload.Summary), append([]model.ReviewFinding(nil), payload.Findings...), nil
+	return "", "", nil, fmt.Errorf("reviewer output does not contain a JSON object")
+}
+
+func reviewResponseCandidates(raw string) []string {
+	candidates := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	for start := strings.IndexByte(raw, '{'); start >= 0; {
+		decoder := json.NewDecoder(bytes.NewReader([]byte(raw[start:])))
+		var payload map[string]any
+		if err := decoder.Decode(&payload); err == nil {
+			consumed := int(decoder.InputOffset())
+			if consumed > 0 {
+				candidate := strings.TrimSpace(raw[start : start+consumed])
+				if candidate != "" {
+					if _, ok := seen[candidate]; !ok {
+						seen[candidate] = struct{}{}
+						candidates = append(candidates, candidate)
+					}
+				}
+			}
+		}
+		next := strings.IndexByte(raw[start+1:], '{')
+		if next < 0 {
+			break
+		}
+		start += next + 1
+	}
+	return candidates
 }
 
 func (o *Orchestrator) launchReviewWorker(workerCtx context.Context, issue model.Issue, record *model.JobRuntime) {
@@ -2221,7 +2259,7 @@ func (o *Orchestrator) launchReviewWorker(workerCtx context.Context, issue model
 			o.sendWorkerResult(result)
 			return
 		}
-		status, summary, findings, err := parseReviewOutput(strings.Join(fragments, "\n"))
+		status, summary, findings, err := parseReviewOutput(strings.Join(fragments, ""))
 		if err != nil {
 			result.Err = model.NewAgentError(model.ErrResponseError, "parse reviewer output", err)
 			result.Phase = phaseFromError(result.Err)
@@ -2499,7 +2537,7 @@ func (o *Orchestrator) captureRecoveryCheckpoint(ctx context.Context, record *mo
 	patchPath := filepath.Join(checkpointRoot, fmt.Sprintf("%s-%d.patch", fileBase, attempt))
 
 	baseSHA := ""
-	if stdout, _, err := runBashOutputWithTimeout(ctx, workspacePath, "git rev-parse HEAD", 15*time.Second); err == nil {
+	if stdout, _, err := gitOutputWithTimeout(ctx, workspacePath, 15*time.Second, "rev-parse", "HEAD"); err == nil {
 		baseSHA = strings.TrimSpace(stdout)
 	}
 	branch := recordBranch(record)
@@ -2509,11 +2547,7 @@ func (o *Orchestrator) captureRecoveryCheckpoint(ctx context.Context, record *mo
 		}
 	}
 
-	patchScript := `git diff --binary --no-color --no-ext-diff HEAD -- .
-while IFS= read -r file; do
-  git diff --binary --no-color --no-ext-diff --no-index -- /dev/null "$file" || true
-done < <(git ls-files --others --exclude-standard)`
-	patchBody, _, err := runBashOutputWithTimeout(ctx, workspacePath, patchScript, 30*time.Second)
+	patchBody, err := buildGitPatch(ctx, workspacePath, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -2523,11 +2557,11 @@ done < <(git ls-files --others --exclude-standard)`
 
 	hiddenRef := ""
 	hiddenCommit := ""
-	if stashSHA, _, err := runBashOutputWithTimeout(ctx, workspacePath, "git stash create 'symphony recovery checkpoint'", 15*time.Second); err == nil {
+	if stashSHA, _, err := gitOutputWithTimeout(ctx, workspacePath, 15*time.Second, "stash", "create", "symphony recovery checkpoint"); err == nil {
 		hiddenCommit = strings.TrimSpace(stashSHA)
 		if hiddenCommit != "" {
 			hiddenRef = fmt.Sprintf("refs/symphony/recovery/%s/%d", fileBase, attempt)
-			if _, _, updateErr := runBashOutputWithTimeout(ctx, workspacePath, fmt.Sprintf("git update-ref %s %s", bashSingleQuote(hiddenRef), bashSingleQuote(hiddenCommit)), 15*time.Second); updateErr != nil {
+			if _, _, updateErr := gitOutputWithTimeout(ctx, workspacePath, 15*time.Second, "update-ref", hiddenRef, hiddenCommit); updateErr != nil {
 				hiddenRef = ""
 				hiddenCommit = ""
 			}
@@ -4222,7 +4256,7 @@ func (o *Orchestrator) moveToAwaitingIntervention(issueID string, identifier str
 	o.reindexRecordLocked(issueID, record)
 	delete(o.pendingRecovery, issueID)
 	version := o.commitStateLocked(true)
-	event := o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, pr)
+	event := o.newIssueInterventionRequiredEvent(issueID, identifier, branch, reason, expectedOutcome, retryAttempt, pr)
 	if version > 0 {
 		o.schedulePersistedActionLocked(version, func() {
 			o.emitNotification(event)
@@ -4445,35 +4479,11 @@ func (o *Orchestrator) completeIssueWithOutcome(ctx context.Context, issueID str
 }
 
 func defaultGitBranch(ctx context.Context, workspacePath string) (string, error) {
-	stdout, stderr, err := runBashOutput(ctx, workspacePath, "git branch --show-current")
+	stdout, stderr, err := gitOutput(ctx, workspacePath, "branch", "--show-current")
 	if err != nil {
 		return "", fmt.Errorf("git branch --show-current: %w: %s", err, strings.TrimSpace(stderr))
 	}
 	return strings.TrimSpace(stdout), nil
-}
-
-func runBashOutput(ctx context.Context, workspacePath string, script string) (string, string, error) {
-	return runBashOutputWithTimeout(ctx, workspacePath, script, 10*time.Second)
-}
-
-func runBashOutputWithTimeout(ctx context.Context, workspacePath string, script string, timeout time.Duration) (string, string, error) {
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd, err := shell.BashCommand(probeCtx, workspacePath, script)
-	if err != nil {
-		return "", "", err
-	}
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err = cmd.Run()
-	return stdout.String(), stderr.String(), err
 }
 
 func compareIssues(left model.Issue, right model.Issue) bool {
@@ -4638,10 +4648,6 @@ func errorString(err error) string {
 		return ""
 	}
 	return err.Error()
-}
-
-func bashSingleQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func archivedJobFromRuntime(record *model.JobRuntime) model.ArchivedJob {
