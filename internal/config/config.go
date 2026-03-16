@@ -204,7 +204,7 @@ func defaultServiceConfig() *model.ServiceConfig {
 		SessionPersistence: model.SessionPersistenceConfig{
 			Kind: model.SessionPersistenceKindFile,
 			File: model.SessionPersistenceFileConfig{
-				Path:            filepath.Join(".", "local", "runtime-ledger.json"),
+				Path:            filepath.Join(".", "local", "runtime-state.json"),
 				FlushIntervalMS: 1000,
 				FsyncOnCritical: true,
 			},

@@ -616,11 +616,11 @@ func TestWatchIgnoresRuntimeLedgerChange(t *testing.T) {
 	}
 
 	time.Sleep(200 * time.Millisecond)
-	writeLoaderFile(t, filepath.Join(root, "local", "runtime-ledger.json"), "{\"version\":1}\n")
+	writeLoaderFile(t, filepath.Join(root, "local", "runtime-state.json"), "{\"version\":1}\n")
 
 	select {
 	case definition := <-updates:
-		t.Fatalf("unexpected update received for runtime-ledger.json change: %+v", definition)
+		t.Fatalf("unexpected update received for runtime-state.json change: %+v", definition)
 	case <-time.After(750 * time.Millisecond):
 	}
 }

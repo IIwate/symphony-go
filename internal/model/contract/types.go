@@ -45,25 +45,6 @@ func (m ServiceMode) IsValid() bool {
 	}
 }
 
-type IssueStatus string
-
-const (
-	IssueStatusActive               IssueStatus = "active"
-	IssueStatusRetryScheduled       IssueStatus = "retry_scheduled"
-	IssueStatusAwaitingMerge        IssueStatus = "awaiting_merge"
-	IssueStatusAwaitingIntervention IssueStatus = "awaiting_intervention"
-	IssueStatusCompleted            IssueStatus = "completed"
-)
-
-func (s IssueStatus) IsValid() bool {
-	switch s {
-	case IssueStatusActive, IssueStatusRetryScheduled, IssueStatusAwaitingMerge, IssueStatusAwaitingIntervention, IssueStatusCompleted:
-		return true
-	default:
-		return false
-	}
-}
-
 type RecordID string
 
 type SourceKind string
@@ -183,28 +164,6 @@ type DurableRefs struct {
 	Branch      *BranchRef      `json:"branch,omitempty"`
 	PullRequest *PullRequestRef `json:"pull_request,omitempty"`
 	LedgerPath  string          `json:"ledger_path"`
-}
-
-type IssueRuntimeRecord struct {
-	RecordID    RecordID     `json:"record_id"`
-	SourceRef   SourceRef    `json:"source_ref"`
-	Status      IssueStatus  `json:"status"`
-	UpdatedAt   string       `json:"updated_at"`
-	Reason      *Reason      `json:"reason"`
-	Observation *Observation `json:"observation"`
-	DurableRefs DurableRefs  `json:"durable_refs"`
-	Result      *Result      `json:"result"`
-}
-
-type IssueLedgerRecord struct {
-	RecordID    RecordID    `json:"record_id"`
-	SourceRef   SourceRef   `json:"source_ref"`
-	Status      IssueStatus `json:"status"`
-	Reason      *Reason     `json:"reason"`
-	RetryDueAt  *string     `json:"retry_due_at"`
-	DurableRefs DurableRefs `json:"durable_refs"`
-	Result      *Result     `json:"result"`
-	UpdatedAt   string      `json:"updated_at"`
 }
 
 type InstanceDocument struct {

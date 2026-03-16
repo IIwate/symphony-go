@@ -753,8 +753,26 @@ type RuntimeServiceState struct {
 	Reasons            []contract.Reason
 }
 
-type IssueRecord struct {
-	Runtime             contract.IssueRuntimeRecord
+type JobLifecycleState string
+
+const (
+	JobLifecycleActive               JobLifecycleState = "active"
+	JobLifecycleRetryScheduled       JobLifecycleState = "retry_scheduled"
+	JobLifecycleAwaitingMerge        JobLifecycleState = "awaiting_merge"
+	JobLifecycleAwaitingIntervention JobLifecycleState = "awaiting_intervention"
+	JobLifecycleCompleted            JobLifecycleState = "completed"
+)
+
+type JobRuntime struct {
+	Object              contract.Job
+	Lifecycle           JobLifecycleState
+	RecordID            contract.RecordID
+	SourceRef           contract.SourceRef
+	Reason              *contract.Reason
+	Observation         *contract.Observation
+	DurableRefs         contract.DurableRefs
+	Result              *contract.Result
+	UpdatedAt           string
 	RetryDueAt          *time.Time
 	RetryAttempt        int
 	StallCount          int
@@ -768,15 +786,35 @@ type IssueRecord struct {
 	NeedsRecovery       bool
 	Run                 *RunState
 	Intervention        *InterventionState
+	Outcome             *contract.Outcome
+	Artifacts           []contract.Artifact
+}
+
+type ArchivedJob struct {
+	Object              contract.Job
+	RecordID            contract.RecordID
+	SourceRef           contract.SourceRef
+	Reason              *contract.Reason
+	Observation         *contract.Observation
+	DurableRefs         contract.DurableRefs
+	Result              *contract.Result
+	UpdatedAt           string
+	LastKnownIssue      *Issue
+	LastKnownIssueState string
+	Dispatch            *DispatchContext
+	Run                 *RunState
+	Intervention        *InterventionState
+	Outcome             *contract.Outcome
+	Artifacts           []contract.Artifact
 }
 
 type OrchestratorState struct {
 	PollIntervalMS      int
 	MaxConcurrentAgents int
 	Service             RuntimeServiceState
-	Records             map[string]*IssueRecord
+	Jobs                map[string]*JobRuntime
 	ProtectedResults    map[string]*ProtectedResultEntry
-	CompletedWindow     []contract.IssueRuntimeRecord
+	ArchivedJobs        []ArchivedJob
 	CodexTotals         TokenTotals
 	CodexRateLimits     any
 }

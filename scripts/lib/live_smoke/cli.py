@@ -748,8 +748,8 @@ def _run_recovery_ledger_smoke(
 
     try:
         port = allocate_port()
-        base_dir = resources.temp_dir / "runtime-ledger"
-        ledger_path = base_dir / "local" / "runtime-ledger.json"
+        base_dir = resources.temp_dir / "runtime-state"
+        ledger_path = base_dir / "local" / "runtime-state.json"
         namespace = f"{branch_namespace}-feature"
         config = SmokeConfig(
             base_dir=base_dir,
@@ -775,13 +775,13 @@ def _run_recovery_ledger_smoke(
             lambda: _await_formal_startup(base_url),
             process,
             timeout_seconds=30,
-            description="runtime_ledger startup",
+            description="runtime_state startup",
         )
         _assert_discovery_source(fetch_json(f"{base_url}/api/v1/discovery"), kind="linear", name="linear-main")
         events = open_events_stream(f"{base_url}/api/v1/events")
-        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_ledger snapshot")
+        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_state snapshot")
 
-        persistence_issue = linear.create_issue(f"{issue_prefix} runtime_ledger persistence {int(time.time())}", context)
+        persistence_issue = linear.create_issue(f"{issue_prefix} runtime_state persistence {int(time.time())}", context)
         resources.issue_ids.append(str(persistence_issue["id"]))
         persistence_identifier = str(persistence_issue["identifier"])
 
@@ -796,12 +796,12 @@ def _run_recovery_ledger_smoke(
             ),
             process,
             timeout_seconds=120,
-            description="runtime_ledger awaiting_intervention via SSE",
+            description="runtime_state awaiting_intervention via SSE",
         )
         record = _require_runtime_record(persistence_state, persistence_identifier, status="awaiting_intervention")
         _assert_source_anchor(
             record,
-            "runtime_ledger.record",
+            "runtime_state.record",
             source_kind="linear",
             source_name="linear-main",
             source_id=str(persistence_issue["id"]),
@@ -815,7 +815,7 @@ def _run_recovery_ledger_smoke(
             lambda: recorder.find(path="/webhook", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=30,
-            description="runtime_ledger webhook intervention notification",
+            description="runtime_state webhook intervention notification",
             interval_seconds=0.5,
         )
         _assert_notification_details(
@@ -829,14 +829,14 @@ def _run_recovery_ledger_smoke(
             lambda: recorder.find(path="/slack", identifier=persistence_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=30,
-            description="runtime_ledger slack intervention notification",
+            description="runtime_state slack intervention notification",
             interval_seconds=0.5,
         )
         ledger_payload = _wait_for(
             lambda: _await_ledger_record(ledger_path, persistence_identifier, status="awaiting_intervention"),
             process,
             timeout_seconds=15,
-            description="runtime_ledger awaiting_intervention persisted",
+            description="runtime_state awaiting_intervention persisted",
             interval_seconds=0.2,
         )
         _assert_ledger_identity(
@@ -849,10 +849,10 @@ def _run_recovery_ledger_smoke(
         )
         ledger_record = _find_ledger_record(ledger_payload, persistence_identifier, status="awaiting_intervention")
         if ledger_record is None:
-            raise RuntimeError(f"runtime_ledger persisted record missing: {ledger_payload}")
+            raise RuntimeError(f"runtime_state persisted record missing: {ledger_payload}")
         _assert_source_anchor(
             ledger_record,
-            "runtime_ledger.ledger_record",
+            "runtime_state.ledger_record",
             source_kind="linear",
             source_name="linear-main",
             source_id=str(persistence_issue["id"]),
@@ -870,20 +870,20 @@ def _run_recovery_ledger_smoke(
             lambda: _await_formal_startup(base_url),
             process,
             timeout_seconds=30,
-            description="runtime_ledger restart",
+            description="runtime_state restart",
         )
         events = open_events_stream(f"{base_url}/api/v1/events")
-        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_ledger restart snapshot")
+        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_state restart snapshot")
         restored_state = _wait_for(
             lambda: _await_runtime_record(base_url, persistence_identifier, status="awaiting_intervention"),
             process,
             timeout_seconds=60,
-            description="runtime_ledger restored awaiting_intervention",
+            description="runtime_state restored awaiting_intervention",
         )
         restored_record = _require_runtime_record(restored_state, persistence_identifier, status="awaiting_intervention")
         _assert_source_anchor(
             restored_record,
-            "runtime_ledger.restored_record",
+            "runtime_state.restored_record",
             source_kind="linear",
             source_name="linear-main",
             source_id=str(persistence_issue["id"]),
@@ -895,7 +895,7 @@ def _run_recovery_ledger_smoke(
                 f"unexpected notification replay after restart: before={notification_count_before_restart}, after={recorder.count()}"
             )
 
-        merge_issue = linear.create_issue(f"{issue_prefix} runtime_ledger merge {int(time.time())}", context)
+        merge_issue = linear.create_issue(f"{issue_prefix} runtime_state merge {int(time.time())}", context)
         resources.issue_ids.append(str(merge_issue["id"]))
         merge_identifier = str(merge_issue["identifier"])
         branch = _linear_branch_name(namespace, branch_scope, merge_identifier)
@@ -905,7 +905,7 @@ def _run_recovery_ledger_smoke(
             branch,
             title=f"test: live smoke {merge_identifier}",
             body="Temporary PR for runtime ledger smoke.",
-            work_root=resources.temp_dir / "runtime-ledger-pr",
+            work_root=resources.temp_dir / "runtime-state-pr",
         )
         resources.pull_request_numbers.append(pr.number)
 
@@ -920,17 +920,17 @@ def _run_recovery_ledger_smoke(
             ),
             process,
             timeout_seconds=120,
-            description="runtime_ledger awaiting_merge via SSE",
+            description="runtime_state awaiting_merge via SSE",
         )
         merge_record = _require_runtime_record(merge_state, merge_identifier, status="awaiting_merge")
         pr_ref = _require_durable_ref(merge_record, "pull_request")
         if int(pr_ref["number"]) != pr.number:
-            raise RuntimeError(f"runtime_ledger awaiting_merge pr_number mismatch: {pr_ref['number']} != {pr.number}")
+            raise RuntimeError(f"runtime_state awaiting_merge pr_number mismatch: {pr_ref['number']} != {pr.number}")
         _wait_for(
             lambda: _await_ledger_record(ledger_path, merge_identifier, status="awaiting_merge"),
             process,
             timeout_seconds=15,
-            description="runtime_ledger awaiting_merge persisted",
+            description="runtime_state awaiting_merge persisted",
             interval_seconds=0.2,
         )
 
@@ -944,20 +944,20 @@ def _run_recovery_ledger_smoke(
             lambda: _await_formal_startup(base_url),
             process,
             timeout_seconds=30,
-            description="runtime_ledger second restart",
+            description="runtime_state second restart",
         )
         events = open_events_stream(f"{base_url}/api/v1/events")
-        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_ledger second snapshot")
+        _await_sse_event(events, process, expected_event="snapshot", timeout_seconds=15, description="runtime_state second snapshot")
         restored_merge_state = _wait_for(
             lambda: _await_runtime_record(base_url, merge_identifier, status="awaiting_merge"),
             process,
             timeout_seconds=60,
-            description="runtime_ledger restored awaiting_merge",
+            description="runtime_state restored awaiting_merge",
         )
         restored_merge = _require_runtime_record(restored_merge_state, merge_identifier, status="awaiting_merge")
         restored_pr_ref = _require_durable_ref(restored_merge, "pull_request")
         if int(restored_pr_ref["number"]) != pr.number:
-            raise RuntimeError(f"runtime_ledger restored pr_number mismatch: {restored_pr_ref['number']} != {pr.number}")
+            raise RuntimeError(f"runtime_state restored pr_number mismatch: {restored_pr_ref['number']} != {pr.number}")
 
         merge_pull_request(repo, pr.number)
         resources.pull_request_numbers.remove(pr.number)
@@ -972,31 +972,31 @@ def _run_recovery_ledger_smoke(
             ),
             process,
             timeout_seconds=180,
-            description="runtime_ledger merged_pr_source_not_terminal via SSE",
+            description="runtime_state merged_pr_source_not_terminal via SSE",
         )
         intervention_record = _require_runtime_record(intervention_state, merge_identifier, status="awaiting_intervention")
         intervention_reason = _require_reason(intervention_record, "record.blocked.awaiting_intervention")
         if intervention_reason.get("details", {}).get("cause") != "merged_pr_source_not_terminal":
-            raise RuntimeError(f"unexpected runtime_ledger merge intervention reason: {intervention_reason}")
+            raise RuntimeError(f"unexpected runtime_state merge intervention reason: {intervention_reason}")
         _wait_for(
             lambda: _await_ledger_record(ledger_path, merge_identifier, status="awaiting_intervention"),
             process,
             timeout_seconds=15,
-            description="runtime_ledger awaiting_intervention persisted after merge",
+            description="runtime_state awaiting_intervention persisted after merge",
             interval_seconds=0.2,
         )
         _wait_for(
             lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=60,
-            description="runtime_ledger webhook intervention notification after merge",
+            description="runtime_state webhook intervention notification after merge",
             interval_seconds=0.5,
         )
         _wait_for(
             lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_intervention_required") or None,
             process,
             timeout_seconds=60,
-            description="runtime_ledger slack intervention notification after merge",
+            description="runtime_state slack intervention notification after merge",
             interval_seconds=0.5,
         )
 
@@ -1005,7 +1005,7 @@ def _run_recovery_ledger_smoke(
             lambda: _await_linear_done(linear, str(merge_issue["id"])),
             process,
             timeout_seconds=180,
-            description="runtime_ledger issue done after external source close",
+            description="runtime_state issue done after external source close",
         )
         completed_state = _wait_for(
             lambda: _await_state_after_sse(
@@ -1019,28 +1019,28 @@ def _run_recovery_ledger_smoke(
             ),
             process,
             timeout_seconds=180,
-            description="runtime_ledger completed_window via SSE",
+            description="runtime_state completed_window via SSE",
         )
         _require_completed_record(completed_state, merge_identifier, outcome="succeeded")
         _wait_for(
             lambda: _await_ledger_record(ledger_path, merge_identifier, status="completed", outcome="succeeded"),
             process,
             timeout_seconds=15,
-            description="runtime_ledger completed persisted",
+            description="runtime_state completed persisted",
             interval_seconds=0.2,
         )
         _wait_for(
             lambda: recorder.find(path="/webhook", identifier=merge_identifier, event_type="issue_completed") or None,
             process,
             timeout_seconds=60,
-            description="runtime_ledger webhook completed notification",
+            description="runtime_state webhook completed notification",
             interval_seconds=0.5,
         )
         _wait_for(
             lambda: recorder.find(path="/slack", identifier=merge_identifier, event_type="issue_completed") or None,
             process,
             timeout_seconds=60,
-            description="runtime_ledger slack completed notification",
+            description="runtime_state slack completed notification",
             interval_seconds=0.5,
         )
 
@@ -1173,7 +1173,7 @@ def _run_unavailable_ledger_smoke(
     try:
         port = allocate_port()
         base_dir = resources.temp_dir / "ledger-unavailable"
-        ledger_path = base_dir / "local" / "runtime-ledger.json"
+        ledger_path = base_dir / "local" / "runtime-state.json"
         config = SmokeConfig(
             base_dir=base_dir,
             port=port,

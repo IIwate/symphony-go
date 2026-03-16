@@ -49,6 +49,16 @@ type ObjectLedgerSnapshot struct {
 	Records []ObjectEnvelope `json:"records"`
 }
 
+func cloneObjectLedgerSnapshot(value ObjectLedgerSnapshot) ObjectLedgerSnapshot {
+	records := make([]ObjectEnvelope, 0, len(value.Records))
+	for _, item := range value.Records {
+		cloned := item
+		cloned.Payload = append([]byte(nil), item.Payload...)
+		records = append(records, cloned)
+	}
+	return ObjectLedgerSnapshot{Records: records}
+}
+
 type ObjectLedger interface {
 	UpsertJob(contract.Job) error
 	UpsertRun(contract.Run) error
@@ -70,6 +80,11 @@ type fileObjectLedger struct {
 	data map[string]ObjectEnvelope
 }
 
+type memoryObjectLedger struct {
+	mu   sync.Mutex
+	data map[string]ObjectEnvelope
+}
+
 func NewFileObjectLedger(path string) (ObjectLedger, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("object ledger path is required")
@@ -84,37 +99,77 @@ func NewFileObjectLedger(path string) (ObjectLedger, error) {
 	return ledger, nil
 }
 
+func NewMemoryObjectLedger(snapshot ObjectLedgerSnapshot) ObjectLedger {
+	ledger := &memoryObjectLedger{
+		data: map[string]ObjectEnvelope{},
+	}
+	for _, item := range snapshot.Records {
+		ledger.data[ledgerKey(item.ObjectType, item.ObjectID)] = item
+	}
+	return ledger
+}
+
 func (l *fileObjectLedger) UpsertJob(value contract.Job) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
+func (l *memoryObjectLedger) UpsertJob(value contract.Job) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
 func (l *fileObjectLedger) UpsertRun(value contract.Run) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
+func (l *memoryObjectLedger) UpsertRun(value contract.Run) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
 func (l *fileObjectLedger) UpsertIntervention(value contract.Intervention) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
+func (l *memoryObjectLedger) UpsertIntervention(value contract.Intervention) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
 func (l *fileObjectLedger) UpsertOutcome(value contract.Outcome) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
+func (l *memoryObjectLedger) UpsertOutcome(value contract.Outcome) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
 func (l *fileObjectLedger) UpsertArtifact(value contract.Artifact) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
+func (l *memoryObjectLedger) UpsertArtifact(value contract.Artifact) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
 func (l *fileObjectLedger) UpsertAction(value contract.Action) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
+func (l *memoryObjectLedger) UpsertAction(value contract.Action) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
 func (l *fileObjectLedger) UpsertInstance(value contract.Instance) error {
+	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
+}
+func (l *memoryObjectLedger) UpsertInstance(value contract.Instance) error {
 	return l.upsert(value.ObjectType, value.ID, value.UpdatedAt, value)
 }
 
 func (l *fileObjectLedger) Archive(objectType contract.ObjectType, id string, at string) error {
 	return l.markLifecycle(objectType, id, LedgerStorageTierArchive, LedgerLifecycleArchived, at)
 }
+func (l *memoryObjectLedger) Archive(objectType contract.ObjectType, id string, at string) error {
+	return l.markLifecycle(objectType, id, LedgerStorageTierArchive, LedgerLifecycleArchived, at)
+}
 
 func (l *fileObjectLedger) Invalidate(objectType contract.ObjectType, id string, at string) error {
 	return l.markLifecycle(objectType, id, "", LedgerLifecycleInvalidated, at)
 }
+func (l *memoryObjectLedger) Invalidate(objectType contract.ObjectType, id string, at string) error {
+	return l.markLifecycle(objectType, id, "", LedgerLifecycleInvalidated, at)
+}
 
 func (l *fileObjectLedger) Terminate(objectType contract.ObjectType, id string, at string) error {
+	return l.markLifecycle(objectType, id, "", LedgerLifecycleTerminated, at)
+}
+func (l *memoryObjectLedger) Terminate(objectType contract.ObjectType, id string, at string) error {
 	return l.markLifecycle(objectType, id, "", LedgerLifecycleTerminated, at)
 }
 
@@ -124,8 +179,23 @@ func (l *fileObjectLedger) Get(objectType contract.ObjectType, id string) (Objec
 	item, ok := l.data[ledgerKey(objectType, id)]
 	return item, ok
 }
+func (l *memoryObjectLedger) Get(objectType contract.ObjectType, id string) (ObjectEnvelope, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	item, ok := l.data[ledgerKey(objectType, id)]
+	return item, ok
+}
 
 func (l *fileObjectLedger) Snapshot() ObjectLedgerSnapshot {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	records := make([]ObjectEnvelope, 0, len(l.data))
+	for _, item := range l.data {
+		records = append(records, item)
+	}
+	return ObjectLedgerSnapshot{Records: records}
+}
+func (l *memoryObjectLedger) Snapshot() ObjectLedgerSnapshot {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	records := make([]ObjectEnvelope, 0, len(l.data))
@@ -171,6 +241,42 @@ func (l *fileObjectLedger) upsert(objectType contract.ObjectType, id string, upd
 	}
 	return l.flushLocked()
 }
+func (l *memoryObjectLedger) upsert(objectType contract.ObjectType, id string, updatedAt string, value any) error {
+	if !objectType.IsValid() {
+		return fmt.Errorf("invalid object type %q", objectType)
+	}
+	if id == "" {
+		return fmt.Errorf("object id is required")
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	existing, ok := l.data[ledgerKey(objectType, id)]
+	if ok {
+		existing.Payload = payload
+		existing.UpdatedAt = updatedAt
+		if existing.Lifecycle == "" {
+			existing.Lifecycle = LedgerLifecycleActive
+		}
+		if existing.StorageTier == "" {
+			existing.StorageTier = LedgerStorageTierHot
+		}
+		l.data[ledgerKey(objectType, id)] = existing
+	} else {
+		l.data[ledgerKey(objectType, id)] = ObjectEnvelope{
+			ObjectType:  objectType,
+			ObjectID:    id,
+			StorageTier: LedgerStorageTierHot,
+			Lifecycle:   LedgerLifecycleActive,
+			UpdatedAt:   updatedAt,
+			Payload:     payload,
+		}
+	}
+	return nil
+}
 
 func (l *fileObjectLedger) markLifecycle(objectType contract.ObjectType, id string, tier LedgerStorageTier, lifecycle LedgerLifecycleState, at string) error {
 	l.mu.Lock()
@@ -195,6 +301,30 @@ func (l *fileObjectLedger) markLifecycle(objectType contract.ObjectType, id stri
 	}
 	l.data[key] = item
 	return l.flushLocked()
+}
+func (l *memoryObjectLedger) markLifecycle(objectType contract.ObjectType, id string, tier LedgerStorageTier, lifecycle LedgerLifecycleState, at string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := ledgerKey(objectType, id)
+	item, ok := l.data[key]
+	if !ok {
+		return fmt.Errorf("object %s/%s not found", objectType, id)
+	}
+	if tier != "" {
+		item.StorageTier = tier
+	}
+	item.Lifecycle = lifecycle
+	item.UpdatedAt = at
+	switch lifecycle {
+	case LedgerLifecycleArchived:
+		item.ArchivedAt = stringPtr(at)
+	case LedgerLifecycleInvalidated:
+		item.InvalidatedAt = stringPtr(at)
+	case LedgerLifecycleTerminated:
+		item.TerminatedAt = stringPtr(at)
+	}
+	l.data[key] = item
+	return nil
 }
 
 func (l *fileObjectLedger) load() error {
@@ -262,12 +392,7 @@ func (o *Orchestrator) ensureObjectLedgerLocked() {
 	if o.objectLedger != nil {
 		return
 	}
-	ledger, err := NewFileObjectLedger(objectLedgerPathForConfig(o.currentConfig()))
-	if err != nil {
-		o.logger.Warn("object ledger init failed", "error", err.Error())
-		return
-	}
-	o.objectLedger = ledger
+	o.objectLedger = NewMemoryObjectLedger(ObjectLedgerSnapshot{})
 	o.restoreObjectLedgerStateLocked()
 }
 
@@ -291,6 +416,13 @@ func (o *Orchestrator) restoreObjectLedgerStateLocked() {
 		}
 	}
 	o.objectLedgerRestored = true
+}
+
+func (o *Orchestrator) restoreObjectLedgerSnapshotLocked(snapshot ObjectLedgerSnapshot) {
+	o.objectLedger = NewMemoryObjectLedger(cloneObjectLedgerSnapshot(snapshot))
+	o.objectLedgerRestored = false
+	clear(o.sourceClosureActions)
+	o.restoreObjectLedgerStateLocked()
 }
 
 func (o *Orchestrator) GetObject(objectType contract.ObjectType, id string) (ObjectEnvelope, bool) {
@@ -445,7 +577,7 @@ func (o *Orchestrator) syncFormalObjectsLocked() {
 		return
 	}
 	o.upsertInstanceObjectLocked()
-	for _, record := range o.state.Records {
+	for _, record := range o.state.Jobs {
 		if record == nil {
 			continue
 		}
@@ -466,7 +598,7 @@ func (o *Orchestrator) syncFormalObjectsLocked() {
 	}
 }
 
-func (o *Orchestrator) syncRecordFormalObjectsLocked(record *model.IssueRecord) {
+func (o *Orchestrator) syncRecordFormalObjectsLocked(record *model.JobRuntime) {
 	if record == nil || o.objectLedger == nil {
 		return
 	}
@@ -570,32 +702,32 @@ func currentInstanceRole(cfg *model.ServiceConfig) contract.InstanceRole {
 	return contract.InstanceRoleLeader
 }
 
-func jobIDForRecord(record *model.IssueRecord) string {
-	return "job-" + strings.TrimSpace(string(record.Runtime.RecordID))
+func jobIDForRecord(record *model.JobRuntime) string {
+	return "job-" + strings.TrimSpace(string(record.RecordID))
 }
 
-func runIDForRecord(record *model.IssueRecord, attempt int) string {
-	return fmt.Sprintf("run-%s-%d", strings.TrimSpace(string(record.Runtime.RecordID)), attempt)
+func runIDForRecord(record *model.JobRuntime, attempt int) string {
+	return fmt.Sprintf("run-%s-%d", strings.TrimSpace(string(record.RecordID)), attempt)
 }
 
-func interventionIDForRecord(record *model.IssueRecord) string {
+func interventionIDForRecord(record *model.JobRuntime) string {
 	attempt := currentAttempt(record)
 	if record.Run != nil {
 		attempt = record.Run.Attempt
 	}
-	return fmt.Sprintf("intervention-%s-%d", strings.TrimSpace(string(record.Runtime.RecordID)), attempt)
+	return fmt.Sprintf("intervention-%s-%d", strings.TrimSpace(string(record.RecordID)), attempt)
 }
 
-func outcomeIDForRecord(record *model.IssueRecord) string {
-	return "outcome-" + strings.TrimSpace(string(record.Runtime.RecordID))
+func outcomeIDForRecord(record *model.JobRuntime) string {
+	return "outcome-" + strings.TrimSpace(string(record.RecordID))
 }
 
-func artifactIDForRecord(record *model.IssueRecord, suffix string) string {
-	return fmt.Sprintf("artifact-%s-%s", strings.TrimSpace(string(record.Runtime.RecordID)), suffix)
+func artifactIDForRecord(record *model.JobRuntime, suffix string) string {
+	return fmt.Sprintf("artifact-%s-%s", strings.TrimSpace(string(record.RecordID)), suffix)
 }
 
-func sourceClosureActionIDForRecord(record *model.IssueRecord) string {
-	return "action-" + strings.TrimSpace(string(record.Runtime.RecordID)) + "-source-closure"
+func sourceClosureActionIDForRecord(record *model.JobRuntime) string {
+	return "action-" + strings.TrimSpace(string(record.RecordID)) + "-source-closure"
 }
 
 func (o *Orchestrator) baseObjectLocked(objectType contract.ObjectType, id string, visibility contract.VisibilityLevel, updatedAt string) contract.BaseObject {
@@ -628,18 +760,15 @@ func (o *Orchestrator) baseObjectLocked(objectType contract.ObjectType, id strin
 	}
 }
 
-func jobStateFromRecord(record *model.IssueRecord) contract.JobStatus {
+func jobStateFromRecord(record *model.JobRuntime) contract.JobStatus {
 	if record == nil {
 		return contract.JobStatusQueued
 	}
-	switch record.Runtime.Status {
-	case contract.IssueStatusAwaitingIntervention:
+	switch {
+	case record.Result != nil:
+		return jobStateFromOutcome(record.Result.Outcome)
+	case record.Lifecycle == model.JobLifecycleAwaitingIntervention:
 		return contract.JobStatusInterventionRequired
-	case contract.IssueStatusCompleted:
-		if record.Runtime.Result != nil {
-			return jobStateFromOutcome(record.Runtime.Result.Outcome)
-		}
-		return contract.JobStatusCompleted
 	default:
 		return contract.JobStatusRunning
 	}
@@ -687,8 +816,8 @@ func (o *Orchestrator) actionSummaryForJobLocked(jobID string) contract.ActionSu
 	return summary
 }
 
-func (o *Orchestrator) jobObjectFromRecord(record *model.IssueRecord, state contract.JobStatus) contract.Job {
-	updatedAt := strings.TrimSpace(record.Runtime.UpdatedAt)
+func (o *Orchestrator) jobObjectFromRecord(record *model.JobRuntime, state contract.JobStatus) contract.Job {
+	updatedAt := strings.TrimSpace(record.UpdatedAt)
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
 	}
@@ -706,8 +835,8 @@ func (o *Orchestrator) jobObjectFromRecord(record *model.IssueRecord, state cont
 		Relations:  relations,
 		References: referencesFromRecord(o, record, updatedAt),
 	}
-	if record.Runtime.Reason != nil {
-		ctx.Reasons = []contract.Reason{*cloneReason(record.Runtime.Reason)}
+	if record.Reason != nil {
+		ctx.Reasons = []contract.Reason{*cloneReason(record.Reason)}
 	}
 	return contract.Job{
 		BaseObject:    o.baseObjectLocked(contract.ObjectTypeJob, jobIDForRecord(record), contract.VisibilityLevelRestricted, updatedAt),
@@ -718,9 +847,9 @@ func (o *Orchestrator) jobObjectFromRecord(record *model.IssueRecord, state cont
 	}
 }
 
-func (o *Orchestrator) runObjectFromRecord(record *model.IssueRecord, outcome *contract.Outcome) contract.Run {
+func (o *Orchestrator) runObjectFromRecord(record *model.JobRuntime, outcome *contract.Outcome) contract.Run {
 	runState := model.CloneRunState(record.Run)
-	updatedAt := strings.TrimSpace(record.Runtime.UpdatedAt)
+	updatedAt := strings.TrimSpace(record.UpdatedAt)
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
 	}
@@ -753,9 +882,9 @@ func (o *Orchestrator) runObjectFromRecord(record *model.IssueRecord, outcome *c
 	}
 }
 
-func (o *Orchestrator) interventionObjectFromRecord(record *model.IssueRecord) contract.Intervention {
+func (o *Orchestrator) interventionObjectFromRecord(record *model.JobRuntime) contract.Intervention {
 	intervention := model.CloneInterventionState(record.Intervention).Object
-	updatedAt := strings.TrimSpace(record.Runtime.UpdatedAt)
+	updatedAt := strings.TrimSpace(record.UpdatedAt)
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
 	}
@@ -806,7 +935,7 @@ func (o *Orchestrator) updateJobActionSummaryLocked(jobID string) {
 	}
 }
 
-func referencesFromRecord(o *Orchestrator, record *model.IssueRecord, updatedAt string) []contract.Reference {
+func referencesFromRecord(o *Orchestrator, record *model.JobRuntime, updatedAt string) []contract.Reference {
 	if record == nil {
 		return nil
 	}
@@ -814,11 +943,11 @@ func referencesFromRecord(o *Orchestrator, record *model.IssueRecord, updatedAt 
 	baseRef := func(id string) contract.BaseObject {
 		return o.baseObjectLocked(contract.ObjectTypeReference, id, contract.VisibilityLevelRestricted, updatedAt)
 	}
-	sourceRef := record.Runtime.SourceRef
+	sourceRef := record.SourceRef
 	switch sourceRef.SourceKind {
 	case contract.SourceKindLinear:
 		references = append(references, contract.Reference{
-			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.Runtime.RecordID)) + "-source"),
+			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.RecordID)) + "-source"),
 			State:       contract.ReferenceStatusActive,
 			Type:        contract.ReferenceTypeLinearIssue,
 			System:      string(sourceRef.SourceKind),
@@ -828,9 +957,9 @@ func referencesFromRecord(o *Orchestrator, record *model.IssueRecord, updatedAt 
 			DisplayName: sourceRef.SourceIdentifier,
 		})
 	}
-	if branch := record.Runtime.DurableRefs.Branch; branch != nil && strings.TrimSpace(branch.Name) != "" {
+	if branch := record.DurableRefs.Branch; branch != nil && strings.TrimSpace(branch.Name) != "" {
 		references = append(references, contract.Reference{
-			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.Runtime.RecordID)) + "-branch"),
+			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.RecordID)) + "-branch"),
 			State:       contract.ReferenceStatusActive,
 			Type:        contract.ReferenceTypeGitBranch,
 			System:      "git",
@@ -838,9 +967,9 @@ func referencesFromRecord(o *Orchestrator, record *model.IssueRecord, updatedAt 
 			DisplayName: branch.Name,
 		})
 	}
-	if pr := record.Runtime.DurableRefs.PullRequest; pr != nil && strings.TrimSpace(pr.URL) != "" {
+	if pr := record.DurableRefs.PullRequest; pr != nil && strings.TrimSpace(pr.URL) != "" {
 		references = append(references, contract.Reference{
-			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.Runtime.RecordID)) + "-pr"),
+			BaseObject:  baseRef("ref-" + strings.TrimSpace(string(record.RecordID)) + "-pr"),
 			State:       contract.ReferenceStatusActive,
 			Type:        contract.ReferenceTypeGitHubPullRequest,
 			System:      "github",
@@ -933,8 +1062,8 @@ func (o *Orchestrator) broadcastEventLocked(event contract.EventEnvelope) {
 	}
 }
 
-func (o *Orchestrator) persistCompletionObjectsLocked(record *model.IssueRecord) {
-	if record == nil || o.objectLedger == nil || record.Runtime.Result == nil {
+func (o *Orchestrator) persistCompletionObjectsLocked(record *model.JobRuntime) {
+	if record == nil || o.objectLedger == nil || record.Result == nil {
 		return
 	}
 	if record.Intervention != nil {
@@ -953,7 +1082,7 @@ func (o *Orchestrator) persistCompletionObjectsLocked(record *model.IssueRecord)
 	if o.requiresSourceClosureAction(record) {
 		o.ensureSourceClosureActionLocked(record)
 	}
-	job := o.jobObjectFromRecord(record, jobStateFromOutcome(record.Runtime.Result.Outcome))
+	job := o.jobObjectFromRecord(record, jobStateFromOutcome(record.Result.Outcome))
 	if err := o.objectLedger.UpsertJob(job); err != nil {
 		o.logger.Warn("upsert final job object failed", "job_id", job.ID, "error", err.Error())
 	}
@@ -969,7 +1098,7 @@ func (o *Orchestrator) persistCompletionObjectsLocked(record *model.IssueRecord)
 	o.updateJobActionSummaryLocked(job.ID)
 }
 
-func (o *Orchestrator) requiresSourceClosureAction(record *model.IssueRecord) bool {
+func (o *Orchestrator) requiresSourceClosureAction(record *model.JobRuntime) bool {
 	if record == nil {
 		return false
 	}
@@ -987,7 +1116,7 @@ func (o *Orchestrator) requiresSourceClosureAction(record *model.IssueRecord) bo
 	return !o.isTerminalState(sourceState, o.currentConfig())
 }
 
-func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.IssueRecord) {
+func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.JobRuntime) {
 	if record == nil {
 		return
 	}
@@ -995,9 +1124,9 @@ func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.IssueRecord
 	if _, ok := o.sourceClosureActions[actionID]; ok {
 		return
 	}
-	updatedAt := strings.TrimSpace(record.Runtime.Result.CompletedAt)
+	updatedAt := strings.TrimSpace(record.Result.CompletedAt)
 	if updatedAt == "" {
-		updatedAt = strings.TrimSpace(record.Runtime.UpdatedAt)
+		updatedAt = strings.TrimSpace(record.UpdatedAt)
 	}
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
@@ -1005,11 +1134,11 @@ func (o *Orchestrator) ensureSourceClosureActionLocked(record *model.IssueRecord
 	sourceIssue := model.CloneIssue(record.LastKnownIssue)
 	if sourceIssue == nil {
 		sourceIssue = &model.Issue{
-			ID:         record.Runtime.SourceRef.SourceID,
-			Identifier: record.Runtime.SourceRef.SourceIdentifier,
+			ID:         record.SourceRef.SourceID,
+			Identifier: record.SourceRef.SourceIdentifier,
 			State:      record.LastKnownIssueState,
 		}
-		if url := strings.TrimSpace(record.Runtime.SourceRef.URL); url != "" {
+		if url := strings.TrimSpace(record.SourceRef.URL); url != "" {
 			sourceIssue.URL = &url
 		}
 	}
@@ -1116,10 +1245,10 @@ func (o *Orchestrator) reconcileSourceClosureActions(ctx context.Context) {
 	}
 }
 
-func (o *Orchestrator) outcomeObjectFromRecord(record *model.IssueRecord, artifacts []contract.Artifact) contract.Outcome {
-	updatedAt := strings.TrimSpace(record.Runtime.Result.CompletedAt)
+func (o *Orchestrator) outcomeObjectFromRecord(record *model.JobRuntime, artifacts []contract.Artifact) contract.Outcome {
+	updatedAt := strings.TrimSpace(record.Result.CompletedAt)
 	if updatedAt == "" {
-		updatedAt = strings.TrimSpace(record.Runtime.UpdatedAt)
+		updatedAt = strings.TrimSpace(record.UpdatedAt)
 	}
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
@@ -1134,25 +1263,25 @@ func (o *Orchestrator) outcomeObjectFromRecord(record *model.IssueRecord, artifa
 			Relations:  relations,
 			References: referencesFromRecord(o, record, updatedAt),
 		},
-		State:       outcomeConclusionFromResult(record.Runtime.Result.Outcome),
-		Summary:     record.Runtime.Result.Summary,
-		CompletedAt: record.Runtime.Result.CompletedAt,
+		State:       outcomeConclusionFromResult(record.Result.Outcome),
+		Summary:     record.Result.Summary,
+		CompletedAt: record.Result.CompletedAt,
 	}
 }
 
-func (o *Orchestrator) artifactsForCompletedRecord(record *model.IssueRecord) []contract.Artifact {
+func (o *Orchestrator) artifactsForCompletedRecord(record *model.JobRuntime) []contract.Artifact {
 	if record == nil {
 		return nil
 	}
-	updatedAt := strings.TrimSpace(record.Runtime.Result.CompletedAt)
+	updatedAt := strings.TrimSpace(record.Result.CompletedAt)
 	if updatedAt == "" {
-		updatedAt = strings.TrimSpace(record.Runtime.UpdatedAt)
+		updatedAt = strings.TrimSpace(record.UpdatedAt)
 	}
 	if updatedAt == "" {
 		updatedAt = o.now().UTC().Format(time.RFC3339Nano)
 	}
 	references := referencesFromRecord(o, record, updatedAt)
-	pr := record.Runtime.DurableRefs.PullRequest
+	pr := record.DurableRefs.PullRequest
 	switch jobTypeForDispatch(record.Dispatch) {
 	case contract.JobTypeCodeChange:
 		if pr == nil || strings.TrimSpace(pr.URL) == "" {

@@ -2,10 +2,12 @@ package contract
 
 import (
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 )
 
-func TestServiceModeAndIssueStatusAreClosedSets(t *testing.T) {
+func TestServiceModeIsClosedSetAndLegacyIssueContractsDoNotReturn(t *testing.T) {
 	serviceModes := []ServiceMode{
 		ServiceModeServing,
 		ServiceModeDegraded,
@@ -19,21 +21,14 @@ func TestServiceModeAndIssueStatusAreClosedSets(t *testing.T) {
 	if ServiceMode("normal").IsValid() {
 		t.Fatal(`ServiceMode("normal").IsValid() = true, want false`)
 	}
-
-	statuses := []IssueStatus{
-		IssueStatusActive,
-		IssueStatusRetryScheduled,
-		IssueStatusAwaitingMerge,
-		IssueStatusAwaitingIntervention,
-		IssueStatusCompleted,
+	raw, err := os.ReadFile("types.go")
+	if err != nil {
+		t.Fatalf("ReadFile(types.go) error = %v", err)
 	}
-	for _, status := range statuses {
-		if !status.IsValid() {
-			t.Fatalf("IssueStatus(%q).IsValid() = false", status)
+	for _, legacy := range []string{"IssueStatus", "IssueRuntimeRecord", "IssueLedgerRecord"} {
+		if strings.Contains(string(raw), legacy) {
+			t.Fatalf("legacy issue-centric contract %q returned to types.go", legacy)
 		}
-	}
-	if IssueStatus("running").IsValid() {
-		t.Fatal(`IssueStatus("running").IsValid() = true, want false`)
 	}
 }
 
@@ -102,24 +97,7 @@ func TestDiscoveryStateAndControlContractsMarshalStableFields(t *testing.T) {
 	assertJSONHasKeys(t, control, []string{"action", "status", "reason", "recommended_next_step", "timestamp"})
 }
 
-func TestLedgerAndEventContractsMarshalStableFields(t *testing.T) {
-	retryDueAt := "2026-03-14T00:10:00Z"
-	ledger := IssueLedgerRecord{
-		RecordID: "rec_linear_linear-main_linear-123",
-		SourceRef: SourceRef{
-			SourceKind:       SourceKindLinear,
-			SourceName:       "linear-main",
-			SourceID:         "linear-123",
-			SourceIdentifier: "ENG-123",
-			URL:              "https://linear.app/example/issue/ENG-123",
-		},
-		Status:      IssueStatusRetryScheduled,
-		Reason:      ptrReason(MustReason(ReasonRecordBlockedRetryScheduled, map[string]any{"attempt": 2})),
-		RetryDueAt:  &retryDueAt,
-		DurableRefs: DurableRefs{LedgerPath: "automation/local/runtime-ledger.json"},
-		Result:      nil,
-		UpdatedAt:   "2026-03-14T00:00:00Z",
-	}
+func TestEventContractsMarshalStableFields(t *testing.T) {
 	event := EventEnvelope{
 		EventID:         "evt-1",
 		EventType:       EventTypeServiceStateChanged,
@@ -131,9 +109,7 @@ func TestLedgerAndEventContractsMarshalStableFields(t *testing.T) {
 		Reason:          ptrReason(MustReason(ReasonActionExternalPending, map[string]any{"action_type": string(ActionTypeSourceClosure)})),
 	}
 
-	assertJSONHasKeys(t, ledger, []string{"record_id", "source_ref", "status", "reason", "retry_due_at", "durable_refs", "result", "updated_at"})
 	assertJSONHasKeys(t, event, []string{"event_id", "event_type", "timestamp", "contract_version", "domain_id", "service_mode", "objects", "reason"})
-	assertJSONHasKeys(t, ledger.SourceRef, []string{"source_kind", "source_name", "source_id", "source_identifier", "url"})
 }
 
 func assertJSONHasKeys(t *testing.T, value any, keys []string) {

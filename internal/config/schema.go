@@ -254,7 +254,7 @@ func ParseWorkflowContract(def *model.WorkflowDefinition) (WorkflowContract, err
 		Persistence: PersistenceContract{
 			BackendKind:         PersistenceBackendKind(model.NormalizeState(getString(getMap(persistenceMap, "backend"), "kind", "file"))),
 			Usage:               PersistenceUsage(model.NormalizeState(getString(getMap(persistenceMap, "backend"), "usage", string(PersistenceUsageDevelopment)))),
-			FilePath:            expandHomePath(strings.TrimSpace(getString(getMap(persistenceMap, "file"), "path", "./local/runtime-ledger.json"))),
+			FilePath:            expandHomePath(strings.TrimSpace(getString(getMap(persistenceMap, "file"), "path", "./local/runtime-state.json"))),
 			FlushIntervalMS:     1000,
 			FsyncOnCritical:     true,
 			ArchiveEnabled:      false,

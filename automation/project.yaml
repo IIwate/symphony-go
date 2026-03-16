@@ -37,7 +37,7 @@ persistence:
     kind: file
     usage: development
   file:
-    path: ./local/runtime-ledger.json
+    path: ./local/runtime-state.json
     flush_interval_ms: 1000
     fsync_on_critical: true
   archive:
