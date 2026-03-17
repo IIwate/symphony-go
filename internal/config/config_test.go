@@ -8,10 +8,10 @@ import (
 	"testing"
 
 	"symphony-go/internal/model"
-	"symphony-go/internal/secret"
+	"symphony-go/internal/model/contract"
 )
 
-func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
+func TestParseWorkflowContractAndNewFromWorkflowApplyFormalSections(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "secret-key")
 	t.Setenv("LINEAR_PROJECT_SLUG", "demo-from-env")
 	t.Setenv("LINEAR_BRANCH_SCOPE", "Demo Scope")
@@ -21,68 +21,38 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	}
 
 	definition := &model.WorkflowDefinition{
-		Config: map[string]any{
-			"tracker": map[string]any{
-				"kind":            "linear",
-				"api_key":         "$LINEAR_API_KEY",
-				"project_slug":    "$LINEAR_PROJECT_SLUG",
-				"linear":          map[string]any{"children_block_parent": false},
-				"repo":            "ignored-repo",
-				"active_states":   "Todo, In Progress",
-				"terminal_states": []any{"Closed", "Done"},
-			},
-			"polling": map[string]any{"interval_ms": "45000"},
-			"workspace": map[string]any{
-				"root":                "~/symphony",
-				"linear_branch_scope": "$LINEAR_BRANCH_SCOPE",
-				"branch_namespace":    " Runner Alias ",
-				"git": map[string]any{
-					"author_name":  " runner-bot ",
-					"author_email": " runner-bot@symphony.invalid ",
-				},
-			},
-			"hooks": map[string]any{
-				"before_run": "echo hi",
-				"timeout_ms": "12000",
-			},
-			"agent": map[string]any{
-				"max_turns": "30",
-				"max_concurrent_agents_by_state": map[string]any{
-					" Todo ": 2,
-					"bad":    0,
-					"oops":   "x",
-				},
-			},
-			"codex": map[string]any{
-				"thread_sandbox":      "workspace-write",
-				"turn_sandbox_policy": map[string]any{"type": "workspaceWrite"},
-			},
-			"server": map[string]any{"host": "0.0.0.0", "port": "0"},
-		},
+		RootDir: "H:/code/temp/symphony-go/automation",
+		Config:  validWorkflowConfigMap(),
+	}
+	workflowContract, err := ParseWorkflowContract(definition)
+	if err != nil {
+		t.Fatalf("ParseWorkflowContract() error = %v", err)
+	}
+	if workflowContract.Source.APIKeyRef.Kind != "env" || workflowContract.Source.APIKeyRef.Name != "LINEAR_API_KEY" {
+		t.Fatalf("Source.APIKeyRef = %+v, want env LINEAR_API_KEY", workflowContract.Source.APIKeyRef)
+	}
+	if workflowContract.Capabilities.Static.Capabilities == nil || len(workflowContract.Capabilities.Static.Capabilities) == 0 {
+		t.Fatal("Capabilities.Static.Capabilities must not be empty")
 	}
 
 	cfg, err := NewFromWorkflow(definition)
 	if err != nil {
 		t.Fatalf("NewFromWorkflow() error = %v", err)
 	}
-
 	if cfg.TrackerAPIKey != "secret-key" {
 		t.Fatalf("TrackerAPIKey = %q, want secret-key", cfg.TrackerAPIKey)
 	}
 	if cfg.TrackerProjectSlug != "demo-from-env" {
 		t.Fatalf("TrackerProjectSlug = %q, want demo-from-env", cfg.TrackerProjectSlug)
 	}
-	if cfg.TrackerLinearChildrenBlockParent {
-		t.Fatal("TrackerLinearChildrenBlockParent = true, want false")
+	if cfg.WorkspaceLinearBranchScope != "demo-scope" {
+		t.Fatalf("WorkspaceLinearBranchScope = %q, want demo-scope", cfg.WorkspaceLinearBranchScope)
 	}
 	if cfg.PollIntervalMS != 45000 {
 		t.Fatalf("PollIntervalMS = %d, want 45000", cfg.PollIntervalMS)
 	}
 	if cfg.WorkspaceRoot != filepath.Join(homeDir, "symphony") {
 		t.Fatalf("WorkspaceRoot = %q, want %q", cfg.WorkspaceRoot, filepath.Join(homeDir, "symphony"))
-	}
-	if cfg.WorkspaceLinearBranchScope != "demo-scope" {
-		t.Fatalf("WorkspaceLinearBranchScope = %q, want demo-scope", cfg.WorkspaceLinearBranchScope)
 	}
 	if cfg.WorkspaceBranchNamespace != "Runner Alias" {
 		t.Fatalf("WorkspaceBranchNamespace = %q, want Runner Alias", cfg.WorkspaceBranchNamespace)
@@ -96,483 +66,341 @@ func TestNewFromWorkflowAppliesDefaultsAndCoercions(t *testing.T) {
 	if cfg.HookBeforeRun == nil || *cfg.HookBeforeRun != "echo hi" {
 		t.Fatalf("HookBeforeRun = %v, want echo hi", cfg.HookBeforeRun)
 	}
-	if cfg.HookTimeoutMS != 12000 {
-		t.Fatalf("HookTimeoutMS = %d, want 12000", cfg.HookTimeoutMS)
-	}
 	if cfg.MaxTurns != 30 {
 		t.Fatalf("MaxTurns = %d, want 30", cfg.MaxTurns)
-	}
-	if got := cfg.MaxConcurrentAgentsByState["todo"]; got != 2 {
-		t.Fatalf("MaxConcurrentAgentsByState[todo] = %d, want 2", got)
-	}
-	if len(cfg.MaxConcurrentAgentsByState) != 1 {
-		t.Fatalf("MaxConcurrentAgentsByState size = %d, want 1", len(cfg.MaxConcurrentAgentsByState))
-	}
-	if cfg.ServerPort == nil || *cfg.ServerPort != 0 {
-		t.Fatalf("ServerPort = %v, want 0", cfg.ServerPort)
-	}
-	if cfg.ServerHost != "0.0.0.0" {
-		t.Fatalf("ServerHost = %q, want 0.0.0.0", cfg.ServerHost)
-	}
-	if cfg.CodexCommand != "codex app-server" {
-		t.Fatalf("CodexCommand = %q, want default", cfg.CodexCommand)
-	}
-	if cfg.SessionPersistence.File.Path != filepath.Join(".", "local", "runtime-ledger.json") {
-		t.Fatalf("SessionPersistence.File.Path = %q, want %q", cfg.SessionPersistence.File.Path, filepath.Join(".", "local", "runtime-ledger.json"))
 	}
 	if cfg.CodexTurnSandboxPolicy != `{"type":"workspaceWrite"}` {
 		t.Fatalf("CodexTurnSandboxPolicy = %q", cfg.CodexTurnSandboxPolicy)
 	}
+	if cfg.SessionPersistence.File.Path != filepath.Join(homeDir, "session-state.json") {
+		t.Fatalf("SessionPersistence.File.Path = %q, want %q", cfg.SessionPersistence.File.Path, filepath.Join(homeDir, "session-state.json"))
+	}
 }
 
-func TestValidateForDispatch(t *testing.T) {
-	base := defaultServiceConfig()
-	base.TrackerKind = "linear"
-	base.TrackerAPIKey = "secret"
-	base.TrackerProjectSlug = "demo"
-	base.WorkspaceLinearBranchScope = "demo-scope"
+func TestNewFromWorkflowResolvesNotificationSecretRefs(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "secret-key")
+	t.Setenv("LINEAR_PROJECT_SLUG", "demo")
+	t.Setenv("LINEAR_BRANCH_SCOPE", "demo-scope")
+	t.Setenv("SLACK_WEBHOOK", "https://hooks.slack.example/services/test")
+	t.Setenv("WEBHOOK_URL", "https://hooks.example.com/runtime")
+	t.Setenv("WEBHOOK_TOKEN", "Bearer secret")
+
+	definition := &model.WorkflowDefinition{
+		Config: validWorkflowConfigMapWithNotifications(),
+	}
+
+	cfg, err := NewFromWorkflow(definition)
+	if err != nil {
+		t.Fatalf("NewFromWorkflow() error = %v", err)
+	}
+	if len(cfg.Notifications.Channels) != 2 {
+		t.Fatalf("len(Notifications.Channels) = %d, want 2", len(cfg.Notifications.Channels))
+	}
+	if cfg.Notifications.Channels[0].Slack == nil || cfg.Notifications.Channels[0].Slack.IncomingWebhookURL != "https://hooks.slack.example/services/test" {
+		t.Fatalf("Slack channel = %+v", cfg.Notifications.Channels[0].Slack)
+	}
+	if cfg.Notifications.Channels[1].Webhook == nil || cfg.Notifications.Channels[1].Webhook.URL != "https://hooks.example.com/runtime" {
+		t.Fatalf("Webhook channel = %+v", cfg.Notifications.Channels[1].Webhook)
+	}
+	if got := cfg.Notifications.Channels[1].Webhook.Headers["Authorization"]; got != "Bearer secret" {
+		t.Fatalf("Webhook.Headers[Authorization] = %q, want Bearer secret", got)
+	}
+}
+
+func TestParseWorkflowContractRejectsInvalidFormalPersistenceAndSecretConfig(t *testing.T) {
+	t.Setenv("LINEAR_PROJECT_SLUG", "demo")
+	t.Setenv("LINEAR_BRANCH_SCOPE", "demo-scope")
 
 	tests := []struct {
-		name   string
-		mutate func(*model.ServiceConfig)
-		target error
+		name    string
+		mutate  func(map[string]any)
+		wantErr string
 	}{
 		{
-			name: "missing tracker kind",
-			mutate: func(cfg *model.ServiceConfig) {
-				cfg.TrackerKind = ""
+			name: "file backend cannot claim production usage",
+			mutate: func(cfg map[string]any) {
+				getMap(cfg, "persistence")["backend"] = map[string]any{
+					"kind":  "file",
+					"usage": "production",
+				}
 			},
-			target: model.ErrUnsupportedTrackerKind,
+			wantErr: "file is limited to development/test/single_machine",
 		},
+		{
+			name: "missing api key ref",
+			mutate: func(cfg map[string]any) {
+				getMap(getMap(cfg, "source_adapter"), "credentials")["api_key_ref"] = map[string]any{}
+			},
+			wantErr: "source_adapter.credentials.api_key_ref",
+		},
+		{
+			name: "unknown job type",
+			mutate: func(cfg map[string]any) {
+				getMap(cfg, "job_policy")["supported_types"] = []any{"documentation"}
+			},
+			wantErr: "unsupported job type",
+		},
+		{
+			name: "invalid notification header ref",
+			mutate: func(cfg map[string]any) {
+				cfgWithNotifications := validWorkflowConfigMapWithNotifications()
+				cfg["service"] = cfgWithNotifications["service"]
+				channels := getMapSlice(getMap(getMap(cfg, "service"), "notifications"), "channels")
+				getMap(getMap(channels[1], "webhook"), "header_refs")["Authorization"] = map[string]any{"kind": "env"}
+			},
+			wantErr: "webhook.header_refs.Authorization",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			configMap := validWorkflowConfigMap()
+			tc.mutate(configMap)
+			_, err := ParseWorkflowContract(&model.WorkflowDefinition{Config: configMap})
+			if !errors.Is(err, model.ErrWorkflowParseError) && !errors.Is(err, model.ErrMissingTrackerProjectSlug) {
+				t.Fatalf("ParseWorkflowContract() error = %v, want workflow parse style error", err)
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ParseWorkflowContract() error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseWorkflowContractSupportsExternalSecretProviders(t *testing.T) {
+	configMap := validWorkflowConfigMap()
+	getMap(configMap, "secrets")["providers"] = map[string]any{
+		"env": map[string]any{"enabled": true},
+		"external": []any{
+			map[string]any{"name": "vault-main", "kind": "vault"},
+		},
+	}
+	getMap(getMap(configMap, "source_adapter"), "credentials")["api_key_ref"] = map[string]any{
+		"kind":      "provider",
+		"provider":  "vault-main",
+		"secret_id": "linear/api-key",
+	}
+	getMap(configMap, "source_adapter")["project_slug"] = "demo"
+	getMap(configMap, "source_adapter")["branch_scope"] = "demo-scope"
+
+	workflowContract, err := ParseWorkflowContract(&model.WorkflowDefinition{Config: configMap})
+	if err != nil {
+		t.Fatalf("ParseWorkflowContract() error = %v", err)
+	}
+	if len(workflowContract.Secrets.ExternalProviders) != 1 {
+		t.Fatalf("len(Secrets.ExternalProviders) = %d, want 1", len(workflowContract.Secrets.ExternalProviders))
+	}
+	if workflowContract.Source.APIKeyRef.Kind != "provider" {
+		t.Fatalf("Source.APIKeyRef.Kind = %q, want provider", workflowContract.Source.APIKeyRef.Kind)
+	}
+}
+
+func TestValidateForDispatchUsesNewFieldPaths(t *testing.T) {
+	cfg := defaultServiceConfig()
+	cfg.TrackerKind = "linear"
+	cfg.TrackerAPIKey = "secret"
+	cfg.TrackerProjectSlug = "demo"
+	cfg.WorkspaceLinearBranchScope = "demo-scope"
+
+	tests := []struct {
+		name    string
+		mutate  func(*model.ServiceConfig)
+		target  error
+		wantErr string
+	}{
 		{
 			name: "missing api key",
 			mutate: func(cfg *model.ServiceConfig) {
 				cfg.TrackerAPIKey = ""
 			},
-			target: model.ErrMissingTrackerAPIKey,
-		},
-		{
-			name: "missing project slug",
-			mutate: func(cfg *model.ServiceConfig) {
-				cfg.TrackerProjectSlug = ""
-			},
-			target: model.ErrMissingTrackerProjectSlug,
-		},
-		{
-			name: "missing branch scope",
-			mutate: func(cfg *model.ServiceConfig) {
-				cfg.WorkspaceLinearBranchScope = ""
-			},
-			target: model.ErrWorkflowParseError,
+			target:  model.ErrMissingTrackerAPIKey,
+			wantErr: "source_adapter.credentials.api_key_ref",
 		},
 		{
 			name: "missing codex command",
 			mutate: func(cfg *model.ServiceConfig) {
 				cfg.CodexCommand = ""
 			},
-			target: model.ErrInvalidCodexCommand,
+			target:  model.ErrInvalidCodexCommand,
+			wantErr: "execution.backend.codex.command",
+		},
+		{
+			name: "invalid persistence path",
+			mutate: func(cfg *model.ServiceConfig) {
+				cfg.SessionPersistence.Enabled = true
+				cfg.SessionPersistence.File.Path = ""
+			},
+			target:  model.ErrWorkflowParseError,
+			wantErr: "persistence.file.path",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := *base
-			cfg.MaxConcurrentAgentsByState = map[string]int{}
-			tc.mutate(&cfg)
-
-			err := ValidateForDispatch(&cfg)
+			current := *cfg
+			current.MaxConcurrentAgentsByState = map[string]int{}
+			tc.mutate(&current)
+			err := ValidateForDispatch(&current)
 			if !errors.Is(err, tc.target) {
 				t.Fatalf("ValidateForDispatch() error = %v, want %v", err, tc.target)
 			}
-		})
-	}
-}
-
-func TestValidateForDispatchFailsWhenHookRequiresMissingEnv(t *testing.T) {
-	t.Setenv("SYMPHONY_GIT_REPO_URL", "")
-
-	cfg := defaultServiceConfig()
-	cfg.TrackerKind = "linear"
-	cfg.TrackerAPIKey = "secret"
-	cfg.TrackerProjectSlug = "demo"
-	cfg.WorkspaceLinearBranchScope = "demo-scope"
-	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"`)
-
-	err := ValidateForDispatch(cfg)
-	if !errors.Is(err, model.ErrWorkflowParseError) {
-		t.Fatalf("ValidateForDispatch() error = %v, want ErrWorkflowParseError", err)
-	}
-	if err == nil || !strings.Contains(err.Error(), "SYMPHONY_GIT_REPO_URL") {
-		t.Fatalf("ValidateForDispatch() error = %v, want missing env detail", err)
-	}
-}
-
-func TestNewFromWorkflowFallsBackToDefaultHookTimeoutForNonPositiveValues(t *testing.T) {
-	tests := []struct {
-		name    string
-		rawTime any
-	}{
-		{name: "zero", rawTime: 0},
-		{name: "negative int", rawTime: -1},
-		{name: "negative string", rawTime: "-10"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := NewFromWorkflow(&model.WorkflowDefinition{
-				Config: map[string]any{
-					"hooks": map[string]any{
-						"timeout_ms": tc.rawTime,
-					},
-				},
-			})
-			if err != nil {
-				t.Fatalf("NewFromWorkflow() error = %v", err)
-			}
-			if cfg.HookTimeoutMS != 60000 {
-				t.Fatalf("HookTimeoutMS = %d, want default 60000", cfg.HookTimeoutMS)
-			}
-			if !cfg.TrackerLinearChildrenBlockParent {
-				t.Fatal("TrackerLinearChildrenBlockParent = false, want default true")
-			}
-		})
-	}
-}
-
-func TestNewFromWorkflowUsesDefaultResolver(t *testing.T) {
-	originalResolver := secret.DefaultResolver
-	secret.DefaultResolver = func(key string) (string, bool) {
-		if key == "LINEAR_API_KEY" {
-			return "resolver-secret", true
-		}
-		return "", false
-	}
-	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
-
-	cfg, err := NewFromWorkflow(&model.WorkflowDefinition{
-		Config: map[string]any{
-			"tracker": map[string]any{
-				"kind":     "linear",
-				"api_key":  "$LINEAR_API_KEY",
-				"endpoint": "https://api.linear.app/graphql",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewFromWorkflow() error = %v", err)
-	}
-	if cfg.TrackerAPIKey != "resolver-secret" {
-		t.Fatalf("TrackerAPIKey = %q, want resolver-secret", cfg.TrackerAPIKey)
-	}
-}
-
-func TestNewFromWorkflowParsesSessionPersistenceAndNotifications(t *testing.T) {
-	t.Setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.example/services/test")
-	t.Setenv("WEBHOOK_AUTH_HEADER", "Bearer secret")
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("UserHomeDir() error = %v", err)
-	}
-
-	cfg, err := NewFromWorkflow(&model.WorkflowDefinition{
-		Config: map[string]any{
-			"session_persistence": map[string]any{
-				"enabled": true,
-				"kind":    "file",
-				"file": map[string]any{
-					"path":              "~/session-state.json",
-					"flush_interval_ms": "2500",
-					"fsync_on_critical": "false",
-				},
-			},
-			"notifications": map[string]any{
-				"channels": []any{
-					map[string]any{
-						"id":           "slack-team",
-						"display_name": "Slack Team",
-						"kind":         "slack",
-						"slack": map[string]any{
-							"incoming_webhook_url": "$SLACK_WEBHOOK_URL",
-						},
-						"subscriptions": map[string]any{
-							"types": []any{"issue_completed", "issue_failed"},
-						},
-					},
-					map[string]any{
-						"id":           "ops-webhook",
-						"display_name": "Ops Webhook",
-						"kind":         "webhook",
-						"webhook": map[string]any{
-							"url": "https://hooks.example.com/symphony",
-							"headers": map[string]any{
-								"Authorization": "$WEBHOOK_AUTH_HEADER",
-							},
-						},
-						"subscriptions": map[string]any{
-							"types": []any{"system_alert"},
-						},
-					},
-				},
-				"defaults": map[string]any{
-					"timeout_ms":          "8000",
-					"retry_count":         "3",
-					"retry_delay_ms":      "1500",
-					"queue_size":          "64",
-					"critical_queue_size": "16",
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewFromWorkflow() error = %v", err)
-	}
-
-	if !cfg.SessionPersistence.Enabled {
-		t.Fatal("SessionPersistence.Enabled = false, want true")
-	}
-	if cfg.SessionPersistence.Kind != model.SessionPersistenceKindFile {
-		t.Fatalf("SessionPersistence.Kind = %q, want file", cfg.SessionPersistence.Kind)
-	}
-	if cfg.SessionPersistence.File.Path != filepath.Join(homeDir, "session-state.json") {
-		t.Fatalf("SessionPersistence.File.Path = %q, want %q", cfg.SessionPersistence.File.Path, filepath.Join(homeDir, "session-state.json"))
-	}
-	if cfg.SessionPersistence.File.FlushIntervalMS != 2500 {
-		t.Fatalf("SessionPersistence.File.FlushIntervalMS = %d, want 2500", cfg.SessionPersistence.File.FlushIntervalMS)
-	}
-	if cfg.SessionPersistence.File.FsyncOnCritical {
-		t.Fatal("SessionPersistence.File.FsyncOnCritical = true, want false")
-	}
-	if len(cfg.Notifications.Channels) != 2 {
-		t.Fatalf("Notifications.Channels size = %d, want 2", len(cfg.Notifications.Channels))
-	}
-	if cfg.Notifications.Channels[0].Slack == nil || cfg.Notifications.Channels[0].Slack.IncomingWebhookURL != "https://hooks.slack.example/services/test" {
-		t.Fatalf("Notifications.Channels[0].Slack = %+v", cfg.Notifications.Channels[0].Slack)
-	}
-	if got := cfg.Notifications.Channels[1].Webhook.Headers["Authorization"]; got != "Bearer secret" {
-		t.Fatalf("Notifications.Channels[1].Headers[Authorization] = %q, want Bearer secret", got)
-	}
-	if cfg.Notifications.Defaults.TimeoutMS != 8000 {
-		t.Fatalf("Notifications.Defaults.TimeoutMS = %d, want 8000", cfg.Notifications.Defaults.TimeoutMS)
-	}
-	if cfg.Notifications.Defaults.RetryCount != 3 {
-		t.Fatalf("Notifications.Defaults.RetryCount = %d, want 3", cfg.Notifications.Defaults.RetryCount)
-	}
-	if cfg.Notifications.Defaults.RetryDelayMS != 1500 {
-		t.Fatalf("Notifications.Defaults.RetryDelayMS = %d, want 1500", cfg.Notifications.Defaults.RetryDelayMS)
-	}
-	if cfg.Notifications.Defaults.QueueSize != 64 {
-		t.Fatalf("Notifications.Defaults.QueueSize = %d, want 64", cfg.Notifications.Defaults.QueueSize)
-	}
-	if cfg.Notifications.Defaults.CriticalQueueSize != 16 {
-		t.Fatalf("Notifications.Defaults.CriticalQueueSize = %d, want 16", cfg.Notifications.Defaults.CriticalQueueSize)
-	}
-}
-
-func TestNewFromWorkflowRejectsLegacyRuntimeExtensionKeys(t *testing.T) {
-	tests := []struct {
-		name    string
-		config  map[string]any
-		wantErr string
-	}{
-		{
-			name: "session persistence backend alias",
-			config: map[string]any{
-				"session_persistence": map[string]any{
-					"enabled": true,
-					"backend": "file",
-				},
-			},
-			wantErr: "runtime.session_persistence.backend",
-		},
-		{
-			name: "session persistence path alias",
-			config: map[string]any{
-				"session_persistence": map[string]any{
-					"path": "./state.json",
-				},
-			},
-			wantErr: "runtime.session_persistence.path",
-		},
-		{
-			name: "session persistence flush alias",
-			config: map[string]any{
-				"session_persistence": map[string]any{
-					"flush_interval_ms": 1000,
-				},
-			},
-			wantErr: "runtime.session_persistence.flush_interval_ms",
-		},
-		{
-			name: "session persistence fsync alias",
-			config: map[string]any{
-				"session_persistence": map[string]any{
-					"fsync_on_critical": true,
-				},
-			},
-			wantErr: "runtime.session_persistence.fsync_on_critical",
-		},
-		{
-			name: "notification legacy channel fields",
-			config: map[string]any{
-				"notifications": map[string]any{
-					"channels": []any{
-						map[string]any{
-							"id":   "ops",
-							"kind": "webhook",
-							"name": "Ops",
-						},
-					},
-				},
-			},
-			wantErr: "runtime.notifications.channels[0].name",
-		},
-		{
-			name: "notification events alias",
-			config: map[string]any{
-				"notifications": map[string]any{
-					"channels": []any{
-						map[string]any{
-							"id":     "ops",
-							"kind":   "webhook",
-							"events": []any{"system_alert"},
-						},
-					},
-				},
-			},
-			wantErr: "runtime.notifications.channels[0].events",
-		},
-		{
-			name: "notification url alias",
-			config: map[string]any{
-				"notifications": map[string]any{
-					"channels": []any{
-						map[string]any{
-							"id":   "ops",
-							"kind": "webhook",
-							"url":  "https://hooks.example.com/symphony",
-						},
-					},
-				},
-			},
-			wantErr: "runtime.notifications.channels[0].url",
-		},
-		{
-			name: "notification headers alias",
-			config: map[string]any{
-				"notifications": map[string]any{
-					"channels": []any{
-						map[string]any{
-							"id":      "ops",
-							"kind":    "webhook",
-							"headers": map[string]any{"Authorization": "Bearer test"},
-						},
-					},
-				},
-			},
-			wantErr: "runtime.notifications.channels[0].headers",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewFromWorkflow(&model.WorkflowDefinition{Config: tc.config})
-			if !errors.Is(err, model.ErrWorkflowParseError) {
-				t.Fatalf("NewFromWorkflow() error = %v, want ErrWorkflowParseError", err)
-			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("NewFromWorkflow() error = %v, want substring %q", err, tc.wantErr)
+				t.Fatalf("ValidateForDispatch() error = %v, want substring %q", err, tc.wantErr)
 			}
 		})
 	}
 }
 
-func TestValidateForDispatchRejectsInvalidRuntimeExtensions(t *testing.T) {
-	base := defaultServiceConfig()
-	base.TrackerKind = "linear"
-	base.TrackerAPIKey = "secret"
-	base.TrackerProjectSlug = "demo"
-	base.WorkspaceLinearBranchScope = "demo-scope"
-
-	tests := []struct {
-		name   string
-		mutate func(*model.ServiceConfig)
-	}{
-		{
-			name: "missing session persistence path",
-			mutate: func(cfg *model.ServiceConfig) {
-				cfg.SessionPersistence.Enabled = true
-				cfg.SessionPersistence.Kind = model.SessionPersistenceKindFile
-				cfg.SessionPersistence.File.Path = ""
+func validWorkflowConfigMap() map[string]any {
+	return map[string]any{
+		"service": map[string]any{
+			"contract_version": "v1",
+			"instance_name":    "symphony",
+			"server": map[string]any{
+				"host": "0.0.0.0",
+				"port": "0",
 			},
 		},
-		{
-			name: "missing notification url",
-			mutate: func(cfg *model.ServiceConfig) {
-				cfg.Notifications.Channels = []model.NotificationChannelConfig{
-					{
-						ID:   "ops",
-						Kind: model.NotificationChannelKindWebhook,
-						Subscriptions: model.NotificationSubscriptionConfig{
-							Types: []model.NotificationEventType{model.NotificationEventSystemAlert},
-						},
-						Delivery: cfg.Notifications.Defaults,
-					},
-				}
+		"domain": map[string]any{
+			"id": "domain-main",
+			"polling": map[string]any{
+				"interval_ms": "45000",
+			},
+			"workspace": map[string]any{
+				"root":             "~/symphony",
+				"branch_namespace": " Runner Alias ",
+				"git": map[string]any{
+					"author_name":  " runner-bot ",
+					"author_email": " runner-bot@symphony.invalid ",
+				},
 			},
 		},
-		{
-			name: "invalid notification event",
-			mutate: func(cfg *model.ServiceConfig) {
-				cfg.Notifications.Channels = []model.NotificationChannelConfig{
-					{
-						ID:   "ops",
-						Kind: model.NotificationChannelKindWebhook,
-						Subscriptions: model.NotificationSubscriptionConfig{
-							Types: []model.NotificationEventType{"bad_event"},
-						},
-						Delivery: cfg.Notifications.Defaults,
-						Webhook: &model.WebhookNotificationConfig{
-							URL: "https://hooks.example.com/symphony",
-						},
-					},
-				}
+		"source_adapter": map[string]any{
+			"name": "linear-main",
+			"kind": "linear",
+			"credentials": map[string]any{
+				"api_key_ref": map[string]any{
+					"kind": "env",
+					"name": "LINEAR_API_KEY",
+				},
+			},
+			"project_slug":  "$LINEAR_PROJECT_SLUG",
+			"branch_scope":  "$LINEAR_BRANCH_SCOPE",
+			"active_states": "Todo, In Progress",
+			"terminal_states": []any{
+				"Closed",
+				"Done",
+			},
+			"linear": map[string]any{
+				"children_block_parent": false,
 			},
 		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := *base
-			cfg.MaxConcurrentAgentsByState = map[string]int{}
-			cfg.Notifications = base.Notifications
-			tc.mutate(&cfg)
-
-			err := ValidateForDispatch(&cfg)
-			if !errors.Is(err, model.ErrWorkflowParseError) {
-				t.Fatalf("ValidateForDispatch() error = %v, want ErrWorkflowParseError", err)
-			}
-		})
+		"execution": map[string]any{
+			"backend": map[string]any{
+				"kind": "codex",
+				"codex": map[string]any{
+					"command":             "codex app-server",
+					"approval_policy":     "never",
+					"thread_sandbox":      "workspace-write",
+					"turn_sandbox_policy": map[string]any{"type": "workspaceWrite"},
+				},
+			},
+			"agent": map[string]any{
+				"max_turns": "30",
+				"max_concurrent_agents_by_state": map[string]any{
+					" Todo ": 2,
+				},
+			},
+			"hooks": map[string]any{
+				"before_run": "echo hi",
+				"timeout_ms": "12000",
+			},
+		},
+		"job_policy": map[string]any{
+			"dispatch_flow": "implement",
+			"supported_types": []any{
+				string(contract.JobTypeCodeChange),
+				string(contract.JobTypeLandChange),
+				string(contract.JobTypeAnalysis),
+				string(contract.JobTypeDiagnostic),
+			},
+		},
+		"auth": map[string]any{
+			"mode":                   "none",
+			"leader_required":        true,
+			"transparent_forwarding": false,
+		},
+		"persistence": map[string]any{
+			"backend": map[string]any{
+				"kind":  "file",
+				"usage": "development",
+			},
+			"file": map[string]any{
+				"path":              "~/session-state.json",
+				"flush_interval_ms": "2500",
+				"fsync_on_critical": false,
+			},
+			"archive": map[string]any{
+				"enabled": true,
+			},
+			"retention": map[string]any{
+				"allow_physical_delete": false,
+			},
+		},
+		"secrets": map[string]any{
+			"providers": map[string]any{
+				"env": map[string]any{
+					"enabled": true,
+				},
+			},
+		},
 	}
 }
 
-func TestValidateForDispatchUsesDefaultResolverForHookEnv(t *testing.T) {
-	originalResolver := secret.DefaultResolver
-	secret.DefaultResolver = func(key string) (string, bool) {
-		if key == "SYMPHONY_GIT_REPO_URL" {
-			return "https://example.com/repo.git", true
-		}
-		return "", false
+func validWorkflowConfigMapWithNotifications() map[string]any {
+	cfg := validWorkflowConfigMap()
+	getMap(cfg, "service")["notifications"] = map[string]any{
+		"defaults": map[string]any{
+			"timeout_ms":          8000,
+			"retry_count":         3,
+			"retry_delay_ms":      1500,
+			"queue_size":          64,
+			"critical_queue_size": 16,
+		},
+		"channels": []any{
+			map[string]any{
+				"id":   "ops-slack",
+				"kind": "slack",
+				"subscriptions": map[string]any{
+					"types": []any{string(model.NotificationEventSystemAlert)},
+				},
+				"slack": map[string]any{
+					"incoming_webhook_url_ref": map[string]any{
+						"kind": "env",
+						"name": "SLACK_WEBHOOK",
+					},
+				},
+			},
+			map[string]any{
+				"id":   "ops-webhook",
+				"kind": "webhook",
+				"subscriptions": map[string]any{
+					"types": []any{string(model.NotificationEventIssueFailed)},
+				},
+				"webhook": map[string]any{
+					"url_ref": map[string]any{
+						"kind": "env",
+						"name": "WEBHOOK_URL",
+					},
+					"header_refs": map[string]any{
+						"Authorization": map[string]any{
+							"kind": "env",
+							"name": "WEBHOOK_TOKEN",
+						},
+					},
+				},
+			},
+		},
 	}
-	t.Cleanup(func() { secret.DefaultResolver = originalResolver })
-
-	cfg := defaultServiceConfig()
-	cfg.TrackerKind = "linear"
-	cfg.TrackerAPIKey = "secret"
-	cfg.TrackerProjectSlug = "demo"
-	cfg.WorkspaceLinearBranchScope = "demo-scope"
-	cfg.HookBeforeRun = stringPointer(`repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"`)
-
-	if err := ValidateForDispatch(cfg); err != nil {
-		t.Fatalf("ValidateForDispatch() error = %v, want nil", err)
-	}
+	return cfg
 }

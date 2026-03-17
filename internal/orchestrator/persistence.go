@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	durableStateVersion             = 5
+	durableStateVersion             = 7
 	sessionPersistenceWriteFailCode = "session_persistence_write_failed"
 	stateStoreDrainTimeout          = 5 * time.Second
 	initialStateStoreRetryDelay     = time.Second
@@ -35,11 +36,12 @@ type LedgerStore interface {
 type stateStore = LedgerStore
 
 type durableRuntimeState struct {
-	Version  int                          `json:"version"`
-	Identity RuntimeIdentity              `json:"identity"`
-	SavedAt  time.Time                    `json:"saved_at"`
-	Service  durableServiceMetadata       `json:"service"`
-	Records  []contract.IssueLedgerRecord `json:"records"`
+	Version       int                    `json:"version"`
+	Identity      RuntimeIdentity        `json:"identity"`
+	SavedAt       time.Time              `json:"saved_at"`
+	Service       durableServiceMetadata `json:"service"`
+	Jobs          []durableJobState      `json:"jobs"`
+	FormalObjects ObjectLedgerSnapshot   `json:"formal_objects"`
 }
 
 type durablePRContext struct {
@@ -51,28 +53,54 @@ type durablePRContext struct {
 }
 
 type durableDispatchContext struct {
-	Kind               string            `json:"kind,omitempty"`
-	RetryAttempt       *int              `json:"retry_attempt,omitempty"`
-	ExpectedOutcome    string            `json:"expected_outcome,omitempty"`
-	OnMissingPR        string            `json:"on_missing_pr,omitempty"`
-	OnClosedPR         string            `json:"on_closed_pr,omitempty"`
-	Reason             *string           `json:"reason,omitempty"`
-	PreviousBranch     *string           `json:"previous_branch,omitempty"`
-	PreviousPR         *durablePRContext `json:"previous_pr,omitempty"`
-	PreviousIssueState *string           `json:"previous_issue_state,omitempty"`
+	JobType            string                       `json:"job_type,omitempty"`
+	Kind               string                       `json:"kind,omitempty"`
+	RetryAttempt       *int                         `json:"retry_attempt,omitempty"`
+	ExpectedOutcome    string                       `json:"expected_outcome,omitempty"`
+	OnMissingPR        string                       `json:"on_missing_pr,omitempty"`
+	OnClosedPR         string                       `json:"on_closed_pr,omitempty"`
+	Reason             *string                      `json:"reason,omitempty"`
+	PreviousBranch     *string                      `json:"previous_branch,omitempty"`
+	PreviousPR         *durablePRContext            `json:"previous_pr,omitempty"`
+	PreviousIssueState *string                      `json:"previous_issue_state,omitempty"`
+	RecoveryCheckpoint *model.RecoveryCheckpoint    `json:"recovery_checkpoint,omitempty"`
+	ReviewFeedback     *model.ReviewFeedbackContext `json:"review_feedback,omitempty"`
 }
 
 type durableServiceMetadata struct {
-	TokenTotal     model.TokenTotals                `json:"token_total"`
-	RecordMetadata map[string]durableRecordMetadata `json:"record_metadata,omitempty"`
+	TokenTotal               model.TokenTotals `json:"token_total"`
+	NotificationFingerprints []string          `json:"notification_fingerprints,omitempty"`
 }
 
-type durableRecordMetadata struct {
-	RetryAttempt        int                     `json:"retry_attempt,omitempty"`
-	StallCount          int                     `json:"stall_count,omitempty"`
-	LastKnownIssueState string                  `json:"last_known_issue_state,omitempty"`
-	NeedsRecovery       bool                    `json:"needs_recovery,omitempty"`
-	Dispatch            *durableDispatchContext `json:"dispatch,omitempty"`
+type durableRunRuntimeState struct {
+	RunID          string                    `json:"run_id,omitempty"`
+	ReviewSummary  string                    `json:"review_summary,omitempty"`
+	ReviewFindings []model.ReviewFinding     `json:"review_findings,omitempty"`
+	Budget         model.RunBudget           `json:"budget,omitempty"`
+	Usage          model.RunBudgetUsage      `json:"usage,omitempty"`
+	Recovery       *model.RecoveryCheckpoint `json:"recovery,omitempty"`
+}
+
+type durableInterventionRuntimeState struct {
+	InterventionID string                    `json:"intervention_id,omitempty"`
+	Handoff        model.InterventionHandoff `json:"handoff,omitempty"`
+}
+
+type durableJobState struct {
+	JobID            string                           `json:"job_id"`
+	Reason           *contract.Reason                 `json:"reason,omitempty"`
+	UpdatedAt        string                           `json:"updated_at,omitempty"`
+	WorkspacePath    string                           `json:"workspace_path,omitempty"`
+	PullRequestState string                           `json:"pull_request_state,omitempty"`
+	RetryDueAt       *string                          `json:"retry_due_at,omitempty"`
+	RetryAttempt     int                              `json:"retry_attempt,omitempty"`
+	StallCount       int                              `json:"stall_count,omitempty"`
+	NeedsRecovery    bool                             `json:"needs_recovery,omitempty"`
+	Dispatch         *durableDispatchContext          `json:"dispatch,omitempty"`
+	Run              *durableRunRuntimeState          `json:"run,omitempty"`
+	Intervention     *durableInterventionRuntimeState `json:"intervention,omitempty"`
+	OutcomeID        string                           `json:"outcome_id,omitempty"`
+	ArtifactIDs      []string                         `json:"artifact_ids,omitempty"`
 }
 
 type scheduledDurableState struct {
@@ -389,7 +417,7 @@ func writeDurableRuntimeState(path string, state durableRuntimeState, force bool
 	}
 	raw = append(raw, '\n')
 
-	tempFile, err := os.CreateTemp(dir, "runtime-ledger-*.tmp")
+	tempFile, err := os.CreateTemp(dir, "runtime-state-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -559,8 +587,10 @@ func (o *Orchestrator) scheduleStatePersistLocked(critical bool) uint64 {
 }
 
 func (o *Orchestrator) commitStateLocked(critical bool) uint64 {
+	o.syncFormalObjectsLocked()
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
+	o.publishFormalEventsLocked()
 	if o.isProtectedLocked() {
 		return 0
 	}
@@ -568,8 +598,10 @@ func (o *Orchestrator) commitStateLocked(critical bool) uint64 {
 }
 
 func (o *Orchestrator) publishViewLocked() {
+	o.syncFormalObjectsLocked()
 	o.refreshSnapshotLocked()
 	o.publishSnapshotLocked()
+	o.publishFormalEventsLocked()
 }
 
 func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
@@ -578,62 +610,278 @@ func (o *Orchestrator) buildPersistedStateLocked() durableRuntimeState {
 		Identity: o.currentRuntimeIdentity(),
 		SavedAt:  o.now().UTC(),
 		Service: durableServiceMetadata{
-			TokenTotal:     o.state.CodexTotals,
-			RecordMetadata: map[string]durableRecordMetadata{},
+			TokenTotal:               o.state.CodexTotals,
+			NotificationFingerprints: durableNotificationFingerprints(o.emittedNotificationKeys),
 		},
 	}
-	for _, record := range o.state.Records {
+	for _, record := range o.state.Jobs {
 		if record == nil {
 			continue
 		}
-		ledger := runtimeRecordToLedger(record.Runtime, record.RetryDueAt)
-		state.Records = append(state.Records, ledger)
-		state.Service.RecordMetadata[string(ledger.RecordID)] = durableRecordMetadata{
-			RetryAttempt:        record.RetryAttempt,
-			StallCount:          record.StallCount,
-			LastKnownIssueState: record.LastKnownIssueState,
-			NeedsRecovery:       record.NeedsRecovery || isRecordRunning(record),
-			Dispatch:            durableDispatchFromModel(record.Dispatch),
-		}
+		state.Jobs = append(state.Jobs, o.durableJobStateFromRuntime(record))
 	}
-	for _, record := range o.state.CompletedWindow {
-		state.Records = append(state.Records, runtimeRecordToLedger(record, nil))
+	for _, record := range o.state.ArchivedJobs {
+		state.Jobs = append(state.Jobs, o.durableJobStateFromArchived(record))
 	}
-	sort.SliceStable(state.Records, func(i int, j int) bool {
-		if state.Records[i].SourceRef.SourceIdentifier != state.Records[j].SourceRef.SourceIdentifier {
-			return state.Records[i].SourceRef.SourceIdentifier < state.Records[j].SourceRef.SourceIdentifier
+	o.ensureObjectLedgerLocked()
+	if o.objectLedger != nil {
+		state.FormalObjects = o.objectLedger.Snapshot()
+	}
+	sort.SliceStable(state.Jobs, func(i int, j int) bool {
+		left := strings.TrimSpace(state.Jobs[i].JobID)
+		right := strings.TrimSpace(state.Jobs[j].JobID)
+		if left != right {
+			return left < right
 		}
-		return state.Records[i].RecordID < state.Records[j].RecordID
+		return strings.TrimSpace(state.Jobs[i].UpdatedAt) < strings.TrimSpace(state.Jobs[j].UpdatedAt)
 	})
 	return state
 }
 
-func runtimeRecordToLedger(record contract.IssueRuntimeRecord, retryDueAt *time.Time) contract.IssueLedgerRecord {
-	ledger := contract.IssueLedgerRecord{
-		RecordID:    record.RecordID,
-		SourceRef:   record.SourceRef,
-		Status:      record.Status,
-		Reason:      cloneReason(record.Reason),
-		DurableRefs: cloneDurableRefs(record.DurableRefs),
-		Result:      cloneResult(record.Result),
-		UpdatedAt:   record.UpdatedAt,
+func (o *Orchestrator) durableJobStateFromRuntime(record *model.JobRuntime) durableJobState {
+	item := durableJobState{
+		JobID:         strings.TrimSpace(record.Object.ID),
+		Reason:        cloneReason(record.Reason),
+		UpdatedAt:     record.UpdatedAt,
+		WorkspacePath: recordWorkspacePath(record),
+		RetryAttempt:  record.RetryAttempt,
+		StallCount:    record.StallCount,
+		NeedsRecovery: record.NeedsRecovery || isRecordRunning(record),
+		Dispatch:      durableDispatchFromModel(record.Dispatch),
+		Run:           durableRunRuntimeFromModel(record.Run),
+		Intervention:  durableInterventionRuntimeFromModel(record.Intervention),
 	}
-	if retryDueAt != nil {
-		value := retryDueAt.UTC().Format(time.RFC3339Nano)
-		ledger.RetryDueAt = &value
+	if record.Outcome != nil {
+		item.OutcomeID = strings.TrimSpace(record.Outcome.ID)
 	}
-	return ledger
+	if pr := recordPullRequest(record); pr != nil {
+		item.PullRequestState = string(pr.State)
+	}
+	if len(record.Artifacts) > 0 {
+		item.ArtifactIDs = make([]string, 0, len(record.Artifacts))
+		for _, artifact := range record.Artifacts {
+			if id := strings.TrimSpace(artifact.ID); id != "" {
+				item.ArtifactIDs = append(item.ArtifactIDs, id)
+			}
+		}
+	}
+	if record.RetryDueAt != nil {
+		value := record.RetryDueAt.UTC().Format(time.RFC3339Nano)
+		item.RetryDueAt = &value
+	}
+	return item
 }
 
-func ledgerRecordToRuntime(record contract.IssueLedgerRecord) contract.IssueRuntimeRecord {
-	return contract.IssueRuntimeRecord{
-		RecordID:    record.RecordID,
-		SourceRef:   record.SourceRef,
-		Status:      record.Status,
-		UpdatedAt:   record.UpdatedAt,
-		Reason:      cloneReason(record.Reason),
-		DurableRefs: cloneDurableRefs(record.DurableRefs),
-		Result:      cloneResult(record.Result),
+func (o *Orchestrator) durableJobStateFromArchived(record model.ArchivedJob) durableJobState {
+	runtime := &model.JobRuntime{
+		Object:           record.Object,
+		Lifecycle:        model.JobLifecycleCompleted,
+		SourceState:      record.SourceState,
+		Reason:           cloneReason(record.Reason),
+		UpdatedAt:        record.UpdatedAt,
+		WorkspacePath:    record.WorkspacePath,
+		PullRequestState: record.PullRequestState,
+		Dispatch:         model.CloneDispatchContext(record.Dispatch),
+		Run:              model.CloneRunState(record.Run),
+		Intervention:     model.CloneInterventionState(record.Intervention),
+		Outcome:          cloneOutcome(record.Outcome),
+		Artifacts:        cloneArtifacts(record.Artifacts),
+	}
+	return o.durableJobStateFromRuntime(runtime)
+}
+
+func durableRunRuntimeFromModel(value *model.RunState) *durableRunRuntimeState {
+	if value == nil {
+		return nil
+	}
+	return &durableRunRuntimeState{
+		RunID:          strings.TrimSpace(value.Object.ID),
+		ReviewSummary:  value.ReviewSummary,
+		ReviewFindings: cloneRuntimeReviewFindings(value.ReviewFindings),
+		Budget:         value.Budget,
+		Usage:          value.Usage,
+		Recovery:       model.CloneRecoveryCheckpoint(value.Recovery),
+	}
+}
+
+func durableInterventionRuntimeFromModel(value *model.InterventionState) *durableInterventionRuntimeState {
+	if value == nil {
+		return nil
+	}
+	return &durableInterventionRuntimeState{
+		InterventionID: strings.TrimSpace(value.Object.ID),
+		Handoff:        cloneRuntimeInterventionHandoff(value.Handoff),
+	}
+}
+
+func sourceRefFromFormalObjects(job contract.Job) contract.SourceRef {
+	for _, reference := range job.References {
+		switch reference.Type {
+		case contract.ReferenceTypeLinearIssue:
+			return contract.SourceRef{
+				SourceKind:       contract.SourceKindLinear,
+				SourceName:       strings.TrimSpace(reference.DisplayName),
+				SourceID:         strings.TrimSpace(reference.ExternalID),
+				SourceIdentifier: strings.TrimSpace(reference.Locator),
+				URL:              strings.TrimSpace(reference.URL),
+			}
+		}
+	}
+	return contract.SourceRef{}
+}
+
+func issueFromSourceRef(ref contract.SourceRef) *model.Issue {
+	sourceID := strings.TrimSpace(ref.SourceID)
+	identifier := strings.TrimSpace(ref.SourceIdentifier)
+	if sourceID == "" && identifier == "" {
+		return nil
+	}
+	issue := &model.Issue{
+		ID:         sourceID,
+		Identifier: identifier,
+	}
+	if url := strings.TrimSpace(ref.URL); url != "" {
+		issue.URL = &url
+	}
+	return issue
+}
+
+func branchNameFromFormalObjects(record *model.JobRuntime) string {
+	for _, reference := range referencesFromFormalObjects(record) {
+		if reference.Type == contract.ReferenceTypeGitBranch {
+			return strings.TrimSpace(reference.Locator)
+		}
+	}
+	return ""
+}
+
+func pullRequestRefFromFormalObjects(record *model.JobRuntime) *contract.PullRequestRef {
+	for _, reference := range referencesFromFormalObjects(record) {
+		if reference.Type != contract.ReferenceTypeGitHubPullRequest {
+			continue
+		}
+		ref := &contract.PullRequestRef{
+			URL: strings.TrimSpace(reference.URL),
+		}
+		if number, err := strconv.Atoi(strings.TrimSpace(reference.ExternalID)); err == nil {
+			ref.Number = number
+		}
+		return ref
+	}
+	return nil
+}
+
+func referencesFromFormalObjects(record *model.JobRuntime) []contract.Reference {
+	if record == nil {
+		return nil
+	}
+	merged := make([]contract.Reference, 0, len(record.Object.References)+8)
+	seen := map[string]struct{}{}
+	appendReferences := func(items []contract.Reference) {
+		for _, reference := range items {
+			key := strings.TrimSpace(reference.ID)
+			if key == "" {
+				key = fmt.Sprintf("%s:%s:%s", reference.Type, reference.System, reference.Locator)
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			merged = append(merged, reference)
+		}
+	}
+	appendReferences(record.Object.References)
+	if record.Run != nil {
+		appendReferences(record.Run.Object.References)
+	}
+	if record.Intervention != nil {
+		appendReferences(record.Intervention.Object.References)
+	}
+	if record.Outcome != nil {
+		appendReferences(record.Outcome.References)
+	}
+	for _, artifact := range record.Artifacts {
+		appendReferences(artifact.References)
+	}
+	return merged
+}
+
+func (o *Orchestrator) runtimeFromDurableJob(item durableJobState) *model.JobRuntime {
+	record := &model.JobRuntime{
+		Reason:           cloneReason(item.Reason),
+		UpdatedAt:        item.UpdatedAt,
+		WorkspacePath:    strings.TrimSpace(item.WorkspacePath),
+		PullRequestState: strings.TrimSpace(item.PullRequestState),
+		RetryAttempt:     item.RetryAttempt,
+		StallCount:       item.StallCount,
+		NeedsRecovery:    item.NeedsRecovery,
+		Dispatch:         durableDispatchToModel(item.Dispatch),
+	}
+	if job, ok := o.jobObjectByIDLocked(item.JobID); ok {
+		record.Object = job
+	}
+	if item.Run != nil {
+		runState := &model.RunState{
+			ReviewSummary:  item.Run.ReviewSummary,
+			ReviewFindings: cloneRuntimeReviewFindings(item.Run.ReviewFindings),
+			Budget:         item.Run.Budget,
+			Usage:          item.Run.Usage,
+			Recovery:       model.CloneRecoveryCheckpoint(item.Run.Recovery),
+		}
+		if run, ok := o.runObjectByIDLocked(item.Run.RunID); ok {
+			runState.Object = run
+		}
+		syncRunStateMirrorsFromObject(runState)
+		record.Run = runState
+	}
+	if item.Intervention != nil {
+		interventionState := &model.InterventionState{
+			Handoff: cloneRuntimeInterventionHandoff(item.Intervention.Handoff),
+		}
+		if intervention, ok := o.interventionObjectByIDLocked(item.Intervention.InterventionID); ok {
+			interventionState.Object = intervention
+		}
+		record.Intervention = interventionState
+	}
+	if item.OutcomeID != "" {
+		if outcome, ok := o.outcomeObjectByIDLocked(item.OutcomeID); ok {
+			record.Outcome = &outcome
+		}
+	}
+	if len(item.ArtifactIDs) > 0 {
+		record.Artifacts = make([]contract.Artifact, 0, len(item.ArtifactIDs))
+		for _, artifactID := range item.ArtifactIDs {
+			if artifact, ok := o.artifactObjectByIDLocked(artifactID); ok {
+				record.Artifacts = append(record.Artifacts, artifact)
+			}
+		}
+	}
+	record.SourceState = ""
+	if item.RetryDueAt != nil {
+		if dueAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*item.RetryDueAt)); err == nil {
+			record.RetryDueAt = &dueAt
+		}
+	}
+	record.Lifecycle = deriveLifecycleFromRuntime(record)
+	return record
+}
+
+func deriveLifecycleFromRuntime(record *model.JobRuntime) model.JobLifecycleState {
+	switch {
+	case record == nil:
+		return model.JobLifecycleActive
+	case record.Outcome != nil || record.Object.State.IsTerminal():
+		return model.JobLifecycleCompleted
+	case record.Intervention != nil && record.Intervention.Object.State == contract.InterventionStatusOpen:
+		return model.JobLifecycleAwaitingIntervention
+	case record.Run != nil && record.Run.State == contract.RunStatusContinuationPending:
+		return model.JobLifecycleRetryScheduled
+	case record.Run != nil && record.Run.State == contract.RunStatusCompleted && recordPullRequest(record) != nil:
+		return model.JobLifecycleAwaitingMerge
+	case record.Reason != nil && (record.Reason.ReasonCode == contract.ReasonRecordBlockedAwaitingIntervention || record.Reason.ReasonCode == contract.ReasonRecordBlockedRecoveryUncertain):
+		return model.JobLifecycleAwaitingIntervention
+	default:
+		return model.JobLifecycleActive
 	}
 }
 
@@ -643,63 +891,51 @@ func (o *Orchestrator) restorePersistedStateLocked(state *durableRuntimeState) {
 	}
 
 	o.state.CodexTotals = state.Service.TokenTotal
-	o.state.Records = map[string]*model.IssueRecord{}
-	o.runningRecords = map[string]*model.IssueRecord{}
-	o.retryRecords = map[string]*model.IssueRecord{}
-	o.awaitingMergeRecords = map[string]*model.IssueRecord{}
-	o.awaitingInterventionRecords = map[string]*model.IssueRecord{}
-	o.state.CompletedWindow = nil
+	o.emittedNotificationKeys = notificationFingerprintSet(state.Service.NotificationFingerprints)
+	o.state.Jobs = map[string]*model.JobRuntime{}
+	o.activeRuns = map[string]*model.JobRuntime{}
+	o.continuationRuns = map[string]*model.JobRuntime{}
+	o.candidateDeliveryJobs = map[string]*model.JobRuntime{}
+	o.interventionJobs = map[string]*model.JobRuntime{}
+	o.state.ArchivedJobs = nil
+	o.restoreObjectLedgerSnapshotLocked(state.FormalObjects)
 
-	for _, item := range state.Records {
-		if item.Status == contract.IssueStatusCompleted {
-			o.rememberCompletedLocked(ledgerRecordToRuntime(item))
-			continue
-		}
-		issueID := strings.TrimSpace(item.SourceRef.SourceID)
+	for _, item := range state.Jobs {
+		record := o.runtimeFromDurableJob(item)
+		issueID := recordSourceID(record)
 		if issueID == "" {
 			continue
 		}
-		record := &model.IssueRecord{
-			Runtime: ledgerRecordToRuntime(item),
+		if record.Outcome != nil || record.Object.State.IsTerminal() {
+			o.rememberCompletedLocked(record)
+			continue
 		}
-		if meta, ok := state.Service.RecordMetadata[string(item.RecordID)]; ok {
-			record.RetryAttempt = meta.RetryAttempt
-			record.StallCount = meta.StallCount
-			record.LastKnownIssueState = meta.LastKnownIssueState
-			record.NeedsRecovery = meta.NeedsRecovery
-			record.Dispatch = durableDispatchToModel(meta.Dispatch)
-		}
-		if item.RetryDueAt != nil {
-			if dueAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*item.RetryDueAt)); err == nil {
-				record.RetryDueAt = &dueAt
-			}
-		}
-		if record.Runtime.Status == contract.IssueStatusActive {
-			record.Runtime.Observation = &contract.Observation{
+		if record.Run != nil && record.Run.State == contract.RunStatusRunning {
+			record.Observation = &contract.Observation{
 				Running: false,
 				Summary: "restored from ledger; awaiting recovery evaluation",
 			}
 		}
-		if record.Runtime.Status == contract.IssueStatusRetryScheduled && record.RetryDueAt != nil {
-			record.RetryTimer = o.newRetryTimer(issueID, *record.RetryDueAt)
+		if record.Run != nil && record.Run.State == contract.RunStatusContinuationPending && record.RetryDueAt != nil {
+			record.RetryTimer = o.newContinuationTimer(issueID, *record.RetryDueAt)
 		}
-		o.state.Records[issueID] = record
-		o.reindexRecordLocked(issueID, record)
+		o.state.Jobs[issueID] = record
 	}
+	o.rebuildRuntimeIndexesLocked()
 }
 
 func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 	o.mu.RLock()
 	protected := o.isProtectedLocked()
-	pending := make(map[string]*model.IssueRecord)
-	for issueID, record := range o.state.Records {
-		if record == nil || record.Runtime.Status != contract.IssueStatusActive || !record.NeedsRecovery {
+	pending := make(map[string]*model.JobRuntime)
+	for issueID, record := range o.state.Jobs {
+		if record == nil || jobStateFromRecord(record) != contract.JobStatusRunning || !record.NeedsRecovery {
 			continue
 		}
 		if _, waiting := o.pendingRecovery[issueID]; waiting {
 			continue
 		}
-		pending[issueID] = cloneIssueRecord(record)
+		pending[issueID] = cloneJobRuntime(record)
 	}
 	o.mu.RUnlock()
 	if protected || len(pending) == 0 {
@@ -746,7 +982,7 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 	for issueID, entry := range pending {
 		issue, ok := byID[issueID]
 		if !ok {
-			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, o.currentWorkflow().Completion.Mode, string(model.ContinuationReasonTrackerIssueMissing), entry.LastKnownIssueState, recordPullRequest(entry))
+			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, o.currentWorkflow().Completion.Mode, string(model.ContinuationReasonTrackerIssueMissing), entry.SourceState, recordPullRequest(entry))
 			continue
 		}
 		switch {
@@ -766,8 +1002,8 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 
 	o.mu.Lock()
 	remaining := false
-	for _, record := range o.state.Records {
-		if record != nil && record.Runtime.Status == contract.IssueStatusActive && record.NeedsRecovery {
+	for _, record := range o.state.Jobs {
+		if record != nil && jobStateFromRecord(record) == contract.JobStatusRunning && record.NeedsRecovery {
 			remaining = true
 			break
 		}
@@ -776,7 +1012,7 @@ func (o *Orchestrator) reconcileRecovering(ctx context.Context) {
 	o.mu.Unlock()
 }
 
-func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID string, entry *model.IssueRecord, issueState string) error {
+func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID string, entry *model.JobRuntime, issueState string) error {
 	if entry == nil {
 		return nil
 	}
@@ -785,6 +1021,64 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 		o.logger.Warn("ledger recovery classification failed", "issue_id", issueID, "issue_identifier", recordIdentifier(entry), "branch", recordBranch(entry), "error", err.Error())
 		o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, o.currentWorkflow().Completion.Mode, "recovery_uncertain", issueState, recordPullRequest(entry))
 		return err
+	}
+
+	if entry.Run != nil {
+		if decision.Disposition == DispositionAwaitingMerge {
+			o.markRunCandidateDelivery(entry, decision.PR)
+		} else if decision.Disposition == DispositionCompleted {
+			switch jobTypeForDispatch(entry.Dispatch) {
+			case contract.JobTypeCodeChange, contract.JobTypeLandChange:
+				o.markRunCandidateDelivery(entry, decision.PR)
+			case contract.JobTypeAnalysis, contract.JobTypeDiagnostic:
+				o.markRunCandidateDelivery(entry, nil)
+			}
+		}
+		if entry.Run.CandidateDelivery != nil && entry.Run.CandidateDelivery.Reached && entry.Run.ReviewGate != nil &&
+			entry.Run.ReviewGate.Status != contract.ReviewGateStatusPassed &&
+			entry.Run.ReviewGate.Status != contract.ReviewGateStatusInterventionRequired {
+			reviewIssue := recordSourceIssue(entry)
+			if reviewIssue == nil {
+				reviewIssue = &model.Issue{
+					ID:         issueID,
+					Identifier: recordIdentifier(entry),
+					Title:      recordIdentifier(entry),
+					State:      issueState,
+				}
+			}
+			workerCtx, cancel := context.WithCancel(o.runtimeContext())
+			o.mu.Lock()
+			current := o.state.Jobs[issueID]
+			if current == nil {
+				o.mu.Unlock()
+				cancel()
+				return nil
+			}
+			startedAt := o.now().UTC()
+			restoreRecoveredRuntimeState(current, entry, issueState)
+			current.StartedAt = &startedAt
+			current.WorkerCancel = cancel
+			current.NeedsRecovery = false
+			o.syncRecordFormalReferencesLocked(current, &model.Issue{ID: issueID, Identifier: recordIdentifier(entry), State: issueState}, recordBranch(current), recordPullRequest(current))
+			o.openRunReviewGate(current)
+			o.setRecordStatusLocked(current, model.JobLifecycleActive, nil, &contract.Observation{
+				Running: true,
+				Summary: "review in progress",
+			})
+			snapshot := cloneJobRuntime(current)
+			version := o.commitStateLocked(true)
+			action := func() {
+				o.launchReviewWorker(workerCtx, *reviewIssue, snapshot)
+			}
+			if version > 0 {
+				o.schedulePersistedActionLocked(version, action)
+			}
+			o.mu.Unlock()
+			if version == 0 {
+				action()
+			}
+			return nil
+		}
 	}
 
 	switch decision.Disposition {
@@ -807,16 +1101,29 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 		if baseDispatch == nil {
 			baseDispatch = freshDispatchContext(normalizeCompletionContract(o.currentWorkflow().Completion))
 		}
+		checkpointDetails := jobIdentityDetails(entry)
+		checkpointDetails["cause"] = reason
+		checkpointReason := contract.MustReason(contract.ReasonRunContinuationPending, checkpointDetails)
+		checkpoint, checkpointErr := o.captureCheckpointFn(ctx, entry, contract.RunPhaseSummaryPublishing, &checkpointReason)
+		if checkpointErr != nil {
+			o.moveToAwaitingIntervention(issueID, recordIdentifier(entry), recordWorkspacePath(entry), recordBranch(entry), entry.RetryAttempt, entry.StallCount, decision.ExpectedOutcome, "recovery_uncertain", issueState, decision.PR)
+			return checkpointErr
+		}
 		retryDispatch := continuationDispatchContext(baseDispatch, normalizeCompletionContract(model.CompletionContract{
 			Mode:        decision.ExpectedOutcome,
 			OnMissingPR: dispatchCompletionAction(baseDispatch, "missing"),
 			OnClosedPR:  dispatchCompletionAction(baseDispatch, "closed"),
 		}), reason, decision.FinalBranch, decision.PR, issueState)
+		retryDispatch.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(checkpoint)
 		o.mu.Lock()
-		current := o.state.Records[issueID]
+		current := o.state.Jobs[issueID]
 		if current != nil {
 			current.NeedsRecovery = false
-			o.scheduleRetryLocked(issueID, recordIdentifier(entry), maxInt(entry.RetryAttempt, 1), nil, true, entry.StallCount, retryDispatch)
+			nextAttempt := entry.RetryAttempt + 1
+			if nextAttempt <= 0 {
+				nextAttempt = 1
+			}
+			o.scheduleContinuationLocked(issueID, recordIdentifier(entry), nextAttempt, nil, entry.StallCount, retryDispatch)
 			o.commitStateLocked(true)
 		}
 		o.mu.Unlock()
@@ -827,14 +1134,14 @@ func (o *Orchestrator) resumeRecoveredSuccessPath(ctx context.Context, issueID s
 	return nil
 }
 
-func (o *Orchestrator) newRetryTimer(issueID string, dueAt time.Time) *time.Timer {
+func (o *Orchestrator) newContinuationTimer(issueID string, dueAt time.Time) *time.Timer {
 	delay := dueAt.Sub(o.now().UTC())
 	if delay < 0 {
 		delay = 0
 	}
 	return time.AfterFunc(delay, func() {
 		select {
-		case o.retryFireCh <- issueID:
+		case o.continuationCh <- issueID:
 		default:
 		}
 	})
@@ -900,10 +1207,8 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 	o.persistenceHealth.ConsecutiveFailures++
 	clear(o.pendingRecovery)
 	clear(o.pendingActions)
-	for issueID := range o.pendingLaunch {
-		delete(o.runningRecords, issueID)
-	}
 	clear(o.pendingLaunch)
+	o.rebuildRuntimeIndexesLocked()
 	if o.stateStore != nil {
 		o.stateStore.Disable()
 	}
@@ -913,27 +1218,159 @@ func (o *Orchestrator) handleSessionPersistenceWriteFailure(err error) {
 
 func cloneDurableRuntimeState(state durableRuntimeState) durableRuntimeState {
 	copyState := state
-	copyState.Service.RecordMetadata = map[string]durableRecordMetadata{}
-	for key, meta := range state.Service.RecordMetadata {
-		copyState.Service.RecordMetadata[key] = durableRecordMetadata{
-			RetryAttempt:        meta.RetryAttempt,
-			StallCount:          meta.StallCount,
-			LastKnownIssueState: meta.LastKnownIssueState,
-			NeedsRecovery:       meta.NeedsRecovery,
-			Dispatch:            cloneDurableDispatchContext(meta.Dispatch),
+	copyState.Service.NotificationFingerprints = append([]string(nil), state.Service.NotificationFingerprints...)
+	copyState.Jobs = make([]durableJobState, 0, len(state.Jobs))
+	for _, item := range state.Jobs {
+		cloned := item
+		cloned.Reason = cloneReason(item.Reason)
+		cloned.Dispatch = cloneDurableDispatchContext(item.Dispatch)
+		cloned.Run = cloneDurableRunRuntimeState(item.Run)
+		cloned.Intervention = cloneDurableInterventionRuntimeState(item.Intervention)
+		cloned.ArtifactIDs = append([]string(nil), item.ArtifactIDs...)
+		if item.RetryDueAt != nil {
+			value := strings.TrimSpace(*item.RetryDueAt)
+			cloned.RetryDueAt = &value
 		}
+		copyState.Jobs = append(copyState.Jobs, cloned)
 	}
-	copyState.Records = append([]contract.IssueLedgerRecord(nil), state.Records...)
-	for index := range copyState.Records {
-		copyState.Records[index].Reason = cloneReason(copyState.Records[index].Reason)
-		copyState.Records[index].DurableRefs = cloneDurableRefs(copyState.Records[index].DurableRefs)
-		copyState.Records[index].Result = cloneResult(copyState.Records[index].Result)
-		if copyState.Records[index].RetryDueAt != nil {
-			value := strings.TrimSpace(*copyState.Records[index].RetryDueAt)
-			copyState.Records[index].RetryDueAt = &value
-		}
-	}
+	copyState.FormalObjects = cloneObjectLedgerSnapshot(state.FormalObjects)
 	return copyState
+}
+
+func durableNotificationFingerprints(values map[string]struct{}) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func notificationFingerprintSet(values []string) map[string]struct{} {
+	result := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		result[value] = struct{}{}
+	}
+	return result
+}
+
+func cloneDurableRunRuntimeState(value *durableRunRuntimeState) *durableRunRuntimeState {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.ReviewFindings = cloneRuntimeReviewFindings(value.ReviewFindings)
+	copyValue.Recovery = model.CloneRecoveryCheckpoint(value.Recovery)
+	return &copyValue
+}
+
+func cloneDurableInterventionRuntimeState(value *durableInterventionRuntimeState) *durableInterventionRuntimeState {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Handoff = cloneRuntimeInterventionHandoff(value.Handoff)
+	return &copyValue
+}
+
+func cloneRuntimeReviewFindings(value []model.ReviewFinding) []model.ReviewFinding {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make([]model.ReviewFinding, len(value))
+	copy(result, value)
+	return result
+}
+
+func cloneRuntimeInterventionHandoff(value model.InterventionHandoff) model.InterventionHandoff {
+	copyValue := value
+	copyValue.Reason = cloneReason(value.Reason)
+	copyValue.Decision = cloneDecision(value.Decision)
+	if value.Checkpoint != nil {
+		checkpoint := *value.Checkpoint
+		checkpoint.ArtifactIDs = append([]string(nil), value.Checkpoint.ArtifactIDs...)
+		checkpoint.ReferenceIDs = append([]string(nil), value.Checkpoint.ReferenceIDs...)
+		checkpoint.Reason = cloneReason(value.Checkpoint.Reason)
+		copyValue.Checkpoint = &checkpoint
+	}
+	copyValue.ReviewFindings = cloneRuntimeReviewFindings(value.ReviewFindings)
+	copyValue.RecommendedActions = append([]contract.DecisionAction(nil), value.RecommendedActions...)
+	copyValue.RequiredInputs = cloneInterventionTemplateInputs(value.RequiredInputs)
+	return copyValue
+}
+
+func cloneOutcome(value *contract.Outcome) *contract.Outcome {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Relations = append([]contract.ObjectRelation(nil), value.Relations...)
+	copyValue.References = append([]contract.Reference(nil), value.References...)
+	if len(value.Reasons) > 0 {
+		copyValue.Reasons = make([]contract.Reason, 0, len(value.Reasons))
+		for _, reason := range value.Reasons {
+			cloned := reason
+			cloned.Details = cloneAnyMap(reason.Details)
+			copyValue.Reasons = append(copyValue.Reasons, cloned)
+		}
+	}
+	copyValue.Decision = cloneDecision(value.Decision)
+	return &copyValue
+}
+
+func cloneArtifacts(value []contract.Artifact) []contract.Artifact {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make([]contract.Artifact, 0, len(value))
+	for _, item := range value {
+		cloned := item
+		cloned.Relations = append([]contract.ObjectRelation(nil), item.Relations...)
+		cloned.References = append([]contract.Reference(nil), item.References...)
+		if len(item.Reasons) > 0 {
+			cloned.Reasons = make([]contract.Reason, 0, len(item.Reasons))
+			for _, reason := range item.Reasons {
+				copyReason := reason
+				copyReason.Details = cloneAnyMap(reason.Details)
+				cloned.Reasons = append(cloned.Reasons, copyReason)
+			}
+		}
+		cloned.Decision = cloneDecision(item.Decision)
+		result = append(result, cloned)
+	}
+	return result
+}
+
+func cloneDecision(value *contract.Decision) *contract.Decision {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Details = cloneAnyMap(value.Details)
+	copyValue.RecommendedActions = append([]contract.DecisionAction(nil), value.RecommendedActions...)
+	return &copyValue
+}
+
+func cloneAnyMap(value map[string]any) map[string]any {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make(map[string]any, len(value))
+	for key, item := range value {
+		result[key] = item
+	}
+	return result
 }
 
 func cloneDurableDispatchContext(dispatch *durableDispatchContext) *durableDispatchContext {
@@ -961,6 +1398,8 @@ func cloneDurableDispatchContext(dispatch *durableDispatchContext) *durableDispa
 		prCopy := *dispatch.PreviousPR
 		copyValue.PreviousPR = &prCopy
 	}
+	copyValue.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	copyValue.ReviewFeedback = cloneReviewFeedbackContext(dispatch.ReviewFeedback)
 	return &copyValue
 }
 
@@ -969,6 +1408,7 @@ func durableDispatchFromModel(dispatch *model.DispatchContext) *durableDispatchC
 		return nil
 	}
 	result := &durableDispatchContext{
+		JobType:         string(dispatch.JobType),
 		Kind:            string(dispatch.Kind),
 		ExpectedOutcome: string(dispatch.ExpectedOutcome),
 		OnMissingPR:     string(dispatch.OnMissingPR),
@@ -999,6 +1439,8 @@ func durableDispatchFromModel(dispatch *model.DispatchContext) *durableDispatchC
 			HeadBranch: dispatch.PreviousPR.HeadBranch,
 		}
 	}
+	result.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	result.ReviewFeedback = cloneReviewFeedbackContext(dispatch.ReviewFeedback)
 	return result
 }
 
@@ -1007,6 +1449,7 @@ func durableDispatchToModel(dispatch *durableDispatchContext) *model.DispatchCon
 		return nil
 	}
 	result := &model.DispatchContext{
+		JobType:         contract.JobType(strings.TrimSpace(dispatch.JobType)),
 		Kind:            model.DispatchKind(strings.TrimSpace(dispatch.Kind)),
 		ExpectedOutcome: model.CompletionMode(strings.TrimSpace(dispatch.ExpectedOutcome)),
 		OnMissingPR:     model.CompletionAction(strings.TrimSpace(dispatch.OnMissingPR)),
@@ -1037,7 +1480,18 @@ func durableDispatchToModel(dispatch *durableDispatchContext) *model.DispatchCon
 			HeadBranch: dispatch.PreviousPR.HeadBranch,
 		}
 	}
+	result.RecoveryCheckpoint = model.CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	result.ReviewFeedback = cloneReviewFeedbackContext(dispatch.ReviewFeedback)
 	return result
+}
+
+func cloneReviewFeedbackContext(value *model.ReviewFeedbackContext) *model.ReviewFeedbackContext {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Findings = append([]model.ReviewFinding(nil), value.Findings...)
+	return &copyValue
 }
 
 func cloneTimePtr(value *time.Time) *time.Time {

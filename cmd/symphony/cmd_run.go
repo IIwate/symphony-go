@@ -66,7 +66,7 @@ func runRunCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if err := config.ValidateForDispatch(cfg); err != nil {
-		diagnosis := config.DiagnoseConfig(cfg, repoDef)
+		diagnosis := config.DiagnoseConfig(cfg, definition, repoDef)
 		if !diagnosis.IsReady() {
 			return diagnosis
 		}

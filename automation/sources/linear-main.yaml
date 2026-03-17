@@ -1,5 +1,8 @@
 kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 endpoint: https://api.linear.app/graphql
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE

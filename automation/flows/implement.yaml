@@ -1,7 +1,7 @@
 prompt: prompts/implement.md.liquid
 hooks:
-  before_run: hooks/before_run.sh
-  before_run_continuation: hooks/before_run_continuation.sh
+  before_run: hooks/before_run.py
+  before_run_continuation: hooks/before_run_continuation.py
 completion:
   mode: pull_request
   on_missing_pr: intervention

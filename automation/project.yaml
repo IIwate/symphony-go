@@ -1,20 +1,54 @@
-runtime:
+service:
+  contract_version: v1
+  instance_name: symphony
+  server:
+    port: null
+
+domain:
+  id: default
   polling:
     interval_ms: 30000
   workspace:
     root: ~/symphony_workspaces
+
+sources:
+  enabled:
+    - linear-main
+
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
   agent:
     max_concurrent_agents: 10
     max_turns: 20
-  codex:
-    command: codex app-server
-  server:
-    port: null
 
-selection:
+job_policy:
   dispatch_flow: implement
-  enabled_sources:
-    - linear-main
+
+auth:
+  mode: none
+  leader_required: true
+  transparent_forwarding: false
+
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+  archive:
+    enabled: false
+  retention:
+    allow_physical_delete: false
+
+secrets:
+  providers:
+    env:
+      enabled: true
 
 defaults:
   profile: null

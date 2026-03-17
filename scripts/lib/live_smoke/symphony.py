@@ -24,7 +24,7 @@ class SmokeConfig:
     linear_project_slug: str
     linear_branch_scope: str
     codex_command: str = "codex app-server"
-    ledger_path: Path | None = None
+    session_state_path: Path | None = None
     notification_port: int | None = None
     broken_notification_port: int | None = None
     broken_notification_channels: tuple[str, ...] = ()
@@ -64,40 +64,16 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
 
     command = json.dumps(config.codex_command)
     workspace_root = str((temp_root() / f"workspaces-{config.namespace}").resolve()).replace("\\", "/")
+    session_state_path = "./local/runtime-state.json"
+    if config.session_state_path is not None:
+        session_state_path = str(config.session_state_path.resolve()).replace("\\", "/")
     project_lines = [
-        "runtime:",
-        "  polling:",
-        "    interval_ms: 3000",
-        "  workspace:",
-        f"    root: {workspace_root}",
-        f"    branch_namespace: {config.namespace}",
-        "  agent:",
-        "    max_turns: 1",
-        "  codex:",
-        f"    command: {command}",
-        "    approval_policy: never",
-        "    thread_sandbox: workspace-write",
-        "    turn_sandbox_policy:",
-        "      type: workspaceWrite",
-        "    turn_timeout_ms: 120000",
-        "    read_timeout_ms: 15000",
-        "    stall_timeout_ms: 120000",
+        "service:",
+        "  contract_version: v1",
+        "  instance_name: symphony",
         "  server:",
         f"    port: {config.port}",
     ]
-    if config.ledger_path is not None:
-        ledger_path = str(config.ledger_path.resolve()).replace("\\", "/")
-        project_lines.extend(
-            [
-                "  session_persistence:",
-                "    enabled: true",
-                "    kind: file",
-                "    file:",
-                f"      path: {ledger_path}",
-                "      flush_interval_ms: 200",
-                "      fsync_on_critical: true",
-            ]
-        )
     if config.notification_port is not None:
         broken_channels = set(config.broken_notification_channels)
         broken_port = config.broken_notification_port if config.broken_notification_port is not None else config.notification_port
@@ -113,14 +89,18 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
                 "        subscriptions:",
                 "          types: [issue_intervention_required, issue_completed]",
                 "        webhook:",
-                f"          url: http://127.0.0.1:{webhook_port}/webhook",
+                "          url_ref:",
+                "            kind: env",
+                "            name: SYMPHONY_TEST_WEBHOOK_URL",
                 "      - id: local-slack",
                 "        display_name: Local Slack",
                 "        kind: slack",
                 "        subscriptions:",
                 "          types: [issue_intervention_required, issue_completed]",
                 "        slack:",
-                f"          incoming_webhook_url: http://127.0.0.1:{slack_port}/slack",
+                "          incoming_webhook_url_ref:",
+                "            kind: env",
+                "            name: SYMPHONY_TEST_SLACK_WEBHOOK_URL",
                 "    defaults:",
                 "      timeout_ms: 3000",
                 "      retry_count: 0",
@@ -131,10 +111,48 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
         )
     project_lines.extend(
         [
-            "selection:",
-            "  dispatch_flow: implement",
-            "  enabled_sources:",
+            "domain:",
+            "  id: default",
+            "  polling:",
+            "    interval_ms: 3000",
+            "  workspace:",
+            f"    root: {workspace_root}",
+            f"    branch_namespace: {config.namespace}",
+            "sources:",
+            "  enabled:",
             "    - linear-main",
+            "execution:",
+            "  backend:",
+            "    kind: codex",
+            "    codex:",
+            f"      command: {command}",
+            "      approval_policy: never",
+            "      thread_sandbox: workspace-write",
+            "      turn_sandbox_policy:",
+            "        type: workspaceWrite",
+            "      turn_timeout_ms: 120000",
+            "      read_timeout_ms: 15000",
+            "      stall_timeout_ms: 120000",
+            "  agent:",
+            "    max_turns: 1",
+            "job_policy:",
+            "  dispatch_flow: implement",
+            "auth:",
+            "  mode: none",
+            "  leader_required: true",
+            "  transparent_forwarding: false",
+            "persistence:",
+            "  backend:",
+            "    kind: file",
+            "    usage: development",
+            "  file:",
+            f"    path: {session_state_path}",
+            "    flush_interval_ms: 200",
+            "    fsync_on_critical: true",
+            "secrets:",
+            "  providers:",
+            "    env:",
+            "      enabled: true",
             "defaults:",
             "  profile: null",
         ]
@@ -145,7 +163,10 @@ def write_smoke_config(config: SmokeConfig, *, prompt_text: str) -> None:
     )
     (config.base_dir / "sources" / "linear-main.yaml").write_text(
         """kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 endpoint: https://api.linear.app/graphql
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE
@@ -164,8 +185,8 @@ terminal_states:
     (config.base_dir / "flows" / "implement.yaml").write_text(
         """prompt: prompts/implement.md.liquid
 hooks:
-  before_run: hooks/before_run.sh
-  before_run_continuation: hooks/before_run_continuation.sh
+  before_run: hooks/before_run.py
+  before_run_continuation: hooks/before_run_continuation.py
 completion:
   mode: pull_request
   on_missing_pr: intervention
@@ -174,36 +195,92 @@ completion:
         encoding="utf-8",
     )
     (config.base_dir / "prompts" / "implement.md.liquid").write_text(prompt_text + "\n", encoding="utf-8")
-    (config.base_dir / "hooks" / "before_run.sh").write_text(
-        """set -euo pipefail
+    (config.base_dir / "hooks" / "before_run.py").write_text(
+        """from __future__ import annotations
 
-repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"
-find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-git clone --depth 1 "$repo_url" .
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def main() -> None:
+    repo_url = os.environ["SYMPHONY_GIT_REPO_URL"]
+    root = Path.cwd()
+    for child in root.iterdir():
+        remove_path(child)
+    subprocess.run(["git", "clone", "--depth", "1", repo_url, "."], check=True)
+
+
+if __name__ == "__main__":
+    main()
 """,
         encoding="utf-8",
     )
-    (config.base_dir / "hooks" / "before_run_continuation.sh").write_text(
-        """set -euo pipefail
+    (config.base_dir / "hooks" / "before_run_continuation.py").write_text(
+        """from __future__ import annotations
 
-if [[ ! -d .git ]]; then
-  repo_url="${SYMPHONY_GIT_REPO_URL:?SYMPHONY_GIT_REPO_URL is required}"
-  find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-  git clone --depth 1 "$repo_url" .
-  exit 0
-fi
+import os
+from pathlib import Path
+import shutil
+import subprocess
 
-git status --short
-git fetch --all --prune || true
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def clone_repo(root: Path) -> None:
+    repo_url = os.environ["SYMPHONY_GIT_REPO_URL"]
+    for child in root.iterdir():
+        remove_path(child)
+    subprocess.run(["git", "clone", "--depth", "1", repo_url, "."], check=True)
+
+
+def main() -> None:
+    root = Path.cwd()
+    if not (root / ".git").is_dir():
+        clone_repo(root)
+        return
+    subprocess.run(["git", "status", "--short"], check=True)
+    subprocess.run(["git", "fetch", "--all", "--prune"], check=False)
+
+
+if __name__ == "__main__":
+    main()
 """,
         encoding="utf-8",
     )
+    extra_env_lines: list[str] = []
+    if config.notification_port is not None:
+        broken_channels = set(config.broken_notification_channels)
+        broken_port = config.broken_notification_port if config.broken_notification_port is not None else config.notification_port
+        webhook_port = broken_port if "local-webhook" in broken_channels else config.notification_port
+        slack_port = broken_port if "local-slack" in broken_channels else config.notification_port
+        extra_env_lines.extend(
+            [
+                f"SYMPHONY_TEST_WEBHOOK_URL=http://127.0.0.1:{webhook_port}/webhook",
+                f"SYMPHONY_TEST_SLACK_WEBHOOK_URL=http://127.0.0.1:{slack_port}/slack",
+            ]
+        )
     (config.base_dir / "local" / "env.local").write_text(
         (
             f"LINEAR_API_KEY={config.linear_api_key}\n"
             f"LINEAR_PROJECT_SLUG={config.linear_project_slug}\n"
             f"LINEAR_BRANCH_SCOPE={config.linear_branch_scope}\n"
             f"SYMPHONY_GIT_REPO_URL={config.repo_url}\n"
+            + "\n".join(extra_env_lines)
+            + ("\n" if extra_env_lines else "")
         ),
         encoding="utf-8",
     )
@@ -212,22 +289,55 @@ git fetch --all --prune || true
 def write_doctor_config(base_dir: Path) -> None:
     for name in ["sources", "flows", "prompts", "local"]:
         (base_dir / name).mkdir(parents=True, exist_ok=True)
+    workspace_root = str((temp_root() / f"workspaces-{base_dir.name}").resolve()).replace("\\", "/")
     (base_dir / "project.yaml").write_text(
-        """runtime:
-  codex:
-    command: $CODEX_COMMAND
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+        """service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  id: default
+  polling:
+    interval_ms: 3000
+  workspace:
+    root: WORKSPACE_ROOT_PLACEHOLDER
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: $CODEX_COMMAND
+job_policy:
+  dispatch_flow: implement
+auth:
+  mode: none
+  leader_required: true
+  transparent_forwarding: false
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
-""",
+""".replace("WORKSPACE_ROOT_PLACEHOLDER", workspace_root),
         encoding="utf-8",
     )
     (base_dir / "sources" / "linear-main.yaml").write_text(
         """kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
+endpoint: https://api.linear.app/graphql
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE
 active_states: ["Todo", "In Progress"]
@@ -237,27 +347,65 @@ terminal_states: ["Closed", "Done"]
     )
     (base_dir / "flows" / "implement.yaml").write_text("prompt: prompts/implement.md.liquid\n", encoding="utf-8")
     (base_dir / "prompts" / "implement.md.liquid").write_text("doctor smoke\n", encoding="utf-8")
+    (base_dir / "local" / "env.local").write_text(
+        "LINEAR_API_KEY=dummy\n"
+        "LINEAR_PROJECT_SLUG=dummy-project\n"
+        "LINEAR_BRANCH_SCOPE=dummy-scope\n",
+        encoding="utf-8",
+    )
 
 
 def write_inline_hook_config(base_dir: Path, *, linear_api_key: str, linear_project_slug: str, linear_branch_scope: str) -> None:
     for name in ["sources", "flows", "prompts", "local"]:
         (base_dir / name).mkdir(parents=True, exist_ok=True)
+    workspace_root = str((temp_root() / f"workspaces-{base_dir.name}").resolve()).replace("\\", "/")
     (base_dir / "project.yaml").write_text(
-        """runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+        """service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  id: default
+  polling:
+    interval_ms: 3000
+  workspace:
+    root: WORKSPACE_ROOT_PLACEHOLDER
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
+auth:
+  mode: none
+  leader_required: true
+  transparent_forwarding: false
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
-""",
+""".replace("WORKSPACE_ROOT_PLACEHOLDER", workspace_root),
         encoding="utf-8",
     )
     (base_dir / "sources" / "linear-main.yaml").write_text(
         """kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 endpoint: https://api.linear.app/graphql
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE
@@ -267,7 +415,7 @@ terminal_states: ["Closed", "Done"]
         encoding="utf-8",
     )
     (base_dir / "flows" / "implement.yaml").write_text(
-        'prompt: prompts/implement.md.liquid\nhooks:\n  before_run: "git remote set-url origin https://example.test/repo.git"\n',
+        'prompt: prompts/implement.md.liquid\nhooks:\n  before_run: "print(\'https://example.test/repo.git\')"\n',
         encoding="utf-8",
     )
     (base_dir / "prompts" / "implement.md.liquid").write_text("inline hook smoke\n", encoding="utf-8")
@@ -280,22 +428,54 @@ terminal_states: ["Closed", "Done"]
 def write_symlink_escape_config(base_dir: Path, *, linear_api_key: str, linear_project_slug: str, linear_branch_scope: str) -> bool:
     for name in ["sources", "flows", "prompts", "hooks", "local"]:
         (base_dir / name).mkdir(parents=True, exist_ok=True)
+    workspace_root = str((temp_root() / f"workspaces-{base_dir.name}").resolve()).replace("\\", "/")
     (base_dir / "project.yaml").write_text(
-        """runtime:
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+        """service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  id: default
+  polling:
+    interval_ms: 3000
+  workspace:
+    root: WORKSPACE_ROOT_PLACEHOLDER
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
+auth:
+  mode: none
+  leader_required: true
+  transparent_forwarding: false
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
-""",
+""".replace("WORKSPACE_ROOT_PLACEHOLDER", workspace_root),
         encoding="utf-8",
     )
     (base_dir / "sources" / "linear-main.yaml").write_text(
         """kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE
 active_states: ["Todo", "In Progress"]
@@ -304,7 +484,7 @@ terminal_states: ["Closed", "Done"]
         encoding="utf-8",
     )
     (base_dir / "flows" / "implement.yaml").write_text(
-        "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: hooks/link.sh\n",
+        "prompt: prompts/implement.md.liquid\nhooks:\n  before_run: hooks/link.py\n",
         encoding="utf-8",
     )
     (base_dir / "prompts" / "implement.md.liquid").write_text("symlink smoke\n", encoding="utf-8")
@@ -312,10 +492,10 @@ terminal_states: ["Closed", "Done"]
         f"LINEAR_API_KEY={linear_api_key}\nLINEAR_PROJECT_SLUG={linear_project_slug}\nLINEAR_BRANCH_SCOPE={linear_branch_scope}\n",
         encoding="utf-8",
     )
-    outside = base_dir.parent / "outside.sh"
-    outside.write_text("echo outside\n", encoding="utf-8")
+    outside = base_dir.parent / "outside.py"
+    outside.write_text("print('outside')\n", encoding="utf-8")
     try:
-        (base_dir / "hooks" / "link.sh").symlink_to(outside)
+        (base_dir / "hooks" / "link.py").symlink_to(outside)
         return True
     except OSError:
         return False

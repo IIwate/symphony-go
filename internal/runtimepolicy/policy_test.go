@@ -32,7 +32,7 @@ func TestBuildRuntimeIdentityUsesStableCompatibilityFields(t *testing.T) {
 			SessionPersistence: model.SessionPersistenceConfig{
 				Kind: model.SessionPersistenceKindFile,
 				File: model.SessionPersistenceFileConfig{
-					Path: "automation/local/runtime-ledger.json",
+					Path: "automation/local/runtime-state.json",
 				},
 			},
 		},
@@ -60,8 +60,8 @@ func TestBuildRuntimeIdentityUsesStableCompatibilityFields(t *testing.T) {
 	if identity.Descriptor.SessionPersistenceKind != "file" {
 		t.Fatalf("identity.Descriptor.SessionPersistenceKind = %q, want file", identity.Descriptor.SessionPersistenceKind)
 	}
-	if identity.Descriptor.SessionStatePath != "automation/local/runtime-ledger.json" {
-		t.Fatalf("identity.Descriptor.SessionStatePath = %q, want automation/local/runtime-ledger.json", identity.Descriptor.SessionStatePath)
+	if identity.Descriptor.SessionStatePath != "automation/local/runtime-state.json" {
+		t.Fatalf("identity.Descriptor.SessionStatePath = %q, want automation/local/runtime-state.json", identity.Descriptor.SessionStatePath)
 	}
 }
 
@@ -185,7 +185,7 @@ func fixtureConfig() (*model.AutomationDefinition, *model.ServiceConfig) {
 			SessionPersistence: model.SessionPersistenceConfig{
 				Kind: model.SessionPersistenceKindFile,
 				File: model.SessionPersistenceFileConfig{
-					Path: "automation/local/runtime-ledger.json",
+					Path: "automation/local/runtime-state.json",
 				},
 			},
 			Notifications: model.NotificationsConfig{

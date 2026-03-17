@@ -73,16 +73,16 @@ func Load(dir string, profile string) (*model.AutomationDefinition, error) {
 
 	selection := model.AutomationSelection{
 		DispatchFlow:   defaultDispatchFlow,
-		EnabledSources: getStringSliceValue(getMapValue(merged, "selection"), "enabled_sources"),
+		EnabledSources: getStringSliceValue(getMapValue(merged, "sources"), "enabled"),
 	}
-	if dispatchFlow, ok := getOptionalStringValue(getMapValue(merged, "selection"), "dispatch_flow"); ok {
+	if dispatchFlow, ok := getOptionalStringValue(getMapValue(merged, "job_policy"), "dispatch_flow"); ok {
 		selection.DispatchFlow = dispatchFlow
 	}
 
 	return &model.AutomationDefinition{
 		RootDir:   rootDir,
 		Profile:   activeProfile,
-		Runtime:   cloneStringMap(getMapValue(merged, "runtime")),
+		Runtime:   cloneStringMap(merged),
 		Selection: selection,
 		Defaults:  defaults,
 		Sources:   sources,
@@ -98,7 +98,7 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 
 	enabledSources := normalizedNames(def.Selection.EnabledSources)
 	if len(enabledSources) != 1 {
-		return nil, model.NewWorkflowError(model.ErrWorkflowParseError, "selection.enabled_sources must contain exactly one source", nil)
+		return nil, model.NewWorkflowError(model.ErrWorkflowParseError, "sources.enabled must contain exactly one source", nil)
 	}
 	sourceName := enabledSources[0]
 	sourceDef, ok := def.Sources[sourceName]
@@ -121,34 +121,20 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 	}
 
 	configMap := map[string]any{}
-	copyMapField(configMap, "polling", def.Runtime)
-	copyMapField(configMap, "agent", def.Runtime)
-	copyMapField(configMap, "codex", def.Runtime)
-	copyMapField(configMap, "server", def.Runtime)
-	copyMapField(configMap, "orchestrator", def.Runtime)
-	copyMapField(configMap, "session_persistence", def.Runtime)
-	copyMapField(configMap, "notifications", def.Runtime)
+	copyMapField(configMap, "service", def.Runtime)
+	copyMapField(configMap, "domain", def.Runtime)
+	copyMapField(configMap, "execution", def.Runtime)
+	copyMapField(configMap, "job_policy", def.Runtime)
+	copyMapField(configMap, "auth", def.Runtime)
+	copyMapField(configMap, "persistence", def.Runtime)
+	copyMapField(configMap, "secrets", def.Runtime)
 
-	workspaceMap := cloneStringMap(getMapValue(def.Runtime, "workspace"))
-	if branchScope, ok := resolvedSource["branch_scope"]; ok {
-		workspaceMap["linear_branch_scope"] = cloneValue(branchScope)
-	}
-	if len(workspaceMap) > 0 {
-		configMap["workspace"] = workspaceMap
-	}
+	sourceAdapterMap := cloneStringMap(resolvedSource)
+	sourceAdapterMap["name"] = sourceName
+	configMap["source_adapter"] = sourceAdapterMap
 
-	trackerMap := map[string]any{}
-	for _, key := range []string{"kind", "api_key", "endpoint", "project_slug", "owner", "repo", "state_label_prefix", "active_states", "terminal_states"} {
-		if value, ok := resolvedSource[key]; ok {
-			trackerMap[key] = cloneValue(value)
-		}
-	}
-	if linearConfig, ok := resolvedSource["linear"]; ok {
-		trackerMap["linear"] = cloneValue(linearConfig)
-	}
-	configMap["tracker"] = trackerMap
-
-	hooksMap := cloneStringMap(getMapValue(def.Runtime, "hooks"))
+	executionMap := cloneStringMap(getMapValue(def.Runtime, "execution"))
+	hooksMap := cloneStringMap(getMapValue(executionMap, "hooks"))
 
 	if hooksValue, ok := flowDef.Raw["hooks"]; ok {
 		flowHooks, ok := asStringMap(hooksValue)
@@ -168,8 +154,17 @@ func ResolveActiveWorkflow(def *model.AutomationDefinition) (*model.WorkflowDefi
 		}
 	}
 	if len(hooksMap) > 0 {
-		configMap["hooks"] = hooksMap
+		executionMap["hooks"] = hooksMap
 	}
+	if len(executionMap) > 0 {
+		configMap["execution"] = executionMap
+	}
+
+	jobPolicyMap := cloneStringMap(getMapValue(def.Runtime, "job_policy"))
+	if strings.TrimSpace(getStringValue(jobPolicyMap, "dispatch_flow")) == "" {
+		jobPolicyMap["dispatch_flow"] = flowName
+	}
+	configMap["job_policy"] = jobPolicyMap
 
 	promptPath, ok := flowDef.Raw["prompt"].(string)
 	if !ok || strings.TrimSpace(promptPath) == "" {
@@ -394,7 +389,10 @@ func resolveHookValue(rootDir string, value any) (any, error) {
 		if err != nil {
 			return nil, model.NewWorkflowError(model.ErrMissingWorkflowFile, fmt.Sprintf("read hook file %q", resolvedPath), err)
 		}
-		return strings.TrimSpace(string(content)), nil
+		if strings.TrimSpace(string(content)) == "" {
+			return nil, model.NewWorkflowError(model.ErrWorkflowParseError, fmt.Sprintf("hook file %q is empty", resolvedPath), nil)
+		}
+		return resolvedPath, nil
 	}
 	return text, nil
 }
@@ -411,7 +409,12 @@ func isHookFileReference(value string) bool {
 	if !strings.Contains(normalized, "/") {
 		return false
 	}
-	return strings.EqualFold(path.Ext(normalized), ".sh")
+	switch strings.ToLower(path.Ext(normalized)) {
+	case ".py":
+		return true
+	default:
+		return false
+	}
 }
 
 func readPromptTemplate(rootDir string, reference string) (string, error) {

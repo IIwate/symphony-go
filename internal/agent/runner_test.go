@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"symphony-go/internal/model"
 )
@@ -108,14 +109,12 @@ func TestRunnerFailsOnUserInputRequest(t *testing.T) {
 	}
 }
 
-func TestRunnerAutoApprovesAndRejectsUnsupportedToolCalls(t *testing.T) {
+func TestRunnerRejectsApprovalEscalationAsHardViolation(t *testing.T) {
 	factory := &fakeProcessFactory{process: newFakeProcess([]string{
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
 		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
 		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
 		jsonLine(map[string]any{"id": "approval-1", "method": "approval/request", "params": map[string]any{"kind": "shell"}}),
-		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "foo"}}),
-		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
 	}, nil, false)}
 	runner := newTestRunner(factory, 200, 200)
 
@@ -124,16 +123,257 @@ func TestRunnerAutoApprovesAndRejectsUnsupportedToolCalls(t *testing.T) {
 		WorkspacePath:  `C:\\work\\ABC-1`,
 		PromptTemplate: "Issue {{ issue.identifier }}",
 	})
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
+	if !errors.Is(err, model.ErrHardViolation) {
+		t.Fatalf("Run() error = %v, want ErrHardViolation", err)
 	}
 
 	responses := factory.process.stdinRecorder.lines()
 	if !containsApprovalResult(responses, "approval-1") {
 		t.Fatalf("approval response missing: %v", responses)
 	}
+}
+
+func TestRunnerClassifiesParallelToolCallAsHardViolation(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "multi_tool_use.parallel"}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if !errors.Is(err, model.ErrHardViolation) {
+		t.Fatalf("Run() error = %v, want ErrHardViolation", err)
+	}
+	var violation *model.HardViolationError
+	if !errors.As(err, &violation) || violation == nil || violation.Code != model.HardViolationParallelWork {
+		t.Fatalf("Run() hard violation = %#v, want parallel_work", violation)
+	}
+}
+
+func TestRunnerStopsOnHardViolationToolCalls(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "spawn_agent"}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if !errors.Is(err, model.ErrHardViolation) {
+		t.Fatalf("Run() error = %v, want ErrHardViolation", err)
+	}
+
+	responses := factory.process.stdinRecorder.lines()
 	if !containsToolFailure(responses, "tool-1") {
 		t.Fatalf("tool failure response missing: %v", responses)
+	}
+}
+
+func TestRunnerReadOnlyModeRejectsToolCalls(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Issue($id: String!) { issue(id: $id) { id } }", "variables": map[string]any{"id": "1"}}}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Review candidate"},
+		WorkspacePath: `C:\\work\\ABC-1`,
+		RawPrompt:     "Review only",
+		ReadOnly:      true,
+	})
+	if !errors.Is(err, model.ErrHardViolation) {
+		t.Fatalf("Run() error = %v, want ErrHardViolation", err)
+	}
+}
+
+func TestRunnerCollectsAssistantTextFragments(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "item/completed", "params": map[string]any{"item": map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": `{"status":"passed","summary":"ok"}`},
+			},
+		}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	texts := make([]string, 0, 1)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Review candidate"},
+		WorkspacePath: `C:\\work\\ABC-1`,
+		RawPrompt:     "Review only",
+		OnAssistantText: func(text string) {
+			texts = append(texts, text)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], `"status":"passed"`) {
+		t.Fatalf("assistant texts = %#v, want reviewer JSON fragment", texts)
+	}
+}
+
+func TestRunnerIgnoresUserPromptWhenCollectingAssistantTextFragments(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "codex/event/user_message", "params": map[string]any{"message": map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Review only"},
+			},
+		}}}),
+		jsonLine(map[string]any{"method": "item/completed", "params": map[string]any{"item": map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": `{"status":"passed","summary":"ok"}`},
+			},
+		}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	texts := make([]string, 0, 1)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Review candidate"},
+		WorkspacePath: `C:\\work\\ABC-1`,
+		RawPrompt:     "Review only",
+		OnAssistantText: func(text string) {
+			texts = append(texts, text)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(texts) != 1 {
+		t.Fatalf("assistant texts count = %d, want 1: %#v", len(texts), texts)
+	}
+	if strings.Contains(texts[0], "Review only") || !strings.Contains(texts[0], `"status":"passed"`) {
+		t.Fatalf("assistant texts = %#v, want only assistant reviewer JSON", texts)
+	}
+}
+
+func TestRunnerCollectsAssistantTextFromAgentMessage(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "codex/event/agent_message", "params": map[string]any{"msg": map[string]any{
+			"type":    "agent_message",
+			"phase":   "final_answer",
+			"message": `{"status":"passed","summary":"ok","findings":[]}`,
+		}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200)
+
+	texts := make([]string, 0, 1)
+	err := runner.Run(context.Background(), RunParams{
+		Issue:         &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Review candidate"},
+		WorkspacePath: `C:\\work\\ABC-1`,
+		RawPrompt:     "Review only",
+		OnAssistantText: func(text string) {
+			texts = append(texts, text)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], `"status":"passed"`) {
+		t.Fatalf("assistant texts = %#v, want assistant agent_message JSON", texts)
+	}
+}
+
+func TestRunnerRejectsOutOfScopeLinearGraphQLAsHardViolation(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+	}, nil, false)}
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerAPIKey:          "secret",
+		TrackerEndpoint:        "https://linear.example/graphql",
+		TrackerProjectSlug:     "demo",
+		CodexCommand:           "codex app-server",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+		RunExecutionBudgetMS:   200,
+	})
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if !errors.Is(err, model.ErrHardViolation) {
+		t.Fatalf("Run() error = %v, want ErrHardViolation", err)
+	}
+	var violation *model.HardViolationError
+	if !errors.As(err, &violation) || violation == nil || violation.Code != model.HardViolationOutOfScopeAccess {
+		t.Fatalf("Run() hard violation = %#v, want out_of_scope_access", violation)
+	}
+}
+
+func TestRunnerRejectsCommentPrefixedLinearGraphQLMutation(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "# comment\nmutation UpdateIssue($id: String!) { issueUpdate(id: $id) { success } }", "variables": map[string]any{"id": "1"}}}}),
+	}, nil, false)}
+	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
+		TrackerKind:            "linear",
+		TrackerAPIKey:          "secret",
+		TrackerEndpoint:        "https://linear.example/graphql",
+		TrackerProjectSlug:     "demo",
+		CodexCommand:           "codex app-server",
+		CodexThreadSandbox:     "workspace-write",
+		CodexTurnSandboxPolicy: `{"type":"workspaceWrite"}`,
+		CodexReadTimeoutMS:     200,
+		CodexTurnTimeoutMS:     200,
+		MaxTurns:               1,
+		RunExecutionBudgetMS:   200,
+	})
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:          &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug"},
+		WorkspacePath:  `C:\\work\\ABC-1`,
+		PromptTemplate: "Issue {{ issue.identifier }}",
+	})
+	if !errors.Is(err, model.ErrHardViolation) {
+		t.Fatalf("Run() error = %v, want ErrHardViolation", err)
+	}
+	var violation *model.HardViolationError
+	if !errors.As(err, &violation) || violation == nil || violation.Code != model.HardViolationBypassResultPath {
+		t.Fatalf("Run() hard violation = %#v, want bypass_result_path", violation)
 	}
 }
 
@@ -166,6 +406,52 @@ func TestRunnerTurnTimeout(t *testing.T) {
 	})
 	if !errors.Is(err, model.ErrTurnTimeout) {
 		t.Fatalf("Run() error = %v, want ErrTurnTimeout", err)
+	}
+}
+
+func TestRunnerExecutionBudgetAppliesAcrossMultipleTurns(t *testing.T) {
+	factory := &fakeProcessFactory{process: newFakeProcess([]string{
+		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
+		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
+		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
+		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
+	}, nil, false)}
+	runner := newTestRunner(factory, 200, 200).(*AppServerRunner)
+	timestamps := []time.Time{
+		time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC),
+		time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC),
+		time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC),
+		time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC),
+		time.Date(2026, 3, 15, 10, 0, 0, 300*int(time.Millisecond), time.UTC),
+	}
+	index := 0
+	runner.now = func() time.Time {
+		if index >= len(timestamps) {
+			return timestamps[len(timestamps)-1]
+		}
+		current := timestamps[index]
+		index++
+		return current
+	}
+
+	err := runner.Run(context.Background(), RunParams{
+		Issue:             &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug", State: "Todo"},
+		WorkspacePath:     `C:\\work\\ABC-1`,
+		PromptTemplate:    "Issue {{ issue.identifier }}",
+		MaxTurns:          2,
+		ExecutionBudgetMS: 200,
+		RefetchIssue: func(_ context.Context, _ string) (*model.Issue, error) {
+			return &model.Issue{ID: "1", Identifier: "ABC-1", Title: "Fix bug", State: "In Progress"}, nil
+		},
+		IsActive: func(state string) bool { return state == "Todo" || state == "In Progress" },
+	})
+	if !errors.Is(err, model.ErrTurnTimeout) {
+		t.Fatalf("Run() error = %v, want ErrTurnTimeout after cross-turn execution budget exhaustion", err)
+	}
+
+	requests := factory.process.stdinRecorder.lines()
+	if len(requests) != 4 {
+		t.Fatalf("request count = %d, want 4 without second turn/start", len(requests))
 	}
 }
 
@@ -263,11 +549,11 @@ func TestHandleStreamMessageLogsWriteFailures(t *testing.T) {
 	runner.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	writer := &failingWriteCloser{writeErr: errors.New("broken pipe")}
 
-	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "approval-1", "method": "approval/request"}, RunParams{}, nil, "", "", ""); err != nil || done {
-		t.Fatalf("approval handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
+	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "approval-1", "method": "approval/request"}, RunParams{}, nil, "", "", ""); !errors.Is(err, model.ErrHardViolation) || done {
+		t.Fatalf("approval handleStreamMessage() = (%v, %v), want (ErrHardViolation, false)", err, done)
 	}
-	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "unknown_tool"}}, RunParams{}, nil, "", "", ""); err != nil || done {
-		t.Fatalf("tool handleStreamMessage() = (%v, %v), want (nil, false)", err, done)
+	if err, done := runner.handleStreamMessage(context.Background(), writer, map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "spawn_agent"}}, RunParams{}, nil, "", "", ""); !errors.Is(err, model.ErrHardViolation) || done {
+		t.Fatalf("tool handleStreamMessage() = (%v, %v), want (ErrHardViolation, false)", err, done)
 	}
 
 	output := logs.String()
@@ -292,7 +578,7 @@ func TestRunnerLinearGraphQLToolSuccess(t *testing.T) {
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
 		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
 		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
-		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Issue($id: String!) { issue(id: $id) { id } }", "variables": map[string]any{"id": "1"}}}}),
 		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
 	}, nil, false)}
 
@@ -332,7 +618,7 @@ func TestRunnerLinearGraphQLToolSuccessWithStringToolField(t *testing.T) {
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
 		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
 		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
-		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"tool": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"tool": "linear_graphql", "arguments": map[string]any{"query": "query Issue($id: String!) { issue(id: $id) { id } }", "variables": map[string]any{"id": "1"}}}}),
 		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
 	}, nil, false)}
 
@@ -372,7 +658,7 @@ func TestRunnerLinearGraphQLToolSuccessWithNestedMsgPayload(t *testing.T) {
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
 		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
 		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
-		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"msg": map[string]any{"tool": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"msg": map[string]any{"tool": "linear_graphql", "arguments": map[string]any{"query": "query Issue($id: String!) { issue(id: $id) { id } }", "variables": map[string]any{"id": "1"}}}}}),
 		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
 	}, nil, false)}
 
@@ -412,7 +698,7 @@ func TestRunnerLinearGraphQLToolGraphQLErrors(t *testing.T) {
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
 		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
 		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
-		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Issue($id: String!) { issue(id: $id) { id } }", "variables": map[string]any{"id": "1"}}}}),
 		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
 	}, nil, false)}
 
@@ -752,7 +1038,7 @@ func TestRunnerLinearGraphQLToolMissingAuth(t *testing.T) {
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
 		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
 		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
-		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Issue($id: String!) { issue(id: $id) { id } }", "variables": map[string]any{"id": "1"}}}}),
 		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
 	}, nil, false)}
 	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
@@ -785,7 +1071,7 @@ func TestRunnerLinearGraphQLToolTransportFailure(t *testing.T) {
 		jsonLine(map[string]any{"id": 1, "result": map[string]any{"ok": true}}),
 		jsonLine(map[string]any{"id": 2, "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}),
 		jsonLine(map[string]any{"id": 3, "result": map[string]any{"turn": map[string]any{"id": "turn-1"}}}),
-		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Viewer { viewer { id } }"}}}),
+		jsonLine(map[string]any{"id": "tool-1", "method": "item/tool/call", "params": map[string]any{"name": "linear_graphql", "arguments": map[string]any{"query": "query Issue($id: String!) { issue(id: $id) { id } }", "variables": map[string]any{"id": "1"}}}}),
 		jsonLine(map[string]any{"method": "turn/completed", "params": map[string]any{}}),
 	}, nil, false)}
 	runner := newTestRunnerWithConfig(factory, &model.ServiceConfig{
@@ -846,7 +1132,7 @@ func TestExecuteLinearGraphQLUsesRequestContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result := runner.executeLinearGraphQL(ctx, map[string]any{"query": "query Viewer { viewer { id } }"})
+	result := runner.executeLinearGraphQL(ctx, "query Issue($id: String!) { issue(id: $id) { id } }", map[string]any{"id": "1"})
 	if !transportCalled {
 		t.Fatal("transport was not called")
 	}
@@ -1054,7 +1340,7 @@ func containsApprovalResult(lines []string, id string) bool {
 		if !ok {
 			continue
 		}
-		if result["approved"] == true {
+		if _, ok := result["approved"].(bool); ok {
 			return true
 		}
 	}

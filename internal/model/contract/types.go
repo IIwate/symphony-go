@@ -1,5 +1,7 @@
 package contract
 
+import "encoding/json"
+
 type APIVersion string
 
 const (
@@ -10,7 +12,9 @@ type CodeCategory string
 
 const (
 	CategoryAPI          CodeCategory = "api"
+	CategoryAction       CodeCategory = "action"
 	CategoryCapability   CodeCategory = "capability"
+	CategoryCheckpoint   CodeCategory = "checkpoint"
 	CategoryConfig       CodeCategory = "config"
 	CategoryControl      CodeCategory = "control"
 	CategoryIntervention CodeCategory = "intervention"
@@ -40,27 +44,6 @@ func (m ServiceMode) IsValid() bool {
 		return false
 	}
 }
-
-type IssueStatus string
-
-const (
-	IssueStatusActive               IssueStatus = "active"
-	IssueStatusRetryScheduled       IssueStatus = "retry_scheduled"
-	IssueStatusAwaitingMerge        IssueStatus = "awaiting_merge"
-	IssueStatusAwaitingIntervention IssueStatus = "awaiting_intervention"
-	IssueStatusCompleted            IssueStatus = "completed"
-)
-
-func (s IssueStatus) IsValid() bool {
-	switch s {
-	case IssueStatusActive, IssueStatusRetryScheduled, IssueStatusAwaitingMerge, IssueStatusAwaitingIntervention, IssueStatusCompleted:
-		return true
-	default:
-		return false
-	}
-}
-
-type RecordID string
 
 type SourceKind string
 
@@ -181,32 +164,23 @@ type DurableRefs struct {
 	LedgerPath  string          `json:"ledger_path"`
 }
 
-type IssueRuntimeRecord struct {
-	RecordID    RecordID     `json:"record_id"`
-	SourceRef   SourceRef    `json:"source_ref"`
-	Status      IssueStatus  `json:"status"`
-	UpdatedAt   string       `json:"updated_at"`
-	Reason      *Reason      `json:"reason"`
-	Observation *Observation `json:"observation"`
-	DurableRefs DurableRefs  `json:"durable_refs"`
-	Result      *Result      `json:"result"`
-}
-
-type IssueLedgerRecord struct {
-	RecordID    RecordID    `json:"record_id"`
-	SourceRef   SourceRef   `json:"source_ref"`
-	Status      IssueStatus `json:"status"`
-	Reason      *Reason     `json:"reason"`
-	RetryDueAt  *string     `json:"retry_due_at"`
-	DurableRefs DurableRefs `json:"durable_refs"`
-	Result      *Result     `json:"result"`
-	UpdatedAt   string      `json:"updated_at"`
-}
-
 type InstanceDocument struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
 	Version string `json:"version"`
+}
+
+type LeaderHint struct {
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+	URL  string `json:"url,omitempty"`
+}
+
+type InstanceStateSummary struct {
+	ID      string       `json:"id"`
+	Name    string       `json:"name"`
+	Version string       `json:"version"`
+	Role    InstanceRole `json:"role"`
 }
 
 type SourceDocument struct {
@@ -214,64 +188,56 @@ type SourceDocument struct {
 	Name string     `json:"name"`
 }
 
-type CapabilityDocument struct {
-	EventProtocol  string          `json:"event_protocol"`
-	ControlActions []ControlAction `json:"control_actions"`
-	Notifications  []string        `json:"notifications"`
-	Sources        []SourceKind    `json:"sources"`
-}
-
-type LimitDocument struct {
-	CompletedWindowSize int `json:"completed_window_size"`
-}
-
 type DiscoveryDocument struct {
-	APIVersion         APIVersion         `json:"api_version"`
-	Instance           InstanceDocument   `json:"instance"`
-	Source             SourceDocument     `json:"source"`
-	ServiceMode        ServiceMode        `json:"service_mode"`
-	RecoveryInProgress bool               `json:"recovery_in_progress"`
-	Capabilities       CapabilityDocument `json:"capabilities"`
-	Reasons            []Reason           `json:"reasons"`
-	Limits             LimitDocument      `json:"limits"`
-}
-
-type StateCounts struct {
-	Total                int `json:"total"`
-	Active               int `json:"active"`
-	RetryScheduled       int `json:"retry_scheduled"`
-	AwaitingMerge        int `json:"awaiting_merge"`
-	AwaitingIntervention int `json:"awaiting_intervention"`
-	Completed            int `json:"completed"`
-}
-
-type CompletedWindow struct {
-	Limit   int                  `json:"limit"`
-	Records []IssueRuntimeRecord `json:"records"`
+	APIVersion   APIVersion          `json:"api_version"`
+	Instance     InstanceDocument    `json:"instance"`
+	DomainID     string              `json:"domain_id"`
+	Source       SourceDocument      `json:"source"`
+	Capabilities StaticCapabilitySet `json:"capabilities"`
 }
 
 type ServiceStateSnapshot struct {
-	GeneratedAt        string               `json:"generated_at"`
-	ServiceMode        ServiceMode          `json:"service_mode"`
-	RecoveryInProgress bool                 `json:"recovery_in_progress"`
-	Reasons            []Reason             `json:"reasons"`
-	Counts             StateCounts          `json:"counts"`
-	Records            []IssueRuntimeRecord `json:"records"`
-	CompletedWindow    CompletedWindow      `json:"completed_window"`
+	GeneratedAt        string                 `json:"generated_at"`
+	ServiceMode        ServiceMode            `json:"service_mode"`
+	RecoveryInProgress bool                   `json:"recovery_in_progress"`
+	Reasons            []Reason               `json:"reasons"`
+	Instance           InstanceStateSummary   `json:"instance"`
+	Leader             *LeaderHint            `json:"leader,omitempty"`
+	Capabilities       AvailableCapabilitySet `json:"capabilities"`
 }
 
 type EventType string
 
 const (
-	EventTypeSnapshot     EventType = "snapshot"
-	EventTypeStateChanged EventType = "state_changed"
+	EventTypeSnapshot            EventType = "snapshot"
+	EventTypeServiceStateChanged EventType = "service_state_changed"
+	EventTypeObjectChanged       EventType = "object_changed"
 )
 
+type EventObject struct {
+	ObjectType ObjectType      `json:"object_type"`
+	ObjectID   string          `json:"object_id"`
+	State      string          `json:"state,omitempty"`
+	Visibility VisibilityLevel `json:"visibility,omitempty"`
+}
+
 type EventEnvelope struct {
-	EventID     string      `json:"event_id"`
-	EventType   EventType   `json:"event_type"`
-	Timestamp   string      `json:"timestamp"`
-	ServiceMode ServiceMode `json:"service_mode"`
-	RecordIDs   []RecordID  `json:"record_ids"`
-	Reason      *Reason     `json:"reason"`
+	EventID         string        `json:"event_id"`
+	EventType       EventType     `json:"event_type"`
+	Timestamp       string        `json:"timestamp"`
+	ContractVersion APIVersion    `json:"contract_version"`
+	DomainID        string        `json:"domain_id"`
+	ServiceMode     ServiceMode   `json:"service_mode"`
+	Objects         []EventObject `json:"objects,omitempty"`
+	Reason          *Reason       `json:"reason"`
+}
+
+type ObjectQueryResponse struct {
+	ObjectType ObjectType      `json:"object_type"`
+	Item       json.RawMessage `json:"item"`
+}
+
+type ObjectListResponse struct {
+	ObjectType ObjectType        `json:"object_type"`
+	Items      []json.RawMessage `json:"items"`
 }

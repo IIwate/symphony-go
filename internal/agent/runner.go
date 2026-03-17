@@ -15,8 +15,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"symphony-go/internal/shell"
 	"time"
+	"unicode"
 
 	"symphony-go/internal/model"
 	"symphony-go/internal/workflow"
@@ -29,17 +29,21 @@ type Runner interface {
 }
 
 type RunParams struct {
-	Issue          *model.Issue
-	Attempt        *int
-	WorkspacePath  string
-	PromptTemplate string
-	Source         map[string]any
-	Dispatch       *model.DispatchContext
-	ProcessEnv     map[string]string
-	MaxTurns       int
-	RefetchIssue   func(context.Context, string) (*model.Issue, error)
-	IsActive       func(string) bool
-	OnEvent        func(AgentEvent)
+	Issue             *model.Issue
+	Attempt           *int
+	WorkspacePath     string
+	PromptTemplate    string
+	RawPrompt         string
+	Source            map[string]any
+	Dispatch          *model.DispatchContext
+	ProcessEnv        map[string]string
+	MaxTurns          int
+	ExecutionBudgetMS int
+	ReadOnly          bool
+	RefetchIssue      func(context.Context, string) (*model.Issue, error)
+	IsActive          func(string) bool
+	OnEvent           func(AgentEvent)
+	OnAssistantText   func(string)
 }
 
 type AgentEvent struct {
@@ -146,8 +150,24 @@ func (r *AppServerRunner) Run(ctx context.Context, params RunParams) error {
 		return model.NewAgentError(model.ErrResponseError, "write initialized notification", err)
 	}
 
+	executionBudgetMS := params.ExecutionBudgetMS
+	if executionBudgetMS <= 0 {
+		executionBudgetMS = cfg.RunExecutionBudgetMS
+	}
+	if executionBudgetMS <= 0 {
+		executionBudgetMS = cfg.CodexTurnTimeoutMS
+	}
+	executionDeadline := time.Time{}
+	if executionBudgetMS > 0 {
+		executionDeadline = r.now().UTC().Add(time.Duration(executionBudgetMS) * time.Millisecond)
+	}
+
 	requestID++
-	threadResponse, err := r.waitThreadStart(ctx, cfg, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid)
+	threadReadTimeoutMS := computeRemainingExecutionBudgetMS(executionDeadline, r.now().UTC(), cfg.CodexReadTimeoutMS)
+	if threadReadTimeoutMS <= 0 {
+		return model.NewAgentError(model.ErrTurnTimeout, "execution budget exhausted before thread start", nil)
+	}
+	threadResponse, err := r.waitThreadStart(ctx, cfg, threadReadTimeoutMS, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid)
 	if err != nil {
 		return err
 	}
@@ -162,13 +182,21 @@ func (r *AppServerRunner) Run(ctx context.Context, params RunParams) error {
 		maxTurns = cfg.MaxTurns
 	}
 	for turnNumber := 1; turnNumber <= maxTurns; turnNumber++ {
+		remainingExecutionBudgetMS := computeRemainingExecutionBudgetMS(executionDeadline, r.now().UTC(), executionBudgetMS)
 		prompt, err := buildTurnPrompt(params, issue, turnNumber, maxTurns)
 		if err != nil {
 			return model.NewAgentError(model.ErrResponseError, "build turn prompt", err)
 		}
 
+		if executionBudgetMS > 0 && remainingExecutionBudgetMS <= 0 {
+			return model.NewAgentError(model.ErrTurnTimeout, "execution budget exhausted before turn start", nil)
+		}
 		requestID++
-		turnResponse, err := r.waitTurnStart(ctx, cfg, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid, threadID, issue, prompt)
+		turnReadTimeoutMS := minPositiveInt(cfg.CodexReadTimeoutMS, remainingExecutionBudgetMS)
+		if turnReadTimeoutMS <= 0 {
+			return model.NewAgentError(model.ErrTurnTimeout, "execution budget exhausted before turn start", nil)
+		}
+		turnResponse, err := r.waitTurnStart(ctx, cfg, turnReadTimeoutMS, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid, threadID, issue, prompt)
 		if err != nil {
 			return err
 		}
@@ -187,7 +215,7 @@ func (r *AppServerRunner) Run(ctx context.Context, params RunParams) error {
 			Message:           sessionID,
 		})
 
-		if err := r.waitForTurnEnd(ctx, cfg.CodexTurnTimeoutMS, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid, threadID, turnID, sessionID); err != nil {
+		if err := r.waitForTurnEnd(ctx, remainingExecutionBudgetMS, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid, threadID, turnID, sessionID); err != nil {
 			return err
 		}
 
@@ -213,7 +241,7 @@ func (r *AppServerRunner) Run(ctx context.Context, params RunParams) error {
 	return nil
 }
 
-func (r *AppServerRunner) waitThreadStart(ctx context.Context, cfg *model.ServiceConfig, requestID int, writer io.Writer, stdoutCh <-chan string, stdoutErrCh <-chan error, stderrCh <-chan string, stderrErrCh <-chan error, waitCh <-chan error, params RunParams, pid *string) (map[string]any, error) {
+func (r *AppServerRunner) waitThreadStart(ctx context.Context, cfg *model.ServiceConfig, timeoutMS int, requestID int, writer io.Writer, stdoutCh <-chan string, stdoutErrCh <-chan error, stderrCh <-chan string, stderrErrCh <-chan error, waitCh <-chan error, params RunParams, pid *string) (map[string]any, error) {
 	request := map[string]any{
 		"id":     requestID,
 		"method": "thread/start",
@@ -231,10 +259,10 @@ func (r *AppServerRunner) waitThreadStart(ctx context.Context, cfg *model.Servic
 		return nil, model.NewAgentError(model.ErrResponseError, "write thread/start request", err)
 	}
 
-	return r.waitForResponse(ctx, cfg.CodexReadTimeoutMS, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid)
+	return r.waitForResponse(ctx, timeoutMS, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid)
 }
 
-func (r *AppServerRunner) waitTurnStart(ctx context.Context, cfg *model.ServiceConfig, requestID int, writer io.Writer, stdoutCh <-chan string, stdoutErrCh <-chan error, stderrCh <-chan string, stderrErrCh <-chan error, waitCh <-chan error, params RunParams, pid *string, threadID string, issue *model.Issue, prompt string) (map[string]any, error) {
+func (r *AppServerRunner) waitTurnStart(ctx context.Context, cfg *model.ServiceConfig, timeoutMS int, requestID int, writer io.Writer, stdoutCh <-chan string, stdoutErrCh <-chan error, stderrCh <-chan string, stderrErrCh <-chan error, waitCh <-chan error, params RunParams, pid *string, threadID string, issue *model.Issue, prompt string) (map[string]any, error) {
 	request := map[string]any{
 		"id":     requestID,
 		"method": "turn/start",
@@ -251,7 +279,7 @@ func (r *AppServerRunner) waitTurnStart(ctx context.Context, cfg *model.ServiceC
 		return nil, model.NewAgentError(model.ErrResponseError, "write turn/start request", err)
 	}
 
-	return r.waitForResponse(ctx, cfg.CodexReadTimeoutMS, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid)
+	return r.waitForResponse(ctx, timeoutMS, requestID, writer, stdoutCh, stdoutErrCh, stderrCh, stderrErrCh, waitCh, params, pid)
 }
 
 func (r *AppServerRunner) waitForResponse(ctx context.Context, timeoutMS int, expectedID int, writer io.Writer, stdoutCh <-chan string, stdoutErrCh <-chan error, stderrCh <-chan string, stderrErrCh <-chan error, waitCh <-chan error, params RunParams, pid *string) (map[string]any, error) {
@@ -360,24 +388,28 @@ func (r *AppServerRunner) handleStreamMessage(ctx context.Context, writer io.Wri
 	lowerMethod := strings.ToLower(method)
 	usage := extractUsage(message)
 	rateLimits := extractRateLimits(message)
+	emitAssistantText(params, assistantTextFragments(message))
 
 	if strings.Contains(lowerMethod, "requestuserinput") {
 		r.emit(params, AgentEvent{Event: "turn_input_required", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: message})
 		return model.NewAgentError(model.ErrTurnInputRequired, "turn requested user input", nil), false
 	}
 	if strings.Contains(lowerMethod, "approval") && message["id"] != nil {
-		if err := writeJSONLine(writer, map[string]any{"id": message["id"], "result": map[string]any{"approved": true}}); err != nil && r.logger != nil {
+		if err := writeJSONLine(writer, map[string]any{"id": message["id"], "result": map[string]any{"approved": false}}); err != nil && r.logger != nil {
 			r.logger.Warn("failed to write approval response", "method", method, "request_id", fmt.Sprint(message["id"]), "error", err.Error())
 		}
-		r.emit(params, AgentEvent{Event: "approval_auto_approved", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: message})
-		return nil, false
+		r.emit(params, AgentEvent{Event: "hard_violation", Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: message})
+		return model.NewHardViolationError(model.HardViolationPolicyOverride, "approval/request", "approval escalation is outside the allowed runtime policy"), false
 	}
 	if strings.Contains(lowerMethod, "tool/call") && message["id"] != nil {
-		toolResult, eventName := r.handleToolCall(ctx, message)
+		toolResult, eventName, eventErr := r.handleToolCall(ctx, message, params)
 		if err := writeJSONLine(writer, map[string]any{"id": message["id"], "result": toolResult}); err != nil && r.logger != nil {
 			r.logger.Warn("failed to write tool response", "method", method, "request_id", fmt.Sprint(message["id"]), "event", eventName, "error", err.Error())
 		}
 		r.emit(params, AgentEvent{Event: eventName, Timestamp: timestamp, CodexAppServerPID: pid, SessionID: optionalPtr(sessionID), ThreadID: optionalPtr(threadID), TurnID: optionalPtr(turnID), Message: method, Payload: toolResult})
+		if eventErr != nil {
+			return eventErr, false
+		}
 		return nil, false
 	}
 
@@ -438,6 +470,84 @@ func isStreamingNoise(lowerMethod string) bool {
 	return false
 }
 
+func emitAssistantText(params RunParams, fragments []string) {
+	if params.OnAssistantText == nil {
+		return
+	}
+	for _, fragment := range fragments {
+		text := strings.TrimSpace(fragment)
+		if text == "" {
+			continue
+		}
+		params.OnAssistantText(text)
+	}
+}
+
+func assistantTextFragments(message map[string]any) []string {
+	if len(message) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	fragments := make([]string, 0, 2)
+	collectAssistantText(&fragments, seen, message, false)
+	if params, ok := message["params"]; ok {
+		collectAssistantText(&fragments, seen, params, false)
+	}
+	if result, ok := message["result"]; ok {
+		collectAssistantText(&fragments, seen, result, false)
+	}
+	return fragments
+}
+
+func collectAssistantText(dst *[]string, seen map[string]struct{}, value any, assistant bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		nextAssistant := assistant
+		if role, ok := typed["role"].(string); ok && strings.EqualFold(strings.TrimSpace(role), "assistant") {
+			nextAssistant = true
+		}
+		if itemType, ok := typed["type"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(itemType)) {
+			case "agent_message":
+				nextAssistant = true
+			}
+		}
+		if text, ok := typed["text"].(string); ok && nextAssistant {
+			appendAssistantFragment(dst, seen, text)
+		}
+		if message, ok := typed["message"].(string); ok && nextAssistant {
+			appendAssistantFragment(dst, seen, message)
+		}
+		if delta, ok := typed["delta"].(string); ok && nextAssistant {
+			appendAssistantFragment(dst, seen, delta)
+		}
+		if lastAgentMessage, ok := typed["last_agent_message"].(string); ok && nextAssistant {
+			appendAssistantFragment(dst, seen, lastAgentMessage)
+		}
+		for _, key := range []string{"item", "message", "content", "output", "response", "msg"} {
+			if nested, ok := typed[key]; ok {
+				collectAssistantText(dst, seen, nested, nextAssistant)
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			collectAssistantText(dst, seen, item, assistant)
+		}
+	}
+}
+
+func appendAssistantFragment(dst *[]string, seen map[string]struct{}, value string) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return
+	}
+	if _, ok := seen[trimmed]; ok {
+		return
+	}
+	seen[trimmed] = struct{}{}
+	*dst = append(*dst, value)
+}
+
 func (r *AppServerRunner) stopProcess(process Process) {
 	if process == nil {
 		return
@@ -479,25 +589,201 @@ func (r *AppServerRunner) dynamicTools(cfg *model.ServiceConfig) []any {
 	}
 }
 
-func (r *AppServerRunner) handleToolCall(ctx context.Context, message map[string]any) (map[string]any, string) {
+func classifyHardViolation(toolName string) model.HardViolationCode {
+	normalized := strings.ToLower(strings.TrimSpace(toolName))
+	switch {
+	case strings.Contains(normalized, "spawn_agent"):
+		return model.HardViolationSubAgent
+	case strings.Contains(normalized, "parallel"):
+		return model.HardViolationParallelWork
+	case strings.Contains(normalized, "policy") || strings.Contains(normalized, "sandbox") || strings.Contains(normalized, "approval") || strings.Contains(normalized, "config"):
+		return model.HardViolationPolicyOverride
+	case strings.Contains(normalized, "git") || strings.Contains(normalized, "pr") || strings.Contains(normalized, "publish") || strings.Contains(normalized, "merge"):
+		return model.HardViolationBypassResultPath
+	case strings.Contains(normalized, "web") || strings.Contains(normalized, "browser") || strings.Contains(normalized, "http") || strings.Contains(normalized, "resource") || strings.Contains(normalized, "search"):
+		return model.HardViolationOutOfScopeAccess
+	default:
+		return model.HardViolationBannedTool
+	}
+}
+
+func (r *AppServerRunner) handleToolCall(ctx context.Context, message map[string]any, params RunParams) (map[string]any, string, error) {
 	toolName, arguments, ok := extractToolCall(message)
 	if !ok {
 		result := map[string]any{"success": false, "error": "unsupported_tool_call"}
-		return dynamicToolResponse(result), "unsupported_tool_call"
+		return dynamicToolResponse(result), "hard_violation", model.NewHardViolationError(model.HardViolationBannedTool, "", "tool call payload is unsupported")
+	}
+	if params.ReadOnly {
+		result := map[string]any{"success": false, "error": "readonly_violation", "message": "reviewer mode is read-only and cannot invoke tools"}
+		return dynamicToolResponse(result), "hard_violation", model.NewHardViolationError(model.HardViolationPolicyOverride, toolName, "reviewer mode is read-only and cannot invoke tools")
 	}
 	if toolName != "linear_graphql" {
 		result := map[string]any{"success": false, "error": "unsupported_tool_call"}
-		return dynamicToolResponse(result), "unsupported_tool_call"
+		return dynamicToolResponse(result), "hard_violation", model.NewHardViolationError(classifyHardViolation(toolName), toolName, "tool is outside the allowed runtime tool whitelist")
 	}
-	result := r.executeLinearGraphQL(ctx, arguments)
-	return dynamicToolResponse(result), "notification"
-}
-
-func (r *AppServerRunner) executeLinearGraphQL(ctx context.Context, arguments any) map[string]any {
 	query, variables, err := parseLinearGraphQLInput(arguments)
 	if err != nil {
-		return map[string]any{"success": false, "error": "invalid_arguments", "message": err.Error()}
+		return dynamicToolResponse(map[string]any{"success": false, "error": "invalid_arguments", "message": err.Error()}), "notification", nil
 	}
+	if violationCode, violationMessage, blocked := validateScopedLinearGraphQL(query, variables, params, r.config()); blocked {
+		result := map[string]any{"success": false, "error": "hard_violation", "message": violationMessage}
+		return dynamicToolResponse(result), "hard_violation", model.NewHardViolationError(violationCode, toolName, violationMessage)
+	}
+	result := r.executeLinearGraphQL(ctx, query, variables)
+	return dynamicToolResponse(result), "notification", nil
+}
+
+func validateScopedLinearGraphQL(query string, variables map[string]any, params RunParams, cfg *model.ServiceConfig) (model.HardViolationCode, string, bool) {
+	operationKind := graphqlOperationKind(query)
+	if operationKind == "mutation" || operationKind == "subscription" {
+		return model.HardViolationBypassResultPath, "linear_graphql must stay read-only and cannot mutate external sources", true
+	}
+	topLevelFields := graphqlTopLevelFields(query)
+	if len(topLevelFields) == 0 {
+		return model.HardViolationOutOfScopeAccess, "linear_graphql must declare a scoped top-level issue field", true
+	}
+	for _, field := range topLevelFields {
+		switch field {
+		case "issue", "issues":
+		default:
+			return model.HardViolationOutOfScopeAccess, "linear_graphql may only query the current issue scope", true
+		}
+	}
+	scopeTokens := make([]string, 0, 3)
+	if params.Issue != nil {
+		if strings.TrimSpace(params.Issue.ID) != "" {
+			scopeTokens = append(scopeTokens, strings.TrimSpace(params.Issue.ID))
+		}
+		if strings.TrimSpace(params.Issue.Identifier) != "" {
+			scopeTokens = append(scopeTokens, strings.TrimSpace(params.Issue.Identifier))
+		}
+	}
+	if cfg != nil && strings.TrimSpace(cfg.TrackerProjectSlug) != "" {
+		scopeTokens = append(scopeTokens, strings.TrimSpace(cfg.TrackerProjectSlug))
+	}
+	if len(scopeTokens) == 0 {
+		return model.HardViolationOutOfScopeAccess, "linear_graphql scope is unavailable for the current run", true
+	}
+	variablesText := ""
+	if len(variables) > 0 {
+		if raw, err := json.Marshal(variables); err == nil {
+			variablesText = string(raw)
+		}
+	}
+	for _, token := range scopeTokens {
+		if token == "" {
+			continue
+		}
+		if strings.Contains(query, token) || strings.Contains(variablesText, token) {
+			return "", "", false
+		}
+	}
+	return model.HardViolationOutOfScopeAccess, "linear_graphql must stay scoped to the current issue or project", true
+}
+
+func graphqlOperationKind(query string) string {
+	trimmed := strings.TrimSpace(stripGraphQLComments(query))
+	switch {
+	case strings.HasPrefix(trimmed, "mutation"):
+		return "mutation"
+	case strings.HasPrefix(trimmed, "subscription"):
+		return "subscription"
+	case strings.HasPrefix(trimmed, "query"), strings.HasPrefix(trimmed, "{"):
+		return "query"
+	default:
+		return ""
+	}
+}
+
+func stripGraphQLComments(query string) string {
+	lines := strings.Split(query, "\n")
+	for i, line := range lines {
+		if comment := strings.Index(line, "#"); comment >= 0 {
+			line = line[:comment]
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func graphqlTopLevelFields(query string) []string {
+	source := stripGraphQLComments(query)
+	start := strings.Index(source, "{")
+	if start < 0 {
+		return nil
+	}
+	fields := make([]string, 0)
+	depth := 0
+	for i := start; i < len(source); i++ {
+		r := rune(source[i])
+		switch r {
+		case '{':
+			depth++
+			continue
+		case '}':
+			depth--
+			if depth <= 0 {
+				return fields
+			}
+			continue
+		}
+		if depth != 1 || !isGraphQLIdentStart(r) {
+			continue
+		}
+		nameStart := i
+		for i < len(source) && isGraphQLIdent(rune(source[i])) {
+			i++
+		}
+		name := source[nameStart:i]
+		for i < len(source) && unicode.IsSpace(rune(source[i])) {
+			i++
+		}
+		if i < len(source) && source[i] == ':' {
+			for i < len(source) && (unicode.IsSpace(rune(source[i])) || source[i] == ':') {
+				i++
+			}
+			nameStart = i
+			for i < len(source) && isGraphQLIdent(rune(source[i])) {
+				i++
+			}
+			name = source[nameStart:i]
+		}
+		fields = append(fields, name)
+		for i < len(source) {
+			switch source[i] {
+			case '(':
+				parenDepth := 1
+				i++
+				for i < len(source) && parenDepth > 0 {
+					switch source[i] {
+					case '(':
+						parenDepth++
+					case ')':
+						parenDepth--
+					}
+					i++
+				}
+				continue
+			case ' ', '\t', '\r', '\n', ',':
+				i++
+				continue
+			}
+			break
+		}
+		i--
+	}
+	return fields
+}
+
+func isGraphQLIdentStart(value rune) bool {
+	return value == '_' || unicode.IsLetter(value)
+}
+
+func isGraphQLIdent(value rune) bool {
+	return isGraphQLIdentStart(value) || unicode.IsDigit(value)
+}
+
+func (r *AppServerRunner) executeLinearGraphQL(ctx context.Context, query string, variables map[string]any) map[string]any {
 	cfg := r.config()
 	if model.NormalizeState(cfg.TrackerKind) != "linear" || strings.TrimSpace(cfg.TrackerAPIKey) == "" {
 		return map[string]any{"success": false, "error": "missing_auth", "message": "linear auth is not configured"}
@@ -689,6 +975,9 @@ func (r *AppServerRunner) emit(params RunParams, event AgentEvent) {
 
 func buildTurnPrompt(params RunParams, issue *model.Issue, turnNumber int, maxTurns int) (string, error) {
 	if turnNumber == 1 {
+		if strings.TrimSpace(params.RawPrompt) != "" {
+			return params.RawPrompt, nil
+		}
 		return workflow.RenderPrompt(params.PromptTemplate, issue, params.Attempt, params.Source, params.Dispatch)
 	}
 
@@ -705,6 +994,30 @@ func optionalPtr(value string) *string {
 func stringPtr(value string) *string {
 	copyValue := value
 	return &copyValue
+}
+
+func minPositiveInt(values ...int) int {
+	min := 0
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if min == 0 || value < min {
+			min = value
+		}
+	}
+	return min
+}
+
+func computeRemainingExecutionBudgetMS(deadline time.Time, now time.Time, fallback int) int {
+	if deadline.IsZero() {
+		return fallback
+	}
+	remaining := int(deadline.Sub(now).Milliseconds())
+	if remaining < 0 {
+		return 0
+	}
+	return minPositiveInt(remaining, fallback)
 }
 
 func optionalString(value *string) string {
@@ -906,8 +1219,10 @@ func runPhaseForEvent(event string) string {
 	switch event {
 	case "session_started":
 		return model.PhaseInitializingSession.String()
-	case "turn_completed", "turn_failed", "turn_cancelled", "turn_input_required", "approval_auto_approved", "unsupported_tool_call", "notification", "other_message", "malformed":
+	case "turn_completed", "turn_failed", "turn_cancelled", "turn_input_required", "approval_auto_approved", "notification", "other_message", "malformed":
 		return model.PhaseStreamingTurn.String()
+	case "hard_violation":
+		return model.PhaseFailed.String()
 	default:
 		return model.PhaseStreamingTurn.String()
 	}
@@ -916,7 +1231,7 @@ func runPhaseForEvent(event string) string {
 type execProcessFactory struct{}
 
 func (execProcessFactory) StartProcess(ctx context.Context, cwd string, command string, env map[string]string) (Process, error) {
-	cmd, err := shell.BashCommand(ctx, cwd, command)
+	cmd, err := commandFromString(ctx, cwd, command)
 	if err != nil {
 		return nil, err
 	}

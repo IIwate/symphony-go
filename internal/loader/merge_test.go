@@ -4,17 +4,19 @@ import "testing"
 
 func TestDeepMergeMapRecursive(t *testing.T) {
 	base := map[string]any{
-		"runtime": map[string]any{
+		"execution": map[string]any{
 			"agent": map[string]any{
 				"max_turns": 20,
 			},
-			"codex": map[string]any{
-				"command": "codex app-server",
+			"backend": map[string]any{
+				"codex": map[string]any{
+					"command": "codex app-server",
+				},
 			},
 		},
 	}
 	override := map[string]any{
-		"runtime": map[string]any{
+		"execution": map[string]any{
 			"agent": map[string]any{
 				"max_turns": 5,
 			},
@@ -22,46 +24,46 @@ func TestDeepMergeMapRecursive(t *testing.T) {
 	}
 
 	merged := mustStringMap(deepMerge(base, override))
-	runtimeConfig := getMapValue(merged, "runtime")
-	agentConfig := getMapValue(runtimeConfig, "agent")
-	codexConfig := getMapValue(runtimeConfig, "codex")
+	executionConfig := getMapValue(merged, "execution")
+	agentConfig := getMapValue(executionConfig, "agent")
+	codexConfig := getMapValue(getMapValue(executionConfig, "backend"), "codex")
 	if got := agentConfig["max_turns"]; got != 5 {
-		t.Fatalf("runtime.agent.max_turns = %v, want 5", got)
+		t.Fatalf("execution.agent.max_turns = %v, want 5", got)
 	}
 	if got := codexConfig["command"]; got != "codex app-server" {
-		t.Fatalf("runtime.codex.command = %v, want codex app-server", got)
+		t.Fatalf("execution.backend.codex.command = %v, want codex app-server", got)
 	}
 }
 
 func TestDeepMergeArrayReplace(t *testing.T) {
 	base := map[string]any{
-		"selection": map[string]any{
-			"enabled_sources": []any{"linear-main"},
+		"sources": map[string]any{
+			"enabled": []any{"linear-main"},
 		},
 	}
 	override := map[string]any{
-		"selection": map[string]any{
-			"enabled_sources": []any{"github-core"},
+		"sources": map[string]any{
+			"enabled": []any{"github-core"},
 		},
 	}
 
 	merged := mustStringMap(deepMerge(base, override))
-	values := getStringSliceValue(getMapValue(merged, "selection"), "enabled_sources")
+	values := getStringSliceValue(getMapValue(merged, "sources"), "enabled")
 	if len(values) != 1 || values[0] != "github-core" {
-		t.Fatalf("enabled_sources = %v, want [github-core]", values)
+		t.Fatalf("sources.enabled = %v, want [github-core]", values)
 	}
 }
 
 func TestDeepMergeNullExplicitClear(t *testing.T) {
 	base := map[string]any{
-		"runtime": map[string]any{
+		"service": map[string]any{
 			"server": map[string]any{
 				"port": 8080,
 			},
 		},
 	}
 	override := map[string]any{
-		"runtime": map[string]any{
+		"service": map[string]any{
 			"server": map[string]any{
 				"port": nil,
 			},
@@ -69,33 +71,33 @@ func TestDeepMergeNullExplicitClear(t *testing.T) {
 	}
 
 	merged := mustStringMap(deepMerge(base, override))
-	serverConfig := getMapValue(getMapValue(merged, "runtime"), "server")
+	serverConfig := getMapValue(getMapValue(merged, "service"), "server")
 	value, ok := serverConfig["port"]
 	if !ok {
-		t.Fatal("runtime.server.port missing after explicit null")
+		t.Fatal("service.server.port missing after explicit null")
 	}
 	if value != nil {
-		t.Fatalf("runtime.server.port = %v, want nil", value)
+		t.Fatalf("service.server.port = %v, want nil", value)
 	}
 }
 
 func TestDeepMergeMissingKeyPreserve(t *testing.T) {
 	base := map[string]any{
-		"runtime": map[string]any{
+		"domain": map[string]any{
 			"workspace": map[string]any{
 				"root": "~/workspaces",
 			},
 		},
 	}
 	override := map[string]any{
-		"selection": map[string]any{
+		"job_policy": map[string]any{
 			"dispatch_flow": "implement",
 		},
 	}
 
 	merged := mustStringMap(deepMerge(base, override))
-	workspaceConfig := getMapValue(getMapValue(merged, "runtime"), "workspace")
+	workspaceConfig := getMapValue(getMapValue(merged, "domain"), "workspace")
 	if got := workspaceConfig["root"]; got != "~/workspaces" {
-		t.Fatalf("runtime.workspace.root = %v, want ~/workspaces", got)
+		t.Fatalf("domain.workspace.root = %v, want ~/workspaces", got)
 	}
 }

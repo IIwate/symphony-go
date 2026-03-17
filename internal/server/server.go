@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"reflect"
-	"sort"
 	"strings"
 
 	"symphony-go/internal/model/contract"
@@ -20,7 +18,9 @@ type RuntimeSource interface {
 	Discovery() orchestrator.DiscoveryDocument
 	Snapshot() orchestrator.Snapshot
 	RequestRefresh() orchestrator.RefreshRequestResult
-	SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func())
+	SubscribeEvents(buffer int) (<-chan contract.EventEnvelope, func())
+	GetObject(objectType contract.ObjectType, id string) (orchestrator.ObjectEnvelope, bool)
+	ListObjects(objectType contract.ObjectType) []orchestrator.ObjectEnvelope
 }
 
 type Server struct {
@@ -95,12 +95,62 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 			writeMethodNotAllowed(w, logger, http.MethodPost)
 			return
 		}
+		state := runtime.Snapshot()
+		if state.Instance.Role != contract.InstanceRoleLeader {
+			details := map[string]any{
+				"role": state.Instance.Role,
+			}
+			if state.Leader != nil {
+				details["leader"] = state.Leader
+			}
+			writeError(w, http.StatusConflict, contract.ErrorAPILeaderRequired, "write control is only available on leader", logger, details)
+			return
+		}
 		payload := runtime.RequestRefresh()
 		status := http.StatusOK
 		if payload.Status == contract.ControlStatusAccepted {
 			status = http.StatusAccepted
 		}
 		writeJSON(w, status, payload, logger)
+	})
+	mux.HandleFunc("/api/v1/objects/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, logger, http.MethodGet)
+			return
+		}
+		trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/objects/")
+		parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			writeError(w, http.StatusNotFound, contract.ErrorAPINotFound, "resource not found", logger, map[string]any{"path": r.URL.Path})
+			return
+		}
+		objectType := contract.ObjectType(parts[0])
+		if !objectType.IsValid() || !objectType.SupportsObjectQuery() {
+			writeError(w, http.StatusBadRequest, contract.ErrorAPIInvalidRequest, "unsupported object query type", logger, map[string]any{"object_type": parts[0]})
+			return
+		}
+		if len(parts) == 1 {
+			items := runtime.ListObjects(objectType)
+			payload := contract.ObjectListResponse{
+				ObjectType: objectType,
+				Items:      make([]json.RawMessage, 0, len(items)),
+			}
+			for _, item := range items {
+				payload.Items = append(payload.Items, item.Payload)
+			}
+			writeJSON(w, http.StatusOK, payload, logger)
+			return
+		}
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			writeError(w, http.StatusBadRequest, contract.ErrorAPIInvalidRequest, "invalid object query path", logger, map[string]any{"path": r.URL.Path})
+			return
+		}
+		item, ok := runtime.GetObject(objectType, parts[1])
+		if !ok {
+			writeError(w, http.StatusNotFound, contract.ErrorAPINotFound, "object not found", logger, map[string]any{"object_type": objectType, "object_id": parts[1]})
+			return
+		}
+		writeJSON(w, http.StatusOK, contract.ObjectQueryResponse{ObjectType: objectType, Item: item.Payload}, logger)
 	})
 	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -119,21 +169,15 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 
-		updates, unsubscribe := runtime.SubscribeSnapshots(8)
+		updates, unsubscribe := runtime.SubscribeEvents(8)
 		defer unsubscribe()
-
-		builder := &sseEventBuilder{}
 		for {
 			select {
 			case <-r.Context().Done():
 				return
-			case snapshot, ok := <-updates:
+			case event, ok := <-updates:
 				if !ok {
 					return
-				}
-				event, emit := builder.Next(snapshot)
-				if !emit {
-					continue
 				}
 				if err := writeSSEEvent(w, string(event.EventType), event); err != nil {
 					return
@@ -149,149 +193,6 @@ func NewHandler(runtime RuntimeSource, logger *slog.Logger) http.Handler {
 	})
 
 	return mux
-}
-
-type sseEventBuilder struct {
-	sequence uint64
-	previous *orchestrator.Snapshot
-}
-
-func (b *sseEventBuilder) Next(snapshot orchestrator.Snapshot) (*contract.EventEnvelope, bool) {
-	if b.previous != nil && equivalentSnapshots(*b.previous, snapshot) {
-		copySnapshot := snapshot
-		b.previous = &copySnapshot
-		return nil, false
-	}
-
-	b.sequence++
-	eventType := contract.EventTypeStateChanged
-	recordIDs := changedRecordIDs(snapshot, b.previous)
-	reason := eventReason(snapshot, b.previous, recordIDs)
-	if b.previous == nil {
-		eventType = contract.EventTypeSnapshot
-	}
-
-	event := &contract.EventEnvelope{
-		EventID:     fmt.Sprintf("evt-%d", b.sequence),
-		EventType:   eventType,
-		Timestamp:   snapshot.GeneratedAt,
-		ServiceMode: snapshot.ServiceMode,
-		RecordIDs:   recordIDs,
-		Reason:      reason,
-	}
-
-	copySnapshot := snapshot
-	b.previous = &copySnapshot
-	return event, true
-}
-
-func equivalentSnapshots(left orchestrator.Snapshot, right orchestrator.Snapshot) bool {
-	return left.ServiceMode == right.ServiceMode &&
-		left.RecoveryInProgress == right.RecoveryInProgress &&
-		reflect.DeepEqual(left.Reasons, right.Reasons) &&
-		reflect.DeepEqual(left.Counts, right.Counts) &&
-		reflect.DeepEqual(left.Records, right.Records) &&
-		reflect.DeepEqual(left.CompletedWindow, right.CompletedWindow)
-}
-
-func changedRecordIDs(current orchestrator.Snapshot, previous *orchestrator.Snapshot) []contract.RecordID {
-	currentRecords := snapshotRecordIndex(current)
-	if previous == nil {
-		return sortedRecordIDs(currentRecords)
-	}
-
-	previousRecords := snapshotRecordIndex(*previous)
-	changed := make([]contract.RecordID, 0, len(currentRecords)+len(previousRecords))
-	seen := map[contract.RecordID]struct{}{}
-	for recordID, currentRecord := range currentRecords {
-		previousRecord, ok := previousRecords[recordID]
-		if ok && reflect.DeepEqual(previousRecord, currentRecord) {
-			continue
-		}
-		changed = append(changed, recordID)
-		seen[recordID] = struct{}{}
-	}
-	for recordID := range previousRecords {
-		if _, ok := currentRecords[recordID]; ok {
-			continue
-		}
-		if _, ok := seen[recordID]; ok {
-			continue
-		}
-		changed = append(changed, recordID)
-	}
-	sort.SliceStable(changed, func(i int, j int) bool {
-		return changed[i] < changed[j]
-	})
-	return changed
-}
-
-func snapshotRecordIndex(snapshot orchestrator.Snapshot) map[contract.RecordID]contract.IssueRuntimeRecord {
-	records := make(map[contract.RecordID]contract.IssueRuntimeRecord, len(snapshot.Records)+len(snapshot.CompletedWindow.Records))
-	for _, record := range snapshot.Records {
-		records[record.RecordID] = record
-	}
-	for _, record := range snapshot.CompletedWindow.Records {
-		records[record.RecordID] = record
-	}
-	return records
-}
-
-func sortedRecordIDs(records map[contract.RecordID]contract.IssueRuntimeRecord) []contract.RecordID {
-	ids := make([]contract.RecordID, 0, len(records))
-	for recordID := range records {
-		ids = append(ids, recordID)
-	}
-	sort.SliceStable(ids, func(i int, j int) bool {
-		return ids[i] < ids[j]
-	})
-	return ids
-}
-
-func eventReason(current orchestrator.Snapshot, previous *orchestrator.Snapshot, recordIDs []contract.RecordID) *contract.Reason {
-	if previous == nil {
-		if len(current.Reasons) == 0 {
-			return nil
-		}
-		return cloneReason(&current.Reasons[0])
-	}
-	if current.ServiceMode != previous.ServiceMode || !reflect.DeepEqual(current.Reasons, previous.Reasons) {
-		if len(current.Reasons) > 0 {
-			return cloneReason(&current.Reasons[0])
-		}
-		if len(previous.Reasons) > 0 {
-			return cloneReason(&previous.Reasons[0])
-		}
-		return nil
-	}
-	if len(recordIDs) != 1 {
-		return nil
-	}
-
-	recordID := recordIDs[0]
-	currentRecords := snapshotRecordIndex(current)
-	if record, ok := currentRecords[recordID]; ok && record.Reason != nil {
-		return cloneReason(record.Reason)
-	}
-	previousRecords := snapshotRecordIndex(*previous)
-	if record, ok := previousRecords[recordID]; ok && record.Reason != nil {
-		return cloneReason(record.Reason)
-	}
-	return nil
-}
-
-func cloneReason(reason *contract.Reason) *contract.Reason {
-	if reason == nil {
-		return nil
-	}
-	copyReason := *reason
-	if reason.Details != nil {
-		copyReason.Details = map[string]any{}
-		for key, value := range reason.Details {
-			copyReason.Details[key] = value
-		}
-	}
-	return &copyReason
 }
 
 func normalizeListenHost(host string) string {

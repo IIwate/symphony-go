@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"symphony-go/internal/model"
+	"symphony-go/internal/model/contract"
 )
 
 func TestCreateForIssueCreatesAndReusesWorkspace(t *testing.T) {
@@ -187,6 +188,106 @@ func TestPrepareForRunContinuationNewWorkspaceFallsBackToFreshHook(t *testing.T)
 	}
 	if got := runner.callCount("fresh"); got != 1 {
 		t.Fatalf("fresh before_run call count = %d, want 1", got)
+	}
+}
+
+func TestPrepareForRunUnhealthyContinuationWorkspaceAppliesRecoveryCheckpoint(t *testing.T) {
+	runner := &fakeRunner{stdoutByScript: map[string]string{"git rev-parse HEAD": "def456\n"}}
+	manager := newTestManager(t, runner)
+	workspacePath := filepath.Join(manager.currentConfig().WorkspaceRoot, "ABC-1")
+	if err := os.MkdirAll(filepath.Join(workspacePath, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	patchPath := filepath.Join(t.TempDir(), "checkpoint.patch")
+	if err := os.WriteFile(patchPath, []byte("diff --git a/a.txt b/a.txt\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(patch) error = %v", err)
+	}
+	workspace := &model.Workspace{
+		Path:         workspacePath,
+		WorkspaceKey: "ABC-1",
+		Identifier:   "ABC-1",
+		CreatedNow:   false,
+		Dispatch: &model.DispatchContext{
+			Kind: model.DispatchKindContinuation,
+			RecoveryCheckpoint: &model.RecoveryCheckpoint{
+				PatchPath:     patchPath,
+				WorkspacePath: workspacePath,
+				Checkpoint: contract.Checkpoint{
+					Type:        contract.CheckpointTypeRecovery,
+					Summary:     "已记录恢复 checkpoint。",
+					CapturedAt:  "2026-03-15T00:00:00Z",
+					Stage:       contract.RunPhaseSummaryExecuting,
+					ArtifactIDs: []string{"art-1"},
+					BaseSHA:     "abc123",
+				},
+			},
+		},
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+
+	applyScript := "git apply --3way --whitespace=nowarn '" + strings.ReplaceAll(patchPath, "\\", "/") + "'"
+	if runner.callCount("git rev-parse HEAD") != 1 {
+		t.Fatalf("health check call count = %d, want 1", runner.callCount("git rev-parse HEAD"))
+	}
+	if runner.callCount(applyScript) != 1 {
+		t.Fatalf("apply recovery call count = %d, want 1", runner.callCount(applyScript))
+	}
+	if !workspace.CreatedNow {
+		t.Fatal("workspace.CreatedNow = false, want true after unhealthy recovery reset")
+	}
+}
+
+func TestPrepareForRunHealthyContinuationWorkspaceSkipsRecoveryCheckpointApply(t *testing.T) {
+	patchBody := "diff --git a/a.txt b/a.txt\n"
+	runner := &fakeRunner{stdoutByScript: map[string]string{
+		"git rev-parse HEAD": "abc123\n",
+		"git diff --binary --no-color --no-ext-diff HEAD -- .": patchBody,
+		"git ls-files --others --exclude-standard":             "",
+	}}
+	manager := newTestManager(t, runner)
+	workspacePath := filepath.Join(manager.currentConfig().WorkspaceRoot, "ABC-1")
+	if err := os.MkdirAll(filepath.Join(workspacePath, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.git) error = %v", err)
+	}
+	patchPath := filepath.Join(t.TempDir(), "checkpoint.patch")
+	if err := os.WriteFile(patchPath, []byte(patchBody), 0o644); err != nil {
+		t.Fatalf("WriteFile(patch) error = %v", err)
+	}
+	workspace := &model.Workspace{
+		Path:         workspacePath,
+		WorkspaceKey: "ABC-1",
+		Identifier:   "ABC-1",
+		CreatedNow:   false,
+		Dispatch: &model.DispatchContext{
+			Kind: model.DispatchKindContinuation,
+			RecoveryCheckpoint: &model.RecoveryCheckpoint{
+				PatchPath:     patchPath,
+				WorkspacePath: workspacePath,
+				Checkpoint: contract.Checkpoint{
+					Type:        contract.CheckpointTypeRecovery,
+					Summary:     "已记录恢复 checkpoint。",
+					CapturedAt:  "2026-03-15T00:00:00Z",
+					Stage:       contract.RunPhaseSummaryExecuting,
+					ArtifactIDs: []string{"art-1"},
+					BaseSHA:     "abc123",
+				},
+			},
+		},
+	}
+
+	if err := manager.PrepareForRun(context.Background(), workspace); err != nil {
+		t.Fatalf("PrepareForRun() error = %v", err)
+	}
+
+	applyScript := "git apply --3way --whitespace=nowarn '" + strings.ReplaceAll(patchPath, "\\", "/") + "'"
+	if runner.callCount(applyScript) != 0 {
+		t.Fatalf("apply recovery call count = %d, want 0", runner.callCount(applyScript))
+	}
+	if workspace.CreatedNow {
+		t.Fatal("workspace.CreatedNow = true, want false when health check passes")
 	}
 }
 
@@ -605,8 +706,8 @@ func TestPrepareForRunUsesRepoLocalGitIdentity(t *testing.T) {
 			"git for-each-ref refs/heads --format='%(refname:short)'":                "main\n",
 			"git ls-remote --heads origin":                                           "",
 			"git switch -c " + bashSingleQuote("testuser/linear-demo-scope-demo-37"): "",
-			"git config --local --get user.name 2>/dev/null || true":                 "repo-user\n",
-			"git config --local --get user.email 2>/dev/null || true":                "repo-user@example.com\n",
+			"git config --local --get user.name":                                     "repo-user\n",
+			"git config --local --get user.email":                                    "repo-user@example.com\n",
 		},
 	}
 	manager := newTestManager(t, runner)
@@ -707,6 +808,43 @@ func TestFinalizeRunAndCleanupIgnoreBestEffortHooks(t *testing.T) {
 	}
 }
 
+func TestHookFilePathRecognizesAbsolutePythonHook(t *testing.T) {
+	hookPath := filepath.Join(t.TempDir(), "before_run.py")
+	if err := os.WriteFile(hookPath, []byte("print('ok')\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got, ok := hookFilePath(hookPath)
+	if !ok {
+		t.Fatal("hookFilePath() ok = false, want true")
+	}
+	if got != hookPath {
+		t.Fatalf("hookFilePath() = %q, want %q", got, hookPath)
+	}
+	if _, ok := hookFilePath("hooks/before_run.py"); ok {
+		t.Fatal("hookFilePath(relative) ok = true, want false")
+	}
+}
+
+func TestShellRunnerRunsPythonHookFile(t *testing.T) {
+	workdir := t.TempDir()
+	hookPath := filepath.Join(workdir, "before_run.py")
+	if err := os.WriteFile(hookPath, []byte("import os\nprint(os.environ['HOOK_TEST'])\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	stdout, stderr, err := (ShellRunner{}).Run(context.Background(), workdir, hookPath, map[string]string{"HOOK_TEST": "python-ok"})
+	if err != nil {
+		if strings.Contains(err.Error(), "python interpreter not found") {
+			t.Skipf("python interpreter unavailable: %v", err)
+		}
+		t.Fatalf("ShellRunner.Run() error = %v, stderr=%q", err, stderr)
+	}
+	if !strings.Contains(stdout, "python-ok") {
+		t.Fatalf("stdout = %q, want python-ok", stdout)
+	}
+}
+
 func newTestManager(t *testing.T, runner HookRunner) *LocalManager {
 	t.Helper()
 
@@ -760,6 +898,16 @@ func (f *fakeRunner) Run(ctx context.Context, _ string, script string, env map[s
 	return "", "", nil
 }
 
+func (f *fakeRunner) RunCommand(ctx context.Context, _ string, argv []string, env map[string]string) (string, string, int, error) {
+	script := fakeCommandString(argv)
+	stdout, stderr, err := f.Run(ctx, "", script, env)
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+	}
+	return stdout, stderr, exitCode, err
+}
+
 func (f *fakeRunner) callCount(script string) int {
 	count := 0
 	for _, item := range f.calledScripts {
@@ -790,4 +938,36 @@ func intPtr(value int) *int {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func fakeCommandString(argv []string) string {
+	if len(argv) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(argv))
+	for _, arg := range argv {
+		parts = append(parts, fakeCommandArg(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func fakeCommandArg(arg string) string {
+	if strings.TrimSpace(arg) == "" {
+		return "''"
+	}
+	if strings.HasPrefix(arg, "--format=") {
+		return "--format=" + bashSingleQuote(strings.TrimPrefix(arg, "--format="))
+	}
+	safe := true
+	for _, r := range arg {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._=-", r) {
+			continue
+		}
+		safe = false
+		break
+	}
+	if safe {
+		return arg
+	}
+	return bashSingleQuote(arg)
 }

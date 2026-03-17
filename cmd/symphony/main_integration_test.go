@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -39,29 +38,17 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 		ServiceMode:        contract.ServiceModeServing,
 		RecoveryInProgress: false,
 		Reasons:            []contract.Reason{},
-		Counts: contract.StateCounts{
-			Total:  1,
-			Active: 1,
+		Instance: contract.InstanceStateSummary{
+			ID:      "automation",
+			Name:    "symphony",
+			Version: "dev",
+			Role:    contract.InstanceRoleLeader,
 		},
-		Records: []contract.IssueRuntimeRecord{
-			{
-				RecordID:  "rec_github_issues_github-main_1",
-				SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceName: "github-main", SourceID: "1", SourceIdentifier: "GH-1"},
-				Status:    contract.IssueStatusActive,
-				UpdatedAt: "2026-03-14T00:00:00Z",
-				Observation: &contract.Observation{
-					Running: true,
-					Summary: "agent run in progress",
-					Details: map[string]any{"runner": "codex"},
-				},
-				DurableRefs: contract.DurableRefs{
-					LedgerPath: "automation/local/runtime-ledger.json",
-				},
+		Capabilities: contract.AvailableCapabilitySet{
+			Capabilities: []contract.AvailableCapability{
+				{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Available: true},
+				{Name: contract.CapabilityServiceRefresh, Category: contract.CapabilityCategoryControl, Summary: "支持服务级 refresh 控制。", Available: true},
 			},
-		},
-		CompletedWindow: contract.CompletedWindow{
-			Limit:   100,
-			Records: []contract.IssueRuntimeRecord{},
 		},
 	}
 	updated := initial
@@ -70,33 +57,6 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 	updated.Reasons = []contract.Reason{contract.MustReason(contract.ReasonServiceDegradedNotificationDelivery, map[string]any{
 		"channel_ids": []string{"ops"},
 	})}
-	updated.Counts = contract.StateCounts{
-		Total:         1,
-		AwaitingMerge: 1,
-	}
-	updated.Records = []contract.IssueRuntimeRecord{
-		{
-			RecordID:  "rec_github_issues_github-main_1",
-			SourceRef: contract.SourceRef{SourceKind: contract.SourceKindGitHubIssues, SourceName: "github-main", SourceID: "1", SourceIdentifier: "GH-1"},
-			Status:    contract.IssueStatusAwaitingMerge,
-			UpdatedAt: "2026-03-14T00:00:01Z",
-			Reason: func() *contract.Reason {
-				reason := contract.MustReason(contract.ReasonRecordBlockedAwaitingMerge, map[string]any{
-					"record_id": "rec_github_issues_github-main_1",
-				})
-				return &reason
-			}(),
-			Observation: &contract.Observation{
-				Running: false,
-				Summary: "waiting for merge",
-				Details: map[string]any{"runner": "codex"},
-			},
-			DurableRefs: contract.DurableRefs{
-				Branch:     &contract.BranchRef{Name: "feature/abc-1"},
-				LedgerPath: "automation/local/runtime-ledger.json",
-			},
-		},
-	}
 
 	discovery := contract.DiscoveryDocument{
 		APIVersion: contract.APIVersionV1,
@@ -105,21 +65,16 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 			Name:    "symphony",
 			Version: "dev",
 		},
+		DomainID: "default",
 		Source: contract.SourceDocument{
 			Kind: contract.SourceKindGitHubIssues,
 			Name: "github-main",
 		},
-		ServiceMode:        contract.ServiceModeServing,
-		RecoveryInProgress: false,
-		Capabilities: contract.CapabilityDocument{
-			EventProtocol:  "sse",
-			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
-			Notifications:  []string{"webhook"},
-			Sources:        []contract.SourceKind{contract.SourceKindGitHubIssues},
-		},
-		Reasons: []contract.Reason{},
-		Limits: contract.LimitDocument{
-			CompletedWindowSize: 100,
+		Capabilities: contract.StaticCapabilitySet{
+			Capabilities: []contract.StaticCapability{
+				{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Supported: true},
+				{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Supported: true},
+			},
 		},
 	}
 
@@ -185,9 +140,12 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 	if discoveryResp.Instance.Name != "symphony" {
 		t.Fatalf("discovery instance.name = %q, want symphony", discoveryResp.Instance.Name)
 	}
+	if discoveryResp.DomainID != "default" {
+		t.Fatalf("discovery domain_id = %q, want default", discoveryResp.DomainID)
+	}
 
 	stateResp := fetchJSON[contract.ServiceStateSnapshot](t, http.MethodGet, baseURL+"/api/v1/state", nil)
-	if stateResp.ServiceMode != contract.ServiceModeServing || stateResp.Counts.Active != 1 {
+	if stateResp.ServiceMode != contract.ServiceModeServing || stateResp.Instance.Role != contract.InstanceRoleLeader {
 		t.Fatalf("initial state = %#v", stateResp)
 	}
 
@@ -207,8 +165,8 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 	}
 
 	secondEvent := readMainSSEEvent(t, reader)
-	if secondEvent.Event != string(contract.EventTypeStateChanged) {
-		t.Fatalf("second event = %q, want %q", secondEvent.Event, contract.EventTypeStateChanged)
+	if secondEvent.Event != string(contract.EventTypeServiceStateChanged) {
+		t.Fatalf("second event = %q, want %q", secondEvent.Event, contract.EventTypeServiceStateChanged)
 	}
 	var envelope contract.EventEnvelope
 	if err := json.Unmarshal([]byte(secondEvent.Data), &envelope); err != nil {
@@ -222,8 +180,8 @@ func TestMainIntegration_RunCommandServesFormalHTTPAPI(t *testing.T) {
 	if updatedState.ServiceMode != contract.ServiceModeDegraded {
 		t.Fatalf("updated service_mode = %q, want %q", updatedState.ServiceMode, contract.ServiceModeDegraded)
 	}
-	if len(updatedState.Records) != 1 || updatedState.Records[0].Status != contract.IssueStatusAwaitingMerge {
-		t.Fatalf("updated records = %#v", updatedState.Records)
+	if len(updatedState.Reasons) != 1 || updatedState.Reasons[0].ReasonCode != contract.ReasonServiceDegradedNotificationDelivery {
+		t.Fatalf("updated reasons = %#v", updatedState.Reasons)
 	}
 
 	_ = eventsResp.Body.Close()
@@ -262,21 +220,16 @@ func TestMainIntegration_RunCommandExposesUnavailableServiceMode(t *testing.T) {
 			Name:    "symphony",
 			Version: "dev",
 		},
+		DomainID: "default",
 		Source: contract.SourceDocument{
 			Kind: contract.SourceKindGitHubIssues,
 			Name: "github-main",
 		},
-		ServiceMode:        contract.ServiceModeUnavailable,
-		RecoveryInProgress: false,
-		Capabilities: contract.CapabilityDocument{
-			EventProtocol:  "sse",
-			ControlActions: []contract.ControlAction{contract.ControlActionRefresh},
-			Notifications:  []string{"webhook"},
-			Sources:        []contract.SourceKind{contract.SourceKindGitHubIssues},
-		},
-		Reasons: []contract.Reason{serviceReason},
-		Limits: contract.LimitDocument{
-			CompletedWindowSize: 100,
+		Capabilities: contract.StaticCapabilitySet{
+			Capabilities: []contract.StaticCapability{
+				{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Supported: true},
+				{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Supported: true},
+			},
 		},
 	}
 	snapshot := contract.ServiceStateSnapshot{
@@ -284,11 +237,17 @@ func TestMainIntegration_RunCommandExposesUnavailableServiceMode(t *testing.T) {
 		ServiceMode:        contract.ServiceModeUnavailable,
 		RecoveryInProgress: false,
 		Reasons:            []contract.Reason{serviceReason},
-		Counts:             contract.StateCounts{},
-		Records:            []contract.IssueRuntimeRecord{},
-		CompletedWindow: contract.CompletedWindow{
-			Limit:   100,
-			Records: []contract.IssueRuntimeRecord{},
+		Instance: contract.InstanceStateSummary{
+			ID:      "automation",
+			Name:    "symphony",
+			Version: "dev",
+			Role:    contract.InstanceRoleLeader,
+		},
+		Capabilities: contract.AvailableCapabilitySet{
+			Capabilities: []contract.AvailableCapability{
+				{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Available: true},
+				{Name: contract.CapabilityServiceRefresh, Category: contract.CapabilityCategoryControl, Summary: "支持服务级 refresh 控制。", Available: true},
+			},
 		},
 	}
 
@@ -350,11 +309,8 @@ func TestMainIntegration_RunCommandExposesUnavailableServiceMode(t *testing.T) {
 
 	baseURL := "http://" + serverAddr
 	discoveryResp := fetchJSON[contract.DiscoveryDocument](t, http.MethodGet, baseURL+"/api/v1/discovery", nil)
-	if discoveryResp.ServiceMode != contract.ServiceModeUnavailable {
-		t.Fatalf("discovery service_mode = %q, want %q", discoveryResp.ServiceMode, contract.ServiceModeUnavailable)
-	}
-	if len(discoveryResp.Reasons) != 1 || discoveryResp.Reasons[0].ReasonCode != contract.ReasonServiceUnavailableCoreDependency {
-		t.Fatalf("discovery reasons = %#v, want %q", discoveryResp.Reasons, contract.ReasonServiceUnavailableCoreDependency)
+	if discoveryResp.DomainID != "default" {
+		t.Fatalf("discovery domain_id = %q, want default", discoveryResp.DomainID)
 	}
 
 	stateResp := fetchJSON[contract.ServiceStateSnapshot](t, http.MethodGet, baseURL+"/api/v1/state", nil)
@@ -430,6 +386,14 @@ func (c integrationTrackerClient) FetchIssueStatesByIDs(ctx context.Context, ids
 	return nil, nil
 }
 
+func (integrationTrackerClient) SourceClosureAvailability(context.Context) tracker.SourceClosureAvailability {
+	return tracker.SourceClosureAvailability{Supported: true, Available: true}
+}
+
+func (integrationTrackerClient) CloseSourceIssue(context.Context, model.Issue) tracker.SourceClosureResult {
+	return tracker.SourceClosureResult{Disposition: tracker.SourceClosureDispositionCompleted}
+}
+
 func newIntegrationServiceConfig(t *testing.T) *model.ServiceConfig {
 	t.Helper()
 	root := t.TempDir()
@@ -446,7 +410,29 @@ func newIntegrationServiceConfig(t *testing.T) *model.ServiceConfig {
 		MaxConcurrentAgents:        1,
 		MaxTurns:                   1,
 		MaxRetryBackoffMS:          100,
+		RunBudgetTotalMS:           1000,
+		RunExecutionBudgetMS:       1000,
+		RunReviewFixBudgetMS:       0,
 		CodexCommand:               "codex app-server",
+		DomainID:                   "default",
+		ServiceContractVersion:     contract.APIVersionV1,
+		ServiceInstanceName:        "symphony",
+		LeaderRequired:             true,
+		InstanceRole:               contract.InstanceRoleLeader,
+		CapabilityContract: contract.CapabilityContract{
+			Static: contract.StaticCapabilitySet{
+				Capabilities: []contract.StaticCapability{
+					{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Supported: true},
+					{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Supported: true},
+				},
+			},
+			Available: contract.AvailableCapabilitySet{
+				Capabilities: []contract.AvailableCapability{
+					{Name: contract.CapabilityStreamEvents, Category: contract.CapabilityCategoryProtocol, Summary: "支持 HTTP/SSE 正式事件流。", Available: true},
+					{Name: contract.CapabilityQueryObjects, Category: contract.CapabilityCategoryQuery, Summary: "支持正式对象查询。", Available: true},
+				},
+			},
+		},
 	}
 }
 
@@ -515,9 +501,7 @@ func waitForUnavailableServiceSurface(
 	for time.Now().Before(deadline) {
 		lastDiscovery = fetchJSON[contract.DiscoveryDocument](t, http.MethodGet, baseURL+"/api/v1/discovery", nil)
 		lastState = fetchJSON[contract.ServiceStateSnapshot](t, http.MethodGet, baseURL+"/api/v1/state", nil)
-		if lastDiscovery.ServiceMode == contract.ServiceModeUnavailable &&
-			lastState.ServiceMode == contract.ServiceModeUnavailable &&
-			reflect.DeepEqual(lastDiscovery.Reasons, lastState.Reasons) {
+		if lastState.ServiceMode == contract.ServiceModeUnavailable {
 			assertUnavailableReasonComponent(t, lastState.Reasons, wantComponent)
 			return lastDiscovery, lastState
 		}
@@ -530,11 +514,14 @@ func waitForUnavailableServiceSurface(
 
 func assertServiceSurfaceConsistency(t *testing.T, discovery contract.DiscoveryDocument, state contract.ServiceStateSnapshot) {
 	t.Helper()
-	if discovery.ServiceMode != state.ServiceMode {
-		t.Fatalf("discovery/state service_mode mismatch: discovery=%q state=%q", discovery.ServiceMode, state.ServiceMode)
+	if discovery.DomainID == "" {
+		t.Fatal("discovery.domain_id must not be empty")
 	}
-	if !reflect.DeepEqual(discovery.Reasons, state.Reasons) {
-		t.Fatalf("discovery/state reasons mismatch: discovery=%#v state=%#v", discovery.Reasons, state.Reasons)
+	if discovery.Source.Kind == "" || discovery.Source.Name == "" {
+		t.Fatalf("discovery source = %#v, want populated source identity", discovery.Source)
+	}
+	if state.Instance.Role != contract.InstanceRoleLeader {
+		t.Fatalf("state instance.role = %q, want %q", state.Instance.Role, contract.InstanceRoleLeader)
 	}
 }
 

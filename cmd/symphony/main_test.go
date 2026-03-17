@@ -58,24 +58,37 @@ func TestRunCLIDryRunSkipsRuntimeDependencies(t *testing.T) {
 
 	configDir := filepath.Join(t.TempDir(), "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	statePath := filepath.Join(configDir, "local", "runtime-ledger.json")
+	statePath := filepath.Join(configDir, "local", "runtime-state.json")
 	writeFile(t, statePath, "not-json\n")
-	projectYAML := fmt.Sprintf(`runtime:
+	projectYAML := fmt.Sprintf(`service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  id: default
   workspace:
     root: %s
-  codex:
-    command: codex app-server
-  session_persistence:
-    enabled: true
-    kind: file
-    file:
-      path: ./local/runtime-ledger.json
-      flush_interval_ms: 1000
-      fsync_on_critical: true
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
 `, filepath.ToSlash(filepath.Join(filepath.Dir(configDir), "workspaces")))
@@ -325,26 +338,14 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
 	writeFile(t, filepath.Join(configDir, "prompts", "other.md.liquid"), "other flow\n")
 
 	writeProject := func(workspaceValue string, branchNamespace string, sessionPath string, notificationURL string, pollInterval int, dispatchFlow string, codexCommand string, maxConcurrentAgents int, agentExtras string) {
+		t.Setenv("SYMPHONY_TEST_NOTIFICATION_URL", notificationURL)
 		agentBlock := fmt.Sprintf("    max_concurrent_agents: %d\n    max_turns: 20\n", maxConcurrentAgents)
 		if agentExtras != "" {
 			agentBlock += agentExtras
 		}
-		projectYAML := fmt.Sprintf(`runtime:
-  workspace:
-    root: %s
-    branch_namespace: %s
-  polling:
-    interval_ms: %d
-  agent:
-%s  codex:
-    command: %s
-  session_persistence:
-    enabled: true
-    kind: file
-    file:
-      path: %s
-      flush_interval_ms: 1000
-      fsync_on_critical: true
+		projectYAML := fmt.Sprintf(`service:
+  contract_version: v1
+  instance_name: symphony
   notifications:
     channels:
       - id: ops
@@ -353,24 +354,52 @@ func TestRuntimeStateApplyReloadRejectsRuntimeExtensionChanges(t *testing.T) {
         subscriptions:
           types: [system_alert]
         webhook:
-          url: %s
+          url_ref:
+            kind: env
+            name: SYMPHONY_TEST_NOTIFICATION_URL
     defaults:
       timeout_ms: 5000
       retry_count: 2
       retry_delay_ms: 1000
       queue_size: 64
       critical_queue_size: 16
-selection:
-  dispatch_flow: %s
-  enabled_sources:
+domain:
+  id: default
+  workspace:
+    root: %s
+    branch_namespace: %s
+  polling:
+    interval_ms: %d
+sources:
+  enabled:
     - linear-main
+execution:
+  agent:
+%s  backend:
+    kind: codex
+    codex:
+      command: %s
+job_policy:
+  dispatch_flow: %s
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: %s
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
-`, workspaceValue, branchNamespace, pollInterval, agentBlock, codexCommand, sessionPath, notificationURL, dispatchFlow)
+`, workspaceValue, branchNamespace, pollInterval, agentBlock, codexCommand, dispatchFlow, sessionPath)
 		writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	}
 
-	writeProject(workspaceRoot, "runner-a", "./automation/local/runtime-ledger.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server", 10, "")
+	writeProject(workspaceRoot, "runner-a", "./automation/local/runtime-state.json", "https://hooks.example.com/a", 30000, "implement", "codex app-server", 10, "")
 
 	repoDef, err := loader.Load(configDir, "")
 	if err != nil {
@@ -413,7 +442,7 @@ defaults:
 			name:            "session persistence",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/other-runtime-ledger.json",
+			sessionPath:     "./automation/local/other-runtime-state.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -425,7 +454,7 @@ defaults:
 			name:            "workspace root",
 			workspace:       filepath.ToSlash(filepath.Join(tmpDir, "other-workspaces")),
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/runtime-ledger.json",
+			sessionPath:     "./automation/local/runtime-state.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -437,7 +466,7 @@ defaults:
 			name:            "workspace branch namespace",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-b",
-			sessionPath:     "./automation/local/runtime-ledger.json",
+			sessionPath:     "./automation/local/runtime-state.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -449,7 +478,7 @@ defaults:
 			name:            "dispatch flow",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/runtime-ledger.json",
+			sessionPath:     "./automation/local/runtime-state.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "other-flow",
@@ -461,7 +490,7 @@ defaults:
 			name:            "codex command",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/runtime-ledger.json",
+			sessionPath:     "./automation/local/runtime-state.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -473,7 +502,7 @@ defaults:
 			name:            "notifications",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/runtime-ledger.json",
+			sessionPath:     "./automation/local/runtime-state.json",
 			url:             "https://hooks.example.com/b",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -485,7 +514,7 @@ defaults:
 			name:            "poll interval",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/runtime-ledger.json",
+			sessionPath:     "./automation/local/runtime-state.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    45000,
 			dispatchFlow:    "implement",
@@ -497,7 +526,7 @@ defaults:
 			name:              "max concurrent agents",
 			workspace:         workspaceRoot,
 			branchNamespace:   "runner-a",
-			sessionPath:       "./automation/local/runtime-ledger.json",
+			sessionPath:       "./automation/local/runtime-state.json",
 			url:               "https://hooks.example.com/a",
 			pollInterval:      30000,
 			dispatchFlow:      "implement",
@@ -509,7 +538,7 @@ defaults:
 			name:            "max concurrent agents by state",
 			workspace:       workspaceRoot,
 			branchNamespace: "runner-a",
-			sessionPath:     "./automation/local/runtime-ledger.json",
+			sessionPath:     "./automation/local/runtime-state.json",
 			url:             "https://hooks.example.com/a",
 			pollInterval:    30000,
 			dispatchFlow:    "implement",
@@ -564,32 +593,45 @@ func TestExecuteFailsWhenSessionStateIdentityMismatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	configDir := filepath.Join(tmpDir, "automation")
 	writeAutomationConfig(t, configDir, automationFixtureOptions{})
-	statePath := filepath.Join(configDir, "local", "runtime-ledger.json")
+	statePath := filepath.Join(configDir, "local", "runtime-state.json")
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
 		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(statePath), err)
 	}
-	projectYAML := fmt.Sprintf(`runtime:
+	projectYAML := fmt.Sprintf(`service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  id: default
   workspace:
     root: %s
-  codex:
-    command: codex app-server
-  session_persistence:
-    enabled: true
-    kind: file
-    file:
-      path: ./local/runtime-ledger.json
-      flush_interval_ms: 1000
-      fsync_on_critical: true
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
 `, filepath.ToSlash(filepath.Join(tmpDir, "workspaces")))
 	writeFile(t, filepath.Join(configDir, "project.yaml"), projectYAML)
 	writeFile(t, statePath, fmt.Sprintf(`{
-  "version": 5,
+  "version": %d,
   "identity": {
     "compatibility": {
       "profile": "",
@@ -609,7 +651,7 @@ defaults:
   },
   "saved_at": "2026-03-12T00:00:00Z"
 }
-`, filepath.ToSlash(statePath)))
+`, 7, filepath.ToSlash(statePath)))
 
 	newTrackerFactory = func(func() *model.ServiceConfig) (tracker.Client, error) {
 		return &fakeTrackerClient{}, nil
@@ -986,6 +1028,43 @@ func TestExecutePassesListenHostConfigurationToHTTPServer(t *testing.T) {
 	}
 }
 
+func TestAutomationFixtureUsesFormalPersistenceSchema(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "automation")
+	writeAutomationConfig(t, root, automationFixtureOptions{})
+
+	raw, err := os.ReadFile(filepath.Join(root, "project.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile(project.yaml) error = %v", err)
+	}
+	text := string(raw)
+	for _, required := range []string{"service:\n", "domain:\n", "execution:\n", "job_policy:\n", "persistence:\n", "path: ./local/runtime-state.json"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("project.yaml missing %q: %s", required, text)
+		}
+	}
+	for _, forbidden := range []string{"runtime:\n", "selection:\n", "runtime-ledger.json"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("project.yaml still contains legacy token %q: %s", forbidden, text)
+		}
+	}
+}
+
+func TestRepositoryAutomationProjectKeepsFormalLedgerPath(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "automation", "project.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile(automation/project.yaml) error = %v", err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "path: ./local/runtime-state.json") {
+		t.Fatalf("automation/project.yaml missing formal persistence path: %s", text)
+	}
+	for _, forbidden := range []string{"runtime-ledger.json", "runtime:\n", "selection:\n"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("automation/project.yaml still contains legacy token %q: %s", forbidden, text)
+		}
+	}
+}
+
 func stubDependencies(t *testing.T) func() {
 	t.Helper()
 	origLoadEnv := loadEnvFile
@@ -1054,6 +1133,12 @@ func (fakeTrackerClient) FetchIssuesByStates(context.Context, []string) ([]model
 func (fakeTrackerClient) FetchIssueStatesByIDs(context.Context, []string) ([]model.Issue, error) {
 	return nil, nil
 }
+func (fakeTrackerClient) SourceClosureAvailability(context.Context) tracker.SourceClosureAvailability {
+	return tracker.SourceClosureAvailability{Supported: true, Available: true}
+}
+func (fakeTrackerClient) CloseSourceIssue(context.Context, model.Issue) tracker.SourceClosureResult {
+	return tracker.SourceClosureResult{Disposition: tracker.SourceClosureDispositionCompleted}
+}
 
 type fakeWorkspaceManager struct{}
 
@@ -1076,7 +1161,8 @@ type fakeOrchestrator struct {
 	discovery      orchestrator.DiscoveryDocument
 	snapshot       orchestrator.Snapshot
 	nextID         int
-	subscribers    map[int]chan orchestrator.Snapshot
+	subscribers    map[int]chan contract.EventEnvelope
+	objects        map[string]orchestrator.ObjectEnvelope
 }
 
 func (f *fakeOrchestrator) Start(ctx context.Context) error {
@@ -1130,18 +1216,25 @@ func (f *fakeOrchestrator) Snapshot() orchestrator.Snapshot {
 	defer f.mu.Unlock()
 	return f.snapshot
 }
-func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.Snapshot, func()) {
+func (f *fakeOrchestrator) SubscribeEvents(buffer int) (<-chan contract.EventEnvelope, func()) {
 	f.mu.Lock()
 	if f.subscribers == nil {
-		f.subscribers = map[int]chan orchestrator.Snapshot{}
+		f.subscribers = map[int]chan contract.EventEnvelope{}
 	}
-	ch := make(chan orchestrator.Snapshot, max(1, buffer))
+	ch := make(chan contract.EventEnvelope, max(1, buffer))
 	id := f.nextID
 	f.nextID++
 	f.subscribers[id] = ch
-	snapshot := f.snapshot
+	event := contract.EventEnvelope{
+		EventID:         "evt-1",
+		EventType:       contract.EventTypeSnapshot,
+		Timestamp:       f.snapshot.GeneratedAt,
+		ContractVersion: contract.APIVersionV1,
+		DomainID:        f.discovery.DomainID,
+		ServiceMode:     f.snapshot.ServiceMode,
+	}
 	f.mu.Unlock()
-	ch <- snapshot
+	ch <- event
 	return ch, func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -1152,16 +1245,53 @@ func (f *fakeOrchestrator) SubscribeSnapshots(buffer int) (<-chan orchestrator.S
 	}
 }
 
+func (f *fakeOrchestrator) GetObject(objectType contract.ObjectType, id string) (orchestrator.ObjectEnvelope, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.objects == nil {
+		return orchestrator.ObjectEnvelope{}, false
+	}
+	item, ok := f.objects[string(objectType)+"/"+id]
+	return item, ok
+}
+
+func (f *fakeOrchestrator) ListObjects(objectType contract.ObjectType) []orchestrator.ObjectEnvelope {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	items := make([]orchestrator.ObjectEnvelope, 0)
+	for _, item := range f.objects {
+		if item.ObjectType == objectType {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
 func (f *fakeOrchestrator) publish(snapshot orchestrator.Snapshot) {
 	f.mu.Lock()
 	f.snapshot = snapshot
-	subscribers := make([]chan orchestrator.Snapshot, 0, len(f.subscribers))
+	subscribers := make([]chan contract.EventEnvelope, 0, len(f.subscribers))
 	for _, ch := range f.subscribers {
 		subscribers = append(subscribers, ch)
 	}
 	f.mu.Unlock()
+	event := contract.EventEnvelope{
+		EventID:         "evt-2",
+		EventType:       contract.EventTypeServiceStateChanged,
+		Timestamp:       snapshot.GeneratedAt,
+		ContractVersion: contract.APIVersionV1,
+		DomainID:        f.discovery.DomainID,
+		ServiceMode:     snapshot.ServiceMode,
+		Reason: func() *contract.Reason {
+			if len(snapshot.Reasons) == 0 {
+				return nil
+			}
+			reason := snapshot.Reasons[0]
+			return &reason
+		}(),
+	}
 	for _, ch := range subscribers {
-		ch <- snapshot
+		ch <- event
 	}
 }
 
@@ -1212,21 +1342,48 @@ func writeAutomationConfig(t *testing.T, root string, opts automationFixtureOpti
 		}
 	}
 
-	projectYAML := fmt.Sprintf(`runtime:
+	projectYAML := fmt.Sprintf(`service:
+  contract_version: v1
+  instance_name: symphony
+domain:
+  id: default
   workspace:
     root: %s
-  codex:
-    command: codex app-server
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
+auth:
+  mode: none
+  leader_required: true
+  transparent_forwarding: false
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
 `, filepath.ToSlash(opts.WorkspaceRoot))
 	writeFile(t, filepath.Join(root, "project.yaml"), projectYAML)
 	writeFile(t, filepath.Join(root, "sources", "linear-main.yaml"), `kind: linear
-api_key: $LINEAR_API_KEY
+credentials:
+  api_key_ref:
+    kind: env
+    name: LINEAR_API_KEY
 project_slug: demo
 branch_scope: demo-scope
 active_states: ["Todo", "In Progress"]
@@ -1245,20 +1402,44 @@ func writeRunProjectConfig(t *testing.T, root string, host string, port int) {
 	if strings.TrimSpace(host) != "" {
 		hostBlock = fmt.Sprintf("    host: %s\n", host)
 	}
-	projectYAML := fmt.Sprintf(`runtime:
-  workspace:
-    root: %s
-  codex:
-    command: codex app-server
+	projectYAML := fmt.Sprintf(`service:
+  contract_version: v1
+  instance_name: symphony
   server:
 %s    port: %d
-selection:
-  dispatch_flow: implement
-  enabled_sources:
+domain:
+  id: default
+  workspace:
+    root: %s
+sources:
+  enabled:
     - linear-main
+execution:
+  backend:
+    kind: codex
+    codex:
+      command: codex app-server
+job_policy:
+  dispatch_flow: implement
+auth:
+  mode: none
+  leader_required: true
+  transparent_forwarding: false
+persistence:
+  backend:
+    kind: file
+    usage: development
+  file:
+    path: ./local/runtime-state.json
+    flush_interval_ms: 1000
+    fsync_on_critical: true
+secrets:
+  providers:
+    env:
+      enabled: true
 defaults:
   profile: null
-`, workspaceRoot, hostBlock, port)
+`, hostBlock, port, workspaceRoot)
 	writeFile(t, filepath.Join(root, "project.yaml"), projectYAML)
 }
 

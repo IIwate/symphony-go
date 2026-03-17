@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strings"
 	"time"
@@ -79,11 +80,12 @@ const (
 type ContinuationReason string
 
 const (
-	ContinuationReasonUnfinishedIssue     ContinuationReason = "unfinished_issue"
-	ContinuationReasonMissingPR           ContinuationReason = "missing_pr"
-	ContinuationReasonClosedUnmergedPR    ContinuationReason = "pr_closed_unmerged"
-	ContinuationReasonMergedPRNotTerminal ContinuationReason = "merged_pr_source_not_terminal"
-	ContinuationReasonTrackerIssueMissing ContinuationReason = "tracker_issue_missing_during_recovery"
+	ContinuationReasonUnfinishedIssue          ContinuationReason = "unfinished_issue"
+	ContinuationReasonMissingPR                ContinuationReason = "missing_pr"
+	ContinuationReasonClosedUnmergedPR         ContinuationReason = "pr_closed_unmerged"
+	ContinuationReasonExecutionBudgetExhausted ContinuationReason = "execution_budget_exhausted"
+	ContinuationReasonRecoverableRuntimeError  ContinuationReason = "recoverable_runtime_error"
+	ContinuationReasonTrackerIssueMissing      ContinuationReason = "tracker_issue_missing_during_recovery"
 )
 
 type PRContext struct {
@@ -94,7 +96,18 @@ type PRContext struct {
 	HeadBranch string
 }
 
+type ReviewFinding struct {
+	Code    string `json:"code"`
+	Summary string `json:"summary"`
+}
+
+type ReviewFeedbackContext struct {
+	Summary  string          `json:"summary,omitempty"`
+	Findings []ReviewFinding `json:"findings,omitempty"`
+}
+
 type DispatchContext struct {
+	JobType            contract.JobType
 	Kind               DispatchKind
 	RetryAttempt       *int
 	ExpectedOutcome    CompletionMode
@@ -104,6 +117,8 @@ type DispatchContext struct {
 	PreviousBranch     *string
 	PreviousPR         *PRContext
 	PreviousIssueState *string
+	RecoveryCheckpoint *RecoveryCheckpoint
+	ReviewFeedback     *ReviewFeedbackContext
 }
 
 func CloneDispatchContext(dispatch *DispatchContext) *DispatchContext {
@@ -131,7 +146,253 @@ func CloneDispatchContext(dispatch *DispatchContext) *DispatchContext {
 		state := *dispatch.PreviousIssueState
 		copyValue.PreviousIssueState = &state
 	}
+	if dispatch.RecoveryCheckpoint != nil {
+		copyValue.RecoveryCheckpoint = CloneRecoveryCheckpoint(dispatch.RecoveryCheckpoint)
+	}
+	if dispatch.ReviewFeedback != nil {
+		copyValue.ReviewFeedback = cloneReviewFeedback(dispatch.ReviewFeedback)
+	}
 	return &copyValue
+}
+
+type RunBudget struct {
+	TotalMS     int `json:"total_ms,omitempty"`
+	ExecutionMS int `json:"execution_ms,omitempty"`
+	ReviewFixMS int `json:"review_fix_ms,omitempty"`
+}
+
+type RunBudgetUsage struct {
+	TotalMS     int `json:"total_ms,omitempty"`
+	ExecutionMS int `json:"execution_ms,omitempty"`
+	ReviewFixMS int `json:"review_fix_ms,omitempty"`
+}
+
+type RecoveryCheckpoint struct {
+	ArtifactID    string              `json:"artifact_id,omitempty"`
+	PatchPath     string              `json:"patch_path,omitempty"`
+	WorkspacePath string              `json:"workspace_path,omitempty"`
+	HiddenRef     string              `json:"hidden_ref,omitempty"`
+	HiddenCommit  string              `json:"hidden_commit,omitempty"`
+	Checkpoint    contract.Checkpoint `json:"checkpoint"`
+}
+
+type RunState struct {
+	Object            contract.Run                `json:"object"`
+	Attempt           int                         `json:"attempt"`
+	State             contract.RunStatus          `json:"state"`
+	Phase             contract.RunPhaseSummary    `json:"phase"`
+	CandidateDelivery *contract.CandidateDelivery `json:"candidate_delivery,omitempty"`
+	ReviewGate        *contract.ReviewGate        `json:"review_gate,omitempty"`
+	ReviewSummary     string                      `json:"review_summary,omitempty"`
+	ReviewFindings    []ReviewFinding             `json:"review_findings,omitempty"`
+	Checkpoints       []contract.Checkpoint       `json:"checkpoints,omitempty"`
+	Budget            RunBudget                   `json:"budget,omitempty"`
+	Usage             RunBudgetUsage              `json:"usage,omitempty"`
+	Reason            *contract.Reason            `json:"reason,omitempty"`
+	Decision          *contract.Decision          `json:"decision,omitempty"`
+	ErrorCode         contract.ErrorCode          `json:"error_code,omitempty"`
+	Recovery          *RecoveryCheckpoint         `json:"recovery,omitempty"`
+}
+
+func CloneRecoveryCheckpoint(value *RecoveryCheckpoint) *RecoveryCheckpoint {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Checkpoint = cloneCheckpoint(value.Checkpoint)
+	return &copyValue
+}
+
+func CloneRunState(value *RunState) *RunState {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.CandidateDelivery = cloneCandidateDelivery(value.CandidateDelivery)
+	copyValue.ReviewGate = cloneReviewGate(value.ReviewGate)
+	copyValue.ReviewFindings = cloneReviewFindings(value.ReviewFindings)
+	copyValue.Checkpoints = cloneCheckpoints(value.Checkpoints)
+	copyValue.Reason = cloneContractReason(value.Reason)
+	copyValue.Decision = cloneContractDecision(value.Decision)
+	copyValue.Recovery = CloneRecoveryCheckpoint(value.Recovery)
+	copyValue.Object = value.Object
+	copyValue.Object.Relations = append([]contract.ObjectRelation(nil), value.Object.Relations...)
+	copyValue.Object.References = append([]contract.Reference(nil), value.Object.References...)
+	if len(value.Object.Reasons) > 0 {
+		copyValue.Object.Reasons = make([]contract.Reason, 0, len(value.Object.Reasons))
+		for _, reason := range value.Object.Reasons {
+			cloned := reason
+			cloned.Details = cloneDetails(reason.Details)
+			copyValue.Object.Reasons = append(copyValue.Object.Reasons, cloned)
+		}
+	}
+	copyValue.Object.Decision = cloneContractDecision(value.Object.Decision)
+	return &copyValue
+}
+
+func cloneReviewFeedback(value *ReviewFeedbackContext) *ReviewFeedbackContext {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Findings = cloneReviewFindings(value.Findings)
+	return &copyValue
+}
+
+func cloneReviewGate(value *contract.ReviewGate) *contract.ReviewGate {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func cloneReviewFindings(value []ReviewFinding) []ReviewFinding {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make([]ReviewFinding, len(value))
+	copy(result, value)
+	return result
+}
+
+func cloneCandidateDelivery(value *contract.CandidateDelivery) *contract.CandidateDelivery {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.ArtifactIDs = append([]string(nil), value.ArtifactIDs...)
+	return &copyValue
+}
+
+func cloneCheckpoints(value []contract.Checkpoint) []contract.Checkpoint {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make([]contract.Checkpoint, len(value))
+	for i, item := range value {
+		result[i] = cloneCheckpoint(item)
+	}
+	return result
+}
+
+func cloneCheckpoint(value contract.Checkpoint) contract.Checkpoint {
+	copyValue := value
+	copyValue.ArtifactIDs = append([]string(nil), value.ArtifactIDs...)
+	copyValue.ReferenceIDs = append([]string(nil), value.ReferenceIDs...)
+	copyValue.Reason = cloneContractReason(value.Reason)
+	return copyValue
+}
+
+func cloneContractReason(value *contract.Reason) *contract.Reason {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	if value.Details != nil {
+		copyValue.Details = cloneDetails(value.Details)
+	}
+	return &copyValue
+}
+
+func cloneContractDecision(value *contract.Decision) *contract.Decision {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.RecommendedActions = append([]contract.DecisionAction(nil), value.RecommendedActions...)
+	if value.Details != nil {
+		copyValue.Details = cloneDetails(value.Details)
+	}
+	return &copyValue
+}
+
+func cloneDetails(details map[string]any) map[string]any {
+	if len(details) == 0 {
+		return nil
+	}
+	result := make(map[string]any, len(details))
+	for key, value := range details {
+		result[key] = value
+	}
+	return result
+}
+
+type InterventionHandoff struct {
+	Phase              contract.RunPhaseSummary          `json:"phase"`
+	Reason             *contract.Reason                  `json:"reason,omitempty"`
+	Decision           *contract.Decision                `json:"decision,omitempty"`
+	ReviewSummary      string                            `json:"review_summary,omitempty"`
+	ReviewFindings     []ReviewFinding                   `json:"review_findings,omitempty"`
+	Checkpoint         *contract.Checkpoint              `json:"checkpoint,omitempty"`
+	RecommendedActions []contract.DecisionAction         `json:"recommended_actions,omitempty"`
+	RequiredInputs     []contract.InterventionInputField `json:"required_inputs,omitempty"`
+}
+
+type InterventionState struct {
+	Object  contract.Intervention `json:"object"`
+	Handoff InterventionHandoff   `json:"handoff"`
+}
+
+func CloneInterventionState(value *InterventionState) *InterventionState {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	copyValue.Object = cloneInterventionObject(value.Object)
+	copyValue.Handoff = cloneInterventionHandoff(value.Handoff)
+	return &copyValue
+}
+
+func cloneInterventionObject(value contract.Intervention) contract.Intervention {
+	copyValue := value
+	copyValue.Relations = append([]contract.ObjectRelation(nil), value.Relations...)
+	copyValue.References = append([]contract.Reference(nil), value.References...)
+	if len(value.Reasons) > 0 {
+		copyValue.Reasons = make([]contract.Reason, 0, len(value.Reasons))
+		for _, reason := range value.Reasons {
+			cloned := reason
+			cloned.Details = cloneDetails(reason.Details)
+			copyValue.Reasons = append(copyValue.Reasons, cloned)
+		}
+	}
+	copyValue.Decision = cloneContractDecision(value.Decision)
+	copyValue.RequiredInputs = cloneInterventionInputs(value.RequiredInputs)
+	copyValue.AllowedActions = append([]contract.ControlAction(nil), value.AllowedActions...)
+	if value.Resolution != nil {
+		resolution := *value.Resolution
+		resolution.ProvidedInputs = cloneDetails(value.Resolution.ProvidedInputs)
+		resolution.Decision = cloneContractDecision(value.Resolution.Decision)
+		copyValue.Resolution = &resolution
+	}
+	return copyValue
+}
+
+func cloneInterventionHandoff(value InterventionHandoff) InterventionHandoff {
+	copyValue := value
+	copyValue.Reason = cloneContractReason(value.Reason)
+	copyValue.Decision = cloneContractDecision(value.Decision)
+	if value.Checkpoint != nil {
+		checkpoint := cloneCheckpoint(*value.Checkpoint)
+		copyValue.Checkpoint = &checkpoint
+	}
+	copyValue.ReviewFindings = cloneReviewFindings(value.ReviewFindings)
+	copyValue.RecommendedActions = append([]contract.DecisionAction(nil), value.RecommendedActions...)
+	copyValue.RequiredInputs = cloneInterventionInputs(value.RequiredInputs)
+	return copyValue
+}
+
+func cloneInterventionInputs(value []contract.InterventionInputField) []contract.InterventionInputField {
+	if len(value) == 0 {
+		return nil
+	}
+	result := make([]contract.InterventionInputField, len(value))
+	for i, item := range value {
+		cloned := item
+		cloned.AllowedValues = append([]string(nil), item.AllowedValues...)
+		result[i] = cloned
+	}
+	return result
 }
 
 type WorkflowDefinition struct {
@@ -181,6 +442,7 @@ type ServiceConfig struct {
 	TrackerRepo                      string
 	ActiveStates                     []string
 	TerminalStates                   []string
+	DomainID                         string
 	PollIntervalMS                   int
 	AutomationRootDir                string
 	WorkspaceRoot                    string
@@ -197,6 +459,9 @@ type ServiceConfig struct {
 	MaxConcurrentAgents              int
 	MaxTurns                         int
 	MaxRetryBackoffMS                int
+	RunBudgetTotalMS                 int
+	RunExecutionBudgetMS             int
+	RunReviewFixBudgetMS             int
 	MaxConcurrentAgentsByState       map[string]int
 	CodexCommand                     string
 	CodexApprovalPolicy              string
@@ -207,6 +472,13 @@ type ServiceConfig struct {
 	CodexStallTimeoutMS              int
 	ServerHost                       string
 	ServerPort                       *int
+	ServiceContractVersion           contract.APIVersion
+	ServiceInstanceName              string
+	CapabilityContract               contract.CapabilityContract
+	LeaderRequired                   bool
+	TransparentForwarding            bool
+	InstanceRole                     contract.InstanceRole
+	LeaderHint                       *contract.LeaderHint
 	SessionPersistence               SessionPersistenceConfig
 	Notifications                    NotificationsConfig
 }
@@ -384,84 +656,6 @@ type LiveSession struct {
 	TurnCount                int
 }
 
-type RetryEntry struct {
-	IssueID       string
-	Identifier    string
-	WorkspacePath string
-	Attempt       int
-	StallCount    int
-	DueAt         time.Time
-	TimerHandle   *time.Timer
-	Error         *string
-	Dispatch      *DispatchContext
-}
-
-type AwaitingMergeEntry struct {
-	Identifier           string
-	State                string
-	WorkspacePath        string
-	Branch               string
-	PRNumber             int
-	PRURL                string
-	PRState              string
-	PRBaseOwner          string
-	PRBaseRepo           string
-	PRHeadOwner          string
-	RetryAttempt         int
-	StallCount           int
-	AwaitingSince        time.Time
-	LastError            *string
-	PostMergeRetryCount  int
-	NextPostMergeRetryAt *time.Time
-}
-
-type AwaitingInterventionEntry struct {
-	Identifier          string
-	WorkspacePath       string
-	Branch              string
-	PRNumber            int
-	PRURL               string
-	PRState             string
-	PRBaseOwner         string
-	PRBaseRepo          string
-	PRHeadOwner         string
-	RetryAttempt        int
-	StallCount          int
-	ObservedAt          time.Time
-	Reason              string
-	ExpectedOutcome     string
-	PreviousBranch      string
-	LastKnownIssueState string
-}
-
-type RecoveryStrategy string
-
-const (
-	RecoveryStrategyContinuationRetry RecoveryStrategy = "continuation_retry"
-	RecoveryStrategyPostRunResume     RecoveryStrategy = "post_run_resume"
-)
-
-type RecoverySource string
-
-const (
-	RecoverySourceRunning   RecoverySource = "running"
-	RecoverySourceRecovered RecoverySource = "recovered"
-	RecoverySourceSucceeded RecoverySource = "succeeded"
-)
-
-type RecoveryEntry struct {
-	Identifier    string
-	WorkspacePath string
-	FinalBranch   string
-	State         string
-	RetryAttempt  int
-	StallCount    int
-	ObservedAt    time.Time
-	Strategy      RecoveryStrategy
-	Source        RecoverySource
-	Dispatch      *DispatchContext
-}
-
 type ProtectedResultOutcome string
 
 const (
@@ -493,28 +687,62 @@ type RuntimeServiceState struct {
 	Reasons            []contract.Reason
 }
 
-type IssueRecord struct {
-	Runtime             contract.IssueRuntimeRecord
-	RetryDueAt          *time.Time
-	RetryAttempt        int
-	StallCount          int
-	LastKnownIssue      *Issue
-	LastKnownIssueState string
-	StartedAt           *time.Time
-	WorkerCancel        context.CancelFunc
-	RetryTimer          *time.Timer
-	Session             LiveSession
-	Dispatch            *DispatchContext
-	NeedsRecovery       bool
+type JobLifecycleState string
+
+const (
+	JobLifecycleActive               JobLifecycleState = "active"
+	JobLifecycleRetryScheduled       JobLifecycleState = "retry_scheduled"
+	JobLifecycleAwaitingMerge        JobLifecycleState = "awaiting_merge"
+	JobLifecycleAwaitingIntervention JobLifecycleState = "awaiting_intervention"
+	JobLifecycleCompleted            JobLifecycleState = "completed"
+)
+
+type JobRuntime struct {
+	Object           contract.Job
+	Lifecycle        JobLifecycleState
+	Reason           *contract.Reason
+	Observation      *contract.Observation
+	UpdatedAt        string
+	WorkspacePath    string
+	SourceState      string
+	PullRequestState string
+	RetryDueAt       *time.Time
+	RetryAttempt     int
+	StallCount       int
+	StartedAt        *time.Time
+	WorkerCancel     context.CancelFunc
+	RetryTimer       *time.Timer
+	Session          LiveSession
+	Dispatch         *DispatchContext
+	NeedsRecovery    bool
+	Run              *RunState
+	Intervention     *InterventionState
+	Outcome          *contract.Outcome
+	Artifacts        []contract.Artifact
+}
+
+type ArchivedJob struct {
+	Object           contract.Job
+	Reason           *contract.Reason
+	Observation      *contract.Observation
+	UpdatedAt        string
+	WorkspacePath    string
+	SourceState      string
+	PullRequestState string
+	Dispatch         *DispatchContext
+	Run              *RunState
+	Intervention     *InterventionState
+	Outcome          *contract.Outcome
+	Artifacts        []contract.Artifact
 }
 
 type OrchestratorState struct {
 	PollIntervalMS      int
 	MaxConcurrentAgents int
 	Service             RuntimeServiceState
-	Records             map[string]*IssueRecord
+	Jobs                map[string]*JobRuntime
 	ProtectedResults    map[string]*ProtectedResultEntry
-	CompletedWindow     []contract.IssueRuntimeRecord
+	ArchivedJobs        []ArchivedJob
 	CodexTotals         TokenTotals
 	CodexRateLimits     any
 }
@@ -593,6 +821,23 @@ func (p RunPhase) String() string {
 	}
 }
 
+type HardViolationCode string
+
+const (
+	HardViolationSubAgent         HardViolationCode = "subagent"
+	HardViolationParallelWork     HardViolationCode = "parallel_work"
+	HardViolationBannedTool       HardViolationCode = "banned_tool"
+	HardViolationOutOfScopeAccess HardViolationCode = "out_of_scope_access"
+	HardViolationBypassResultPath HardViolationCode = "bypass_result_path"
+	HardViolationPolicyOverride   HardViolationCode = "policy_override"
+)
+
+type HardViolationError struct {
+	Code    HardViolationCode
+	Tool    string
+	Message string
+}
+
 type WorkflowError struct {
 	Code    string
 	Message string
@@ -632,6 +877,7 @@ var (
 	ErrInvalidWorkspaceCWD       = &AgentError{Code: "invalid_workspace_cwd"}
 	ErrResponseTimeout           = &AgentError{Code: "response_timeout"}
 	ErrTurnTimeout               = &AgentError{Code: "turn_timeout"}
+	ErrHardViolation             = &AgentError{Code: "hard_violation"}
 	ErrPortExit                  = &AgentError{Code: "port_exit"}
 	ErrResponseError             = &AgentError{Code: "response_error"}
 	ErrTurnFailed                = &AgentError{Code: "turn_failed"}
@@ -682,6 +928,26 @@ func NewAgentError(kind *AgentError, message string, err error) error {
 	}
 
 	return &AgentError{Code: code, Message: message, Err: err}
+}
+
+func NewHardViolationError(code HardViolationCode, tool string, message string) error {
+	if strings.TrimSpace(message) == "" {
+		message = "hard violation detected"
+	}
+	return &HardViolationError{
+		Code:    code,
+		Tool:    strings.TrimSpace(tool),
+		Message: strings.TrimSpace(message),
+	}
+}
+
+func AsHardViolation(err error) (*HardViolationError, bool) {
+	var target *HardViolationError
+	if err == nil || !errors.As(err, &target) || target == nil {
+		return nil, false
+	}
+	copyValue := *target
+	return &copyValue, true
 }
 
 func NewTrackerError(kind *TrackerError, message string, err error) error {
@@ -758,6 +1024,38 @@ func (e *AgentError) Is(target error) bool {
 
 func (e *TrackerError) Error() string {
 	return formatTypedError(e.Code, e.Message, e.Err)
+}
+
+func (e *HardViolationError) Error() string {
+	code := strings.TrimSpace(string(e.Code))
+	if code == "" {
+		code = ErrHardViolation.Code
+	}
+	parts := []string{code}
+	if strings.TrimSpace(e.Tool) != "" {
+		parts = append(parts, "tool="+strings.TrimSpace(e.Tool))
+	}
+	if strings.TrimSpace(e.Message) != "" {
+		parts = append(parts, strings.TrimSpace(e.Message))
+	}
+	return strings.Join(parts, ": ")
+}
+
+func (e *HardViolationError) Is(target error) bool {
+	switch typed := target.(type) {
+	case *AgentError:
+		return typed != nil && typed.Code == ErrHardViolation.Code
+	case *HardViolationError:
+		if typed == nil {
+			return false
+		}
+		if typed.Code == "" {
+			return true
+		}
+		return typed.Code == e.Code
+	default:
+		return false
+	}
 }
 
 func (e *TrackerError) Unwrap() error {

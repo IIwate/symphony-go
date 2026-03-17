@@ -12,6 +12,33 @@ var officialJobTypeDefinitions = []JobTypeDefinition{
 				ReferenceTypeGitBranch,
 			},
 		},
+		CandidateDelivery: CandidateDeliveryPoint{
+			Kind:    CandidateDeliveryPointReviewablePullRequest,
+			Summary: "候选交付点必须是已创建的 draft/open PR。",
+			RequiredArtifactKinds: []ArtifactKind{
+				ArtifactKindPullRequest,
+			},
+			RequiredReferenceTypes: []ReferenceType{
+				ReferenceTypeGitHubPullRequest,
+			},
+		},
+		BusinessCheckpoint: BusinessCheckpointRule{
+			Type:                  CheckpointTypeBusiness,
+			CandidateDeliveryKind: CandidateDeliveryPointReviewablePullRequest,
+			Summary:               "业务 checkpoint 必须是远端 draft/open PR；本地 commit 或仅本地分支不算正式业务 checkpoint。",
+			RequiredArtifactKinds: []ArtifactKind{
+				ArtifactKindPullRequest,
+			},
+			RequiredReferenceTypes: []ReferenceType{
+				ReferenceTypeGitHubPullRequest,
+			},
+			RequiresRemotePublication: true,
+		},
+		ReviewGate: ReviewGatePolicy{
+			Required:     true,
+			ReviewerMode: ReviewerModeReadOnly,
+			MaxFixRounds: 2,
+		},
 		CompletionCriteria: []CompletionCriterion{
 			{
 				Code:               "reviewable_pr_created",
@@ -53,19 +80,45 @@ var officialJobTypeDefinitions = []JobTypeDefinition{
 				ReferenceTypeGitHubPullRequest,
 			},
 		},
+		CandidateDelivery: CandidateDeliveryPoint{
+			Kind:    CandidateDeliveryPointTargetPRSnapshot,
+			Summary: "候选交付点必须是可推进的目标 PR 快照。",
+			RequiredReferenceTypes: []ReferenceType{
+				ReferenceTypeGitHubPullRequest,
+			},
+		},
+		BusinessCheckpoint: BusinessCheckpointRule{
+			Type:                  CheckpointTypeBusiness,
+			CandidateDeliveryKind: CandidateDeliveryPointTargetPRSnapshot,
+			Summary:               "业务 checkpoint 必须记录可推进的目标 PR 快照，不以本地临时提交代替。",
+			RequiredReferenceTypes: []ReferenceType{
+				ReferenceTypeGitHubPullRequest,
+			},
+			RequiresRemotePublication: true,
+		},
+		ReviewGate: ReviewGatePolicy{
+			Required:     true,
+			ReviewerMode: ReviewerModeReadOnly,
+			MaxFixRounds: 2,
+		},
 		CompletionCriteria: []CompletionCriterion{
 			{
 				Code:               "landed_change_recorded",
-				Summary:            "存在 landed change record 或 merge result 引用且最终 Outcome 为 succeeded。",
+				Summary:            "正式完成点是目标 PR 已 merged，且存在 merge result 与 landed change record 正式产物。",
 				AcceptableOutcomes: []OutcomeConclusion{OutcomeConclusionSucceeded},
 				RequiredArtifactKinds: []ArtifactKind{
+					ArtifactKindMergeResult,
 					ArtifactKindLandedChangeRecord,
 				},
+				RequiredReferenceTypes: []ReferenceType{
+					ReferenceTypeGitHubPullRequest,
+				},
+				RequiresMergedTarget: true,
 			},
 		},
 		DefaultArtifacts: []ArtifactExpectation{
 			{Role: ArtifactRolePrimary, Kind: ArtifactKindLandedChangeRecord, Required: true, Summary: "主产物为 landed change record"},
-			{Role: ArtifactRoleSupporting, Kind: ArtifactKindMergeResult, Required: false, Summary: "辅助产物可为 merge result 引用"},
+			{Role: ArtifactRoleSupporting, Kind: ArtifactKindMergeResult, Required: true, Summary: "必需产物包含 merge result 引用，用于证明目标 PR 已 merged"},
 		},
 		InterventionTemplates: []InterventionTemplate{
 			{
@@ -83,7 +136,7 @@ var officialJobTypeDefinitions = []JobTypeDefinition{
 	},
 	{
 		Type:    JobTypeAnalysis,
-		Summary: "产出结构化分析结论，主产物为 Report。",
+		Summary: "产出结构化分析结论，documentation 作为 analysis 的结果路径存在，不单独升成一级 Job type。",
 		Target: TargetReferencePolicy{
 			Required:          false,
 			RequiresCodeSpace: false,
@@ -92,6 +145,27 @@ var officialJobTypeDefinitions = []JobTypeDefinition{
 				ReferenceTypeGitHubRepo,
 				ReferenceTypeReportURL,
 			},
+		},
+		CandidateDelivery: CandidateDeliveryPoint{
+			Kind:    CandidateDeliveryPointAnalysisReportDraft,
+			Summary: "候选交付点必须是正式分析报告草案。",
+			RequiredArtifactKinds: []ArtifactKind{
+				ArtifactKindAnalysisReport,
+			},
+		},
+		BusinessCheckpoint: BusinessCheckpointRule{
+			Type:                  CheckpointTypeBusiness,
+			CandidateDeliveryKind: CandidateDeliveryPointAnalysisReportDraft,
+			Summary:               "业务 checkpoint 必须记录正式分析报告草案。",
+			RequiredArtifactKinds: []ArtifactKind{
+				ArtifactKindAnalysisReport,
+			},
+			RequiresRemotePublication: false,
+		},
+		ReviewGate: ReviewGatePolicy{
+			Required:     true,
+			ReviewerMode: ReviewerModeReadOnly,
+			MaxFixRounds: 2,
 		},
 		CompletionCriteria: []CompletionCriterion{
 			{
@@ -131,6 +205,27 @@ var officialJobTypeDefinitions = []JobTypeDefinition{
 				ReferenceTypeGitHubRepo,
 				ReferenceTypeReportURL,
 			},
+		},
+		CandidateDelivery: CandidateDeliveryPoint{
+			Kind:    CandidateDeliveryPointDiagnosticReportDraft,
+			Summary: "候选交付点必须是正式诊断报告草案。",
+			RequiredArtifactKinds: []ArtifactKind{
+				ArtifactKindDiagnosticReport,
+			},
+		},
+		BusinessCheckpoint: BusinessCheckpointRule{
+			Type:                  CheckpointTypeBusiness,
+			CandidateDeliveryKind: CandidateDeliveryPointDiagnosticReportDraft,
+			Summary:               "业务 checkpoint 必须记录正式诊断报告草案。",
+			RequiredArtifactKinds: []ArtifactKind{
+				ArtifactKindDiagnosticReport,
+			},
+			RequiresRemotePublication: false,
+		},
+		ReviewGate: ReviewGatePolicy{
+			Required:     true,
+			ReviewerMode: ReviewerModeReadOnly,
+			MaxFixRounds: 2,
 		},
 		CompletionCriteria: []CompletionCriterion{
 			{
@@ -182,13 +277,34 @@ func DescribeJobType(jobType JobType) (JobTypeDefinition, bool) {
 func cloneJobTypeDefinition(definition JobTypeDefinition) JobTypeDefinition {
 	clone := definition
 	clone.Target.AllowedReferenceTypes = append([]ReferenceType(nil), definition.Target.AllowedReferenceTypes...)
+	clone.CandidateDelivery = CandidateDeliveryPoint{
+		Kind:                   definition.CandidateDelivery.Kind,
+		Summary:                definition.CandidateDelivery.Summary,
+		RequiredArtifactKinds:  append([]ArtifactKind(nil), definition.CandidateDelivery.RequiredArtifactKinds...),
+		RequiredReferenceTypes: append([]ReferenceType(nil), definition.CandidateDelivery.RequiredReferenceTypes...),
+	}
+	clone.BusinessCheckpoint = BusinessCheckpointRule{
+		Type:                      definition.BusinessCheckpoint.Type,
+		CandidateDeliveryKind:     definition.BusinessCheckpoint.CandidateDeliveryKind,
+		Summary:                   definition.BusinessCheckpoint.Summary,
+		RequiredArtifactKinds:     append([]ArtifactKind(nil), definition.BusinessCheckpoint.RequiredArtifactKinds...),
+		RequiredReferenceTypes:    append([]ReferenceType(nil), definition.BusinessCheckpoint.RequiredReferenceTypes...),
+		RequiresRemotePublication: definition.BusinessCheckpoint.RequiresRemotePublication,
+	}
+	clone.ReviewGate = ReviewGatePolicy{
+		Required:     definition.ReviewGate.Required,
+		ReviewerMode: definition.ReviewGate.ReviewerMode,
+		MaxFixRounds: definition.ReviewGate.MaxFixRounds,
+	}
 	clone.CompletionCriteria = make([]CompletionCriterion, len(definition.CompletionCriteria))
 	for i, criterion := range definition.CompletionCriteria {
 		clone.CompletionCriteria[i] = CompletionCriterion{
-			Code:                  criterion.Code,
-			Summary:               criterion.Summary,
-			AcceptableOutcomes:    append([]OutcomeConclusion(nil), criterion.AcceptableOutcomes...),
-			RequiredArtifactKinds: append([]ArtifactKind(nil), criterion.RequiredArtifactKinds...),
+			Code:                   criterion.Code,
+			Summary:                criterion.Summary,
+			AcceptableOutcomes:     append([]OutcomeConclusion(nil), criterion.AcceptableOutcomes...),
+			RequiredArtifactKinds:  append([]ArtifactKind(nil), criterion.RequiredArtifactKinds...),
+			RequiredReferenceTypes: append([]ReferenceType(nil), criterion.RequiredReferenceTypes...),
+			RequiresMergedTarget:   criterion.RequiresMergedTarget,
 		}
 	}
 	clone.DefaultArtifacts = append([]ArtifactExpectation(nil), definition.DefaultArtifacts...)
