@@ -62,6 +62,8 @@ class SymphonyConfigWriterTest(unittest.TestCase):
             symphony.write_doctor_config(base_dir)
 
             project_yaml = (base_dir / "project.yaml").read_text(encoding="utf-8")
+            source_yaml = (base_dir / "sources" / "linear-main.yaml").read_text(encoding="utf-8")
+            env_local = (base_dir / "local" / "env.local").read_text(encoding="utf-8")
             self.assertIn("service:\n", project_yaml)
             self.assertIn("domain:\n", project_yaml)
             self.assertIn("  polling:\n", project_yaml)
@@ -72,6 +74,10 @@ class SymphonyConfigWriterTest(unittest.TestCase):
             self.assertIn("persistence:\n", project_yaml)
             self.assertNotIn("runtime:\n", project_yaml)
             self.assertNotIn("selection:\n", project_yaml)
+            self.assertIn("endpoint: https://api.linear.app/graphql\n", source_yaml)
+            self.assertIn("LINEAR_API_KEY=dummy\n", env_local)
+            self.assertIn("LINEAR_PROJECT_SLUG=dummy-project\n", env_local)
+            self.assertIn("LINEAR_BRANCH_SCOPE=dummy-scope\n", env_local)
 
     def test_auxiliary_formal_smoke_configs_include_workspace_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

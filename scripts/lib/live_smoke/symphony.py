@@ -337,6 +337,7 @@ credentials:
   api_key_ref:
     kind: env
     name: LINEAR_API_KEY
+endpoint: https://api.linear.app/graphql
 project_slug: $LINEAR_PROJECT_SLUG
 branch_scope: $LINEAR_BRANCH_SCOPE
 active_states: ["Todo", "In Progress"]
@@ -346,6 +347,12 @@ terminal_states: ["Closed", "Done"]
     )
     (base_dir / "flows" / "implement.yaml").write_text("prompt: prompts/implement.md.liquid\n", encoding="utf-8")
     (base_dir / "prompts" / "implement.md.liquid").write_text("doctor smoke\n", encoding="utf-8")
+    (base_dir / "local" / "env.local").write_text(
+        "LINEAR_API_KEY=dummy\n"
+        "LINEAR_PROJECT_SLUG=dummy-project\n"
+        "LINEAR_BRANCH_SCOPE=dummy-scope\n",
+        encoding="utf-8",
+    )
 
 
 def write_inline_hook_config(base_dir: Path, *, linear_api_key: str, linear_project_slug: str, linear_branch_scope: str) -> None:
