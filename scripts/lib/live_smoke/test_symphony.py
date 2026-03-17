@@ -63,11 +63,42 @@ class SymphonyConfigWriterTest(unittest.TestCase):
 
             project_yaml = (base_dir / "project.yaml").read_text(encoding="utf-8")
             self.assertIn("service:\n", project_yaml)
+            self.assertIn("domain:\n", project_yaml)
+            self.assertIn("  polling:\n", project_yaml)
+            self.assertIn("  workspace:\n", project_yaml)
+            self.assertIn("    root: ", project_yaml)
             self.assertIn("execution:\n", project_yaml)
             self.assertIn("job_policy:\n", project_yaml)
             self.assertIn("persistence:\n", project_yaml)
             self.assertNotIn("runtime:\n", project_yaml)
             self.assertNotIn("selection:\n", project_yaml)
+
+    def test_auxiliary_formal_smoke_configs_include_workspace_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            inline_dir = base_dir / "inline-hook"
+            symphony.write_inline_hook_config(
+                inline_dir,
+                linear_api_key="linear-key",
+                linear_project_slug="proj",
+                linear_branch_scope="scope",
+            )
+            inline_yaml = (inline_dir / "project.yaml").read_text(encoding="utf-8")
+            self.assertIn("  polling:\n", inline_yaml)
+            self.assertIn("  workspace:\n", inline_yaml)
+            self.assertIn("    root: ", inline_yaml)
+
+            symlink_dir = base_dir / "symlink"
+            symphony.write_symlink_escape_config(
+                symlink_dir,
+                linear_api_key="linear-key",
+                linear_project_slug="proj",
+                linear_branch_scope="scope",
+            )
+            symlink_yaml = (symlink_dir / "project.yaml").read_text(encoding="utf-8")
+            self.assertIn("  polling:\n", symlink_yaml)
+            self.assertIn("  workspace:\n", symlink_yaml)
+            self.assertIn("    root: ", symlink_yaml)
 
 
 if __name__ == "__main__":

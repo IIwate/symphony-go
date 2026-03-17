@@ -408,9 +408,22 @@ def _run_doctor_and_set(resources: Resources) -> str:
         check=False,
     )
     combined = doctor.stdout + doctor.stderr
-    if doctor.returncode == 0 or "CODEX_COMMAND (runtime.codex.command)" not in combined:
-        raise RuntimeError("doctor did not report missing runtime.codex.command")
+    if doctor.returncode == 0 or not _doctor_reports_missing_codex_command(combined):
+        raise RuntimeError("doctor did not report missing CODEX_COMMAND secret")
     return "doctor ok"
+
+
+def _doctor_reports_missing_codex_command(output: str) -> bool:
+    for marker in (
+        "execution.backend.codex.command is required",
+        "runtime.codex.command is required",
+        "codex.command is required",
+    ):
+        if marker in output:
+            return True
+    if "missing required secrets:" not in output:
+        return False
+    return re.search(r"(?m)^-\s+CODEX_COMMAND(?:\s|\()", output) is not None
 
 
 def _run_inline_hook_dry_run(resources: Resources, linear_api_key: str, project_slug: str, branch_scope: str) -> str:

@@ -289,12 +289,17 @@ if __name__ == "__main__":
 def write_doctor_config(base_dir: Path) -> None:
     for name in ["sources", "flows", "prompts", "local"]:
         (base_dir / name).mkdir(parents=True, exist_ok=True)
+    workspace_root = str((temp_root() / f"workspaces-{base_dir.name}").resolve()).replace("\\", "/")
     (base_dir / "project.yaml").write_text(
         """service:
   contract_version: v1
   instance_name: symphony
 domain:
   id: default
+  polling:
+    interval_ms: 3000
+  workspace:
+    root: WORKSPACE_ROOT_PLACEHOLDER
 sources:
   enabled:
     - linear-main
@@ -323,7 +328,7 @@ secrets:
       enabled: true
 defaults:
   profile: null
-""",
+""".replace("WORKSPACE_ROOT_PLACEHOLDER", workspace_root),
         encoding="utf-8",
     )
     (base_dir / "sources" / "linear-main.yaml").write_text(
@@ -346,12 +351,17 @@ terminal_states: ["Closed", "Done"]
 def write_inline_hook_config(base_dir: Path, *, linear_api_key: str, linear_project_slug: str, linear_branch_scope: str) -> None:
     for name in ["sources", "flows", "prompts", "local"]:
         (base_dir / name).mkdir(parents=True, exist_ok=True)
+    workspace_root = str((temp_root() / f"workspaces-{base_dir.name}").resolve()).replace("\\", "/")
     (base_dir / "project.yaml").write_text(
         """service:
   contract_version: v1
   instance_name: symphony
 domain:
   id: default
+  polling:
+    interval_ms: 3000
+  workspace:
+    root: WORKSPACE_ROOT_PLACEHOLDER
 sources:
   enabled:
     - linear-main
@@ -380,7 +390,7 @@ secrets:
       enabled: true
 defaults:
   profile: null
-""",
+""".replace("WORKSPACE_ROOT_PLACEHOLDER", workspace_root),
         encoding="utf-8",
     )
     (base_dir / "sources" / "linear-main.yaml").write_text(
@@ -411,12 +421,17 @@ terminal_states: ["Closed", "Done"]
 def write_symlink_escape_config(base_dir: Path, *, linear_api_key: str, linear_project_slug: str, linear_branch_scope: str) -> bool:
     for name in ["sources", "flows", "prompts", "hooks", "local"]:
         (base_dir / name).mkdir(parents=True, exist_ok=True)
+    workspace_root = str((temp_root() / f"workspaces-{base_dir.name}").resolve()).replace("\\", "/")
     (base_dir / "project.yaml").write_text(
         """service:
   contract_version: v1
   instance_name: symphony
 domain:
   id: default
+  polling:
+    interval_ms: 3000
+  workspace:
+    root: WORKSPACE_ROOT_PLACEHOLDER
 sources:
   enabled:
     - linear-main
@@ -445,7 +460,7 @@ secrets:
       enabled: true
 defaults:
   profile: null
-""",
+""".replace("WORKSPACE_ROOT_PLACEHOLDER", workspace_root),
         encoding="utf-8",
     )
     (base_dir / "sources" / "linear-main.yaml").write_text(

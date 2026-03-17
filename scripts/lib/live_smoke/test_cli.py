@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 LIB_ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +81,32 @@ def _run(identifier: str, state: str, phase: str) -> dict[str, object]:
 
 
 class LiveSmokeCliContractTest(unittest.TestCase):
+    def test_doctor_missing_codex_command_accepts_legacy_and_formal_paths(self) -> None:
+        for path in ("runtime.codex.command", "execution.backend.codex.command"):
+            with self.subTest(path=path):
+                output = f"missing required secrets:\n- CODEX_COMMAND ({path})\n"
+                self.assertTrue(cli._doctor_reports_missing_codex_command(output))
+
+    def test_doctor_missing_codex_command_rejects_unrelated_output(self) -> None:
+        output = "other configuration errors:\n- source_adapter.branch_scope is required for linear source\n"
+        self.assertFalse(cli._doctor_reports_missing_codex_command(output))
+
+    def test_doctor_missing_codex_command_accepts_structural_validation_output(self) -> None:
+        output = "invalid_codex_command: execution.backend.codex.command is required\n"
+        self.assertTrue(cli._doctor_reports_missing_codex_command(output))
+
+    def test_run_doctor_and_set_accepts_formal_missing_secret_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resources = cli.Resources(temp_dir=Path(tmp_dir), binary_path=Path("symphony.exe"))
+            doctor = SimpleNamespace(
+                returncode=1,
+                stdout="missing required secrets:\n- CODEX_COMMAND (execution.backend.codex.command)\n",
+                stderr="",
+            )
+
+            with patch.object(cli, "run", return_value=doctor):
+                self.assertEqual(cli._run_doctor_and_set(resources), "doctor ok")
+
     def test_state_surface_rejects_legacy_runtime_records(self) -> None:
         payload = {
             "generated_at": "2026-03-16T00:00:00Z",
